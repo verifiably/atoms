@@ -15,9 +15,9 @@ after Plan A's interfaces settle.
 
 ## Authority order
 
-1. [`docs/plans/2026-07-20-txn-substrate-convergence-design.md`](docs/plans/2026-07-20-txn-substrate-convergence-design.md)
+1. [`docs/plans/2026-07-20-recoverable-fs-effect-engine-design.md`](docs/plans/2026-07-20-recoverable-fs-effect-engine-design.md)
    — the design contract under review. When a future `STANDARD`/spec supersedes it, update this note.
-2. [`docs/plans/2026-07-20-txn-substrate-convergence-implementation.md`](docs/plans/2026-07-20-txn-substrate-convergence-implementation.md)
+2. [`docs/plans/2026-07-20-recoverable-fs-effect-engine-implementation.md`](docs/plans/2026-07-20-recoverable-fs-effect-engine-implementation.md)
    — the delivery roadmap and approval gate.
 
 These are dated historical/founding records. Treat their `Package: science` framing as

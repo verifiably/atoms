@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-21
 **Status:** Deferred roadmap — gated on design approval; intentionally task-free (do not resurrect the former task sequence)
-**Design:** [`2026-07-20-txn-substrate-convergence-design.md`](2026-07-20-txn-substrate-convergence-design.md)
+**Design:** [`2026-07-20-recoverable-fs-effect-engine-design.md`](2026-07-20-recoverable-fs-effect-engine-design.md)
 
 ## Why this document changed
 

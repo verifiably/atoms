@@ -25,8 +25,8 @@ dozen rounds of adversarial contract review) and is carried here verbatim under
 `docs/plans/` as the founding spec. No production code exists yet; the design's own
 roadmap gates implementation on owner approval.
 
-- Design: [`docs/plans/2026-07-20-txn-substrate-convergence-design.md`](docs/plans/2026-07-20-txn-substrate-convergence-design.md)
-- Delivery roadmap (Plan A / Plan B, approval gate): [`docs/plans/2026-07-20-txn-substrate-convergence-implementation.md`](docs/plans/2026-07-20-txn-substrate-convergence-implementation.md)
+- Design: [`docs/plans/2026-07-20-recoverable-fs-effect-engine-design.md`](docs/plans/2026-07-20-recoverable-fs-effect-engine-design.md)
+- Delivery roadmap (Plan A / Plan B, approval gate): [`docs/plans/2026-07-20-recoverable-fs-effect-engine-implementation.md`](docs/plans/2026-07-20-recoverable-fs-effect-engine-implementation.md)
 
 ## Scope
 
