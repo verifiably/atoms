@@ -20,13 +20,15 @@ half-write.
 
 ## Status
 
-Pre-implementation. The founding design was authored inside science (through roughly a
-dozen rounds of adversarial contract review) and is carried here verbatim under
-`docs/plans/` as the founding spec. No production code exists yet; the design's own
-roadmap gates implementation on owner approval.
+Pre-implementation. The engine was originally designed inside science through roughly a
+dozen rounds of adversarial contract review; that review capital is carried into the
+standalone authority design below. No production code exists yet; the design's own
+roadmap (§14) gates implementation on owner approval.
 
-- Design: [`docs/plans/2026-07-20-recoverable-fs-effect-engine-design.md`](docs/plans/2026-07-20-recoverable-fs-effect-engine-design.md)
-- Delivery roadmap (Plan A / Plan B, approval gate): [`docs/plans/2026-07-20-recoverable-fs-effect-engine-implementation.md`](docs/plans/2026-07-20-recoverable-fs-effect-engine-implementation.md)
+- **Authority design:** [`docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md`](docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md)
+  — standalone `atoms` engine, SQLite-in-WAL metadata store, `nodes`/science as deferred consumers.
+- Historical (superseded): the science-framed [`2026-07-20-*`](docs/plans/2026-07-20-recoverable-fs-effect-engine-design.md)
+  design + roadmap, retained as the record of the review that hardened the effect/recovery contracts.
 
 ## Scope
 

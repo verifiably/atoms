@@ -1,9 +1,15 @@
 # Recoverable filesystem effect engine — design
 
 **Date:** 2026-07-21
-**Status:** Draft for owner review
+**Status:** **Superseded (2026-07-23)** — historical, review-hardened record; not the current authority.
 **Scope:** durable filesystem transaction engine plus archive/import/supersede adoption
 **Package:** `science` (`src/science_tool/`, tests, saved-plan schemas)
+
+> **Superseded by [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md).**
+> That document recenters this engine as the standalone `atoms` library — SQLite-in-WAL metadata store,
+> consumers `nodes` and science adopted later. The capability vocabulary, coherent capture, per-effect
+> contracts, restartable materialization, and recovery classifier below are carried into it
+> near-verbatim; this file is retained only as the historical record of the review that hardened them.
 
 > This design supersedes the earlier “transaction substrate convergence” architecture at this path
 > before implementation began. The earlier reviews remain useful: their capture, containment,
