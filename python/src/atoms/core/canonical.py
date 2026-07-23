@@ -218,6 +218,14 @@ def _ensure(condition: object, message: str) -> None:
 
 def _as_dict(value: Any, ctx: str) -> dict[Any, Any]:
     _ensure(type(value) is dict, f"{ctx} must be an object")
+    for field in value:
+        _ensure(
+            type(field) is str,
+            (
+                f"{ctx} has an unexpected object key; "
+                "object keys must use the exact string type"
+            ),
+        )
     return value
 
 

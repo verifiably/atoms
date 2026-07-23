@@ -18,6 +18,29 @@ from tests.test_canonical import _all_variants_spec
 F = FileState(content_hash="sha256:" + "5" * 64, mode=0o644, byte_len=7)
 
 
+class _AllowedNameStrSubclass(str):
+    pass
+
+
+class _AllowedNameEqualityMasquerader:
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+    def __hash__(self) -> int:
+        return hash(self.value)
+
+    def __eq__(self, other: object) -> bool:
+        return other == self.value
+
+
+class _ExplodingEqualityKey:
+    def __hash__(self) -> int:
+        return hash("type")
+
+    def __eq__(self, other: object) -> bool:
+        raise AssertionError(f"unexpected equality comparison with {other!r}")
+
+
 def _minimal_obj(**overrides: object) -> dict[object, object]:
     obj: dict[object, object] = {
         "schema_version": 1,
@@ -241,6 +264,35 @@ def test_unexpected_mixed_type_object_keys_raise_only_spec_validation_error():
     obj[1] = "integer key"
     obj[None] = "none key"
     with pytest.raises(SpecValidationError, match="unexpected"):
+        from_canonical_obj(obj)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        _AllowedNameStrSubclass("schema_version"),
+        _AllowedNameEqualityMasquerader("schema_version"),
+    ],
+)
+def test_allowed_name_non_builtin_string_keys_are_rejected(key):
+    obj = _minimal_obj()
+    obj[key] = obj.pop("schema_version")
+
+    with pytest.raises(SpecValidationError, match="object keys"):
+        from_canonical_obj(obj)
+
+
+def test_nested_non_string_key_is_rejected_before_discriminator_membership():
+    obj = _minimal_obj(
+        initial_surface=[
+            {
+                "path": "a",
+                "state": {_ExplodingEqualityKey(): "absent"},
+            }
+        ]
+    )
+
+    with pytest.raises(SpecValidationError, match="object keys"):
         from_canonical_obj(obj)
 
 
