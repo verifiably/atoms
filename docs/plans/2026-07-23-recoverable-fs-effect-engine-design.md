@@ -111,6 +111,10 @@ For a valid `TransactionSpec` that passes compilation validation (§5.4):
   detected. (Directory quarantines are exempt — `rmdir` atomically refuses a non-empty directory.)
   The engine cannot make that writer participate in the transaction.
 - Arbitrary corruption or deletion of the metadata root (§7) is not automatically repaired.
+- The runtime capability probe proves functional *availability*, not power-loss *durability*. The engine
+  trusts the §8–§10 recovery tables only on an allowlisted, crash-tested filesystem type (§5.5, §13.2);
+  on a filesystem outside that allowlist it refuses at preparation rather than assume the barrier
+  semantics hold.
 - A `ReplaceFile` that refuses on concurrent drift briefly publishes its own postimage to the single
   live path during the atomic exchange, before exchanging the concurrent writer's entry back. A reader
   or sync client observing that path between the two exchanges can see content from a transaction that
@@ -199,14 +203,16 @@ persistent paths cannot be established by comparing concrete names then. It is i
 guarantee: every same-parent scratch name (file staging, delete tombstone, move anchor) occupies a
 **reserved scratch grammar** — a single-component leaf name carrying a reserved sigil that a persistent
 project path may never bear (`CreateDirectory` staging instead lives in the protected `work/`
-namespace, §9.5). The sigil is chosen to be **invariant under the backend's name equivalence**: grammar
-matching uses the same case- and Unicode-normalization semantics as the metadata-namespace identity
-check (§5.4), and the sigil itself is composed only of equivalence-invariant characters — an
-ASCII-punctuation-and-digit prefix with no letters (for example `.#txn.<txid>.<effect-id>.<role>`) — so
-a persistent path cannot alias a scratch name through a case or NFC/NFD variant on an insensitive
-volume, as a letter-bearing prefix like `.txn.` would allow. Compilation rejects any persistent effect
-path matching the grammar under those semantics, so declared persistent paths and scratch are disjoint
-regardless of which transaction ID is later bound.
+namespace, §9.5). The **discriminating sigil** is the exact leaf prefix `.#~` — three ASCII punctuation bytes (dot,
+hash, tilde), none of which has a case or NFC/NFD variant. A leaf is a scratch name **if and only if it
+begins with `.#~`**; scratch leaves have the form `.#~<txid>.<effect-id>.<role>`, but only the
+letter-free `.#~` prefix participates in classification — the `<txid>.<effect-id>.<role>` remainder may
+contain hex or letters, because it is never matched against a persistent path. Because the
+discriminating prefix is letter-free, no persistent path can alias it through a case or NFC/NFD variant
+on an insensitive volume, as a letter-bearing sigil like `.txn.` (which folds to `.TXN.`) would allow.
+Compilation rejects any persistent effect path whose leaf begins with `.#~`, under the same case- and
+Unicode-normalization semantics as the metadata-namespace identity check (§5.4), so declared persistent
+paths and scratch are disjoint regardless of which transaction ID is later bound.
 
 The grammar forecloses *declared* collisions, not concrete ones: a noncooperating writer, or debris
 predating this engine, can still create a concrete scratch leaf. Preparation therefore checks each
@@ -274,7 +280,10 @@ Before any metadata or blob write, validation proves:
   runtime transaction ID;
 - every semantic capability (§5.5) named by the spec's effects, plus the always-required
   `anchored_traversal`, `durable_publish`, and `advisory_project_lock`, is supplied by the active
-  backend for the project-root volume; a missing capability refuses before any metadata or blob write.
+  backend for the project-root volume; a missing capability refuses before any transaction-record write
+  (spec, journal, or blob) or project mutation. The engine-owned bootstrap the probe itself requires —
+  creating/opening `metadata_root`, the lock, and `probe/` — is exempt and necessarily precedes this
+  approval (§5.5).
 
 After this boundary, internal execution code trusts the specification.
 
@@ -305,6 +314,26 @@ namespace, discarded before any record is written; it can never be mistaken for 
 The probe also certifies that the metadata-root volume can host the **SQLite-WAL** metadata store
 (§7): working POSIX advisory locking and shared-memory-backed WAL. A volume that cannot is refused
 with `CapabilityUnavailable`, like any other missing capability; there is no fallback store.
+
+**Bootstrap precedes approval.** Creating or opening `metadata_root`, acquiring the project lock, and
+running this probe form an idempotent bootstrap phase that necessarily precedes capability approval —
+the probe cannot certify a volume without writing to it. That bootstrap touches only the engine-owned
+`metadata_root` (the `lock` and `probe/`), never a project path or a transaction record, and its
+survivors are reclaimed under the lock at lease entry (above). The "refuses before any write" guarantee
+(§5.4) is scoped accordingly: **transaction-record metadata (spec, journal, blobs) and project
+mutation** never begin until every required capability, and the volume's ability to host the store, is
+approved.
+
+**Availability is not durability.** The probe proves a capability is *functionally* present (e.g.
+`RENAME_EXCHANGE` succeeds and swaps), but it cannot prove the volume upholds the durability guarantees
+in this table under real power loss — a filesystem can offer atomic exchange yet lie about `fsync`,
+reorder across a barrier, or be mounted `nobarrier`. Power-loss correctness is therefore **not**
+established at runtime. The engine additionally restricts `metadata_root`'s volume to a **known-durable
+filesystem allowlist** (matched by `statfs` type — local journaling/CoW filesystems whose barrier
+behavior is crash-tested, §13.2) and refuses an unknown or known-non-durable filesystem (tmpfs, network
+filesystems, `nobarrier` mounts) with `CapabilityUnavailable`. The allowlist, not any per-run probe,
+carries the durability guarantee; admitting a filesystem type to it requires block-device/VM crash
+certification (§13.2).
 
 | Capability | Required guarantee | Reference backends |
 | --- | --- | --- |
@@ -427,16 +456,36 @@ staging publication reach live targets by atomic hard-link and rename. Preparati
 once and **refuses** (`CapabilityUnavailable`) if it cannot host the required primitives — including
 SQLite-WAL itself (§5.5). There is no fallback to a weaker store.
 
-The metadata namespace is anchored exactly like effect paths (§6): the engine opens `metadata_root`
-and its subdirectories from a durably-held descriptor through guarded traversal — refusing any symlink
-or mount crossing — retains those descriptors, and issues every lock, staging, blob, and
-database-file operation relative to a held descriptor, never a re-resolved absolute path. Without this,
-a pre-existing symlink or an ancestor swap could place the database on another path or volume while
-effects still mutate the intended project, and fresh-process recovery could then open a different store
-than the interrupted run wrote. Recovery reacquires these descriptors by the same guarded traversal
-before opening the database (subject to the ancestor-relocation non-guarantee, §3.2). Compilation
-additionally rejects any persistent effect path at or below `metadata_root` by filesystem identity
-(§5.4), so no consumer effect can target the engine's own storage.
+The engine's **own** metadata operations — the `lock`, `staging/`, `work/`, blob promotion, and
+directory fsyncs — are anchored exactly like effect paths (§6): the engine opens `metadata_root` and
+its subdirectories from a durably-held descriptor through guarded traversal, refusing any symlink or
+mount crossing, retains those descriptors, and issues each as a single-component leaf operation relative
+to a held descriptor, never a re-resolved absolute path.
+
+The **SQLite database files** (`atoms.db`, `-wal`, `-shm`) are the exception, and the design does not
+claim otherwise: stdlib `sqlite3.connect()` opens by pathname and SQLite performs all database and
+sidecar I/O through its own VFS, so those operations are neither issued through the engine's `openat`
+traversal nor visible to the in-process interposer (§13.5). They are handled as follows.
+
+- *Anchoring by verified identity, not by descriptor.* At bootstrap the engine resolves `metadata_root`
+  once through guarded traversal, records its `st_dev`/`st_ino`, confirms it is a real directory on the
+  probed, allowlisted volume, and opens the database by that verified path. A pre-existing symlink or
+  ancestor swap that would place the store elsewhere is caught at that resolution; a relocation *after*
+  it is the documented §3.2 non-guarantee. Fresh-process recovery repeats the same verified resolution
+  before opening the database.
+- *Allowlisted metadata surface, not per-syscall audit.* The fixed `atoms.db{,-wal,-shm}` set under the
+  verified `metadata_root` is an allowlisted metadata surface (§13.5). The interposer does not audit
+  SQLite's internal C-level I/O — exactly as the persistence-cut model does not re-verify SQLite's WAL
+  atomicity (§13.2); the engine trusts the library on a certified volume. The interposer's obligation is
+  to prove no *effect* mutation targets that set, not to observe the library's writes.
+- *No custom VFS is required for durability.* SQLite's stock unix VFS honors `PRAGMA fullfsync` (macOS
+  `F_FULLFSYNC`), so `durable_publish` for the store is met by configuration (§7.2). A custom VFS —
+  giving `openat`-anchored, `O_NOFOLLOW` opens and interposer-visible I/O, via a maintained binding
+  such as `apsw` or a small vendored shim — is an **optional Plan A hardening**, specified there with its
+  own auditing and recovery tests, not a correctness prerequisite for the cooperating-process model.
+
+Compilation additionally rejects any persistent effect path at or below `metadata_root` by filesystem
+identity (§5.4), so no consumer effect can target the engine's own storage.
 
 This metadata is single-host by construction. On creation of `metadata_root`, the engine best-effort
 **requests** that cross-machine sync clients ignore the directory — via the platform's Dropbox ignore
@@ -720,8 +769,12 @@ engine preserves that blocker, removes only its own staging object, and rolls ba
 a refused outcome. An exact postimage with no staging survivor is classified as landed, subject to the
 fingerprint-equivalent recreation non-guarantee.
 
-The compiler rejects duplicate destinations within the transaction; a concurrent creator loses at
-no-clobber publication and the transaction rolls back. There is no live reservation sentinel and no
+Two `CreateFileNoClobber` occurrences of the *same* destination are legal only when separated by an
+intervening deletion — a continuous `absent → file → absent → file` timeline (§5.3). There is no
+separate global duplicate-destination ban; it is the §5.3 continuity check that rejects two
+`absent → file` occurrences of one destination with no `file → absent` between them, because their
+timelines would not be continuous. (A concurrent *external* creator instead loses at no-clobber
+publication and the transaction rolls back.) There is no live reservation sentinel and no
 partial-destination hard-halt.
 
 ### 9.3 `DeletePath`
@@ -1001,7 +1054,10 @@ removal update did not — source, destination, and anchor all naming the origin
 **anchor-only** tuple (the removal update persisted but the insertion update did not — both persistent
 paths absent, only the durable anchor surviving). It asserts recovery repairs the dual-name tuple by
 removing the destination and the anchor-only tuple by restoring the source from the anchor, each
-reaching the pre-state. Where feasible it is complemented by VM or block-device crash testing.
+reaching the pre-state. VM or block-device crash testing is the **certification** method for the
+durability filesystem allowlist (§5.5): the persistence-cut model exercises the engine's ordering logic
+on every run, while the crash-test matrix is what admits a filesystem *type* to the allowlist. A
+filesystem type the engine has not crash-certified is refused at preparation, not trusted.
 
 ### 13.3 Spec and compiler conformance
 
@@ -1034,8 +1090,11 @@ succeeds. Every target must be:
 
 It wraps `rename`, `replace`, `unlink`, `mkdir`, `rmdir`, `symlink`, `chmod`, **`fchmod`**, `link`,
 mutating `open`, the `*at` and descriptor-relative variants (`renameat2`, `openat`, `linkat`,
-`fchmodat`), and `setxattr`/`fsetxattr` applied to the metadata root, so no metadata mutation escapes
-the audit. Because the effects set modes with `fchmod` through retained descriptors, the interposer
+`fchmodat`), and `setxattr`/`fsetxattr` applied to the metadata root, so no *engine-issued* metadata
+mutation escapes the audit. SQLite's own database/WAL/SHM I/O goes through its VFS and is **not**
+observable to this in-process interposer (§7); that fixed file set is an allowlisted metadata surface,
+and the interposer's obligation there is only to prove no *effect* mutation targets it, not to observe
+the library's internal writes. Because the effects set modes with `fchmod` through retained descriptors, the interposer
 resolves descriptor-relative mutations through **descriptor provenance**: it tracks the engine-issued
 path each retained descriptor was opened against, attributes a mutation through that descriptor to its
 declared or engine-derived target exactly as a path-based mutation, and fails the surface assertion on
@@ -1081,12 +1140,17 @@ transaction model.
 2. A platform capability backend layer resolving the §5.5 vocabulary behind one interface: a Linux
    backend (`openat2` anchored traversal, `renameat2`, `fsync`) and a macOS backend
    (`openat`+`O_NOFOLLOW_ANY`, `renamex_np`/`renameatx_np`, `fcntl(F_FULLFSYNC)`), plus a per-volume
-   capability probe that refuses an unsupported platform, filesystem, or SQLite-WAL-incapable volume
-   before any mutation. Leaf syscall wrappers are **vendored/adapted** (not depended on) for `renameat2`
+   capability probe that separates functional-availability probing from power-loss durability, and
+   refuses an unsupported platform, a filesystem outside the crash-tested durability allowlist (§5.5),
+   or a SQLite-WAL-incapable volume before any mutation. Leaf syscall wrappers are **vendored/adapted**
+   (not depended on) for `renameat2`
    / `openat2` on Linux and `renamex_np` / `F_FULLFSYNC` on macOS; the solved single-file case uses
    stdlib `os.replace`.
 3. The SQLite-WAL metadata store (§7): schema, the project lock and universal recovery-resolve lease,
-   blobs, and the preparation/per-effect commit ordering.
+   blobs, and the preparation/per-effect commit ordering — including the idempotent bootstrap phase
+   (§5.5) that precedes capability approval, and the **metadata-store I/O-layer decision** (§7): stdlib
+   `sqlite3` with verified-directory resolution and an allowlisted-surface audit, versus an optional
+   custom VFS (`openat`-anchored, `O_NOFOLLOW`, interposer-visible).
 4. Coherent capture and restartable atomic materialization (§6, §10).
 5. Five effects and the recovery executor (§8–§9).
 6. Model, real-filesystem, subprocess-recovery, and persistence-cut suites, run on both backends (§13).

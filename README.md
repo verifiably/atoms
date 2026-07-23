@@ -40,19 +40,30 @@ roadmap (§14) gates implementation on owner approval.
   …) and refuse only the specific effects a mount cannot satisfy. Linux lands complete
   first; macOS fills in capability-by-capability. No all-or-nothing platform gate.
 
-## Open questions (to resolve here, in isolation)
+## Design decisions (settled in the authority design)
 
-1. **Leaf-primitive sourcing.** Vendor/adapt syscall wrappers (`renameat2`/`openat2`
-   on Linux; `renamex_np`/`F_FULLFSYNC` on macOS) rather than depend on the tiny,
-   inactive third-party packages; lean on stdlib `os.replace` for the solved
-   single-file case.
-2. **Durable-metadata delegation.** Spike whether SQLite-in-WAL (stdlib `sqlite3`)
-   should own the journal / spec / blob-index — trading a hand-rolled directory-of-JSON
-   write-ahead log for a batteries-included one, at the cost of a second durability
-   domain the recovery classifier must reconcile against the filesystem.
-3. **Data-VCS composition (downstream).** DVC / lakeFS / dolt version data *content*
-   for reproducibility; that is orthogonal to atomic mutation, but `atoms` could
-   underlie how such a system safely materializes a checkout. Not a driver now.
+1. **Durable metadata → SQLite-in-WAL** (stdlib `sqlite3`, `synchronous=FULL` + macOS
+   `fullfsync`): a `COMMIT` is the durability barrier and WAL replay is metadata recovery,
+   replacing the hand-rolled directory-of-JSON journal. Blob *content*, staging, and work
+   dirs stay on the filesystem; only the journal / spec / blob-index / active-pointer live
+   in the DB. The one hand-ordered rule is cross-substrate: anything the DB references is
+   filesystem-durable before the `COMMIT` that references it.
+2. **Leaf-primitive sourcing:** vendor/adapt `renameat2`/`openat2` (Linux) and
+   `renamex_np`/`F_FULLFSYNC` (macOS); stdlib `os.replace` for the single-file case. No
+   dependency on the tiny, inactive third-party wrappers.
+3. **Vertical slice = a synthetic in-repo exerciser** (Plan A); production adoption —
+   `nodes` corpus-write first, then science — is deferred to Plan B.
+
+## Open items (to settle in Plan A)
+
+- **SQLite I/O layer:** whether the DB/WAL/SHM get a custom VFS (`openat`-anchored,
+  `O_NOFOLLOW`, interposer-visible) or the stdlib default with verified-directory
+  resolution and an allowlisted-surface audit. Durability itself needs no custom VFS —
+  the stock VFS honors `PRAGMA fullfsync`.
+- **Durability allowlist:** the crash-tested filesystem-type allowlist `metadata_root` is
+  restricted to. Functional probing proves *availability*, not power-loss *correctness*.
+- **Data-VCS composition (downstream):** DVC / lakeFS / dolt version data *content* —
+  orthogonal, but `atoms` could underlie safe checkout materialization. Not a driver now.
 
 ## Relationship to science
 
