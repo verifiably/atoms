@@ -329,11 +329,20 @@ approved.
 in this table under real power loss — a filesystem can offer atomic exchange yet lie about `fsync`,
 reorder across a barrier, or be mounted `nobarrier`. Power-loss correctness is therefore **not**
 established at runtime. The engine additionally restricts `metadata_root`'s volume to a **known-durable
-filesystem allowlist** (matched by `statfs` type — local journaling/CoW filesystems whose barrier
-behavior is crash-tested, §13.2) and refuses an unknown or known-non-durable filesystem (tmpfs, network
-filesystems, `nobarrier` mounts) with `CapabilityUnavailable`. The allowlist, not any per-run probe,
-carries the durability guarantee; admitting a filesystem type to it requires block-device/VM crash
-certification (§13.2).
+configuration allowlist** and refuses an unknown or known-non-durable configuration (tmpfs, network
+filesystems, `nobarrier`/`barrier=0` mounts) with `CapabilityUnavailable`. The allowlist, not any
+per-run probe, carries the durability guarantee; admitting a configuration to it requires block-device/VM
+crash certification (§13.2).
+
+The allowlist is keyed on a **supported configuration tuple**, not on `statfs` `f_type` alone, because
+`f_type` is too coarse to carry a durability claim: ext2, ext3, and ext4 all report `0xef53` despite
+different journaling guarantees, and barrier-defeating mount options (`nobarrier`, `barrier=0`) are not
+reflected in `statfs` at all. A tuple is (backend/OS, filesystem implementation, the feature and mount
+options that bear on barrier/`fsync` behavior, and the tested storage assumptions). Runtime validation
+resolves the metadata volume to its actual mount and inspects that tuple — on Linux, the filesystem type
+and mount options from `/proc/self/mountinfo` (and superblock features where they matter), not `f_type` —
+and refuses any volume whose tuple is not a crash-certified entry. A crash test therefore certifies one
+tuple, never every volume that merely shares an `f_type`.
 
 | Capability | Required guarantee | Reference backends |
 | --- | --- | --- |
@@ -470,14 +479,29 @@ traversal nor visible to the in-process interposer (§13.5). They are handled as
 - *Anchoring by verified identity, not by descriptor.* At bootstrap the engine resolves `metadata_root`
   once through guarded traversal, records its `st_dev`/`st_ino`, confirms it is a real directory on the
   probed, allowlisted volume, and opens the database by that verified path. A pre-existing symlink or
-  ancestor swap that would place the store elsewhere is caught at that resolution; a relocation *after*
-  it is the documented §3.2 non-guarantee. Fresh-process recovery repeats the same verified resolution
-  before opening the database.
-- *Allowlisted metadata surface, not per-syscall audit.* The fixed `atoms.db{,-wal,-shm}` set under the
-  verified `metadata_root` is an allowlisted metadata surface (§13.5). The interposer does not audit
-  SQLite's internal C-level I/O — exactly as the persistence-cut model does not re-verify SQLite's WAL
-  atomicity (§13.2); the engine trusts the library on a certified volume. The interposer's obligation is
-  to prove no *effect* mutation targets that set, not to observe the library's writes.
+  ancestor swap that would place the store elsewhere is caught at that resolution. Fresh-process recovery
+  repeats the same verified resolution before opening the database. This resolution is verify-then-open,
+  not a held-descriptor anchor: stdlib `sqlite3` re-resolves `metadata_root`'s pathname whenever it opens
+  the database or a sidecar, so — unlike an effect path pinned to a held parent descriptor — no descriptor
+  participates and the §3.2 held-directory reasoning does not carry over. The stdlib baseline therefore
+  makes an explicit cooperating-process assumption, broader than §3.2's relocation case: **mutating or
+  replacing `metadata_root` or any of its ancestors while a lease is active voids the recovery
+  guarantee.** The project lock serializes cooperating processes, for which this never arises; defending
+  against an adversary who substitutes the store's path mid-lease requires the optional hardened VFS
+  below, which opens the database through `openat`-anchored, `O_NOFOLLOW` descriptors.
+- *Bounded SQLite surface under a pinned profile, not per-syscall audit.* SQLite may touch more than
+  `atoms.db{,-wal,-shm}` — it documents several temporary-file kinds (rollback and statement journals,
+  temp databases, materializations) whose presence and location it explicitly disclaims as an application
+  contract. The engine therefore does **not** name a fixed three-file allowlist; it **bounds** the
+  surface with a pinned SQL/configuration profile and treats whatever files that profile can produce
+  under the verified `metadata_root` as the excluded SQLite surface (§13.5). The profile pins the SQLite
+  capabilities the engine relies on, sets `temp_store=MEMORY` and a `metadata_root`-local temp directory
+  so no temp file escapes the store, and forbids `ATTACH` and `VACUUM`; the one transient on-disk journal
+  — the rollback journal SQLite writes while first switching the database into WAL mode — is created and
+  consumed inside bootstrap (§5.5), before any effect runs. The interposer does not audit SQLite's
+  internal C-level I/O — exactly as the persistence-cut model does not re-verify SQLite's WAL atomicity
+  (§13.2); the engine trusts the library on a certified volume. Its obligation is to prove no *effect*
+  mutation targets the store, not to enumerate the library's own writes.
 - *No custom VFS is required for durability.* SQLite's stock unix VFS honors `PRAGMA fullfsync` (macOS
   `F_FULLFSYNC`), so `durable_publish` for the store is met by configuration (§7.2). A custom VFS —
   giving `openat`-anchored, `O_NOFOLLOW` opens and interposer-visible I/O, via a maintained binding
@@ -1055,9 +1079,12 @@ removal update did not — source, destination, and anchor all naming the origin
 paths absent, only the durable anchor surviving). It asserts recovery repairs the dual-name tuple by
 removing the destination and the anchor-only tuple by restoring the source from the anchor, each
 reaching the pre-state. VM or block-device crash testing is the **certification** method for the
-durability filesystem allowlist (§5.5): the persistence-cut model exercises the engine's ordering logic
-on every run, while the crash-test matrix is what admits a filesystem *type* to the allowlist. A
-filesystem type the engine has not crash-certified is refused at preparation, not trusted.
+durability configuration allowlist (§5.5): the persistence-cut model exercises the engine's ordering
+logic on every run, while the crash-test matrix is what admits a **configuration tuple** — backend/OS,
+filesystem implementation, barrier-relevant feature and mount options, and storage assumptions — to the
+allowlist. Because one `statfs` `f_type` spans several such tuples (ext2/3/4 all report `0xef53`, and
+`nobarrier` is invisible to `statfs`), certification is keyed on the tuple, and a volume whose resolved
+tuple the engine has not crash-certified is refused at preparation, not trusted.
 
 ### 13.3 Spec and compiler conformance
 
@@ -1091,10 +1118,11 @@ succeeds. Every target must be:
 It wraps `rename`, `replace`, `unlink`, `mkdir`, `rmdir`, `symlink`, `chmod`, **`fchmod`**, `link`,
 mutating `open`, the `*at` and descriptor-relative variants (`renameat2`, `openat`, `linkat`,
 `fchmodat`), and `setxattr`/`fsetxattr` applied to the metadata root, so no *engine-issued* metadata
-mutation escapes the audit. SQLite's own database/WAL/SHM I/O goes through its VFS and is **not**
-observable to this in-process interposer (§7); that fixed file set is an allowlisted metadata surface,
-and the interposer's obligation there is only to prove no *effect* mutation targets it, not to observe
-the library's internal writes. Because the effects set modes with `fchmod` through retained descriptors, the interposer
+mutation escapes the audit. SQLite's own I/O — the database, WAL, SHM, and any temporary file its pinned
+profile (§7) can create — goes through its VFS and is **not** observable to this in-process interposer
+(§7); that whole SQLite surface, bounded by the profile under the verified `metadata_root`, is excluded
+from the audit, and the interposer's obligation there is only to prove no *effect* mutation targets it,
+not to enumerate the library's internal writes. Because the effects set modes with `fchmod` through retained descriptors, the interposer
 resolves descriptor-relative mutations through **descriptor provenance**: it tracks the engine-issued
 path each retained descriptor was opened against, attributes a mutation through that descriptor to its
 declared or engine-derived target exactly as a path-based mutation, and fails the surface assertion on
@@ -1141,8 +1169,10 @@ transaction model.
    backend (`openat2` anchored traversal, `renameat2`, `fsync`) and a macOS backend
    (`openat`+`O_NOFOLLOW_ANY`, `renamex_np`/`renameatx_np`, `fcntl(F_FULLFSYNC)`), plus a per-volume
    capability probe that separates functional-availability probing from power-loss durability, and
-   refuses an unsupported platform, a filesystem outside the crash-tested durability allowlist (§5.5),
-   or a SQLite-WAL-incapable volume before any mutation. Leaf syscall wrappers are **vendored/adapted**
+   refuses an unsupported platform, a volume whose configuration tuple is outside the crash-tested
+   durability allowlist (§5.5), or a SQLite-WAL-incapable volume before any transaction-record metadata
+   or project mutation (the idempotent bootstrap of §5.5 necessarily precedes this refusal). Leaf syscall
+   wrappers are **vendored/adapted**
    (not depended on) for `renameat2`
    / `openat2` on Linux and `renamex_np` / `F_FULLFSYNC` on macOS; the solved single-file case uses
    stdlib `os.replace`.

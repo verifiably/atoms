@@ -58,10 +58,15 @@ roadmap (§14) gates implementation on owner approval.
 
 - **SQLite I/O layer:** whether the DB/WAL/SHM get a custom VFS (`openat`-anchored,
   `O_NOFOLLOW`, interposer-visible) or the stdlib default with verified-directory
-  resolution and an allowlisted-surface audit. Durability itself needs no custom VFS —
-  the stock VFS honors `PRAGMA fullfsync`.
-- **Durability allowlist:** the crash-tested filesystem-type allowlist `metadata_root` is
-  restricted to. Functional probing proves *availability*, not power-loss *correctness*.
+  resolution and a bounded-surface audit (a pinned SQL profile — `temp_store=MEMORY`, no
+  `ATTACH`/`VACUUM` — keeps SQLite's file surface inside the store). Durability itself
+  needs no custom VFS — the stock VFS honors `PRAGMA fullfsync`. The stdlib baseline
+  trusts cooperating processes not to relocate `metadata_root` mid-lease; the custom VFS
+  is what closes that gap.
+- **Durability allowlist:** the crash-tested allowlist `metadata_root` is restricted to,
+  keyed on a *configuration tuple* (fs implementation + barrier-relevant mount options),
+  not `statfs` `f_type` — which is too coarse (ext2/3/4 share one type; `nobarrier` is
+  invisible to it). Functional probing proves *availability*, not power-loss *correctness*.
 - **Data-VCS composition (downstream):** DVC / lakeFS / dolt version data *content* —
   orthogonal, but `atoms` could underlie safe checkout materialization. Not a driver now.
 
