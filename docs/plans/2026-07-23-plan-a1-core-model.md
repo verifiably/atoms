@@ -1,0 +1,1351 @@
+# Plan A1 — Core transaction model, vocabulary, and canonical form
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Build the pure, in-memory core of the `atoms` engine — the `TransactionSpec` data model, the five effect variants, the semantic capability vocabulary, the reserved scratch grammar, and a deterministic canonical serialization — with zero filesystem, SQLite, or platform dependency.
+
+**Architecture:** Frozen stdlib dataclasses model spec/effect/state *shapes*; behavior (occurrence enumeration, capability derivation, canonical encoding) lives in separate dispatch functions, keeping "shapes vs. rules" cleanly split (design §4.3). No pydantic and no third-party runtime dependency in the core — the determinism guarantee (§5.1, §13.3) is met by explicit canonicalization, not a validation library. This sub-plan implements **only** the parts of design §5 expressible without touching a filesystem; the filesystem-identity checks of §5.4 (metadata-root containment, ancestor resolution) are deferred to A2/A4, and validation of specs is deferred to A2.
+
+**Tech Stack:** Python ≥3.11, stdlib only (`dataclasses`, `enum`, `functools.singledispatch`, `json`, `unicodedata`, `hashlib`), managed with `uv`; hatchling build; `ruff` + `pyright` + `pytest`.
+
+## Where this sits in the Plan A program
+
+Design §14's "Plan A" is a program of eight sub-plans, sequenced so each produces working, testable software and no sub-plan prematurely locks a design decision the doc deferred:
+
+| Sub-plan | Scope | Design refs | Deferred decisions settled |
+| --- | --- | --- | --- |
+| **A1 (this doc)** | Pure model, vocabulary, scratch grammar, canonical form | §5.1–§5.3, §5.5-as-data | none (dependency-free) |
+| A2 | Compilation validation (fs-independent subset) + repeated-path timelines | §5.3, §5.4 | none |
+| A3 | Executable recovery reference model (transaction + variant classifiers) | §8.4, §13.1 | none |
+| A4 | Platform capability backend + per-volume probe + durability-allowlist tuples | §5.5, §14 | **durability-allowlist configuration tuples** |
+| A5 | SQLite-WAL metadata store, project lock, recovery-resolve lease, preparation/commit ordering | §7 | **SQLite I/O-layer (stdlib vs. custom VFS)** |
+| A6 | Coherent capture + restartable atomic materialization | §6, §10 | none |
+| A7 | Five effect implementations + recovery executor | §8, §9 | none |
+| A8 | Real-fs / subprocess / persistence-cut suites + synthetic exerciser + e2e recovery matrix | §12.1, §13 | none |
+
+A1 depends on nothing. A2 and A3 depend only on A1's types. A4 onward introduce syscalls and are where the two deferred design decisions get made — each in its own reviewed sub-plan.
+
+## Global Constraints
+
+- **Python floor:** `requires-python = ">=3.11"` (matches `nodes`). Copy verbatim into `pyproject.toml`.
+- **No third-party runtime dependency in `atoms.core`.** Stdlib only. Dev deps (`pytest`, `ruff`, `pyright`) are the only dependencies.
+- **Distribution/import identity:** distribution name `atoms-core`; import namespace `atoms` (PEP 420 namespace — no `src/atoms/__init__.py`); import package `atoms.core`. Mirrors `nodes-core` / `nodes.core`.
+- **Layout:** all package work lives under `python/` (`python/pyproject.toml`, `python/src/atoms/core/`, `python/tests/`), mirroring `~/d/nodes/python/`.
+- **Tooling:** `ruff` line-length 120; `pyright` `typeCheckingMode = "basic"`, `pythonVersion = "3.11"`; `pytest` `addopts = "-q"`, `testpaths = ["tests"]`. All commands run via `uv run` from `python/`.
+- **Content hashes** are strings of the form `sha256:<64 lowercase hex>`. **Modes** are integer permission bits only (e.g. `0o644`), never type bits.
+- **Project-relative paths** (`RelPath`) are POSIX, `/`-separated, no leading slash, no `.`/`..` components. A1 stores them verbatim; resolution/containment is A2/A4's job.
+- No AI-attribution trailers on commits/PRs/comments. Docs use `~/d/` (never `/home/keith/d/` or `/mnt/ssd/Dropbox/`).
+
+---
+
+### Task 1: Package scaffold and error hierarchy
+
+Scaffolding for the whole `python/` subtree is folded here because every later task imports from it; the error hierarchy ships with it because it is trivial and needed by every module.
+
+**Files:**
+- Create: `python/pyproject.toml`
+- Create: `python/src/atoms/core/__init__.py`
+- Create: `python/src/atoms/core/errors.py`
+- Create: `python/tests/__init__.py`
+- Test: `python/tests/test_errors.py`
+
+**Interfaces:**
+- Consumes: nothing.
+- Produces: exception classes `AtomsError`, `ProtocolError(AtomsError)`, `SpecValidationError(AtomsError)`, `PreconditionRefused(AtomsError)`, `CapabilityUnavailable(AtomsError)`, `TransactionHalted(AtomsError)`. Package import path `atoms.core`.
+
+- [ ] **Step 1: Write the failing test**
+
+`python/tests/test_errors.py`:
+
+```python
+import pytest
+
+from atoms.core.errors import (
+    AtomsError,
+    CapabilityUnavailable,
+    PreconditionRefused,
+    ProtocolError,
+    SpecValidationError,
+    TransactionHalted,
+)
+
+
+def test_all_engine_errors_subclass_atoms_error():
+    for exc in (
+        ProtocolError,
+        SpecValidationError,
+        PreconditionRefused,
+        CapabilityUnavailable,
+        TransactionHalted,
+    ):
+        assert issubclass(exc, AtomsError)
+
+
+def test_errors_carry_a_message():
+    with pytest.raises(CapabilityUnavailable, match="atomic_exchange"):
+        raise CapabilityUnavailable("atomic_exchange missing on volume")
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run (from `python/`): `uv run pytest tests/test_errors.py -v`
+Expected: FAIL — `ModuleNotFoundError: No module named 'atoms'` (package not yet built/installed).
+
+- [ ] **Step 3: Create the scaffold**
+
+`python/pyproject.toml`:
+
+```toml
+[project]
+name = "atoms-core"
+import-names = ["atoms.core"]
+import-namespaces = ["atoms"]
+version = "0.1.0"
+description = "Atoms core: a recoverable filesystem effect engine (pure model)"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Keith Hughitt", email = "keith.hughitt@gmail.com" }]
+requires-python = ">=3.11"
+classifiers = ["Typing :: Typed"]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/atoms-dev/core"
+Repository = "https://github.com/atoms-dev/core"
+Issues = "https://github.com/atoms-dev/core/issues"
+
+[build-system]
+requires = ["hatchling>=1.30"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/atoms"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.pyright]
+typeCheckingMode = "basic"
+pythonVersion = "3.11"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0",
+    "ruff>=0.15.7",
+    "pyright>=1.1.390",
+]
+```
+
+`python/src/atoms/core/__init__.py`:
+
+```python
+"""Atoms core: the pure, in-memory transaction model and vocabulary."""
+```
+
+`python/tests/__init__.py`: empty file.
+
+`python/src/atoms/core/errors.py`:
+
+```python
+"""Engine error hierarchy (design §11)."""
+
+
+class AtomsError(Exception):
+    """Base class for every error the engine raises."""
+
+
+class ProtocolError(AtomsError):
+    """An internal engine contract was violated."""
+
+
+class SpecValidationError(AtomsError):
+    """A TransactionSpec failed compilation validation (design §5.4)."""
+
+
+class PreconditionRefused(AtomsError):
+    """Concurrent drift was detected; the transaction refuses cleanly."""
+
+
+class CapabilityUnavailable(AtomsError):
+    """A required filesystem capability is not supplied by the active backend."""
+
+
+class TransactionHalted(AtomsError):
+    """State is unattributable; the engine preserves the record and evidence."""
+```
+
+Notes: a README is required by `pyproject.toml`'s `readme` field; the repo root `README.md` is one directory up, so add `readme = "README.md"` only if a `python/README.md` exists — instead point it at the root by creating a one-line `python/README.md`:
+
+```markdown
+# atoms-core
+
+Pure model for the atoms recoverable filesystem effect engine. See `~/d/atoms/README.md`.
+```
+
+(Create `python/README.md` with that content in this step.)
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run (from `python/`): `uv run pytest tests/test_errors.py -v`
+Expected: PASS (both tests). `uv run` builds/installs the editable package on first invocation.
+
+- [ ] **Step 5: Lint and type-check the new files**
+
+Run (from `python/`): `uv run ruff check` then `uv run pyright`
+Expected: no errors.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add python/
+git commit -m "feat(core): scaffold atoms-core package and error hierarchy"
+```
+
+---
+
+### Task 2: Path-state fingerprints
+
+**Files:**
+- Create: `python/src/atoms/core/fingerprint.py`
+- Test: `python/tests/test_fingerprint.py`
+
+**Interfaces:**
+- Consumes: nothing.
+- Produces:
+  - `PathKind` enum (`ABSENT`, `FILE`, `DIRECTORY`, `SYMLINK`).
+  - Frozen dataclasses `AbsentState`, `FileState(content_hash: str, mode: int, byte_len: int)`, `DirectoryState(mode: int)`, `SymlinkState(target: str, mode: int)`.
+  - Type alias `PathState = AbsentState | FileState | DirectoryState | SymlinkState`.
+  - `ABSENT: AbsentState` singleton.
+  - `kind_of(state: PathState) -> PathKind`.
+
+- [ ] **Step 1: Write the failing test**
+
+`python/tests/test_fingerprint.py`:
+
+```python
+import pytest
+
+from atoms.core.fingerprint import (
+    ABSENT,
+    AbsentState,
+    DirectoryState,
+    FileState,
+    PathKind,
+    SymlinkState,
+    kind_of,
+)
+
+
+def test_states_are_frozen_and_hashable():
+    f = FileState(content_hash="sha256:" + "0" * 64, mode=0o644, byte_len=10)
+    assert hash(f) == hash(FileState(content_hash="sha256:" + "0" * 64, mode=0o644, byte_len=10))
+    with pytest.raises(Exception):
+        f.mode = 0o600  # type: ignore[misc]
+
+
+def test_absent_is_a_singleton_value():
+    assert ABSENT is ABSENT
+    assert AbsentState() == ABSENT
+
+
+def test_kind_of_maps_every_variant():
+    assert kind_of(ABSENT) is PathKind.ABSENT
+    assert kind_of(FileState(content_hash="sha256:" + "a" * 64, mode=0o644, byte_len=1)) is PathKind.FILE
+    assert kind_of(DirectoryState(mode=0o755)) is PathKind.DIRECTORY
+    assert kind_of(SymlinkState(target="../x", mode=0o777)) is PathKind.SYMLINK
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `uv run pytest tests/test_fingerprint.py -v`
+Expected: FAIL — `ModuleNotFoundError: No module named 'atoms.core.fingerprint'`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+`python/src/atoms/core/fingerprint.py`:
+
+```python
+"""Path-state fingerprints — the declared/observed state of a single path (design §6)."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
+
+
+class PathKind(Enum):
+    ABSENT = "absent"
+    FILE = "file"
+    DIRECTORY = "directory"
+    SYMLINK = "symlink"
+
+
+@dataclass(frozen=True, slots=True)
+class AbsentState:
+    """The path does not exist."""
+
+
+@dataclass(frozen=True, slots=True)
+class FileState:
+    """A regular file: content hash, exact permission bits, and byte length."""
+
+    content_hash: str
+    mode: int
+    byte_len: int
+
+
+@dataclass(frozen=True, slots=True)
+class DirectoryState:
+    """A directory with exact permission bits."""
+
+    mode: int
+
+
+@dataclass(frozen=True, slots=True)
+class SymlinkState:
+    """A symlink: its target and exact permission bits (lstat-coherent)."""
+
+    target: str
+    mode: int
+
+
+PathState = AbsentState | FileState | DirectoryState | SymlinkState
+
+ABSENT = AbsentState()
+
+
+def kind_of(state: PathState) -> PathKind:
+    match state:
+        case AbsentState():
+            return PathKind.ABSENT
+        case FileState():
+            return PathKind.FILE
+        case DirectoryState():
+            return PathKind.DIRECTORY
+        case SymlinkState():
+            return PathKind.SYMLINK
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `uv run pytest tests/test_fingerprint.py -v`
+Expected: PASS.
+
+- [ ] **Step 5: Lint, type-check, commit**
+
+```bash
+uv run ruff check && uv run pyright
+git add python/src/atoms/core/fingerprint.py python/tests/test_fingerprint.py
+git commit -m "feat(core): path-state fingerprints"
+```
+
+---
+
+### Task 3: Reserved scratch grammar
+
+Implements the letter-free `.#~` sigil (design §5.1) and the property that makes the letter-free choice sound: on any input, a plain `startswith` and an equivalence-aware (case + NFC/NFD) match must agree, so no persistent path can alias scratch through a normalization variant (§13.3).
+
+**Files:**
+- Create: `python/src/atoms/core/scratch.py`
+- Test: `python/tests/test_scratch.py`
+
+**Interfaces:**
+- Consumes: nothing.
+- Produces:
+  - `SCRATCH_SIGIL = ".#~"`.
+  - `leaf_of(rel_path: str) -> str` — last POSIX component.
+  - `is_scratch_leaf(leaf: str) -> bool` — plain prefix test.
+  - `aliases_scratch_sigil(leaf: str) -> bool` — equivalence-aware test across `{leaf, NFC, NFD, casefold}`.
+  - `scratch_leaf(txid: str, effect_id: str, role: str) -> str` — build `f"{SCRATCH_SIGIL}{txid}.{effect_id}.{role}"`.
+
+- [ ] **Step 1: Write the failing test**
+
+`python/tests/test_scratch.py`:
+
+```python
+import unicodedata
+
+from atoms.core.scratch import (
+    SCRATCH_SIGIL,
+    aliases_scratch_sigil,
+    is_scratch_leaf,
+    leaf_of,
+    scratch_leaf,
+)
+
+
+def test_sigil_is_letter_free_punctuation():
+    assert SCRATCH_SIGIL == ".#~"
+    assert all(not c.isalpha() for c in SCRATCH_SIGIL)
+
+
+def test_leaf_of_takes_last_component():
+    assert leaf_of("a/b/c.txt") == "c.txt"
+    assert leaf_of("solo") == "solo"
+
+
+def test_scratch_leaf_builds_expected_shape():
+    name = scratch_leaf("deadbeef", "e07", "stage")
+    assert name == ".#~deadbeef.e07.stage"
+    assert is_scratch_leaf(name)
+
+
+def test_persistent_names_are_not_scratch():
+    for name in ("index.md", ".hidden", "#notsigil", "~backup", ".#nottilde"):
+        assert not is_scratch_leaf(name)
+        assert not aliases_scratch_sigil(name)
+
+
+def test_letter_free_sigil_has_no_case_or_normalization_alias():
+    # The core invariant: because the sigil is letter-free ASCII punctuation with no
+    # case or NFC/NFD variant, the plain prefix test and the equivalence-aware test
+    # agree on EVERY input — so no persistent leaf can alias scratch through folding.
+    samples = [
+        "index.md",
+        ".#~x",
+        "A" * 3,
+        "café",                                   # NFC vs NFD differ, but not at the prefix
+        unicodedata.normalize("NFD", "café"),
+        ".#~" + unicodedata.normalize("NFD", "é"),
+        "K" + " elvin",                       # KELVIN SIGN casefolds to 'k'
+    ]
+    for s in samples:
+        assert is_scratch_leaf(s) == aliases_scratch_sigil(s)
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `uv run pytest tests/test_scratch.py -v`
+Expected: FAIL — `ModuleNotFoundError: No module named 'atoms.core.scratch'`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+`python/src/atoms/core/scratch.py`:
+
+```python
+"""Reserved scratch grammar (design §5.1).
+
+The discriminating sigil is the exact leaf prefix ``.#~`` — three ASCII punctuation
+bytes, none of which has a case or NFC/NFD variant. A leaf is a scratch name iff it
+begins with the sigil; only the sigil participates in classification.
+"""
+
+from __future__ import annotations
+
+import unicodedata
+
+SCRATCH_SIGIL = ".#~"
+
+
+def leaf_of(rel_path: str) -> str:
+    """Return the last ``/``-separated component of a project-relative path."""
+    return rel_path.rsplit("/", 1)[-1]
+
+
+def is_scratch_leaf(leaf: str) -> bool:
+    """True iff ``leaf`` begins with the reserved sigil (plain prefix test)."""
+    return leaf.startswith(SCRATCH_SIGIL)
+
+
+def aliases_scratch_sigil(leaf: str) -> bool:
+    """True iff any case- or NFC/NFD-normalized form of ``leaf`` begins with the sigil.
+
+    Because the sigil is letter-free, this must agree with :func:`is_scratch_leaf` on
+    every input; the agreement is the property that proves the letter-free choice sound
+    (design §13.3).
+    """
+    forms = {
+        leaf,
+        unicodedata.normalize("NFC", leaf),
+        unicodedata.normalize("NFD", leaf),
+        leaf.casefold(),
+    }
+    return any(form.startswith(SCRATCH_SIGIL) for form in forms)
+
+
+def scratch_leaf(txid: str, effect_id: str, role: str) -> str:
+    """Build a scratch leaf name ``.#~<txid>.<effect-id>.<role>``."""
+    return f"{SCRATCH_SIGIL}{txid}.{effect_id}.{role}"
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `uv run pytest tests/test_scratch.py -v`
+Expected: PASS.
+
+- [ ] **Step 5: Lint, type-check, commit**
+
+```bash
+uv run ruff check && uv run pyright
+git add python/src/atoms/core/scratch.py python/tests/test_scratch.py
+git commit -m "feat(core): reserved scratch grammar with letter-free sigil property"
+```
+
+---
+
+### Task 4: Effect variants and uniform occurrence enumeration
+
+**Files:**
+- Create: `python/src/atoms/core/effects.py`
+- Test: `python/tests/test_effects.py`
+
+**Interfaces:**
+- Consumes: `atoms.core.fingerprint` (`AbsentState`, `FileState`, `DirectoryState`, `SymlinkState`, `PathState`, `ABSENT`).
+- Produces:
+  - `RelPath = str` alias.
+  - Frozen dataclasses `ReplaceFile(effect_id, path, pre: FileState, post: FileState)`, `CreateFileNoClobber(effect_id, path, post: FileState)`, `DeletePath(effect_id, path, pre: FileState | SymlinkState)`, `MoveNoClobber(effect_id, source, destination, source_pre: FileState)`, `CreateDirectory(effect_id, path, post: DirectoryState)`.
+  - `Effect` union alias.
+  - `Occurrence(path: RelPath, pre: PathState, post: PathState, role: str)` frozen dataclass.
+  - `occurrences(effect: Effect) -> tuple[Occurrence, ...]` (`singledispatch`), enumerating every `(path, pre, post, role)` the variant touches, with roles `"target"`, `"source"`, `"destination"`.
+  - `effect_id_of(effect: Effect) -> str`, `variant_name(effect: Effect) -> str`.
+
+- [ ] **Step 1: Write the failing test**
+
+`python/tests/test_effects.py`:
+
+```python
+from atoms.core.effects import (
+    CreateDirectory,
+    CreateFileNoClobber,
+    DeletePath,
+    MoveNoClobber,
+    Occurrence,
+    ReplaceFile,
+    effect_id_of,
+    occurrences,
+    variant_name,
+)
+from atoms.core.fingerprint import (
+    ABSENT,
+    DirectoryState,
+    FileState,
+    SymlinkState,
+)
+
+F1 = FileState(content_hash="sha256:" + "1" * 64, mode=0o644, byte_len=3)
+F2 = FileState(content_hash="sha256:" + "2" * 64, mode=0o644, byte_len=5)
+
+
+def test_replace_file_occurrence_is_pre_to_post_on_one_path():
+    e = ReplaceFile(effect_id="e1", path="a.txt", pre=F1, post=F2)
+    assert occurrences(e) == (Occurrence(path="a.txt", pre=F1, post=F2, role="target"),)
+    assert effect_id_of(e) == "e1"
+    assert variant_name(e) == "ReplaceFile"
+
+
+def test_create_file_is_absent_to_post():
+    e = CreateFileNoClobber(effect_id="e2", path="new.txt", post=F1)
+    assert occurrences(e) == (Occurrence(path="new.txt", pre=ABSENT, post=F1, role="target"),)
+
+
+def test_delete_is_pre_to_absent_for_file_and_symlink():
+    ef = DeletePath(effect_id="e3", path="gone.txt", pre=F1)
+    assert occurrences(ef) == (Occurrence(path="gone.txt", pre=F1, post=ABSENT, role="target"),)
+    sl = SymlinkState(target="x", mode=0o777)
+    es = DeletePath(effect_id="e4", path="link", pre=sl)
+    assert occurrences(es) == (Occurrence(path="link", pre=sl, post=ABSENT, role="target"),)
+
+
+def test_move_enumerates_source_and_destination():
+    e = MoveNoClobber(effect_id="e5", source="s.txt", destination="d.txt", source_pre=F1)
+    assert occurrences(e) == (
+        Occurrence(path="s.txt", pre=F1, post=ABSENT, role="source"),
+        Occurrence(path="d.txt", pre=ABSENT, post=F1, role="destination"),
+    )
+
+
+def test_create_directory_is_absent_to_dir():
+    d = DirectoryState(mode=0o755)
+    e = CreateDirectory(effect_id="e6", path="sub", post=d)
+    assert occurrences(e) == (Occurrence(path="sub", pre=ABSENT, post=d, role="target"),)
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `uv run pytest tests/test_effects.py -v`
+Expected: FAIL — `ModuleNotFoundError: No module named 'atoms.core.effects'`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+`python/src/atoms/core/effects.py`:
+
+```python
+"""The closed effect set and a uniform per-path occurrence view (design §5.2)."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from functools import singledispatch
+
+from atoms.core.fingerprint import (
+    ABSENT,
+    DirectoryState,
+    FileState,
+    PathState,
+    SymlinkState,
+)
+
+RelPath = str
+
+
+@dataclass(frozen=True, slots=True)
+class ReplaceFile:
+    effect_id: str
+    path: RelPath
+    pre: FileState
+    post: FileState
+
+
+@dataclass(frozen=True, slots=True)
+class CreateFileNoClobber:
+    effect_id: str
+    path: RelPath
+    post: FileState
+
+
+@dataclass(frozen=True, slots=True)
+class DeletePath:
+    effect_id: str
+    path: RelPath
+    pre: FileState | SymlinkState
+
+
+@dataclass(frozen=True, slots=True)
+class MoveNoClobber:
+    effect_id: str
+    source: RelPath
+    destination: RelPath
+    source_pre: FileState
+
+
+@dataclass(frozen=True, slots=True)
+class CreateDirectory:
+    effect_id: str
+    path: RelPath
+    post: DirectoryState
+
+
+Effect = ReplaceFile | CreateFileNoClobber | DeletePath | MoveNoClobber | CreateDirectory
+
+
+@dataclass(frozen=True, slots=True)
+class Occurrence:
+    """One path's (pre, post) transition within a single effect."""
+
+    path: RelPath
+    pre: PathState
+    post: PathState
+    role: str
+
+
+@singledispatch
+def occurrences(effect: Effect) -> tuple[Occurrence, ...]:
+    raise TypeError(f"unknown effect variant: {type(effect).__name__}")
+
+
+@occurrences.register
+def _(effect: ReplaceFile) -> tuple[Occurrence, ...]:
+    return (Occurrence(path=effect.path, pre=effect.pre, post=effect.post, role="target"),)
+
+
+@occurrences.register
+def _(effect: CreateFileNoClobber) -> tuple[Occurrence, ...]:
+    return (Occurrence(path=effect.path, pre=ABSENT, post=effect.post, role="target"),)
+
+
+@occurrences.register
+def _(effect: DeletePath) -> tuple[Occurrence, ...]:
+    return (Occurrence(path=effect.path, pre=effect.pre, post=ABSENT, role="target"),)
+
+
+@occurrences.register
+def _(effect: MoveNoClobber) -> tuple[Occurrence, ...]:
+    return (
+        Occurrence(path=effect.source, pre=effect.source_pre, post=ABSENT, role="source"),
+        Occurrence(path=effect.destination, pre=ABSENT, post=effect.source_pre, role="destination"),
+    )
+
+
+@occurrences.register
+def _(effect: CreateDirectory) -> tuple[Occurrence, ...]:
+    return (Occurrence(path=effect.path, pre=ABSENT, post=effect.post, role="target"),)
+
+
+def effect_id_of(effect: Effect) -> str:
+    return effect.effect_id
+
+
+def variant_name(effect: Effect) -> str:
+    return type(effect).__name__
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `uv run pytest tests/test_effects.py -v`
+Expected: PASS.
+
+- [ ] **Step 5: Lint, type-check, commit**
+
+```bash
+uv run ruff check && uv run pyright
+git add python/src/atoms/core/effects.py python/tests/test_effects.py
+git commit -m "feat(core): five effect variants and uniform occurrence enumeration"
+```
+
+---
+
+### Task 5: Capability vocabulary
+
+Implements design §5.5's semantic capability set as data: the always-required trio, the per-variant additions (including `DeletePath`'s file-vs-symlink branch), and the spec-level union.
+
+**Files:**
+- Create: `python/src/atoms/core/capabilities.py`
+- Test: `python/tests/test_capabilities.py`
+
+**Interfaces:**
+- Consumes: `atoms.core.effects` (`Effect` union + variants), `atoms.core.fingerprint` (`FileState`, `SymlinkState`).
+- Produces:
+  - `Capability` enum: `ATOMIC_EXCHANGE`, `NOCLOBBER_TRANSFER`, `IDENTITY_ANCHOR`, `ANCHORED_TRAVERSAL`, `DURABLE_PUBLISH`, `NOFOLLOW_COHERENT_READ`, `SYMLINK_FINGERPRINT`, `ADVISORY_PROJECT_LOCK`.
+  - `ALWAYS_REQUIRED: frozenset[Capability]` = `{ANCHORED_TRAVERSAL, DURABLE_PUBLISH, ADVISORY_PROJECT_LOCK}`.
+  - `variant_capabilities(effect: Effect) -> frozenset[Capability]`.
+  - `required_capabilities(effects: Iterable[Effect]) -> frozenset[Capability]` = `ALWAYS_REQUIRED ∪ union(variant_capabilities)`.
+
+- [ ] **Step 1: Write the failing test**
+
+`python/tests/test_capabilities.py`:
+
+```python
+from atoms.core.capabilities import (
+    ALWAYS_REQUIRED,
+    Capability,
+    required_capabilities,
+    variant_capabilities,
+)
+from atoms.core.effects import (
+    CreateDirectory,
+    CreateFileNoClobber,
+    DeletePath,
+    MoveNoClobber,
+    ReplaceFile,
+)
+from atoms.core.fingerprint import DirectoryState, FileState, SymlinkState
+
+F = FileState(content_hash="sha256:" + "3" * 64, mode=0o644, byte_len=2)
+C = Capability
+
+
+def test_always_required_trio():
+    assert ALWAYS_REQUIRED == frozenset(
+        {C.ANCHORED_TRAVERSAL, C.DURABLE_PUBLISH, C.ADVISORY_PROJECT_LOCK}
+    )
+
+
+def test_replace_file_needs_exchange_and_nofollow_read():
+    e = ReplaceFile(effect_id="e", path="a", pre=F, post=F)
+    assert variant_capabilities(e) == frozenset({C.ATOMIC_EXCHANGE, C.NOFOLLOW_COHERENT_READ})
+
+
+def test_delete_capability_branches_on_precondition_kind():
+    file_delete = DeletePath(effect_id="e", path="a", pre=F)
+    assert variant_capabilities(file_delete) == frozenset(
+        {C.NOCLOBBER_TRANSFER, C.NOFOLLOW_COHERENT_READ}
+    )
+    link_delete = DeletePath(effect_id="e", path="a", pre=SymlinkState(target="x", mode=0o777))
+    assert variant_capabilities(link_delete) == frozenset(
+        {C.NOCLOBBER_TRANSFER, C.SYMLINK_FINGERPRINT}
+    )
+
+
+def test_move_needs_identity_anchor():
+    e = MoveNoClobber(effect_id="e", source="s", destination="d", source_pre=F)
+    assert variant_capabilities(e) == frozenset(
+        {C.IDENTITY_ANCHOR, C.NOCLOBBER_TRANSFER, C.NOFOLLOW_COHERENT_READ}
+    )
+
+
+def test_create_variants_need_noclobber_transfer():
+    cf = CreateFileNoClobber(effect_id="e", path="a", post=F)
+    cd = CreateDirectory(effect_id="e", path="a", post=DirectoryState(mode=0o755))
+    assert variant_capabilities(cf) == frozenset({C.NOCLOBBER_TRANSFER})
+    assert variant_capabilities(cd) == frozenset({C.NOCLOBBER_TRANSFER})
+
+
+def test_replace_only_spec_excludes_identity_anchor_and_noclobber():
+    caps = required_capabilities([ReplaceFile(effect_id="e", path="a", pre=F, post=F)])
+    assert C.IDENTITY_ANCHOR not in caps
+    assert C.NOCLOBBER_TRANSFER not in caps
+    assert ALWAYS_REQUIRED <= caps
+    assert {C.ATOMIC_EXCHANGE, C.NOFOLLOW_COHERENT_READ} <= caps
+
+
+def test_required_is_union_over_effects():
+    effects = [
+        ReplaceFile(effect_id="e1", path="a", pre=F, post=F),
+        MoveNoClobber(effect_id="e2", source="s", destination="d", source_pre=F),
+    ]
+    caps = required_capabilities(effects)
+    assert caps == ALWAYS_REQUIRED | frozenset(
+        {C.ATOMIC_EXCHANGE, C.NOFOLLOW_COHERENT_READ, C.IDENTITY_ANCHOR, C.NOCLOBBER_TRANSFER}
+    )
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `uv run pytest tests/test_capabilities.py -v`
+Expected: FAIL — `ModuleNotFoundError: No module named 'atoms.core.capabilities'`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+`python/src/atoms/core/capabilities.py`:
+
+```python
+"""Semantic filesystem capability vocabulary (design §5.5), expressed as data."""
+
+from __future__ import annotations
+
+from collections.abc import Iterable
+from enum import Enum
+from functools import singledispatch
+
+from atoms.core.effects import (
+    CreateDirectory,
+    CreateFileNoClobber,
+    DeletePath,
+    Effect,
+    MoveNoClobber,
+    ReplaceFile,
+)
+from atoms.core.fingerprint import FileState
+
+
+class Capability(Enum):
+    ATOMIC_EXCHANGE = "atomic_exchange"
+    NOCLOBBER_TRANSFER = "noclobber_transfer"
+    IDENTITY_ANCHOR = "identity_anchor"
+    ANCHORED_TRAVERSAL = "anchored_traversal"
+    DURABLE_PUBLISH = "durable_publish"
+    NOFOLLOW_COHERENT_READ = "nofollow_coherent_read"
+    SYMLINK_FINGERPRINT = "symlink_fingerprint"
+    ADVISORY_PROJECT_LOCK = "advisory_project_lock"
+
+
+ALWAYS_REQUIRED: frozenset[Capability] = frozenset(
+    {
+        Capability.ANCHORED_TRAVERSAL,
+        Capability.DURABLE_PUBLISH,
+        Capability.ADVISORY_PROJECT_LOCK,
+    }
+)
+
+
+@singledispatch
+def variant_capabilities(effect: Effect) -> frozenset[Capability]:
+    raise TypeError(f"unknown effect variant: {type(effect).__name__}")
+
+
+@variant_capabilities.register
+def _(effect: ReplaceFile) -> frozenset[Capability]:
+    return frozenset({Capability.ATOMIC_EXCHANGE, Capability.NOFOLLOW_COHERENT_READ})
+
+
+@variant_capabilities.register
+def _(effect: CreateFileNoClobber) -> frozenset[Capability]:
+    return frozenset({Capability.NOCLOBBER_TRANSFER})
+
+
+@variant_capabilities.register
+def _(effect: DeletePath) -> frozenset[Capability]:
+    read = (
+        Capability.NOFOLLOW_COHERENT_READ
+        if isinstance(effect.pre, FileState)
+        else Capability.SYMLINK_FINGERPRINT
+    )
+    return frozenset({Capability.NOCLOBBER_TRANSFER, read})
+
+
+@variant_capabilities.register
+def _(effect: MoveNoClobber) -> frozenset[Capability]:
+    return frozenset(
+        {
+            Capability.IDENTITY_ANCHOR,
+            Capability.NOCLOBBER_TRANSFER,
+            Capability.NOFOLLOW_COHERENT_READ,
+        }
+    )
+
+
+@variant_capabilities.register
+def _(effect: CreateDirectory) -> frozenset[Capability]:
+    return frozenset({Capability.NOCLOBBER_TRANSFER})
+
+
+def required_capabilities(effects: Iterable[Effect]) -> frozenset[Capability]:
+    caps = set(ALWAYS_REQUIRED)
+    for effect in effects:
+        caps |= variant_capabilities(effect)
+    return frozenset(caps)
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `uv run pytest tests/test_capabilities.py -v`
+Expected: PASS.
+
+- [ ] **Step 5: Lint, type-check, commit**
+
+```bash
+uv run ruff check && uv run pyright
+git add python/src/atoms/core/capabilities.py python/tests/test_capabilities.py
+git commit -m "feat(core): semantic capability vocabulary and per-variant derivation"
+```
+
+---
+
+### Task 6: TransactionSpec and canonicalizing builder
+
+`build_spec` is the only sanctioned constructor: it canonicalizes surfaces (sorted by path, de-duplicated) and dependencies (sorted) so two builds from differently-ordered inputs produce an equal spec. It performs **no** validation — that is A2's `compile`/`validate` step; `build_spec` only imposes deterministic *form*.
+
+**Files:**
+- Create: `python/src/atoms/core/spec.py`
+- Test: `python/tests/test_spec.py`
+
+**Interfaces:**
+- Consumes: `atoms.core.effects` (`Effect`), `atoms.core.fingerprint` (`PathState`), `atoms.core.capabilities` (`required_capabilities`, `Capability`).
+- Produces:
+  - `SCHEMA_VERSION = 1`.
+  - `SurfaceEntry(path: str, state: PathState)` frozen dataclass.
+  - `Dependency(before: str, after: str)` frozen dataclass.
+  - `TransactionSpec(schema_version, consumer_tag, intent_digest, initial_surface: tuple[SurfaceEntry, ...], final_surface: tuple[SurfaceEntry, ...], effects: tuple[Effect, ...], dependencies: tuple[Dependency, ...])` frozen dataclass, with method `required_capabilities(self) -> frozenset[Capability]`.
+  - `build_spec(*, consumer_tag, intent_digest, initial_surface: Mapping[str, PathState], final_surface: Mapping[str, PathState], effects: Sequence[Effect], dependencies: Iterable[tuple[str, str]] = ()) -> TransactionSpec`.
+
+- [ ] **Step 1: Write the failing test**
+
+`python/tests/test_spec.py`:
+
+```python
+from atoms.core.capabilities import ALWAYS_REQUIRED, Capability
+from atoms.core.effects import CreateFileNoClobber, ReplaceFile
+from atoms.core.fingerprint import ABSENT, FileState
+from atoms.core.spec import (
+    SCHEMA_VERSION,
+    Dependency,
+    SurfaceEntry,
+    TransactionSpec,
+    build_spec,
+)
+
+F = FileState(content_hash="sha256:" + "4" * 64, mode=0o644, byte_len=1)
+
+
+def _spec(initial, final, effects, deps=()):
+    return build_spec(
+        consumer_tag="test",
+        intent_digest="sha256:" + "0" * 64,
+        initial_surface=initial,
+        final_surface=final,
+        effects=tuple(effects),
+        dependencies=deps,
+    )
+
+
+def test_build_spec_sets_schema_version_and_is_frozen():
+    spec = _spec({"a": F}, {"a": F}, [ReplaceFile(effect_id="e1", path="a", pre=F, post=F)])
+    assert spec.schema_version == SCHEMA_VERSION
+    assert isinstance(spec, TransactionSpec)
+
+
+def test_surfaces_are_canonicalized_sorted_by_path():
+    spec = _spec(
+        {"b": ABSENT, "a": ABSENT},
+        {"b": F, "a": F},
+        [
+            CreateFileNoClobber(effect_id="e1", path="a", post=F),
+            CreateFileNoClobber(effect_id="e2", path="b", post=F),
+        ],
+    )
+    assert spec.initial_surface == (
+        SurfaceEntry(path="a", state=ABSENT),
+        SurfaceEntry(path="b", state=ABSENT),
+    )
+    assert [e.path for e in spec.final_surface] == ["a", "b"]
+
+
+def test_build_is_order_independent_for_surface_inputs():
+    a = _spec({"a": ABSENT, "b": ABSENT}, {"a": F, "b": F},
+              [CreateFileNoClobber(effect_id="e1", path="a", post=F),
+               CreateFileNoClobber(effect_id="e2", path="b", post=F)])
+    b = _spec({"b": ABSENT, "a": ABSENT}, {"b": F, "a": F},
+              [CreateFileNoClobber(effect_id="e1", path="a", post=F),
+               CreateFileNoClobber(effect_id="e2", path="b", post=F)])
+    assert a == b
+
+
+def test_dependencies_are_sorted():
+    spec = _spec(
+        {"a": F, "b": F},
+        {"a": F, "b": F},
+        [ReplaceFile(effect_id="e1", path="a", pre=F, post=F),
+         ReplaceFile(effect_id="e2", path="b", pre=F, post=F)],
+        deps=[("e2", "e1"), ("e1", "e2")],
+    )
+    assert spec.dependencies == (Dependency(before="e1", after="e2"), Dependency(before="e2", after="e1"))
+
+
+def test_required_capabilities_derives_from_effects():
+    spec = _spec({"a": F}, {"a": F}, [ReplaceFile(effect_id="e1", path="a", pre=F, post=F)])
+    caps = spec.required_capabilities()
+    assert ALWAYS_REQUIRED <= caps
+    assert Capability.ATOMIC_EXCHANGE in caps
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `uv run pytest tests/test_spec.py -v`
+Expected: FAIL — `ModuleNotFoundError: No module named 'atoms.core.spec'`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+`python/src/atoms/core/spec.py`:
+
+```python
+"""The internal TransactionSpec and its canonicalizing builder (design §5.1)."""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
+
+from atoms.core.capabilities import Capability, required_capabilities
+from atoms.core.effects import Effect
+from atoms.core.fingerprint import PathState
+
+SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True, slots=True)
+class SurfaceEntry:
+    path: str
+    state: PathState
+
+
+@dataclass(frozen=True, slots=True)
+class Dependency:
+    before: str
+    after: str
+
+
+@dataclass(frozen=True, slots=True)
+class TransactionSpec:
+    schema_version: int
+    consumer_tag: str
+    intent_digest: str
+    initial_surface: tuple[SurfaceEntry, ...]
+    final_surface: tuple[SurfaceEntry, ...]
+    effects: tuple[Effect, ...]
+    dependencies: tuple[Dependency, ...]
+
+    def required_capabilities(self) -> frozenset[Capability]:
+        return required_capabilities(self.effects)
+
+
+def _canonical_surface(surface: Mapping[str, PathState]) -> tuple[SurfaceEntry, ...]:
+    return tuple(
+        SurfaceEntry(path=path, state=surface[path]) for path in sorted(surface)
+    )
+
+
+def build_spec(
+    *,
+    consumer_tag: str,
+    intent_digest: str,
+    initial_surface: Mapping[str, PathState],
+    final_surface: Mapping[str, PathState],
+    effects: Sequence[Effect],
+    dependencies: Iterable[tuple[str, str]] = (),
+) -> TransactionSpec:
+    """Construct a spec in canonical form. Imposes deterministic ordering only; it does
+    not validate (that is compilation validation, design §5.4)."""
+    deps = tuple(sorted(Dependency(before=b, after=a) for b, a in dependencies))
+    return TransactionSpec(
+        schema_version=SCHEMA_VERSION,
+        consumer_tag=consumer_tag,
+        intent_digest=intent_digest,
+        initial_surface=_canonical_surface(initial_surface),
+        final_surface=_canonical_surface(final_surface),
+        effects=tuple(effects),
+        dependencies=deps,
+    )
+```
+
+Note: `sorted(Dependency(...))` requires `Dependency` to be order-comparable. `@dataclass(frozen=True, slots=True)` is not ordered by default; add `order=True` to the `Dependency` decorator (`@dataclass(frozen=True, slots=True, order=True)`) so the sort is well-defined. Apply that change to `Dependency` before running the test.
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `uv run pytest tests/test_spec.py -v`
+Expected: PASS.
+
+- [ ] **Step 5: Lint, type-check, commit**
+
+```bash
+uv run ruff check && uv run pyright
+git add python/src/atoms/core/spec.py python/tests/test_spec.py
+git commit -m "feat(core): TransactionSpec and canonicalizing builder"
+```
+
+---
+
+### Task 7: Deterministic canonical serialization
+
+Implements the byte-stable encoding the design relies on twice: §13.3 (validate a spec twice → identical canonical output) and §7.2 (`spec_json` stored immutably). Encoding is a tagged-union `dict` tree emitted via `json.dumps` with sorted keys and no whitespace variance.
+
+**Files:**
+- Create: `python/src/atoms/core/canonical.py`
+- Test: `python/tests/test_canonical.py`
+
+**Interfaces:**
+- Consumes: all of `atoms.core.fingerprint`, `atoms.core.effects`, `atoms.core.spec`.
+- Produces:
+  - `canonical_obj(spec: TransactionSpec) -> dict` — a JSON-ready tree with `"type"` discriminators for each state and effect.
+  - `canonical_json(spec: TransactionSpec) -> str` — `json.dumps(canonical_obj(spec), sort_keys=True, separators=(",", ":"), ensure_ascii=False)`.
+  - `canonical_bytes(spec: TransactionSpec) -> bytes` — UTF-8 of `canonical_json`.
+
+- [ ] **Step 1: Write the failing test**
+
+`python/tests/test_canonical.py`:
+
+```python
+import json
+
+from atoms.core.canonical import canonical_bytes, canonical_json, canonical_obj
+from atoms.core.effects import CreateFileNoClobber, MoveNoClobber, ReplaceFile
+from atoms.core.fingerprint import ABSENT, FileState
+from atoms.core.spec import build_spec
+
+F = FileState(content_hash="sha256:" + "5" * 64, mode=0o644, byte_len=7)
+
+
+def _spec_two_orderings():
+    forward = build_spec(
+        consumer_tag="c",
+        intent_digest="sha256:" + "0" * 64,
+        initial_surface={"a": ABSENT, "b": ABSENT},
+        final_surface={"a": F, "b": F},
+        effects=(CreateFileNoClobber(effect_id="e1", path="a", post=F),
+                 CreateFileNoClobber(effect_id="e2", path="b", post=F)),
+    )
+    reverse = build_spec(
+        consumer_tag="c",
+        intent_digest="sha256:" + "0" * 64,
+        initial_surface={"b": ABSENT, "a": ABSENT},
+        final_surface={"b": F, "a": F},
+        effects=(CreateFileNoClobber(effect_id="e1", path="a", post=F),
+                 CreateFileNoClobber(effect_id="e2", path="b", post=F)),
+    )
+    return forward, reverse
+
+
+def test_canonical_json_is_valid_and_stable():
+    forward, reverse = _spec_two_orderings()
+    assert canonical_json(forward) == canonical_json(reverse)
+    parsed = json.loads(canonical_json(forward))
+    assert parsed["schema_version"] == 1
+
+
+def test_canonical_json_has_no_incidental_whitespace():
+    forward, _ = _spec_two_orderings()
+    s = canonical_json(forward)
+    assert ", " not in s and ": " not in s
+
+
+def test_bytes_are_utf8_of_json():
+    forward, _ = _spec_two_orderings()
+    assert canonical_bytes(forward) == canonical_json(forward).encode("utf-8")
+
+
+def test_states_and_effects_carry_type_discriminators():
+    spec = build_spec(
+        consumer_tag="c",
+        intent_digest="sha256:" + "0" * 64,
+        initial_surface={"s": F, "d": ABSENT},
+        final_surface={"s": ABSENT, "d": F},
+        effects=(MoveNoClobber(effect_id="m", source="s", destination="d", source_pre=F),),
+    )
+    obj = canonical_obj(spec)
+    assert obj["effects"][0]["type"] == "MoveNoClobber"
+    assert obj["initial_surface"][0]["state"]["type"] in {"absent", "file"}
+
+
+def test_two_replace_specs_differing_only_in_hash_differ():
+    g = FileState(content_hash="sha256:" + "6" * 64, mode=0o644, byte_len=7)
+    a = build_spec(consumer_tag="c", intent_digest="sha256:" + "0" * 64,
+                   initial_surface={"x": F}, final_surface={"x": g},
+                   effects=(ReplaceFile(effect_id="e", path="x", pre=F, post=g),))
+    b = build_spec(consumer_tag="c", intent_digest="sha256:" + "0" * 64,
+                   initial_surface={"x": F}, final_surface={"x": F},
+                   effects=(ReplaceFile(effect_id="e", path="x", pre=F, post=F),))
+    assert canonical_json(a) != canonical_json(b)
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `uv run pytest tests/test_canonical.py -v`
+Expected: FAIL — `ModuleNotFoundError: No module named 'atoms.core.canonical'`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+`python/src/atoms/core/canonical.py`:
+
+```python
+"""Deterministic canonical serialization of a TransactionSpec (design §13.3, §7.2)."""
+
+from __future__ import annotations
+
+import json
+from functools import singledispatch
+from typing import Any
+
+from atoms.core.effects import (
+    CreateDirectory,
+    CreateFileNoClobber,
+    DeletePath,
+    Effect,
+    MoveNoClobber,
+    ReplaceFile,
+)
+from atoms.core.fingerprint import (
+    AbsentState,
+    DirectoryState,
+    FileState,
+    PathState,
+    SymlinkState,
+)
+from atoms.core.spec import Dependency, SurfaceEntry, TransactionSpec
+
+
+@singledispatch
+def _state_obj(state: PathState) -> dict[str, Any]:
+    raise TypeError(f"unknown path state: {type(state).__name__}")
+
+
+@_state_obj.register
+def _(state: AbsentState) -> dict[str, Any]:
+    return {"type": "absent"}
+
+
+@_state_obj.register
+def _(state: FileState) -> dict[str, Any]:
+    return {"type": "file", "content_hash": state.content_hash, "mode": state.mode, "byte_len": state.byte_len}
+
+
+@_state_obj.register
+def _(state: DirectoryState) -> dict[str, Any]:
+    return {"type": "directory", "mode": state.mode}
+
+
+@_state_obj.register
+def _(state: SymlinkState) -> dict[str, Any]:
+    return {"type": "symlink", "target": state.target, "mode": state.mode}
+
+
+@singledispatch
+def _effect_obj(effect: Effect) -> dict[str, Any]:
+    raise TypeError(f"unknown effect variant: {type(effect).__name__}")
+
+
+@_effect_obj.register
+def _(effect: ReplaceFile) -> dict[str, Any]:
+    return {"type": "ReplaceFile", "effect_id": effect.effect_id, "path": effect.path,
+            "pre": _state_obj(effect.pre), "post": _state_obj(effect.post)}
+
+
+@_effect_obj.register
+def _(effect: CreateFileNoClobber) -> dict[str, Any]:
+    return {"type": "CreateFileNoClobber", "effect_id": effect.effect_id, "path": effect.path,
+            "post": _state_obj(effect.post)}
+
+
+@_effect_obj.register
+def _(effect: DeletePath) -> dict[str, Any]:
+    return {"type": "DeletePath", "effect_id": effect.effect_id, "path": effect.path,
+            "pre": _state_obj(effect.pre)}
+
+
+@_effect_obj.register
+def _(effect: MoveNoClobber) -> dict[str, Any]:
+    return {"type": "MoveNoClobber", "effect_id": effect.effect_id, "source": effect.source,
+            "destination": effect.destination, "source_pre": _state_obj(effect.source_pre)}
+
+
+@_effect_obj.register
+def _(effect: CreateDirectory) -> dict[str, Any]:
+    return {"type": "CreateDirectory", "effect_id": effect.effect_id, "path": effect.path,
+            "post": _state_obj(effect.post)}
+
+
+def _surface_obj(entry: SurfaceEntry) -> dict[str, Any]:
+    return {"path": entry.path, "state": _state_obj(entry.state)}
+
+
+def _dependency_obj(dep: Dependency) -> dict[str, Any]:
+    return {"before": dep.before, "after": dep.after}
+
+
+def canonical_obj(spec: TransactionSpec) -> dict[str, Any]:
+    return {
+        "schema_version": spec.schema_version,
+        "consumer_tag": spec.consumer_tag,
+        "intent_digest": spec.intent_digest,
+        "initial_surface": [_surface_obj(e) for e in spec.initial_surface],
+        "final_surface": [_surface_obj(e) for e in spec.final_surface],
+        "effects": [_effect_obj(e) for e in spec.effects],
+        "dependencies": [_dependency_obj(d) for d in spec.dependencies],
+    }
+
+
+def canonical_json(spec: TransactionSpec) -> str:
+    return json.dumps(canonical_obj(spec), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def canonical_bytes(spec: TransactionSpec) -> bytes:
+    return canonical_json(spec).encode("utf-8")
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `uv run pytest tests/test_canonical.py -v`
+Expected: PASS.
+
+- [ ] **Step 5: Full suite, lint, type-check**
+
+Run (from `python/`): `uv run pytest && uv run ruff check && uv run pyright`
+Expected: all tests pass, no lint/type errors.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add python/src/atoms/core/canonical.py python/tests/test_canonical.py
+git commit -m "feat(core): deterministic canonical serialization"
+```
+
+---
+
+## Self-review
+
+**Spec coverage (against design §5, the A1 slice):**
+- §5.1 `TransactionSpec` fields — Task 6 (schema version, consumer tag, intent digest, initial/final surfaces, ordered effects, dependencies). Required-capability set is derived (Task 5/6), not stored, per §5.1. ✔
+- §5.1 reserved scratch grammar + letter-free sigil — Task 3, including the case/NFC/NFD-agreement property (§13.3). ✔ Compiler *rejection* of persistent paths that alias scratch is A2 (needs the validation pass); A1 ships the predicates it will use.
+- §5.2 closed effect set + "move is one effect over source and destination" — Task 4. ✔
+- §5.3 repeated-path timelines — the `Occurrence` view (Task 4) is the data A2's continuity check consumes; the *check itself* is A2. Flagged, not silently dropped.
+- §5.5 capability vocabulary as data, always-required trio, per-variant additions incl. Delete file/symlink branch — Task 5. ✔ Empirical probing is A4.
+- §13.3 build-twice-identical canonical output — Task 7. ✔
+- **Deferred by design, not omitted:** filesystem-identity metadata-root containment and ancestor-resolution checks (§5.4), all compilation validation (§5.4), and the recovery classifier (§8.4/§13.1) belong to A2/A3/A4 and are listed in the program table above.
+
+**Placeholder scan:** none — every code step carries complete source. ✔
+
+**Type consistency:** `occurrences`, `variant_capabilities`, `required_capabilities`, `build_spec`, `canonical_json` names and signatures are used identically across tasks and the interface blocks. `Dependency` is declared `order=True` (Task 6 note) precisely because `build_spec` sorts it. `FileState`/`DirectoryState`/`SymlinkState`/`AbsentState` field names are stable from Task 2 through Task 7. ✔
+
+**Scope:** A1 is one dependency-free subsystem, correctly sized for a single plan; the remaining Plan A work is decomposed into A2–A8 above. ✔
