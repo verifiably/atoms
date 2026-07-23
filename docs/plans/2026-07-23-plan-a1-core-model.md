@@ -196,7 +196,7 @@ Pure model for the atoms recoverable filesystem effect engine. See `~/d/atoms/RE
 
 `python/LICENSE`: copy the repository-root license so `license-files = ["LICENSE"]` resolves within `python/` (nodes keeps the same file in both places). Run from the repo root: `cp LICENSE python/LICENSE`.
 
-- [ ] **Step 3b: Add the packaging test**
+- [ ] **Step 3b: Add the source-marker sanity test**
 
 `python/tests/test_packaging.py`:
 
@@ -206,15 +206,40 @@ from pathlib import Path
 import atoms.core
 
 
-def test_py_typed_marker_is_shipped():
+def test_py_typed_marker_present_in_source_package():
+    # Necessary-but-not-sufficient: proves the marker sits next to the package
+    # source. That it actually ships in the built wheel is proven separately, by
+    # building and inspecting the wheel (see the packaging-verification step).
     marker = Path(atoms.core.__file__).with_name("py.typed")
-    assert marker.is_file(), "PEP 561 py.typed marker must ship with atoms.core"
+    assert marker.is_file(), "PEP 561 py.typed marker must sit in atoms.core"
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run (from `python/`): `uv run pytest tests/test_errors.py tests/test_packaging.py -v`
-Expected: PASS (all three tests). `uv run` builds/installs the editable package on first invocation. The `py.typed` test proves the marker is packaged, not merely present in the source tree.
+Expected: PASS (all three tests). `uv run` builds/installs the editable package on first invocation. This only proves the marker exists in the source tree — the wheel-shipping proof is the next step.
+
+- [ ] **Step 4b: Build the wheel and prove the typed-distribution surface ships**
+
+The editable install cannot show what a *published* wheel contains. Build one and inspect its ZIP and `METADATA` directly, so `py.typed` and the metadata-2.5 `Import-Name`/`Import-Namespace`/`License-File` fields are proven present in the actual artifact. Run from `python/`:
+
+```bash
+uv build --wheel
+uv run python -c "
+import glob, zipfile
+whl = sorted(glob.glob('dist/atoms_core-*.whl'))[-1]
+z = zipfile.ZipFile(whl)
+names = z.namelist()
+assert 'atoms/core/py.typed' in names, f'py.typed missing from wheel: {names}'
+meta = next(n for n in names if n.endswith('.dist-info/METADATA'))
+text = z.read(meta).decode()
+for field in ('Import-Name: atoms.core', 'Import-Namespace: atoms', 'License-File:'):
+    assert field in text, f'missing metadata field {field!r} in {meta}'
+print('OK:', whl.rsplit('/', 1)[-1], '— py.typed + metadata-2.5 fields present')
+"
+```
+
+Expected: prints `OK: atoms_core-0.1.0-…whl — py.typed + metadata-2.5 fields present`. If `Import-Name`/`Import-Namespace` are absent, `core-metadata-version = "2.5"` was not applied; if `License-File` is absent, `license-files` / `python/LICENSE` is missing. Add `dist/` to `python/.gitignore` in this step (create the file with a single `dist/` line) so build output is not committed.
 
 - [ ] **Step 5: Lint and type-check the new files**
 
@@ -1575,7 +1600,7 @@ git commit -m "feat(core): deterministic canonical serialization + golden durabl
 
 ### Task 8: Strict canonical decoder and round-trip
 
-The durable format (design §7.2 `spec_json`) is only half-specified by an encoder: **fresh-process recovery must reconstruct the exact `TransactionSpec` from stored bytes** (design §8.4). This task adds the inverse of Task 7 — a strict decoder with schema-version dispatch that rejects unknown discriminators, missing or extra fields, and duplicate JSON keys (fail-early, design conventions) — and locks the encode/decode round-trip, including on the golden fixture.
+The durable format (design §7.2 `spec_json`) is only half-specified by an encoder: **fresh-process recovery must reconstruct the exact `TransactionSpec` from stored bytes** (design §8.4). This task adds the inverse of Task 7 as a **complete, type-safe structural boundary** — not a happy-path parser. It validates every object, array, and scalar with an exact type (refusing `bool` where an integer is required, since `bool` subclasses `int`), dispatches on schema version and effect/state discriminators, rejects unknown discriminators / missing / extra fields / duplicate JSON keys, enforces effect↔state compatibility (e.g. `ReplaceFile.pre` must be a file, never absent), and converts malformed JSON and non-UTF-8 input into `SpecValidationError`. The guarantee is that `from_canonical_*` raises **only** `SpecValidationError` on any malformed input — never a leaked `KeyError`/`AttributeError`/`TypeError`/`UnicodeDecodeError` — and round-trips every well-formed spec, including the golden fixture. This is durable-*format* validation, distinct from A2's semantic/path/timeline validation.
 
 **Files:**
 - Modify: `python/src/atoms/core/canonical.py` (add decoder functions)
@@ -1584,10 +1609,11 @@ The durable format (design §7.2 `spec_json`) is only half-specified by an encod
 **Interfaces:**
 - Consumes: `atoms.core.errors` (`SpecValidationError`), all of `atoms.core.fingerprint`, `atoms.core.effects`, `atoms.core.spec`.
 - Produces:
-  - `from_canonical_obj(obj: dict) -> TransactionSpec`.
-  - `from_canonical_json(text: str) -> TransactionSpec` — parses with a duplicate-key-rejecting hook, then delegates.
-  - `from_canonical_bytes(data: bytes) -> TransactionSpec`.
+  - `from_canonical_obj(obj: object) -> TransactionSpec` — accepts an arbitrary parsed value and refuses anything that is not a well-typed spec.
+  - `from_canonical_json(text: str) -> TransactionSpec` — parses with a duplicate-key-rejecting hook (and JSON-error trapping), then delegates.
+  - `from_canonical_bytes(data: bytes) -> TransactionSpec` — decodes UTF-8 (trapping decode errors), then delegates.
   - Round-trip guarantee: for any `build_spec`-produced spec, `from_canonical_bytes(canonical_bytes(spec)) == spec`.
+  - Failure guarantee: on any malformed input, exactly `SpecValidationError` is raised.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1600,18 +1626,27 @@ import pytest
 
 from atoms.core.canonical import (
     canonical_bytes,
-    canonical_json,
     canonical_obj,
     from_canonical_bytes,
     from_canonical_json,
     from_canonical_obj,
 )
+from atoms.core.effects import ReplaceFile
 from atoms.core.errors import SpecValidationError
 from atoms.core.fingerprint import ABSENT, FileState
 from atoms.core.spec import build_spec
 from tests.test_canonical import _all_variants_spec
 
 F = FileState(content_hash="sha256:" + "5" * 64, mode=0o644, byte_len=7)
+
+
+def _minimal_obj(**overrides):
+    obj = {
+        "schema_version": 1, "consumer_tag": "c", "intent_digest": "sha256:" + "0" * 64,
+        "initial_surface": [], "final_surface": [], "effects": [], "dependencies": [],
+    }
+    obj.update(overrides)
+    return obj
 
 
 def test_round_trip_of_every_variant_is_identity():
@@ -1643,22 +1678,16 @@ def test_unknown_effect_discriminator_is_rejected():
         from_canonical_obj(obj)
 
 
-def test_missing_field_is_rejected():
+def test_missing_state_field_is_rejected():
     with pytest.raises(SpecValidationError, match="content_hash"):
-        from_canonical_obj({
-            "schema_version": 1, "consumer_tag": "c", "intent_digest": "sha256:" + "0" * 64,
-            "initial_surface": [{"path": "a", "state": {"type": "file", "mode": 420, "byte_len": 1}}],
-            "final_surface": [], "effects": [], "dependencies": [],
-        })
+        from_canonical_obj(_minimal_obj(
+            initial_surface=[{"path": "a", "state": {"type": "file", "mode": 420, "byte_len": 1}}],
+        ))
 
 
 def test_extra_field_is_rejected():
     with pytest.raises(SpecValidationError, match="unexpected"):
-        from_canonical_obj({
-            "schema_version": 1, "consumer_tag": "c", "intent_digest": "sha256:" + "0" * 64,
-            "initial_surface": [], "final_surface": [], "effects": [], "dependencies": [],
-            "surprise": True,
-        })
+        from_canonical_obj(_minimal_obj(surprise=True))
 
 
 def test_duplicate_json_key_is_rejected():
@@ -1666,6 +1695,76 @@ def test_duplicate_json_key_is_rejected():
           '"initial_surface":[],"final_surface":[],"effects":[],"dependencies":[]}'
     with pytest.raises(SpecValidationError, match="duplicate"):
         from_canonical_json(dup)
+
+
+# --- adversarial coverage at each nesting level (F1) ---
+
+def test_non_object_top_level_is_rejected():
+    with pytest.raises(SpecValidationError, match="spec must be an object"):
+        from_canonical_obj([1, 2, 3])
+
+
+def test_bool_schema_version_is_rejected():
+    # bool is a subclass of int; True == 1 must NOT pass as schema_version.
+    with pytest.raises(SpecValidationError, match="schema_version must be an integer"):
+        from_canonical_obj(_minimal_obj(schema_version=True))
+
+
+def test_float_schema_version_is_rejected():
+    with pytest.raises(SpecValidationError, match="schema_version must be an integer"):
+        from_canonical_obj(_minimal_obj(schema_version=1.0))
+
+
+def test_string_field_with_wrong_type_is_rejected():
+    with pytest.raises(SpecValidationError, match="consumer_tag must be a string"):
+        from_canonical_obj(_minimal_obj(consumer_tag=5))
+
+
+def test_effects_not_a_list_is_rejected():
+    with pytest.raises(SpecValidationError, match="effects must be an array"):
+        from_canonical_obj(_minimal_obj(effects="nope"))
+
+
+def test_surface_entry_not_an_object_is_rejected():
+    with pytest.raises(SpecValidationError, match=r"initial_surface\[0\] must be an object"):
+        from_canonical_obj(_minimal_obj(initial_surface=["a"]))
+
+
+def test_missing_surface_path_is_rejected():
+    with pytest.raises(SpecValidationError, match="path"):
+        from_canonical_obj(_minimal_obj(
+            initial_surface=[{"state": {"type": "absent"}}],
+        ))
+
+
+def test_mode_bool_is_rejected():
+    with pytest.raises(SpecValidationError, match="mode must be an integer"):
+        from_canonical_obj(_minimal_obj(
+            initial_surface=[{"path": "a", "state": {"type": "directory", "mode": True}}],
+        ))
+
+
+def test_effect_field_rejects_incompatible_state_kind():
+    # ReplaceFile.pre must be a file; an absent state must be refused, not accepted
+    # into a field whose annotation is FileState.
+    obj = canonical_obj(build_spec(
+        consumer_tag="c", intent_digest="sha256:" + "0" * 64,
+        initial_surface={"a": F}, final_surface={"a": F},
+        effects=(ReplaceFile(effect_id="e", path="a", pre=F, post=F),),
+    ))
+    obj["effects"][0]["pre"] = {"type": "absent"}
+    with pytest.raises(SpecValidationError, match="pre"):
+        from_canonical_obj(obj)
+
+
+def test_malformed_json_is_rejected():
+    with pytest.raises(SpecValidationError, match="malformed canonical JSON"):
+        from_canonical_json("{not json")
+
+
+def test_malformed_utf8_is_rejected():
+    with pytest.raises(SpecValidationError, match="not valid UTF-8"):
+        from_canonical_bytes(b"\xff\xfe")
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -1678,53 +1777,96 @@ Expected: FAIL — `ImportError: cannot import name 'from_canonical_bytes'`.
 First, add two imports at the **top** of `python/src/atoms/core/canonical.py` (alongside the existing imports, so ruff's E402 does not fire): `from atoms.core.errors import SpecValidationError` and extend the `atoms.core.spec` import to include `SCHEMA_VERSION` (i.e. `from atoms.core.spec import SCHEMA_VERSION, Dependency, SurfaceEntry, TransactionSpec`). The module already imports `json`. Then append the decoder below the existing encoder:
 
 ```python
-_STATE_FIELDS = {
+# Scalar-type sentinels: distinct objects compared with `is`.
+_STR = object()
+_INT = object()
+
+# Each state variant: (class, ((field, scalar-sentinel), ...)).
+_STATE_SPEC: dict[str, tuple[Any, tuple[tuple[str, Any], ...]]] = {
     "absent": (AbsentState, ()),
-    "file": (FileState, ("content_hash", "mode", "byte_len")),
-    "directory": (DirectoryState, ("mode",)),
-    "symlink": (SymlinkState, ("target", "mode")),
+    "file": (FileState, (("content_hash", _STR), ("mode", _INT), ("byte_len", _INT))),
+    "directory": (DirectoryState, (("mode", _INT),)),
+    "symlink": (SymlinkState, (("target", _STR), ("mode", _INT))),
 }
-_EFFECT_FIELDS = {
-    "ReplaceFile": (ReplaceFile, ("effect_id", "path", "pre", "post")),
-    "CreateFileNoClobber": (CreateFileNoClobber, ("effect_id", "path", "post")),
-    "DeletePath": (DeletePath, ("effect_id", "path", "pre")),
-    "MoveNoClobber": (MoveNoClobber, ("effect_id", "source", "destination", "source_pre")),
-    "CreateDirectory": (CreateDirectory, ("effect_id", "path", "post")),
+
+# Each effect variant: (class, ((field, spec), ...)) where spec is _STR for a string
+# field or a tuple of the state classes that field is permitted to hold.
+_EFFECT_SPEC: dict[str, tuple[Any, tuple[tuple[str, Any], ...]]] = {
+    "ReplaceFile": (ReplaceFile, (("effect_id", _STR), ("path", _STR),
+                                  ("pre", (FileState,)), ("post", (FileState,)))),
+    "CreateFileNoClobber": (CreateFileNoClobber, (("effect_id", _STR), ("path", _STR),
+                                                  ("post", (FileState,)))),
+    "DeletePath": (DeletePath, (("effect_id", _STR), ("path", _STR),
+                                ("pre", (FileState, SymlinkState)))),
+    "MoveNoClobber": (MoveNoClobber, (("effect_id", _STR), ("source", _STR),
+                                      ("destination", _STR), ("source_pre", (FileState,)))),
+    "CreateDirectory": (CreateDirectory, (("effect_id", _STR), ("path", _STR),
+                                          ("post", (DirectoryState,)))),
 }
-_STATE_KEYS = {"pre", "post", "source_pre", "state"}
 
 
-def _reject_extra(what: str, obj: dict[str, Any], allowed: tuple[str, ...]) -> None:
+def _ensure(condition: object, message: str) -> None:
+    if not condition:
+        raise SpecValidationError(message)
+
+
+def _as_dict(value: Any, ctx: str) -> dict[str, Any]:
+    _ensure(isinstance(value, dict), f"{ctx} must be an object")
+    return value
+
+
+def _as_list(value: Any, ctx: str) -> list[Any]:
+    _ensure(isinstance(value, list), f"{ctx} must be an array")
+    return value
+
+
+def _as_str(value: Any, ctx: str) -> str:
+    _ensure(isinstance(value, str), f"{ctx} must be a string")
+    return value
+
+
+def _as_int(value: Any, ctx: str) -> int:
+    # bool is a subclass of int; reject it where a true integer is required.
+    _ensure(isinstance(value, int) and not isinstance(value, bool), f"{ctx} must be an integer")
+    return value
+
+
+def _require_only(what: str, obj: dict[str, Any], allowed: tuple[str, ...]) -> None:
+    for field in allowed:
+        _ensure(field in obj, f"{what} is missing field {field!r}")
     extra = set(obj) - set(allowed)
-    if extra:
-        raise SpecValidationError(f"{what} has unexpected field(s): {sorted(extra)}")
+    _ensure(not extra, f"{what} has unexpected field(s): {sorted(extra)}")
 
 
-def _decode_state(obj: dict[str, Any]) -> PathState:
+def _decode_scalar(sentinel: Any, value: Any, ctx: str) -> Any:
+    return _as_str(value, ctx) if sentinel is _STR else _as_int(value, ctx)
+
+
+def _decode_state(value: Any, ctx: str) -> PathState:
+    obj = _as_dict(value, ctx)
     tag = obj.get("type")
-    if tag not in _STATE_FIELDS:
-        raise SpecValidationError(f"unknown path-state discriminator: {tag!r}")
-    cls, fields = _STATE_FIELDS[tag]
-    _reject_extra(f"state {tag}", obj, ("type", *fields))
-    kwargs: dict[str, Any] = {}
-    for field in fields:
-        if field not in obj:
-            raise SpecValidationError(f"state {tag} is missing field {field!r}")
-        kwargs[field] = obj[field]
+    _ensure(tag in _STATE_SPEC, f"{ctx}: unknown path-state discriminator: {tag!r}")
+    cls, fields = _STATE_SPEC[tag]
+    _require_only(f"{ctx} state {tag}", obj, ("type", *(name for name, _ in fields)))
+    kwargs = {name: _decode_scalar(sentinel, obj[name], f"{ctx}.{name}") for name, sentinel in fields}
     return cls(**kwargs)
 
 
-def _decode_effect(obj: dict[str, Any]) -> Effect:
+def _decode_effect(value: Any, ctx: str) -> Effect:
+    obj = _as_dict(value, ctx)
     tag = obj.get("type")
-    if tag not in _EFFECT_FIELDS:
-        raise SpecValidationError(f"unknown effect discriminator: {tag!r}")
-    cls, fields = _EFFECT_FIELDS[tag]
-    _reject_extra(f"effect {tag}", obj, ("type", *fields))
+    _ensure(tag in _EFFECT_SPEC, f"{ctx}: unknown effect discriminator: {tag!r}")
+    cls, fields = _EFFECT_SPEC[tag]
+    _require_only(f"{ctx} effect {tag}", obj, ("type", *(name for name, _ in fields)))
     kwargs: dict[str, Any] = {}
-    for field in fields:
-        if field not in obj:
-            raise SpecValidationError(f"effect {tag} is missing field {field!r}")
-        kwargs[field] = _decode_state(obj[field]) if field in _STATE_KEYS else obj[field]
+    for name, spec in fields:
+        if spec is _STR:
+            kwargs[name] = _as_str(obj[name], f"{ctx}.{name}")
+        else:
+            state = _decode_state(obj[name], f"{ctx}.{name}")
+            _ensure(isinstance(state, spec),
+                    f"{ctx} effect {tag} field {name!r} may not hold a {type(state).__name__}")
+            kwargs[name] = state
     return cls(**kwargs)
 
 
@@ -1737,46 +1879,63 @@ def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return seen
 
 
-def from_canonical_obj(obj: dict[str, Any]) -> TransactionSpec:
-    top = ("schema_version", "consumer_tag", "intent_digest",
-           "initial_surface", "final_surface", "effects", "dependencies")
-    for field in top:
-        if field not in obj:
-            raise SpecValidationError(f"spec is missing field {field!r}")
-    _reject_extra("spec", obj, top)
-    if obj["schema_version"] != SCHEMA_VERSION:
-        raise SpecValidationError(f"unsupported schema_version: {obj['schema_version']!r}")
-    surfaces = {}
+def from_canonical_obj(obj: Any) -> TransactionSpec:
+    spec = _as_dict(obj, "spec")
+    _require_only("spec", spec, ("schema_version", "consumer_tag", "intent_digest",
+                                 "initial_surface", "final_surface", "effects", "dependencies"))
+    version = _as_int(spec["schema_version"], "schema_version")
+    _ensure(version == SCHEMA_VERSION, f"unsupported schema_version: {version!r}")
+    surfaces: dict[str, tuple[SurfaceEntry, ...]] = {}
     for key in ("initial_surface", "final_surface"):
         entries = []
-        for item in obj[key]:
-            _reject_extra(key, item, ("path", "state"))
-            entries.append(SurfaceEntry(path=item["path"], state=_decode_state(item["state"])))
+        for i, raw in enumerate(_as_list(spec[key], key)):
+            item = _as_dict(raw, f"{key}[{i}]")
+            _require_only(f"{key}[{i}]", item, ("path", "state"))
+            entries.append(SurfaceEntry(
+                path=_as_str(item["path"], f"{key}[{i}].path"),
+                state=_decode_state(item["state"], f"{key}[{i}].state"),
+            ))
         surfaces[key] = tuple(entries)
     deps = []
-    for item in obj["dependencies"]:
-        _reject_extra("dependency", item, ("before", "after"))
-        deps.append(Dependency(before=item["before"], after=item["after"]))
+    for i, raw in enumerate(_as_list(spec["dependencies"], "dependencies")):
+        item = _as_dict(raw, f"dependencies[{i}]")
+        _require_only(f"dependencies[{i}]", item, ("before", "after"))
+        deps.append(Dependency(
+            before=_as_str(item["before"], f"dependencies[{i}].before"),
+            after=_as_str(item["after"], f"dependencies[{i}].after"),
+        ))
+    effects = tuple(
+        _decode_effect(raw, f"effects[{i}]")
+        for i, raw in enumerate(_as_list(spec["effects"], "effects"))
+    )
     return TransactionSpec(
-        schema_version=obj["schema_version"],
-        consumer_tag=obj["consumer_tag"],
-        intent_digest=obj["intent_digest"],
+        schema_version=version,
+        consumer_tag=_as_str(spec["consumer_tag"], "consumer_tag"),
+        intent_digest=_as_str(spec["intent_digest"], "intent_digest"),
         initial_surface=surfaces["initial_surface"],
         final_surface=surfaces["final_surface"],
-        effects=tuple(_decode_effect(e) for e in obj["effects"]),
+        effects=effects,
         dependencies=tuple(deps),
     )
 
 
 def from_canonical_json(text: str) -> TransactionSpec:
-    return from_canonical_obj(json.loads(text, object_pairs_hook=_no_duplicate_keys))
+    try:
+        parsed = json.loads(text, object_pairs_hook=_no_duplicate_keys)
+    except json.JSONDecodeError as exc:
+        raise SpecValidationError(f"malformed canonical JSON: {exc}") from exc
+    return from_canonical_obj(parsed)
 
 
 def from_canonical_bytes(data: bytes) -> TransactionSpec:
-    return from_canonical_json(data.decode("utf-8"))
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise SpecValidationError(f"canonical bytes are not valid UTF-8: {exc}") from exc
+    return from_canonical_json(text)
 ```
 
-Note: decoding rebuilds `TransactionSpec` directly (not via `build_spec`), preserving the stored tuple order; round-trip identity holds because a `build_spec`-produced spec is already in canonical (sorted) order, and `==` on the frozen dataclasses is structural.
+Note: every JSON scalar, object, and array is type-checked with an exact type (`bool` refused where an integer is required), each state is checked for compatibility with the effect field that holds it (so `ReplaceFile(pre=AbsentState())` is refused, not silently reconstructed), and malformed JSON / non-UTF-8 input is converted to `SpecValidationError` — so `from_canonical_*` raises **only** `SpecValidationError`, never a leaked `KeyError`/`AttributeError`/`TypeError`/`UnicodeDecodeError`. This is durable-format validation, distinct from A2's semantic/path/timeline validation. Decoding rebuilds `TransactionSpec` directly (not via `build_spec`), preserving stored tuple order; round-trip identity holds because a `build_spec`-produced spec is already canonical and `==` on the frozen dataclasses is structural.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -1802,12 +1961,12 @@ git commit -m "feat(core): strict canonical decoder with round-trip and fail-ear
 - §5.2 closed effect set + "move is one effect over source and destination" — Task 4. ✔
 - §5.3 repeated-path timelines — the `Occurrence` view (Task 4) is the data A2's continuity check consumes; the *check itself* is A2. Flagged, not silently dropped.
 - §5.5 capability vocabulary as data, always-required trio, per-variant additions incl. Delete file/symlink branch — Task 5. ✔ Empirical probing is A4.
-- §7.2 / §13.3 durable canonical format — Task 7 (deterministic encode; set-like fields sorted in the serializer so equal content yields equal bytes even for a directly-constructed spec; golden-byte fixture over every variant/state + non-ASCII) and **Task 8** (strict decode reconstructing the spec from `spec_json` for fresh-process recovery, with round-trip identity and fail-early rejection). ✔
-- PEP 561 typed-distribution parity with `nodes-core` — Task 1 (`py.typed`, `core-metadata-version = "2.5"`, `license-files`), verified against `~/d/nodes/python`. ✔
+- §7.2 / §13.3 durable canonical format — Task 7 (deterministic encode; set-like fields sorted in the serializer so equal content yields equal bytes even for a directly-constructed spec; golden-byte fixture over every variant/state + non-ASCII) and **Task 8** (a complete type-safe decode boundary reconstructing the spec from `spec_json` for fresh-process recovery: exact scalar/container typing incl. bool-vs-int, effect↔state compatibility, malformed-JSON/UTF-8 trapping, round-trip identity, and the guarantee that only `SpecValidationError` escapes — with adversarial tests at each nesting level). ✔
+- PEP 561 typed-distribution parity with `nodes-core` — Task 1: the `py.typed` marker, `core-metadata-version = "2.5"`, and `license-files` are proven to ship by **building the wheel and inspecting its ZIP + METADATA** (Step 4b), not merely by the editable-install source check; all verified against `~/d/nodes/python`. ✔
 - **Deferred by design, not omitted:** filesystem-identity metadata-root containment and ancestor-resolution checks (§5.4), all compilation validation (§5.4), and the recovery classifier (§8.4/§13.1) belong to A2/A3/A4 and are listed in the program table above.
 
 **Placeholder scan:** none — every code step carries complete source. The one golden fixture is generated by an explicit committed command (Task 7 Step 4), not left as a blank. ✔
 
-**Type consistency:** `occurrences`, `variant_capabilities`, `required_capabilities`, `build_spec`, `canonical_json`/`canonical_bytes`, and `from_canonical_obj`/`from_canonical_json`/`from_canonical_bytes` names and signatures are used identically across tasks and the interface blocks. The decoder's per-variant field lists (`_STATE_FIELDS`, `_EFFECT_FIELDS`) mirror the encoder's `_state_obj`/`_effect_obj` field spellings exactly, so a round-trip is structurally closed. `Dependency` is declared `order=True` (Task 6 note) precisely because `build_spec` sorts it. `FileState`/`DirectoryState`/`SymlinkState`/`AbsentState` field names are stable from Task 2 through Task 8. `SpecValidationError` (Task 1) is the single failure type for both identifier violations (Task 3) and decode violations (Task 8). ✔
+**Type consistency:** `occurrences`, `variant_capabilities`, `required_capabilities`, `build_spec`, `canonical_json`/`canonical_bytes`, and `from_canonical_obj`/`from_canonical_json`/`from_canonical_bytes` names and signatures are used identically across tasks and the interface blocks. The decoder's per-variant descriptors (`_STATE_SPEC`, `_EFFECT_SPEC`) mirror the encoder's `_state_obj`/`_effect_obj` field spellings exactly, so a round-trip is structurally closed, and their per-field state-class constraints match the effect dataclass annotations from Task 4. `Dependency` is declared `order=True` (Task 6 note) precisely because `build_spec` sorts it. `FileState`/`DirectoryState`/`SymlinkState`/`AbsentState` field names are stable from Task 2 through Task 8. `SpecValidationError` (Task 1) is the single failure type for identifier violations (Task 3) and every decode violation (Task 8). ✔
 
 **Scope:** A1 is one dependency-free subsystem, correctly sized for a single plan; the remaining Plan A work is decomposed into A2–A8 above. ✔
