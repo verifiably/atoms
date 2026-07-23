@@ -79,6 +79,23 @@ def test_states_and_effects_carry_type_discriminators():
     assert obj["initial_surface"][0]["state"]["type"] in {"absent", "file"}
 
 
+def test_canonical_obj_preserves_effect_order():
+    spec = build_spec(
+        consumer_tag="c",
+        intent_digest="sha256:" + "0" * 64,
+        initial_surface={"a": ABSENT, "b": ABSENT},
+        final_surface={"a": F, "b": F},
+        effects=(
+            CreateFileNoClobber(effect_id="e2", path="b", post=F),
+            CreateFileNoClobber(effect_id="e1", path="a", post=F),
+        ),
+    )
+    assert [effect["effect_id"] for effect in canonical_obj(spec)["effects"]] == [
+        "e2",
+        "e1",
+    ]
+
+
 def test_two_replace_specs_differing_only_in_hash_differ():
     g = FileState(content_hash="sha256:" + "6" * 64, mode=0o644, byte_len=7)
     a = build_spec(

@@ -1,3 +1,7 @@
+from dataclasses import FrozenInstanceError
+
+import pytest
+
 from atoms.core.capabilities import ALWAYS_REQUIRED, Capability
 from atoms.core.effects import CreateFileNoClobber, ReplaceFile
 from atoms.core.fingerprint import ABSENT, FileState
@@ -27,6 +31,21 @@ def test_build_spec_sets_schema_version_and_is_frozen():
     spec = _spec({"a": F}, {"a": F}, [ReplaceFile(effect_id="e1", path="a", pre=F, post=F)])
     assert spec.schema_version == SCHEMA_VERSION
     assert isinstance(spec, TransactionSpec)
+    with pytest.raises(FrozenInstanceError):
+        spec.consumer_tag = "changed"  # type: ignore[misc]
+    assert not hasattr(spec, "__dict__")
+
+
+def test_build_spec_preserves_effect_order():
+    spec = _spec(
+        {"a": ABSENT, "b": ABSENT},
+        {"a": F, "b": F},
+        [
+            CreateFileNoClobber(effect_id="e2", path="b", post=F),
+            CreateFileNoClobber(effect_id="e1", path="a", post=F),
+        ],
+    )
+    assert [effect.effect_id for effect in spec.effects] == ["e2", "e1"]
 
 
 def test_surfaces_are_canonicalized_sorted_by_path():
