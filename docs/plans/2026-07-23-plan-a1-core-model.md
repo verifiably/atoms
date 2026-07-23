@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build the pure, in-memory core of the `atoms` engine — the `TransactionSpec` data model, the five effect variants, the semantic capability vocabulary, the reserved scratch grammar, and a deterministic canonical serialization — with zero filesystem, SQLite, or platform dependency.
+**Goal:** Build the pure, in-memory core of the `atoms` engine — the `TransactionSpec` data model, the five effect variants, the semantic capability vocabulary, the reserved scratch grammar with a bounded safe-identifier grammar, and the durable canonical format (deterministic encode **and** strict decode) — with zero filesystem, SQLite, or platform dependency.
 
-**Architecture:** Frozen stdlib dataclasses model spec/effect/state *shapes*; behavior (occurrence enumeration, capability derivation, canonical encoding) lives in separate dispatch functions, keeping "shapes vs. rules" cleanly split (design §4.3). No pydantic and no third-party runtime dependency in the core — the determinism guarantee (§5.1, §13.3) is met by explicit canonicalization, not a validation library. This sub-plan implements **only** the parts of design §5 expressible without touching a filesystem; the filesystem-identity checks of §5.4 (metadata-root containment, ancestor resolution) are deferred to A2/A4, and validation of specs is deferred to A2.
+**Architecture:** Frozen stdlib dataclasses model spec/effect/state *shapes*; behavior (occurrence enumeration, capability derivation, canonical encode/decode) lives in separate dispatch functions, keeping "shapes vs. rules" cleanly split (design §4.3). No pydantic and no third-party runtime dependency in the core — the determinism guarantee (§5.1, §13.3) is met by explicit canonicalization (the serializer sorts set-like fields so canonical bytes are a pure function of content), not a validation library. The canonical format is round-trippable: a strict decoder reconstructs the exact spec from `spec_json` for fresh-process recovery (§7.2, §8.4), failing early on unknown discriminators, missing/extra fields, or duplicate keys. This sub-plan implements **only** the parts of design §5 expressible without touching a filesystem; the filesystem-identity checks of §5.4 (metadata-root containment, ancestor resolution) and all spec *validation* are deferred to A2/A4.
 
 **Tech Stack:** Python ≥3.11, stdlib only (`dataclasses`, `enum`, `functools.singledispatch`, `json`, `unicodedata`, `hashlib`), managed with `uv`; hatchling build; `ruff` + `pyright` + `pytest`.
 
@@ -14,8 +14,8 @@ Design §14's "Plan A" is a program of eight sub-plans, sequenced so each produc
 
 | Sub-plan | Scope | Design refs | Deferred decisions settled |
 | --- | --- | --- | --- |
-| **A1 (this doc)** | Pure model, vocabulary, scratch grammar, canonical form | §5.1–§5.3, §5.5-as-data | none (dependency-free) |
-| A2 | Compilation validation (fs-independent subset) + repeated-path timelines | §5.3, §5.4 | none |
+| **A1 (this doc)** | Pure model, vocabulary, scratch grammar + safe identifiers, and the durable canonical format (encode **and** strict decode) | §5.1–§5.3, §5.5-as-data, §7.2/§13.3 format | none (dependency-free) |
+| A2 | Compilation validation (fs-independent subset) + repeated-path timelines; enforces the safe-identifier grammar over every effect ID | §5.3, §5.4 | none |
 | A3 | Executable recovery reference model (transaction + variant classifiers) | §8.4, §13.1 | none |
 | A4 | Platform capability backend + per-volume probe + durability-allowlist tuples | §5.5, §14 | **durability-allowlist configuration tuples** |
 | A5 | SQLite-WAL metadata store, project lock, recovery-resolve lease, preparation/commit ordering | §7 | **SQLite I/O-layer (stdlib vs. custom VFS)** |
@@ -44,14 +44,18 @@ Scaffolding for the whole `python/` subtree is folded here because every later t
 
 **Files:**
 - Create: `python/pyproject.toml`
+- Create: `python/README.md`
+- Create: `python/LICENSE` (copy of `~/d/atoms/LICENSE`)
 - Create: `python/src/atoms/core/__init__.py`
+- Create: `python/src/atoms/core/py.typed` (empty PEP 561 marker)
 - Create: `python/src/atoms/core/errors.py`
 - Create: `python/tests/__init__.py`
 - Test: `python/tests/test_errors.py`
+- Test: `python/tests/test_packaging.py`
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: exception classes `AtomsError`, `ProtocolError(AtomsError)`, `SpecValidationError(AtomsError)`, `PreconditionRefused(AtomsError)`, `CapabilityUnavailable(AtomsError)`, `TransactionHalted(AtomsError)`. Package import path `atoms.core`.
+- Produces: exception classes `AtomsError`, `ProtocolError(AtomsError)`, `SpecValidationError(AtomsError)`, `PreconditionRefused(AtomsError)`, `CapabilityUnavailable(AtomsError)`, `TransactionHalted(AtomsError)`. Package import path `atoms.core`, shipped as an inline-typed (PEP 561) distribution mirroring `nodes-core`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -104,6 +108,7 @@ version = "0.1.0"
 description = "Atoms core: a recoverable filesystem effect engine (pure model)"
 readme = "README.md"
 license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Keith Hughitt", email = "keith.hughitt@gmail.com" }]
 requires-python = ">=3.11"
 classifiers = ["Typing :: Typed"]
@@ -119,6 +124,7 @@ requires = ["hatchling>=1.30"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
+core-metadata-version = "2.5"
 packages = ["src/atoms"]
 
 [tool.pytest.ini_options]
@@ -178,7 +184,9 @@ class TransactionHalted(AtomsError):
     """State is unattributable; the engine preserves the record and evidence."""
 ```
 
-Notes: a README is required by `pyproject.toml`'s `readme` field; the repo root `README.md` is one directory up, so add `readme = "README.md"` only if a `python/README.md` exists — instead point it at the root by creating a one-line `python/README.md`:
+`python/src/atoms/core/py.typed`: an **empty** file. PEP 561 requires this marker for a package to ship inline type information; the `Typing :: Typed` classifier is a promise the marker fulfills. Combined with `core-metadata-version = "2.5"` (which lets Hatchling emit the `Import-Name`/`Import-Namespace` metadata-2.5 fields) and `license-files = ["LICENSE"]`, this makes the distribution mirror `nodes-core` exactly (see `~/d/nodes/python/pyproject.toml` and `~/d/nodes/python/src/nodes/core/py.typed`).
+
+`python/README.md` (required by `pyproject.toml`'s `readme` field, which resolves relative to `python/`):
 
 ```markdown
 # atoms-core
@@ -186,12 +194,27 @@ Notes: a README is required by `pyproject.toml`'s `readme` field; the repo root 
 Pure model for the atoms recoverable filesystem effect engine. See `~/d/atoms/README.md`.
 ```
 
-(Create `python/README.md` with that content in this step.)
+`python/LICENSE`: copy the repository-root license so `license-files = ["LICENSE"]` resolves within `python/` (nodes keeps the same file in both places). Run from the repo root: `cp LICENSE python/LICENSE`.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [ ] **Step 3b: Add the packaging test**
 
-Run (from `python/`): `uv run pytest tests/test_errors.py -v`
-Expected: PASS (both tests). `uv run` builds/installs the editable package on first invocation.
+`python/tests/test_packaging.py`:
+
+```python
+from pathlib import Path
+
+import atoms.core
+
+
+def test_py_typed_marker_is_shipped():
+    marker = Path(atoms.core.__file__).with_name("py.typed")
+    assert marker.is_file(), "PEP 561 py.typed marker must ship with atoms.core"
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run (from `python/`): `uv run pytest tests/test_errors.py tests/test_packaging.py -v`
+Expected: PASS (all three tests). `uv run` builds/installs the editable package on first invocation. The `py.typed` test proves the marker is packaged, not merely present in the source tree.
 
 - [ ] **Step 5: Lint and type-check the new files**
 
@@ -345,30 +368,114 @@ git commit -m "feat(core): path-state fingerprints"
 
 ---
 
-### Task 3: Reserved scratch grammar
+### Task 3: Reserved scratch grammar and safe identifiers
 
 Implements the letter-free `.#~` sigil (design §5.1) and the property that makes the letter-free choice sound: on any input, a plain `startswith` and an equivalence-aware (case + NFC/NFD) match must agree, so no persistent path can alias scratch through a normalization variant (§13.3).
 
+It also fixes a distinct hazard: `scratch_leaf` interpolates a `txid`, a **consumer-controlled** `effect_id`, and a `role` directly into a single pathname component. An `effect_id` containing `/`, a NUL, a `.`, or excessive length would break the single-component grammar and only surface much later, when a `*at` syscall receives the malformed scratch name. A bounded **safe-identifier grammar** (`identifiers.py`) closes this: `scratch_leaf` validates every interpolated part at construction and raises `SpecValidationError` on a bad one, so the failure is a compile-time contract violation (the same predicate A2's compiler applies to every effect ID before any scratch is materialized), never a runtime syscall error. `.` is excluded from the grammar so the `.#~<txid>.<effect-id>.<role>` remainder stays unambiguously delimited.
+
 **Files:**
+- Create: `python/src/atoms/core/identifiers.py`
 - Create: `python/src/atoms/core/scratch.py`
+- Test: `python/tests/test_identifiers.py`
 - Test: `python/tests/test_scratch.py`
 
 **Interfaces:**
-- Consumes: nothing.
+- Consumes: `atoms.core.errors` (`SpecValidationError`).
 - Produces:
+  - `SAFE_IDENTIFIER: re.Pattern` matching `^[A-Za-z0-9_-]{1,64}$`.
+  - `is_valid_identifier(value: str) -> bool`.
+  - `require_valid_identifier(kind: str, value: str) -> str` — returns `value` or raises `SpecValidationError` naming `kind` (e.g. `"effect_id"`).
   - `SCRATCH_SIGIL = ".#~"`.
   - `leaf_of(rel_path: str) -> str` — last POSIX component.
   - `is_scratch_leaf(leaf: str) -> bool` — plain prefix test.
   - `aliases_scratch_sigil(leaf: str) -> bool` — equivalence-aware test across `{leaf, NFC, NFD, casefold}`.
-  - `scratch_leaf(txid: str, effect_id: str, role: str) -> str` — build `f"{SCRATCH_SIGIL}{txid}.{effect_id}.{role}"`.
+  - `scratch_leaf(txid: str, effect_id: str, role: str) -> str` — validates each part via `require_valid_identifier`, then builds `f"{SCRATCH_SIGIL}{txid}.{effect_id}.{role}"`.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing identifier test**
+
+`python/tests/test_identifiers.py`:
+
+```python
+import pytest
+
+from atoms.core.errors import SpecValidationError
+from atoms.core.identifiers import (
+    is_valid_identifier,
+    require_valid_identifier,
+)
+
+
+def test_accepts_bounded_ascii_identifiers():
+    for good in ("e07", "effect_1", "A-B-C", "x" * 64):
+        assert is_valid_identifier(good)
+        assert require_valid_identifier("effect_id", good) == good
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["", "a/b", "a.b", "a b", "x" * 65, "e\x00", "café", "e#1"],
+)
+def test_rejects_unsafe_identifiers(bad):
+    assert not is_valid_identifier(bad)
+    with pytest.raises(SpecValidationError, match="effect_id"):
+        require_valid_identifier("effect_id", bad)
+```
+
+- [ ] **Step 2: Run it and verify it fails**
+
+Run: `uv run pytest tests/test_identifiers.py -v`
+Expected: FAIL — `ModuleNotFoundError: No module named 'atoms.core.identifiers'`.
+
+- [ ] **Step 3: Implement `identifiers.py`**
+
+`python/src/atoms/core/identifiers.py`:
+
+```python
+"""Bounded safe-identifier grammar for names interpolated into path components.
+
+A stable effect ID (consumer-supplied) and the engine's txid/role are woven into a
+single scratch-leaf component (design §5.1). Restricting them to a bounded ASCII
+grammar makes that leaf a well-formed single component and turns a malformed ID into a
+compile-time refusal (design §5.4) rather than a `*at` syscall failure at mutation time.
+"""
+
+from __future__ import annotations
+
+import re
+
+from atoms.core.errors import SpecValidationError
+
+SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def is_valid_identifier(value: str) -> bool:
+    return SAFE_IDENTIFIER.fullmatch(value) is not None
+
+
+def require_valid_identifier(kind: str, value: str) -> str:
+    if not is_valid_identifier(value):
+        raise SpecValidationError(
+            f"{kind} {value!r} is not a valid identifier: expected 1–64 chars of [A-Za-z0-9_-]"
+        )
+    return value
+```
+
+- [ ] **Step 4: Run it and verify it passes**
+
+Run: `uv run pytest tests/test_identifiers.py -v`
+Expected: PASS.
+
+- [ ] **Step 5: Write the failing scratch test**
 
 `python/tests/test_scratch.py`:
 
 ```python
 import unicodedata
 
+import pytest
+
+from atoms.core.errors import SpecValidationError
 from atoms.core.scratch import (
     SCRATCH_SIGIL,
     aliases_scratch_sigil,
@@ -415,14 +522,23 @@ def test_letter_free_sigil_has_no_case_or_normalization_alias():
     ]
     for s in samples:
         assert is_scratch_leaf(s) == aliases_scratch_sigil(s)
+
+
+def test_scratch_leaf_rejects_unsafe_effect_id():
+    # A malformed consumer effect_id must fail here, not when a *at syscall
+    # later receives a multi-component or over-long scratch name.
+    with pytest.raises(SpecValidationError, match="effect_id"):
+        scratch_leaf("deadbeef", "bad/id", "stage")
+    with pytest.raises(SpecValidationError):
+        scratch_leaf("deadbeef", "e07", "x" * 65)
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 6: Run test to verify it fails**
 
 Run: `uv run pytest tests/test_scratch.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'atoms.core.scratch'`.
 
-- [ ] **Step 3: Write minimal implementation**
+- [ ] **Step 7: Write minimal implementation**
 
 `python/src/atoms/core/scratch.py`:
 
@@ -437,6 +553,8 @@ begins with the sigil; only the sigil participates in classification.
 from __future__ import annotations
 
 import unicodedata
+
+from atoms.core.identifiers import require_valid_identifier
 
 SCRATCH_SIGIL = ".#~"
 
@@ -468,21 +586,30 @@ def aliases_scratch_sigil(leaf: str) -> bool:
 
 
 def scratch_leaf(txid: str, effect_id: str, role: str) -> str:
-    """Build a scratch leaf name ``.#~<txid>.<effect-id>.<role>``."""
+    """Build a scratch leaf name ``.#~<txid>.<effect-id>.<role>``.
+
+    Every interpolated part is validated against the safe-identifier grammar first, so a
+    malformed (multi-component, over-long, or NUL-bearing) part raises ``SpecValidationError``
+    here rather than producing a leaf that fails a later ``*at`` syscall.
+    """
+    require_valid_identifier("txid", txid)
+    require_valid_identifier("effect_id", effect_id)
+    require_valid_identifier("role", role)
     return f"{SCRATCH_SIGIL}{txid}.{effect_id}.{role}"
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [ ] **Step 8: Run test to verify it passes**
 
 Run: `uv run pytest tests/test_scratch.py -v`
 Expected: PASS.
 
-- [ ] **Step 5: Lint, type-check, commit**
+- [ ] **Step 9: Lint, type-check, commit**
 
 ```bash
 uv run ruff check && uv run pyright
-git add python/src/atoms/core/scratch.py python/tests/test_scratch.py
-git commit -m "feat(core): reserved scratch grammar with letter-free sigil property"
+git add python/src/atoms/core/identifiers.py python/src/atoms/core/scratch.py \
+        python/tests/test_identifiers.py python/tests/test_scratch.py
+git commit -m "feat(core): scratch grammar with letter-free sigil + bounded safe identifiers"
 ```
 
 ---
@@ -1102,14 +1229,17 @@ git commit -m "feat(core): TransactionSpec and canonicalizing builder"
 
 Implements the byte-stable encoding the design relies on twice: §13.3 (validate a spec twice → identical canonical output) and §7.2 (`spec_json` stored immutably). Encoding is a tagged-union `dict` tree emitted via `json.dumps` with sorted keys and no whitespace variance.
 
+`TransactionSpec` stays a public frozen dataclass, so a caller *could* construct one with unsorted set-like fields and bypass `build_spec`'s canonicalization. To make canonical bytes a pure function of the spec's *content* rather than its tuple order, the serializer **re-sorts the set-like fields itself**: `initial_surface` and `final_surface` (sets keyed by path) and `dependencies` (a set) are sorted at emit time. `effects` is an ordered sequence — its order is semantically meaningful (design §5.2) — so it is **not** re-sorted. (De-duplication and well-formedness remain compilation-validation's job in A2; A1's guarantee is order-invariance of equivalent content, not rejection of malformed content.)
+
 **Files:**
 - Create: `python/src/atoms/core/canonical.py`
+- Create: `python/tests/fixtures/spec_all_variants.canonical.json` (generated golden fixture)
 - Test: `python/tests/test_canonical.py`
 
 **Interfaces:**
 - Consumes: all of `atoms.core.fingerprint`, `atoms.core.effects`, `atoms.core.spec`.
 - Produces:
-  - `canonical_obj(spec: TransactionSpec) -> dict` — a JSON-ready tree with `"type"` discriminators for each state and effect.
+  - `canonical_obj(spec: TransactionSpec) -> dict` — a JSON-ready tree with `"type"` discriminators for each state and effect; `initial_surface`, `final_surface`, and `dependencies` are emitted in sorted order regardless of the spec's tuple order.
   - `canonical_json(spec: TransactionSpec) -> str` — `json.dumps(canonical_obj(spec), sort_keys=True, separators=(",", ":"), ensure_ascii=False)`.
   - `canonical_bytes(spec: TransactionSpec) -> bytes` — UTF-8 of `canonical_json`.
 
@@ -1119,13 +1249,22 @@ Implements the byte-stable encoding the design relies on twice: §13.3 (validate
 
 ```python
 import json
+from pathlib import Path
 
 from atoms.core.canonical import canonical_bytes, canonical_json, canonical_obj
-from atoms.core.effects import CreateFileNoClobber, MoveNoClobber, ReplaceFile
-from atoms.core.fingerprint import ABSENT, FileState
-from atoms.core.spec import build_spec
+from atoms.core.effects import (
+    CreateDirectory,
+    CreateFileNoClobber,
+    DeletePath,
+    MoveNoClobber,
+    ReplaceFile,
+)
+from atoms.core.fingerprint import ABSENT, DirectoryState, FileState, SymlinkState
+from atoms.core.spec import Dependency, SurfaceEntry, TransactionSpec, build_spec
 
 F = FileState(content_hash="sha256:" + "5" * 64, mode=0o644, byte_len=7)
+G = DirectoryState(mode=0o755)
+L = SymlinkState(target="café/target", mode=0o777)
 
 
 def _spec_two_orderings():
@@ -1188,6 +1327,83 @@ def test_two_replace_specs_differing_only_in_hash_differ():
                    initial_surface={"x": F}, final_surface={"x": F},
                    effects=(ReplaceFile(effect_id="e", path="x", pre=F, post=F),))
     assert canonical_json(a) != canonical_json(b)
+
+
+def _all_variants_spec():
+    """One spec exercising every effect variant, every path-state, dependencies,
+    and non-ASCII data — the fixture the durable-format tests lock."""
+    return build_spec(
+        consumer_tag="cnsmr",
+        intent_digest="sha256:" + "0" * 64,
+        initial_surface={
+            "café.txt": F, "new.txt": ABSENT, "del.txt": F, "lnk": L,
+            "src": F, "dst": ABSENT, "dir": ABSENT,
+        },
+        final_surface={
+            "café.txt": F, "new.txt": F, "del.txt": ABSENT, "lnk": ABSENT,
+            "src": ABSENT, "dst": F, "dir": G,
+        },
+        effects=(
+            ReplaceFile(effect_id="e1", path="café.txt", pre=F, post=F),
+            CreateFileNoClobber(effect_id="e2", path="new.txt", post=F),
+            DeletePath(effect_id="e3", path="del.txt", pre=F),
+            DeletePath(effect_id="e4", path="lnk", pre=L),
+            MoveNoClobber(effect_id="e5", source="src", destination="dst", source_pre=F),
+            CreateDirectory(effect_id="e6", path="dir", post=G),
+        ),
+        dependencies=[("e2", "e5"), ("e1", "e3")],
+    )
+
+
+def test_every_effect_and_state_variant_encodes_with_exact_discriminators():
+    obj = canonical_obj(_all_variants_spec())
+    by_id = {e["effect_id"]: e for e in obj["effects"]}
+    file_obj = {"type": "file", "content_hash": F.content_hash, "mode": 0o644, "byte_len": 7}
+    assert by_id["e1"] == {"type": "ReplaceFile", "effect_id": "e1", "path": "café.txt",
+                           "pre": file_obj, "post": file_obj}
+    assert by_id["e2"] == {"type": "CreateFileNoClobber", "effect_id": "e2", "path": "new.txt",
+                           "post": file_obj}
+    assert by_id["e3"] == {"type": "DeletePath", "effect_id": "e3", "path": "del.txt", "pre": file_obj}
+    assert by_id["e4"]["pre"] == {"type": "symlink", "target": "café/target", "mode": 0o777}
+    assert by_id["e5"] == {"type": "MoveNoClobber", "effect_id": "e5", "source": "src",
+                           "destination": "dst", "source_pre": file_obj}
+    assert by_id["e6"]["post"] == {"type": "directory", "mode": 0o755}
+    assert "absent" in {e["state"]["type"] for e in obj["initial_surface"]}
+    # dependencies emitted in sorted order regardless of input order
+    assert obj["dependencies"] == [{"before": "e1", "after": "e3"}, {"before": "e2", "after": "e5"}]
+
+
+def test_non_ascii_is_preserved_literally_not_escaped():
+    s = canonical_json(_all_variants_spec())
+    assert "café.txt" in s and "café/target" in s
+    assert "\\u" not in s  # ensure_ascii=False keeps non-ASCII literal
+
+
+def test_serializer_canonicalizes_a_directly_constructed_unsorted_spec():
+    # F3: canonical bytes are a pure function of content even when a caller bypasses
+    # build_spec and constructs TransactionSpec with unsorted set-like fields.
+    ordered = _all_variants_spec()
+    shuffled = TransactionSpec(
+        schema_version=ordered.schema_version,
+        consumer_tag=ordered.consumer_tag,
+        intent_digest=ordered.intent_digest,
+        initial_surface=tuple(reversed(ordered.initial_surface)),
+        final_surface=tuple(reversed(ordered.final_surface)),
+        effects=ordered.effects,  # order is semantic — left as-is
+        dependencies=tuple(reversed(ordered.dependencies)),
+    )
+    assert canonical_bytes(shuffled) == canonical_bytes(ordered)
+    assert isinstance(shuffled.initial_surface[0], SurfaceEntry)
+    assert isinstance(shuffled.dependencies[0], Dependency)
+
+
+def test_golden_bytes_lock_the_durable_contract():
+    # Exact-byte fixture, generated once from the encoder and committed at
+    # tests/fixtures/spec_all_variants.canonical.json, then locked here so any
+    # tag or field-spelling drift fails. Regenerate intentionally only when the
+    # durable format version changes.
+    fixture = Path(__file__).with_name("fixtures") / "spec_all_variants.canonical.json"
+    assert canonical_bytes(_all_variants_spec()) == fixture.read_bytes()
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -1295,14 +1511,21 @@ def _dependency_obj(dep: Dependency) -> dict[str, Any]:
 
 
 def canonical_obj(spec: TransactionSpec) -> dict[str, Any]:
+    # Set-like fields (surfaces keyed by path; dependencies) are sorted here so canonical
+    # bytes are a pure function of content, independent of a spec's tuple order — even a
+    # spec built directly, bypassing build_spec. `effects` is an ordered sequence (its
+    # order is semantic, design §5.2) and is emitted as-is.
+    initial = sorted(spec.initial_surface, key=lambda e: e.path)
+    final = sorted(spec.final_surface, key=lambda e: e.path)
+    deps = sorted(spec.dependencies, key=lambda d: (d.before, d.after))
     return {
         "schema_version": spec.schema_version,
         "consumer_tag": spec.consumer_tag,
         "intent_digest": spec.intent_digest,
-        "initial_surface": [_surface_obj(e) for e in spec.initial_surface],
-        "final_surface": [_surface_obj(e) for e in spec.final_surface],
+        "initial_surface": [_surface_obj(e) for e in initial],
+        "final_surface": [_surface_obj(e) for e in final],
         "effects": [_effect_obj(e) for e in spec.effects],
-        "dependencies": [_dependency_obj(d) for d in spec.dependencies],
+        "dependencies": [_dependency_obj(d) for d in deps],
     }
 
 
@@ -1314,38 +1537,277 @@ def canonical_bytes(spec: TransactionSpec) -> bytes:
     return canonical_json(spec).encode("utf-8")
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [ ] **Step 4: Generate the golden fixture**
+
+`test_golden_bytes_lock_the_durable_contract` needs the fixture to exist. Generate it once from the now-implemented encoder and commit it (this is deliberate golden-file bootstrap, not a placeholder). Run from `python/`:
+
+```bash
+mkdir -p tests/fixtures
+uv run python -c "
+from pathlib import Path
+from atoms.core.canonical import canonical_bytes
+from tests.test_canonical import _all_variants_spec
+Path('tests/fixtures/spec_all_variants.canonical.json').write_bytes(canonical_bytes(_all_variants_spec()))
+"
+```
+
+Then eyeball the fixture (`cat tests/fixtures/spec_all_variants.canonical.json`) and confirm it contains each discriminator (`ReplaceFile`, `CreateFileNoClobber`, `DeletePath`, `MoveNoClobber`, `CreateDirectory`, `file`, `directory`, `symlink`, `absent`), the literal `café`, and sorted dependencies — i.e. that the *reviewed content*, not just self-generated bytes, is what gets locked.
+
+- [ ] **Step 5: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_canonical.py -v`
-Expected: PASS.
+Expected: PASS (all tests, including the golden and non-ASCII locks).
 
-- [ ] **Step 5: Full suite, lint, type-check**
+- [ ] **Step 6: Full suite, lint, type-check**
 
 Run (from `python/`): `uv run pytest && uv run ruff check && uv run pyright`
 Expected: all tests pass, no lint/type errors.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add python/src/atoms/core/canonical.py python/tests/test_canonical.py
-git commit -m "feat(core): deterministic canonical serialization"
+git add python/src/atoms/core/canonical.py python/tests/test_canonical.py \
+        python/tests/fixtures/spec_all_variants.canonical.json
+git commit -m "feat(core): deterministic canonical serialization + golden durable-format lock"
+```
+
+---
+
+### Task 8: Strict canonical decoder and round-trip
+
+The durable format (design §7.2 `spec_json`) is only half-specified by an encoder: **fresh-process recovery must reconstruct the exact `TransactionSpec` from stored bytes** (design §8.4). This task adds the inverse of Task 7 — a strict decoder with schema-version dispatch that rejects unknown discriminators, missing or extra fields, and duplicate JSON keys (fail-early, design conventions) — and locks the encode/decode round-trip, including on the golden fixture.
+
+**Files:**
+- Modify: `python/src/atoms/core/canonical.py` (add decoder functions)
+- Test: `python/tests/test_canonical_decode.py`
+
+**Interfaces:**
+- Consumes: `atoms.core.errors` (`SpecValidationError`), all of `atoms.core.fingerprint`, `atoms.core.effects`, `atoms.core.spec`.
+- Produces:
+  - `from_canonical_obj(obj: dict) -> TransactionSpec`.
+  - `from_canonical_json(text: str) -> TransactionSpec` — parses with a duplicate-key-rejecting hook, then delegates.
+  - `from_canonical_bytes(data: bytes) -> TransactionSpec`.
+  - Round-trip guarantee: for any `build_spec`-produced spec, `from_canonical_bytes(canonical_bytes(spec)) == spec`.
+
+- [ ] **Step 1: Write the failing test**
+
+`python/tests/test_canonical_decode.py`:
+
+```python
+from pathlib import Path
+
+import pytest
+
+from atoms.core.canonical import (
+    canonical_bytes,
+    canonical_json,
+    canonical_obj,
+    from_canonical_bytes,
+    from_canonical_json,
+    from_canonical_obj,
+)
+from atoms.core.errors import SpecValidationError
+from atoms.core.fingerprint import ABSENT, FileState
+from atoms.core.spec import build_spec
+from tests.test_canonical import _all_variants_spec
+
+F = FileState(content_hash="sha256:" + "5" * 64, mode=0o644, byte_len=7)
+
+
+def test_round_trip_of_every_variant_is_identity():
+    spec = _all_variants_spec()
+    assert from_canonical_bytes(canonical_bytes(spec)) == spec
+
+
+def test_round_trip_through_the_committed_golden_fixture():
+    fixture = Path(__file__).with_name("fixtures") / "spec_all_variants.canonical.json"
+    assert from_canonical_bytes(fixture.read_bytes()) == _all_variants_spec()
+
+
+def test_unknown_schema_version_is_rejected():
+    spec = build_spec(consumer_tag="c", intent_digest="sha256:" + "0" * 64,
+                      initial_surface={"a": F}, final_surface={"a": F}, effects=())
+    obj = canonical_obj(spec)
+    obj["schema_version"] = 999
+    with pytest.raises(SpecValidationError, match="schema_version"):
+        from_canonical_obj(obj)
+
+
+def test_unknown_effect_discriminator_is_rejected():
+    obj = canonical_obj(
+        build_spec(consumer_tag="c", intent_digest="sha256:" + "0" * 64,
+                   initial_surface={"a": ABSENT}, final_surface={"a": F}, effects=())
+    )
+    obj["effects"] = [{"type": "Frobnicate", "effect_id": "e", "path": "a"}]
+    with pytest.raises(SpecValidationError, match="Frobnicate"):
+        from_canonical_obj(obj)
+
+
+def test_missing_field_is_rejected():
+    with pytest.raises(SpecValidationError, match="content_hash"):
+        from_canonical_obj({
+            "schema_version": 1, "consumer_tag": "c", "intent_digest": "sha256:" + "0" * 64,
+            "initial_surface": [{"path": "a", "state": {"type": "file", "mode": 420, "byte_len": 1}}],
+            "final_surface": [], "effects": [], "dependencies": [],
+        })
+
+
+def test_extra_field_is_rejected():
+    with pytest.raises(SpecValidationError, match="unexpected"):
+        from_canonical_obj({
+            "schema_version": 1, "consumer_tag": "c", "intent_digest": "sha256:" + "0" * 64,
+            "initial_surface": [], "final_surface": [], "effects": [], "dependencies": [],
+            "surprise": True,
+        })
+
+
+def test_duplicate_json_key_is_rejected():
+    dup = '{"schema_version":1,"schema_version":1,"consumer_tag":"c","intent_digest":"x",' \
+          '"initial_surface":[],"final_surface":[],"effects":[],"dependencies":[]}'
+    with pytest.raises(SpecValidationError, match="duplicate"):
+        from_canonical_json(dup)
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `uv run pytest tests/test_canonical_decode.py -v`
+Expected: FAIL — `ImportError: cannot import name 'from_canonical_bytes'`.
+
+- [ ] **Step 3: Add the decoder to `canonical.py`**
+
+First, add two imports at the **top** of `python/src/atoms/core/canonical.py` (alongside the existing imports, so ruff's E402 does not fire): `from atoms.core.errors import SpecValidationError` and extend the `atoms.core.spec` import to include `SCHEMA_VERSION` (i.e. `from atoms.core.spec import SCHEMA_VERSION, Dependency, SurfaceEntry, TransactionSpec`). The module already imports `json`. Then append the decoder below the existing encoder:
+
+```python
+_STATE_FIELDS = {
+    "absent": (AbsentState, ()),
+    "file": (FileState, ("content_hash", "mode", "byte_len")),
+    "directory": (DirectoryState, ("mode",)),
+    "symlink": (SymlinkState, ("target", "mode")),
+}
+_EFFECT_FIELDS = {
+    "ReplaceFile": (ReplaceFile, ("effect_id", "path", "pre", "post")),
+    "CreateFileNoClobber": (CreateFileNoClobber, ("effect_id", "path", "post")),
+    "DeletePath": (DeletePath, ("effect_id", "path", "pre")),
+    "MoveNoClobber": (MoveNoClobber, ("effect_id", "source", "destination", "source_pre")),
+    "CreateDirectory": (CreateDirectory, ("effect_id", "path", "post")),
+}
+_STATE_KEYS = {"pre", "post", "source_pre", "state"}
+
+
+def _reject_extra(what: str, obj: dict[str, Any], allowed: tuple[str, ...]) -> None:
+    extra = set(obj) - set(allowed)
+    if extra:
+        raise SpecValidationError(f"{what} has unexpected field(s): {sorted(extra)}")
+
+
+def _decode_state(obj: dict[str, Any]) -> PathState:
+    tag = obj.get("type")
+    if tag not in _STATE_FIELDS:
+        raise SpecValidationError(f"unknown path-state discriminator: {tag!r}")
+    cls, fields = _STATE_FIELDS[tag]
+    _reject_extra(f"state {tag}", obj, ("type", *fields))
+    kwargs: dict[str, Any] = {}
+    for field in fields:
+        if field not in obj:
+            raise SpecValidationError(f"state {tag} is missing field {field!r}")
+        kwargs[field] = obj[field]
+    return cls(**kwargs)
+
+
+def _decode_effect(obj: dict[str, Any]) -> Effect:
+    tag = obj.get("type")
+    if tag not in _EFFECT_FIELDS:
+        raise SpecValidationError(f"unknown effect discriminator: {tag!r}")
+    cls, fields = _EFFECT_FIELDS[tag]
+    _reject_extra(f"effect {tag}", obj, ("type", *fields))
+    kwargs: dict[str, Any] = {}
+    for field in fields:
+        if field not in obj:
+            raise SpecValidationError(f"effect {tag} is missing field {field!r}")
+        kwargs[field] = _decode_state(obj[field]) if field in _STATE_KEYS else obj[field]
+    return cls(**kwargs)
+
+
+def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    seen: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in seen:
+            raise SpecValidationError(f"duplicate JSON key: {key!r}")
+        seen[key] = value
+    return seen
+
+
+def from_canonical_obj(obj: dict[str, Any]) -> TransactionSpec:
+    top = ("schema_version", "consumer_tag", "intent_digest",
+           "initial_surface", "final_surface", "effects", "dependencies")
+    for field in top:
+        if field not in obj:
+            raise SpecValidationError(f"spec is missing field {field!r}")
+    _reject_extra("spec", obj, top)
+    if obj["schema_version"] != SCHEMA_VERSION:
+        raise SpecValidationError(f"unsupported schema_version: {obj['schema_version']!r}")
+    surfaces = {}
+    for key in ("initial_surface", "final_surface"):
+        entries = []
+        for item in obj[key]:
+            _reject_extra(key, item, ("path", "state"))
+            entries.append(SurfaceEntry(path=item["path"], state=_decode_state(item["state"])))
+        surfaces[key] = tuple(entries)
+    deps = []
+    for item in obj["dependencies"]:
+        _reject_extra("dependency", item, ("before", "after"))
+        deps.append(Dependency(before=item["before"], after=item["after"]))
+    return TransactionSpec(
+        schema_version=obj["schema_version"],
+        consumer_tag=obj["consumer_tag"],
+        intent_digest=obj["intent_digest"],
+        initial_surface=surfaces["initial_surface"],
+        final_surface=surfaces["final_surface"],
+        effects=tuple(_decode_effect(e) for e in obj["effects"]),
+        dependencies=tuple(deps),
+    )
+
+
+def from_canonical_json(text: str) -> TransactionSpec:
+    return from_canonical_obj(json.loads(text, object_pairs_hook=_no_duplicate_keys))
+
+
+def from_canonical_bytes(data: bytes) -> TransactionSpec:
+    return from_canonical_json(data.decode("utf-8"))
+```
+
+Note: decoding rebuilds `TransactionSpec` directly (not via `build_spec`), preserving the stored tuple order; round-trip identity holds because a `build_spec`-produced spec is already in canonical (sorted) order, and `==` on the frozen dataclasses is structural.
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `uv run pytest tests/test_canonical_decode.py -v`
+Expected: PASS.
+
+- [ ] **Step 5: Full suite, lint, type-check, commit**
+
+```bash
+uv run pytest && uv run ruff check && uv run pyright
+git add python/src/atoms/core/canonical.py python/tests/test_canonical_decode.py
+git commit -m "feat(core): strict canonical decoder with round-trip and fail-early rejection"
 ```
 
 ---
 
 ## Self-review
 
-**Spec coverage (against design §5, the A1 slice):**
+**Spec coverage (against design §5 + the durable-format contract, the A1 slice):**
 - §5.1 `TransactionSpec` fields — Task 6 (schema version, consumer tag, intent digest, initial/final surfaces, ordered effects, dependencies). Required-capability set is derived (Task 5/6), not stored, per §5.1. ✔
 - §5.1 reserved scratch grammar + letter-free sigil — Task 3, including the case/NFC/NFD-agreement property (§13.3). ✔ Compiler *rejection* of persistent paths that alias scratch is A2 (needs the validation pass); A1 ships the predicates it will use.
+- §5.1 scratch-leaf identifier safety — Task 3's bounded safe-identifier grammar makes a malformed consumer `effect_id` fail at construction, not at a later `*at` syscall. ✔ A2's compiler applies the same predicate to every effect ID.
 - §5.2 closed effect set + "move is one effect over source and destination" — Task 4. ✔
 - §5.3 repeated-path timelines — the `Occurrence` view (Task 4) is the data A2's continuity check consumes; the *check itself* is A2. Flagged, not silently dropped.
 - §5.5 capability vocabulary as data, always-required trio, per-variant additions incl. Delete file/symlink branch — Task 5. ✔ Empirical probing is A4.
-- §13.3 build-twice-identical canonical output — Task 7. ✔
+- §7.2 / §13.3 durable canonical format — Task 7 (deterministic encode; set-like fields sorted in the serializer so equal content yields equal bytes even for a directly-constructed spec; golden-byte fixture over every variant/state + non-ASCII) and **Task 8** (strict decode reconstructing the spec from `spec_json` for fresh-process recovery, with round-trip identity and fail-early rejection). ✔
+- PEP 561 typed-distribution parity with `nodes-core` — Task 1 (`py.typed`, `core-metadata-version = "2.5"`, `license-files`), verified against `~/d/nodes/python`. ✔
 - **Deferred by design, not omitted:** filesystem-identity metadata-root containment and ancestor-resolution checks (§5.4), all compilation validation (§5.4), and the recovery classifier (§8.4/§13.1) belong to A2/A3/A4 and are listed in the program table above.
 
-**Placeholder scan:** none — every code step carries complete source. ✔
+**Placeholder scan:** none — every code step carries complete source. The one golden fixture is generated by an explicit committed command (Task 7 Step 4), not left as a blank. ✔
 
-**Type consistency:** `occurrences`, `variant_capabilities`, `required_capabilities`, `build_spec`, `canonical_json` names and signatures are used identically across tasks and the interface blocks. `Dependency` is declared `order=True` (Task 6 note) precisely because `build_spec` sorts it. `FileState`/`DirectoryState`/`SymlinkState`/`AbsentState` field names are stable from Task 2 through Task 7. ✔
+**Type consistency:** `occurrences`, `variant_capabilities`, `required_capabilities`, `build_spec`, `canonical_json`/`canonical_bytes`, and `from_canonical_obj`/`from_canonical_json`/`from_canonical_bytes` names and signatures are used identically across tasks and the interface blocks. The decoder's per-variant field lists (`_STATE_FIELDS`, `_EFFECT_FIELDS`) mirror the encoder's `_state_obj`/`_effect_obj` field spellings exactly, so a round-trip is structurally closed. `Dependency` is declared `order=True` (Task 6 note) precisely because `build_spec` sorts it. `FileState`/`DirectoryState`/`SymlinkState`/`AbsentState` field names are stable from Task 2 through Task 8. `SpecValidationError` (Task 1) is the single failure type for both identifier violations (Task 3) and decode violations (Task 8). ✔
 
 **Scope:** A1 is one dependency-free subsystem, correctly sized for a single plan; the remaining Plan A work is decomposed into A2–A8 above. ✔
