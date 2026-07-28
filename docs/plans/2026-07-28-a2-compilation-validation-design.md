@@ -128,8 +128,11 @@ Top level:
 - `consumer_tag` satisfies A1's safe-identifier grammar (`require_valid_identifier`).
 - `intent_digest` matches `^sha256:[0-9a-f]{64}$`.
 - `initial_surface` and `final_surface` are tuples of `SurfaceEntry`.
-- `effects` is a tuple whose every member is one of the five effect variants.
+- `effects` is a **non-empty** tuple whose every member is one of the five effect variants.
 - `dependencies` is a tuple of `Dependency`.
+
+The non-empty requirement is why an empty specification does not slip through: with no effects, phases 9
+through 13 are all vacuously satisfied, so refusing here is the only place it can be caught. See §7.
 
 Nested, for every element of those tuples:
 
@@ -370,6 +373,22 @@ the effect sequence (phase 7), so in a compiled spec they carry no scheduling in
 consumer-declared assertion that A2 checks. A7's executor follows the sequence and does not consult
 `dependencies` for ordering.
 
+**A zero-effect transaction is refused.** A specification with no effects and empty surfaces satisfies
+phases 9 through 13 vacuously — coverage compares three empty sets and there are no timelines to check —
+so it would otherwise compile, and the engine would take the project lock, write a durable record, and
+commit having mutated nothing.
+
+Design §13.3's "reject missing effects" does not settle this, despite appearances. In context that phrase
+sits in a list of coverage-divergence cases — "missing effects, extra effects, invalid ordering, malformed
+timelines, payload/mode mismatches, path escapes, and initial/final surface divergence" — where "missing"
+and "extra" are the two directions of a declared surface failing to match the effect surface. That is
+phase 10, which already implements it. The authority design was simply silent on a transaction that
+declares nothing at all.
+
+It is now explicit: §5.4 gains the requirement that a specification declare at least one effect, and A2
+enforces it in phase 1, which is the only phase that can. Consumers computing an empty change set skip the
+engine rather than transacting over nothing.
+
 **Compilation is total and pure.** `compile_spec` reads nothing outside its argument. Compiling the same
 specification twice yields equal `CompiledSpec` values and byte-identical `canonical_bytes(compiled.spec)`,
 satisfying §13.3's "validate a spec twice, require identical canonical output". Compilation is also
@@ -390,6 +409,8 @@ documented phase order is actually pinned. Beyond per-rule coverage:
   initially *and* `p/q` declared `FILE` initially — is refused. The reverse direction (a directory
   becoming a file) is not expressible in the closed effect set of §5.2, since `DeletePath` does not
   accept directories, so it is not a case A2 can reach.
+- **Zero-effect refusal.** A specification with no effects and empty surfaces is refused, asserted
+  explicitly so the vacuous pass through phases 9–13 can never silently become acceptance.
 - **Path alias distinctness.** A specification declaring both `docs/a.md` and `docs/A.md`, and one
   declaring NFC and NFD spellings of `café.txt`, are each refused; the byte-identical single-spelling
   case compiles.
@@ -413,25 +434,5 @@ documented phase order is actually pinned. Beyond per-rule coverage:
 
 ## 9. Open items
 
-**Is a zero-effect transaction valid?** A specification with no effects and empty surfaces satisfies
-every phase above vacuously: coverage compares three empty sets, and there are no timelines to check. A2
-would compile it, and the engine would take the project lock, write a durable record, and commit having
-mutated nothing.
-
-Design §13.3's "reject missing effects" does **not** settle this. In context that phrase sits in a list of
-coverage-divergence cases — "missing effects, extra effects, invalid ordering, malformed timelines,
-payload/mode mismatches, path escapes, and initial/final surface divergence" — where "missing" and "extra"
-are the two directions of a declared surface not matching the effect surface. That is phase 10, and phase
-10 already implements it. Nothing in the authority design speaks to a transaction that declares nothing at
-all.
-
-So this is a genuine gap in the authority design rather than an A2 omission, and it needs a line there
-either way. Pending that decision, A2 does not yet fix a rule. The two options:
-
-- **Reject** an empty effect sequence in phase 1, consistent with fail-early and with not running the
-  durable machinery for a guaranteed no-op. A consumer that computes an empty change set handles that
-  case itself rather than paying for a transaction.
-- **Accept** it as a well-formed no-op, which is trivially safe and spares consumers a special case.
-
-The remaining two decisions design §14 defers — the durability-allowlist configuration tuples and the
-SQLite I/O layer — belong to A4 and A5 respectively and are untouched here.
+None. The two decisions design §14 defers — the durability-allowlist configuration tuples and the SQLite
+I/O layer — belong to A4 and A5 respectively and are untouched here.

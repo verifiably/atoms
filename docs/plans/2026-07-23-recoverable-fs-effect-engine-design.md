@@ -262,6 +262,9 @@ single-snapshot ambiguity that would force globally unique `rel_path` values.
 
 Before any metadata or blob write, validation proves:
 
+- the specification declares at least one effect — a zero-effect transaction is refused rather than
+  committed as a no-op, so the project lock, the durable record, and the recovery machinery are never
+  spent on a transaction that cannot mutate anything;
 - effect IDs are unique and ordering is complete;
 - each effect's shapes are legal for its variant;
 - payload hashes and modes match the declared postconditions;
