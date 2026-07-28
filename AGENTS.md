@@ -31,6 +31,16 @@ Work lives under `python/` (`uv run pytest`, `uv run ruff check`, `uv run pyrigh
    review that hardened the capability, capture, effect, materialization, and recovery contracts.
    Their `Package: science` framing is pre-extraction rationale, not the current package boundary.
 
+## Deferred obligations
+
+[`docs/deferred-obligation-ledger.md`](docs/deferred-obligation-ledger.md) tracks every shape a trust
+boundary admits but does not itself execute, and which sub-plan owes the refusal or execution. Add an
+entry in the same commit as the admission that creates it; remove one only when its owning sub-plan lands
+**and** its verification suite covers it. A sub-plan is not ready for review until every entry naming it
+as owner has a stated required behavior.
+
+Sub-plans A3 and A4 get a seam review against this ledger *before* their plans are written, not after.
+
 ## Conventions
 
 - Fail early; no silent fallbacks.

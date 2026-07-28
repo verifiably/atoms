@@ -1164,13 +1164,30 @@ tuple the engine has not crash-certified is refused at preparation, not trusted.
 
 Build a spec, validate it twice, and require identical canonical output. Reject missing effects, extra
 effects, invalid ordering, malformed timelines, payload/mode mismatches, path escapes, and initial/final
-surface divergence. Apply the same case- and Unicode (NFC/NFD) alias tests to **both** name-equivalence
-surfaces on case- and normalization-insensitive volumes: the metadata namespace (a persistent path
-spelled as an upper-case or NFC/NFD variant of `metadata_root`, which the identity-based check of §5.4
-must reject where a lexical prefix check would not) and the reserved scratch grammar (a persistent path
-aliasing the scratch sigil through a case or normalization variant, which the equivalence-aware grammar
-match of §5.1 must reject). A letter-free sigil and equivalence-aware matching must both pass these
-tests.
+surface divergence. Apply the same case- and Unicode (NFC/NFD) alias tests to **all three**
+name-equivalence surfaces on case- and normalization-insensitive volumes:
+
+1. **The metadata namespace** — a persistent path spelled as an upper-case or NFC/NFD variant of
+   `metadata_root`, which the identity-based check of §5.4 must reject where a lexical prefix check would
+   not.
+2. **The reserved scratch grammar** — a persistent path aliasing the scratch sigil through a case or
+   normalization variant, which the equivalence-aware grammar match of §5.1 must reject. A letter-free
+   sigil and equivalence-aware matching must both pass these tests.
+3. **Persistent-path distinctness** — two declared persistent paths that the *lookup directory* folds
+   together, which the pairwise-distinctness check of §5.4 must reject. Because that rule is scoped per
+   parent directory rather than per volume, its conformance suite must cover:
+   - **Mixed policies on one filesystem.** A `casefold`-enabled ext4 volume carrying both a plain parent
+     and a `+F` (`FS_CASEFOLD_FL`) parent, proving a policy determined in one directory is never applied
+     to another. This case is the reason the rule is not mount-scoped
+     ([ext4 admin guide](https://cdn.kernel.org/doc/html/latest/admin-guide/ext4.html#case-insensitive-file-name-lookups)).
+   - **Transaction-created parent inheritance.** A `CreateDirectory` beneath a `+F` parent, proving the
+     created directory is evaluated under the inherited policy and not under the volume default.
+   - **Absent-path alias refusal.** Two aliasing paths both declared `ABSENT`, refused **before capture**
+     — the case where no inode exists to compare and identity alone cannot decide.
+   - **The create/delete/re-create counterexample.** The `create x`, `delete x`, `create y` sequence of
+     §5.4, asserting that compilation refuses it. Every `O_EXCL` and no-clobber transfer in that sequence
+     succeeds, so a suite that only exercises mutation-time guards would pass while the declared final
+     states remain jointly unsatisfiable.
 
 ### 13.4 End-to-end recovery
 

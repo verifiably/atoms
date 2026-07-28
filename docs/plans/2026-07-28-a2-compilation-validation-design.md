@@ -479,7 +479,15 @@ documented phase order is actually pinned. Beyond per-rule coverage:
 - **§13.3 alias conformance.** A persistent path aliasing the scratch sigil through a case or NFC/NFD
   variant is refused, in leaf position and in ancestor position.
 
-## 9. Open items
+## 9. Obligations this boundary creates
+
+Compilation admits shapes it does not itself execute, and each admission obliges a later sub-plan.
+Those are registered in [`docs/deferred-obligation-ledger.md`](../deferred-obligation-ledger.md) —
+entries 1 through 6 and 8 originate here. The register exists because every finding across three review
+rounds of this document sat at that seam: a shape A2 permitted whose downstream contract was unwritten.
+A3 and A4 are reviewed against it before their plans are written.
+
+## 10. Open items
 
 None. The two decisions design §14 defers — the durability-allowlist configuration tuples and the SQLite
 I/O layer — belong to A4 and A5 respectively and are untouched here.
