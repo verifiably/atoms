@@ -15,6 +15,20 @@ snapshot into a frozen semantic recovery plan, authorizes each plan step against
 observation, and applies the same plan to an abstract snapshot for convergence testing:
 
 ```python
+build_recovery_snapshot(
+    *,
+    compiled: CompiledSpec,
+    topology: RecoveryTopology,
+    transaction_state: TransactionState,
+    commit_decision: CommitDecision,
+    rollback_result: RollbackResult | None,
+    halt_diagnostic: HaltDiagnostic | None,
+    active: bool,
+    journals: tuple[EffectJournalState, ...],
+    persistent_observations: tuple[PersistentObservation, ...],
+    scratch_observations: tuple[ScratchObservation, ...],
+) -> RecoverySnapshot
+
 classify_recovery(snapshot: RecoverySnapshot) -> RecoveryPlan
 
 authorize_recovery_step(
@@ -22,6 +36,12 @@ authorize_recovery_step(
     step_index: int,
     observed: JointObservation,
 ) -> AuthorizedStep | HaltPlan
+
+reduce_recovery_plan_prefix(
+    snapshot: RecoverySnapshot,
+    plan: RecoveryPlan,
+    completed_steps: int,
+) -> RecoverySnapshot
 
 apply_recovery_plan(
     snapshot: RecoverySnapshot,
@@ -65,12 +85,12 @@ A3 remains stdlib-only at runtime and performs no filesystem I/O.
 
 ## 3. Seam review and authority corrections
 
-The pre-plan seam review found no ledger row whose first owner was A3, but deriving the executable
-contract exposed four authority seams that must be corrected with this design:
+At the time of the pre-plan seam review, no ledger row named A3 as its first owner. Deriving the
+executable contract then exposed four authority seams that this design corrected:
 
-1. §13.1 still names raw `TransactionSpec` as the classifier input. A3 operates on the exact
-   factory-issued `CompiledSpec`, plus logical recovery evidence. It never revalidates or accepts a raw
-   spec.
+1. §13.1 named raw `TransactionSpec` as the classifier input. A3 instead operates on the exact
+   factory-issued `CompiledSpec`, plus logical recovery evidence; the authority now says so. A3 never
+   revalidates or accepts a raw spec.
 2. `PathState` fingerprints cannot express the same-entry relations required by `MoveNoClobber` and
    `CreateDirectory`. Observations need opaque snapshot-local entry identities.
 3. `PathState` also cannot express an attributable file prefix or whether a directory contains
@@ -84,7 +104,7 @@ silently delegate these questions to a later plan.
 
 ## 4. Architecture and ownership
 
-A3 is a focused `atoms.core.recovery` package. Its public surface is the three pure operations in §1
+A3 is a focused `atoms.core.recovery` package. Its public surface is the five pure operations in §1
 and the frozen values needed to call and inspect them. Frontier reconstruction, journal-topology
 validation, and variant classifiers are internal modules.
 
@@ -112,9 +132,12 @@ factory-controlled. Ordinary public-field construction and `dataclasses.replace`
 same conventional Python boundary as `CompiledSpec`: it prevents ordinary in-repository fabrication,
 not hostile code using private state or `object.__new__`.
 
-`RecoverySnapshot` is not project approval. Pure model tests may construct validated synthetic
-snapshots. Production mutation still requires A4's factory-issued `ProjectApprovedSpec`; A7 constructs
-the production snapshot from that composed proof and its fresh observations. Architecture tests must
+`build_recovery_snapshot` is the sole validating construction authority for `RecoverySnapshot`. It
+requires exact closed types, exhaustive observation coverage, and a structurally valid topology before
+constructing the frozen value. Ordinary construction and `dataclasses.replace` refuse. A snapshot is
+still not project approval: pure model tests may pass validated synthetic inputs, while production
+mutation requires A4's factory-issued `ProjectApprovedSpec`. A7 calls the same factory with the
+compiled proof and topology from that composed approval plus fresh observations. Architecture tests
 reject any A7 entry point accepting raw `TransactionSpec`, raw `CompiledSpec`, or a synthetic snapshot
 without the approved project context.
 
@@ -134,6 +157,10 @@ TransactionState:
     ROLLED_BACK
     HALTED
 
+CommitDecision:
+    UNCOMMITTED
+    COMMITTED
+
 JournalState:
     PENDING
     STARTED
@@ -146,10 +173,20 @@ RollbackResult:
     EXTERNAL_DRIFT_PRESERVED
 ```
 
+`CommitDecision` models §7.2's durable `committed` column independently from `TransactionState`. It
+changes to `COMMITTED` with the logical commit decision and is never cleared by a later halt. A halt
+after commit therefore remains distinguishable from a halt while applying and can never license
+rollback.
+
 The snapshot also records whether this transaction is the active binding. That fact is needed to model
 terminal detachment and a second recovery pass. `RollbackResult` is absent until the durable
 `ROLLED_BACK` transition; that transition records exactly one result so a crash before active
 detachment cannot erase whether the engine owes a clean rollback outcome or `PreconditionRefused`.
+
+`HaltDiagnostic` is absent before the first halt and present exactly when `transaction_state` is
+`HALTED`. It freezes the pre-halt transaction state, the unchanged `CommitDecision`, the journal
+frontier, expected and observed evidence, reason code, and operator action. A second pass returns that
+stored diagnostic rather than recomputing it with `HALTED` as the origin state.
 
 ### 5.2 Logical scratch roles
 
@@ -193,7 +230,7 @@ An observed entry is a closed union:
 ```text
 ObservedAbsent
 ObservedFile(state: FileState, identity: EntryIdentity)
-ObservedSymlink(state: SymlinkState, identity: EntryIdentity)
+ObservedSymlink(state: SymlinkState)
 ObservedDirectory(
     state: DirectoryState,
     identity: EntryIdentity,
@@ -201,9 +238,14 @@ ObservedDirectory(
 )
 ```
 
-`EntryIdentity` is an opaque, snapshot-local equality token. A3 may only compare two identities for
-equality. Tokens are not serialized, logged through arbitrary `repr`, or interpreted as `st_dev` /
-`st_ino`.
+`EntryIdentity` is an opaque, snapshot-local equality token carried only by regular files and
+directories. A3 may only compare two identities for equality. Tokens are not serialized, logged
+through arbitrary `repr`, or interpreted as `st_dev` / `st_ino`.
+
+A symlink carries no A3 identity. Its observation is the weaker `lstat` + `readlink`
+`symlink_fingerprint` contract from authority §§5.5 and 6; it is not descriptor-coherent and A3 never
+uses symlink identity for an ownership decision. Delete/restore classification compares the exact
+`SymlinkState` and retained tombstone tuple instead.
 
 Directory emptiness is derived from:
 
@@ -232,6 +274,23 @@ joint tuple.
 
 ### 5.5 Recovery snapshot
 
+The factory's repeated members are frozen exact dataclasses:
+
+```text
+EffectJournalState(effect_id: str, state: JournalState)
+PersistentObservation(path: RelPath, entry: ObservedEntry)
+ScratchObservation(
+    effect_id: str,
+    role: ScratchRole,
+    entry: ObservedEntry,
+    file_build_relation: FileBuildRelation | None,
+)
+```
+
+`file_build_relation` is present exactly for a present file in a `STAGING` slot and absent for every
+other entry/role combination. The snapshot factory validates this invariant rather than allowing an
+irrelevant or missing relation into classification.
+
 `RecoverySnapshot` is frozen and complete:
 
 - it contains the exact `CompiledSpec`;
@@ -241,10 +300,23 @@ joint tuple.
 - repeated paths have one current live observation interpreted through the whole timeline;
 - the topology covers the same persistent and scratch nodes;
 - all observation evidence is internally coherent; and
-- the active-binding state and optional terminal rollback result are explicit.
+- the commit decision, active-binding state, optional terminal rollback result, and optional frozen
+  halt diagnostic are explicit.
 
 Missing, extra, duplicated, or wrongly typed members are refused as malformed internal input. Exact
 runtime types define membership in every closed union; subclasses are not members.
+
+### 5.6 Joint observation
+
+`JointObservation` is the frozen fresh evidence for one filesystem-mutating plan step. It contains
+exactly the persistent and scratch node observations named by that step's expected before-tuple, plus
+the affected parent-directory occupancy evidence named by the step. It contains no journal or
+transaction state: A5 supplies those durable facts, while A7 supplies the descriptor-coherent
+filesystem evidence.
+
+`authorize_recovery_step` validates the joint observation's exact node coverage and closed runtime
+types. Missing, extra, duplicated, or incoherent evidence is `ProtocolError`; well-shaped evidence
+that differs from the plan precondition yields `PLAN_PRECONDITION_CHANGED`.
 
 ## 6. Transaction classifier
 
@@ -253,7 +325,7 @@ runtime types define membership in every closed union; subclasses are not member
 1. validate the transaction/journal topology;
 2. reconstruct every declared path's forward or reverse frontier;
 3. validate all persistent and scratch evidence for every effect;
-4. classify the one in-flight effect jointly across its persistent paths and scratch role; and
+4. classify the at-most-one in-flight effect jointly across its persistent paths and scratch role; and
 5. emit the complete ordered plan only after every observation has been classified.
 
 No step is emitted incrementally while later evidence remains unchecked. Recovery therefore cannot
@@ -266,16 +338,30 @@ destroy early evidence before discovering a later conflict.
 | `PREPARED` | all `PENDING` | No project mutation; record rollback, preserve any external drift, detach |
 | `APPLYING` | `DONE* STARTED? PENDING*` | Settle the in-flight effect, undo attributable effects in reverse order |
 | `APPLIED` | all `DONE` | No commit exists; undo every effect in reverse order |
-| `ROLLING_BACK` | `DONE* (STARTED \| UNDO_STARTED)? UNDONE* PENDING*` | Resume from the one forward-or-reverse frontier |
+| `ROLLING_BACK` | `DONE* STARTED? PENDING*` **or** `DONE* UNDO_STARTED? UNDONE* PENDING*` | Resume from the one forward-or-reverse frontier |
 | `COMMITTED` | all `DONE` | Rollback forbidden; verify final surface, clean retained scratch, detach |
 | `ROLLED_BACK` | `UNDONE* PENDING*` | Detach metadata only; never mutate project or scratch |
 | `HALTED` | the frozen journal topology recorded by the first halt | Stable halt; no further state change |
 
-The optional `STARTED` or `UNDO_STARTED` is the single frontier between effects not yet reversed and
-effects already reversed. `STARTED` represents a forward effect interrupted before rollback could
-claim it; `UNDO_STARTED` represents an interrupted reverse settlement. A well-typed but illegal
-combination produces a halt plan and preserves evidence; it is never normalized into a plausible
-history.
+The two `ROLLING_BACK` branches are exclusive. A forward `STARTED` is the highest executed effect and
+must be settled before any reverse effect, so `STARTED` followed by `UNDONE` is unreachable.
+`UNDO_STARTED` is the single reverse frontier between effects not yet reversed and effects already
+reversed. A well-typed but illegal combination produces a halt plan and preserves evidence; it is
+never normalized into a plausible history.
+
+The state, commit decision, and active binding are validated jointly:
+
+- `PREPARED`, `APPLYING`, `APPLIED`, `ROLLING_BACK`, and `ROLLED_BACK` require `UNCOMMITTED`;
+- `COMMITTED` requires `COMMITTED`;
+- `HALTED` preserves whichever commit decision existed at the first halt;
+- an active `COMMITTED` or `ROLLED_BACK` record resumes cleanup or detachment;
+- a detached `COMMITTED` or `ROLLED_BACK` record is `NO_RECOVERY`; and
+- a detached `PREPARED`, `APPLYING`, `APPLIED`, or `ROLLING_BACK` record produces
+  `ACTIVE_BINDING_MISSING` and never reattaches itself.
+
+An already `HALTED` snapshot returns its frozen halt diagnostic without changing project state,
+scratch state, commit decision, or diagnostic. If its active binding is unexpectedly absent, A3 still
+does not invent or attach a new binding.
 
 The compiled effect sequence is the only execution order. `dependencies` carry no scheduling
 information and never affect A3 classification or A7 execution.
@@ -310,6 +396,10 @@ NoRecoveryPlan:
     NO_RECOVERY
 ```
 
+`ActionPlan`, `HaltPlan`, and `NoRecoveryPlan` are the three exact dataclass variants.
+`ROLL_BACK`, `HALT`, and the other uppercase names are values of their closed disposition field, not
+classes or subclasses.
+
 `ROLL_BACK_REFUSED` means the transaction reaches durable rollback while preserving proved external
 drift. An action plan fixes the corresponding terminal `RollbackResult`; A5 must persist that value in
 the same metadata transaction as `ROLLED_BACK`. `NO_RECOVERY` is the fixed point for a detached
@@ -328,6 +418,12 @@ PreserveExternal
 DetachActive
 ```
 
+`TransitionTransactionState` contains `from_state`, `to_state`, and closed optional payloads. A
+transition to `ROLLED_BACK` carries exactly one `RollbackResult`; no other transition carries a
+rollback result. A transition to `HALTED` carries exactly one frozen `HaltDiagnostic`, including the
+pre-halt state and unchanged commit decision; no other transition carries a halt diagnostic. These
+payload rules make the metadata ordering in ledger entry 12 expressible rather than implicit.
+
 `TransformEffectTuple` carries:
 
 - the effect ID and exact variant;
@@ -345,17 +441,29 @@ Skipping, duplicating, or reordering a step is `ProtocolError`.
 
 ### 7.3 Source binding and fresh authorization
 
-Every plan is bound to the exact source snapshot. Applying it to another snapshot is `ProtocolError`;
-plans are not reusable capabilities.
+Every plan is bound by immutable value equality (`==`) to its exact source snapshot, not by Python
+object identity. Applying it to a value-unequal snapshot is `ProtocolError`; plans are not reusable
+capabilities.
 
 Before each filesystem-mutating step, A7 obtains one fresh coherent joint observation and calls
 `authorize_recovery_step`. Exact agreement returns a factory-controlled `AuthorizedStep`. Any mismatch
 returns a halt plan with stable reason `PLAN_PRECONDITION_CHANGED`. A7 may not silently retry,
 reclassify, or reinterpret the stale step.
 
-The authorization binds the plan, step index, and fresh evidence. A mismatch halt is bound to the
-logical prefix snapshot obtained by reducing every already-completed plan step, with the fresh
-conflicting observation substituted at the selected step. It is not incorrectly bound to the plan's
+`step_index` must select a filesystem-mutating `TransformEffectTuple` or `RemoveScratch`. Naming
+`TransitionTransactionState`, `TransitionEffectState`, `PreserveExternal`, or `DetachActive` is
+`ProtocolError`; those semantic/metadata steps do not consume fresh filesystem authorization.
+
+The call has one durable precondition: every plan step before `step_index` completed in order and no
+later step began. A5/A7 establish that fact from the persisted metadata and executor position.
+`reduce_recovery_plan_prefix(snapshot, plan, completed_steps)` validates source binding and returns the
+logical snapshot after exactly that many steps; `apply_recovery_plan` is the special case that reduces
+the full step count. Prefix reduction is pure and grants no execution authority.
+
+Authorization binds the plan, mutating step index, derived prefix snapshot, and fresh evidence. A
+mismatch halt uses
+`reduce_recovery_plan_prefix(snapshot, plan, completed_steps=step_index)` as that prefix, with the
+conflicting observation substituted at the selected step; it is not incorrectly bound to the plan's
 original source snapshot. Held descriptors and atomic capabilities close the remaining
 observation-to-operation window according to §§6 and 9 of the authority design.
 
@@ -366,9 +474,11 @@ A halt plan contains no project or scratch mutation. A first halt may persist on
 - the transition to transaction state `HALTED`; and
 - its structured diagnostic.
 
-The diagnostic contains the transaction state, effect and logical paths when applicable, journal
-state, expected and observed tuples, a stable reason code, and a non-mutating operator action. Human
-prose is derived from this structure and is not the machine contract.
+The diagnostic contains the pre-halt transaction state, preserved commit decision, effect and logical
+paths when applicable, journal state, expected and observed tuples, a stable reason code, and a
+non-mutating operator action. Human prose is derived from this structure and is not the machine
+contract. Classification of an already halted snapshot reuses this exact stored diagnostic; it never
+recomputes the origin state as `HALTED`.
 
 ## 8. Abstract reducer
 
@@ -378,8 +488,9 @@ prose is derived from this structure and is not the machine contract.
 - removal produces `ObservedAbsent`;
 - preserved external entries remain unchanged;
 - directory occupancy is recomputed through the resolved topology;
-- journal and transaction states advance only through allowed edges; and
-- the terminal rollback transition records its exact `RollbackResult`; and
+- journal and transaction states advance only through allowed edges;
+- the terminal rollback transition records its exact `RollbackResult`;
+- the first halt preserves `CommitDecision` and stores its exact `HaltDiagnostic`; and
 - terminal detachment clears the abstract active binding.
 
 It produces these fixed points:
@@ -388,10 +499,12 @@ It produces these fixed points:
 | --- | --- |
 | successful uncommitted recovery | `ROLLED_BACK`, `RESTORED`, detached, initial surface restored |
 | refused rollback | `ROLLED_BACK`, `EXTERNAL_DRIFT_PRESERVED`, detached, proved external drift preserved |
+| `PREPARED` with external drift | `ROLLED_BACK`, `EXTERNAL_DRIFT_PRESERVED`, detached, no project mutation |
 | committed cleanup | `COMMITTED`, detached, final surface retained |
 | terminal detachment | existing terminal state, detached |
-| first halt | observations unchanged, active retained, transaction `HALTED` |
-| already halted | identical stable halt |
+| first uncommitted halt | observations unchanged, active retained, `UNCOMMITTED`, transaction `HALTED`, frozen diagnostic |
+| first committed halt | observations unchanged, active retained, `COMMITTED`, transaction `HALTED`, frozen diagnostic; rollback forbidden |
+| already halted | identical commit decision, diagnostic, evidence, and halt disposition |
 | detached terminal snapshot | `NO_RECOVERY`, identity reduction |
 
 The core property is:
@@ -415,6 +528,14 @@ Notation below:
 - `X` — another present state;
 - `==` between present entries — equal opaque identity.
 
+An entry is **attributable** only when it occupies the effect's A4-approved logical scratch slot and
+the complete joint observation gives that slot one of the shapes permitted by the variant and current
+journal state. Constructive evidence is an exact expected fingerprint, a proved prefix of the planned
+blob, or an expected identity relation. Transfer evidence is a variant-specific atomic tuple, such as
+`ReplaceFile (post, X)`, proving that the operation placed the unvalidated displaced entry in
+`STAGING`. Occupying a reserved-looking slot by itself is never attribution; a shape outside these
+rules is foreign or unattributable and is preserved.
+
 Every tuple not listed is unattributable and halts.
 
 ### 9.1 `ReplaceFile`: `(live, staging)`
@@ -426,7 +547,7 @@ Forward `STARTED`:
 | `(pre, A)` | exchange did not land; undo without project mutation |
 | `(pre, prefix)` or `(pre, post)` | unpublished staging; remove it and undo |
 | `(post, pre)` | exchange landed; exchange back, validate `pre`, remove displaced `post` |
-| `(post, X)` | unvalidated entry was displaced; exchange it back while live remains exact `post`, preserve it as external drift, finish refused rollback |
+| `(post, X)` | unvalidated entry was displaced; exchange it back while live remains exact `post`, preserve the restored entry as external drift, validate and remove the engine postimage now in `STAGING`, finish refused rollback |
 
 Reverse `UNDO_STARTED` accepts both atomic sides:
 
@@ -435,6 +556,10 @@ Reverse `UNDO_STARTED` accepts both atomic sides:
 | `(post, pre)` | retry exchange |
 | `(pre, post)` | exchange landed; finish scratch removal |
 | `(pre, A)` | undo and cleanup already landed |
+
+`DONE` under uncommitted rollback accepts only `(post, pre)`. It transitions to `UNDO_STARTED` and
+uses the ordinary landed rollback above. `(post, A)` is a contradiction before a commit decision
+because terminal scratch cleanup was not yet licensed.
 
 Committed cleanup accepts `(post, pre)` or `(post, A)`, where absent scratch means cleanup already
 landed. `live=post` without the displaced entry is not attributed during uncommitted recovery.
@@ -458,8 +583,9 @@ Reverse `UNDO_STARTED`:
 | `(A, post)` | quarantine landed; finish validated removal |
 | `(A, A)` | removal already landed |
 
-A changed live target during undo or foreign staging evidence halts. Committed state requires
-`(post, A)`.
+A changed live target during undo or foreign staging evidence halts. `DONE` under uncommitted rollback
+accepts only `(post, A)`, transitions to `UNDO_STARTED`, and performs the ordinary landed rollback.
+Committed cleanup also requires `(post, A)`.
 
 ### 9.3 `DeletePath`: `(live, tombstone)`
 
@@ -474,6 +600,9 @@ Forward `STARTED`:
 Reverse `UNDO_STARTED` accepts `(A, pre)` to retry restoration and `(pre, A)` as already restored.
 `(A, A)` does not prove a completed deletion: absence without the retained tombstone is
 unattributable.
+
+`DONE` under uncommitted rollback accepts only `(A, pre)`, transitions to `UNDO_STARTED`, and restores
+the retained tombstone. `(A, A)` is not accepted before commit.
 
 Committed cleanup accepts `(A, pre)` or `(A, A)`.
 
@@ -494,9 +623,13 @@ A foreign source, diverged anchor, non-anchor destination where ownership is req
 without anchor halts.
 
 `UNDO_STARTED` accepts the same atomic endpoints and two persistence intermediates. Every repair
-converges to `(pre, A, anchor)` and then removes the anchor.
+converges to `(pre, A, pre)` with source `==` anchor and then removes the anchor.
 
-Committed cleanup requires `(A, pre, anchor)` with destination `==` anchor, or `(A, pre, A)` after
+`DONE` under uncommitted rollback accepts only `(A, pre, pre)` with destination `==` anchor,
+transitions to `UNDO_STARTED`, and performs the ordinary landed rollback. A missing anchor is a
+contradiction before commit.
+
+Committed cleanup requires `(A, pre, pre)` with destination `==` anchor, or `(A, pre, A)` after
 anchor cleanup. Source reappearance or destination divergence never licenses rollback.
 
 ### 9.5 `CreateDirectory`: `(live, work)`
@@ -509,7 +642,7 @@ empty removal is possible:
 | `(A, A)` | nothing landed |
 | `(A, attributable work)` | publication did not land; remove empty work directory |
 | `(post, A)` | publication landed; quarantine live into `WORK`, validate emptiness, remove |
-| `(post, post)`, live `==` work | publication landed but work-name removal did not; rollback removes both logical names and the directory |
+| `(post, post)`, live `==` work | publication landed but work-name removal did not; after declared descendants are reversed and the shared directory is empty, remove the stale `WORK` entry first, yielding `(post, A)`, then perform the ordinary landed rollback |
 | live blocker plus attributable different-identity work | publication did not land; preserve blocker, remove work, refuse |
 
 A live divergence without surviving work is unattributable. Any unmodeled child that would prevent
@@ -518,8 +651,10 @@ eventual removal halts before recovery mutation.
 `UNDO_STARTED` accepts live-only, work-only, same-identity dual-name, and fully absent atomic endpoints,
 converging to `(A, A)`.
 
-A `DONE` or `COMMITTED` directory effect requires `(post, A)`. Work removal is durable before `DONE`;
-a work survivor beside `DONE` is a contradiction, not committed cleanup.
+`DONE` under uncommitted rollback accepts only `(post, A)`, transitions to `UNDO_STARTED`, and performs
+the ordinary landed rollback after declared descendants have been reversed. Committed cleanup also
+requires `(post, A)`. Work removal is durable before `DONE`; a work survivor beside `DONE` is a
+contradiction, not committed cleanup.
 
 ### 9.6 Intentional differences across variants
 
@@ -574,6 +709,7 @@ Table tests cover every variant across:
 Bounded exhaustive generators cover:
 
 - every legal and illegal journal topology for short transactions;
+- every transaction-state × commit-decision × active-binding combination;
 - repeated-path timelines;
 - every equality partition of move and directory identity tokens;
 - exact, prefix, diverged, absent, and wrong-kind observations;
@@ -590,8 +726,10 @@ Properties lock:
 - deterministic classification;
 - whole-effect joint decisions;
 - all-evidence-before-any-action;
+- explicit `DONE`-under-rollback acceptance without reusing `UNDO_STARTED` tuples;
 - rollback restoration or explicit preserved drift;
 - committed recovery never emits rollback;
+- a committed halt retains its commit decision and frozen first-halt diagnostic;
 - halt preserves filesystem evidence;
 - `dependencies` never affect ordering;
 - plan/source binding and exact step authorization;
@@ -604,7 +742,11 @@ Mutation checks must demonstrate that the tests fail when:
 
 - a move is classified per path rather than jointly;
 - committed and applied states share a decision;
+- a `ROLLING_BACK` history accepts `STARTED` followed by `UNDONE`;
+- an already halted snapshot recomputes its diagnostic from state `HALTED`;
 - a stale step is authorized;
+- a non-mutating step receives filesystem authorization;
+- a symlink is given decisive opaque identity;
 - resolved topology is replaced by lexical topology;
 - scratch absence is treated uniformly across variants; or
 - the reducer omits a reverse intermediate.
@@ -615,7 +757,8 @@ This design refines existing ledger entries for ancestor topology, dependencies,
 equivalence. It also creates downstream obligations:
 
 - A4 constructs and retains the resolved logical topology A3 consumes in production.
-- A5 persists A3's transaction/effect transitions and structured halt diagnostics in plan order.
+- A5 persists A3's transaction/effect transitions, separate commit decision, rollback result, and
+  frozen first-halt diagnostic in plan order.
 - A6/A7 produce coherent identity, prefix, and directory-occupancy evidence.
 - A7 executes only A3-authorized steps and does not rederive recovery decisions.
 - A8 tests the real executor against A3's decisions and fixed points.
@@ -626,7 +769,7 @@ They remain open until the owning implementation and its verification land.
 
 A3 is complete when:
 
-- all three pure APIs and their closed types are implemented;
+- all five pure APIs and their closed types are implemented;
 - all five variant tables are executable;
 - legal and illegal journal topologies are exhaustive and tested;
 - classifier output is deterministic and factory-controlled;

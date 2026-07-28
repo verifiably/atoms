@@ -721,9 +721,10 @@ each `COMMIT` flushes the WAL to true stable storage (plain fsync is not power-l
 §5.5). **A `COMMIT` is the engine's durability barrier**, replacing the numbered-generation-file fsyncs
 of the earlier design. Table shapes (informative):
 
-- `transaction(txid PRIMARY KEY, schema_version, spec_json, state, committed, …)` — one row per
-  transaction; `state` is the §8.1 machine; `spec_json` is the immutable canonical `TransactionSpec`,
-  written once.
+- `transaction(txid PRIMARY KEY, schema_version, spec_json, state, committed, rollback_result,
+  halt_diagnostic, …)` — one row per transaction; `state` is the §8.1 machine; `committed` is the
+  separate durable commit decision retained through `HALTED`; `spec_json` is the immutable canonical
+  `TransactionSpec`, written once.
 - `effect(txid, effect_id, variant, journal_state, …, PRIMARY KEY(txid, effect_id))` — per-effect
   forward/reverse journal state (§8.2–§8.3).
 - `blob(digest PRIMARY KEY, byte_len, refcount)` — the content-addressed blob index; the bytes live
@@ -813,7 +814,10 @@ detachment, and their directory fsyncs complete.
 A transaction may enter `ROLLING_BACK` because of a caught application failure or because recovery
 finds any noncommitted active transaction. `HALTED` preserves the record, scratch objects, the last
 durable commit decision (if any), and diagnostic classification. A halt after `COMMITTED` never
-licenses rollback; it preserves the final state and reports incomplete cleanup.
+licenses rollback; it preserves the final state and reports incomplete cleanup. The halt transition
+does not clear the separate `committed` value. Its diagnostic freezes the pre-halt transaction state
+and commit decision; later recovery returns that stored diagnostic rather than recomputing an origin
+state of `HALTED`.
 
 ### 8.2 Forward effect states
 
@@ -847,16 +851,23 @@ DONE or attributable STARTED → UNDO_STARTED → UNDONE
 from the same exact path-state contract and restartable restore survivors. An already-initial path is
 idempotently accepted; an unattributable path halts.
 
+The legal global journal shapes while rolling back are
+`DONE* STARTED? PENDING*` or `DONE* UNDO_STARTED? UNDONE* PENDING*`. The branches are exclusive: the
+highest executed forward `STARTED` effect must be settled before any reverse effect, so `STARTED`
+followed by `UNDONE` is not a reachable history.
+
 ### 8.4 Recovery classification
 
 Recovery is a two-level operation. First it reconstructs, **per path**, where that path's timeline
-stands; then it classifies the single in-flight effect **jointly over all of its paths**. Its inputs
+stands; then it classifies the at-most-one in-flight effect **jointly over all of its paths**. Its inputs
 are the exact A2 `CompiledSpec`, A4's resolved logical topology in production, the active binding, the
-`transaction.state`, the per-effect `journal_state` rows, and coherent logical observations of every
-persistent path and effect scratch role. Present observations carry opaque snapshot-local entry
-identities; file staging observations also carry their exact/prefix/diverged relation to the planned
-postimage, and directory observations identify children outside the resolved topology. Because SQLite
-gives a single crash-consistent metadata state on open, there is no partial journal to
+`transaction.state`, separate commit decision, optional rollback result, optional frozen halt
+diagnostic, the per-effect `journal_state` rows, and coherent logical observations of every persistent
+path and effect scratch role. Regular-file and directory observations carry opaque snapshot-local entry
+identities; symlinks carry only their `lstat` + `readlink` fingerprint and are never identity-decided.
+File staging observations also carry their exact/prefix/diverged relation to the planned postimage, and
+directory observations identify children outside the resolved topology. Because SQLite gives a single
+crash-consistent metadata state on open, there is no partial journal to
 reconcile before classification begins. Comparing each occurrence independently against the single live
 entry would misread a repeated-path timeline (§5.3), and classifying a multi-path effect (e.g.
 `MoveNoClobber` over source, destination, and anchor, §9.4) per path could yield contradictory
@@ -883,7 +894,7 @@ durable journal states; the direction depends on the transaction state (§8.1):
   `UNDO_STARTED`. A path whose occurrences are all `UNDONE` or `PENDING` is at its initial state and is
   idempotently accepted.
 
-**Joint effect classification.** The frontiers identify the transaction's single in-flight effect — a
+**Joint effect classification.** The frontiers identify the transaction's at-most-one in-flight effect — a
 forward `STARTED` (whether `APPLYING`, or a failure-interrupted `STARTED` under `ROLLING_BACK`), or a
 reverse `UNDO_STARTED`. That effect is classified once over the union of its persistent and scratch
 paths, using the variant's tuple rule, and the one decision applies to every path it owns:
@@ -909,6 +920,11 @@ A `PREPARED` transaction — every effect `PENDING`, `active` published but noth
 no project path, so rollback has nothing to undo. But because `active` references it, recovery durably
 records `ROLLED_BACK`, then clears `active` and reclaims per §7.5, so no crash can leave a dangling
 pointer.
+
+Transaction state, commit decision, and active binding are classified jointly. A detached `COMMITTED`
+or `ROLLED_BACK` record needs no recovery. A detached `PREPARED`, `APPLYING`, `APPLIED`, or
+`ROLLING_BACK` record is contradictory durable metadata: recovery records a halt if possible, never
+reattaches the active pointer, and performs no project or scratch mutation.
 
 Recovery classifies every path's whole timeline and every in-flight effect's joint tuple before
 performing any mutation, so an early repair cannot destroy evidence needed to recognize a later
@@ -1137,11 +1153,12 @@ At entry, restoration classifies a surviving staging or tombstone object:
 - undo quarantine for an absent preimage → validate, delete, and fsync it before `UNDONE`;
 - foreign object or changed live target → halt and preserve evidence.
 
-The recovery observation that feeds A3 is coherent. State and identity for one entry come from the same
-opened object; a file prefix relation is computed by comparing that object with the planned blob; and a
-directory's occupancy evidence comes from one descriptor-relative enumeration reconciled against A4's
-resolved persistent-and-scratch topology. A3 receives those primitive facts and owns the verdict. A6/A7
-may not pre-classify them into a recovery outcome.
+The recovery observation that feeds A3 is coherent. A regular file's or directory's state and identity
+come from the same opened object; a file prefix relation is computed by comparing that object with the
+planned blob; and a directory's occupancy evidence comes from one descriptor-relative enumeration
+reconciled against A4's resolved persistent-and-scratch topology. A symlink instead carries the weaker
+`lstat` + `readlink` fingerprint above and no A3 identity. A3 receives those primitive facts and owns
+the verdict. A6/A7 may not pre-classify them into a recovery outcome.
 
 The authority check precedes every staging-object mutation, including prefix removal. Atomic live
 publication means a crash during restoration leaves the target at the effect state or restored state,
@@ -1212,13 +1229,18 @@ Recovery is specified as a production **top-level transaction classifier** with 
 classifiers, fresh step authorization, and a pure abstract reducer:
 
 ```text
-transaction: (CompiledSpec, resolved logical topology, active binding,
-              transaction state, rollback result, per-effect journal states, logical observations)
+snapshot:    (CompiledSpec, resolved logical topology, active binding,
+              transaction state, commit decision, rollback result, frozen halt diagnostic,
+              per-effect journal states, logical observations)
+                 → validated RecoverySnapshot
+transaction: RecoverySnapshot
                  → frozen ordered RecoveryPlan
 variant:     (variant, effect journal state, effect's joint persistent-and-scratch observation)
                  → effect settlement decision
 authorize:   (RecoveryPlan, step index, fresh coherent observation)
                  → AuthorizedStep | HaltPlan
+prefix:      (RecoverySnapshot, RecoveryPlan, completed step count)
+                 → prefix RecoverySnapshot
 reduce:      (recovery snapshot, RecoveryPlan)
                  → next recovery snapshot
 ```
@@ -1235,9 +1257,10 @@ halt plan rather than silent reclassification.
 
 The reducer applies the same semantic steps to the logical snapshot. It models identity-preserving
 transfers, removals, preserved external blockers, resolved directory occupancy, journal transitions,
-and active detachment, but no syscall or durability barrier. Applying classification and reduction
-twice reaches a fixed point: a detached terminal snapshot is `NO_RECOVERY`, and an already halted
-snapshot is a stable halt.
+the separate commit decision, the frozen first-halt diagnostic, and active detachment, but no syscall
+or durability barrier. Applying classification and reduction twice reaches a fixed point: a detached
+terminal snapshot is `NO_RECOVERY`, and an already halted snapshot preserves the exact commit decision,
+diagnostic, and evidence from its first halt.
 
 Table and property tests cover every variant, forward/reverse state, named intermediate, and
 unattributable state. Generated valid effect sequences prove:
