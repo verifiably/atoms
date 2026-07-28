@@ -2,8 +2,9 @@ import unicodedata
 
 import pytest
 
+import atoms.core.paths as paths_module
 from atoms.core.errors import SpecValidationError
-from atoms.core.paths import ancestors, path_equivalence_key, require_rel_path
+from atoms.core.paths import portability_equivalence_key, require_rel_path
 
 
 def test_accepts_ordinary_project_relative_paths():
@@ -54,19 +55,17 @@ def test_error_names_the_kind():
 
 
 def test_equivalence_key_folds_case_and_normalization():
-    assert path_equivalence_key("docs/A.md") == path_equivalence_key("docs/a.md")
+    assert portability_equivalence_key("docs/A.md") == portability_equivalence_key("docs/a.md")
     nfc = unicodedata.normalize("NFC", "café.txt")
     nfd = unicodedata.normalize("NFD", "café.txt")
     assert nfc != nfd
-    assert path_equivalence_key(nfc) == path_equivalence_key(nfd)
+    assert portability_equivalence_key(nfc) == portability_equivalence_key(nfd)
 
 
 def test_equivalence_key_separates_genuinely_distinct_paths():
-    assert path_equivalence_key("a/b") != path_equivalence_key("a/c")
-    assert path_equivalence_key("a/b") != path_equivalence_key("ab")
+    assert portability_equivalence_key("a/b") != portability_equivalence_key("a/c")
+    assert portability_equivalence_key("a/b") != portability_equivalence_key("ab")
 
 
-def test_ancestors_are_proper_and_outermost_first():
-    assert ancestors("a/b/c") == ("a", "a/b")
-    assert ancestors("a/b") == ("a",)
-    assert ancestors("a") == ()
+def test_old_path_equivalence_key_is_not_exposed():
+    assert not hasattr(paths_module, "path_equivalence_key")

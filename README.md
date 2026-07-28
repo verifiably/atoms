@@ -34,6 +34,8 @@ platform dependency yet — no path is mutated by any code in this repository to
   — standalone `atoms` engine, SQLite-in-WAL metadata store, `nodes`/science as deferred consumers.
 - **A1 — core model (implemented):** [`docs/plans/2026-07-23-plan-a1-core-model.md`](docs/plans/2026-07-23-plan-a1-core-model.md)
 - **A2 — compilation validation (implemented):** [`docs/plans/2026-07-28-plan-a2-compilation-validation.md`](docs/plans/2026-07-28-plan-a2-compilation-validation.md)
+  — pure filesystem-independent `CompiledSpec` proof; A4 still owns project/root approval and must
+  produce `ProjectApprovedSpec` before A5–A8.
 - Historical (superseded): the science-framed [`2026-07-20-*`](docs/plans/2026-07-20-recoverable-fs-effect-engine-design.md)
   design + roadmap, retained as the record of the review that hardened the effect/recovery contracts.
 

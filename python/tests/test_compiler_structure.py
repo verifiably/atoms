@@ -1,13 +1,18 @@
-from dataclasses import dataclass
+import sys
+from dataclasses import FrozenInstanceError, dataclass, replace
 
 import pytest
 
+import atoms.core.compiler as compiler_module
+from atoms.core.canonical import canonical_bytes, from_canonical_bytes
 from atoms.core.compiler import CompiledSpec, compile_spec
-from atoms.core.effects import CreateFileNoClobber, DeletePath, ReplaceFile
+from atoms.core.effects import CreateDirectory, CreateFileNoClobber, DeletePath, ReplaceFile
 from atoms.core.errors import SpecValidationError
 from atoms.core.fingerprint import ABSENT, DirectoryState, FileState, SymlinkState
-from atoms.core.spec import Dependency, SurfaceEntry, TransactionSpec
+from atoms.core.spec import SCHEMA_VERSION, Dependency, SurfaceEntry, TransactionSpec
 from tests.support import EMPTY, F, valid_spec
+
+MAX_SQLITE_INTEGER = 2**63 - 1
 
 
 def test_a_valid_spec_compiles():
@@ -19,8 +24,22 @@ def test_a_valid_spec_compiles():
 
 def test_compiled_spec_is_frozen():
     compiled = compile_spec(valid_spec())
-    with pytest.raises(Exception):  # noqa: B017
+    with pytest.raises(FrozenInstanceError):
         compiled.spec = None  # type: ignore[misc]
+
+
+def test_compiled_spec_refuses_ordinary_direct_construction():
+    compiled = compile_spec(valid_spec())
+    with pytest.raises(TypeError, match="compile_spec"):
+        CompiledSpec(spec=compiled.spec, timelines=compiled.timelines)
+
+
+def test_compiled_spec_refuses_dataclasses_replace():
+    compiled = compile_spec(valid_spec())
+    with pytest.raises(TypeError, match="compile_spec"):
+        replace(compiled)
+    with pytest.raises(TypeError, match="compile_spec"):
+        replace(compiled, spec=compiled.spec)
 
 
 # --- phase 1: top-level structure ---
@@ -42,28 +61,52 @@ class _HostileValue(metaclass=_HostileType):
     pass
 
 
-def test_hostile_type_diagnostics_are_normalized():
+class _InjectedCompilerFault(RuntimeError):
+    pass
+
+
+def test_unexpected_internal_fault_propagates_unchanged(monkeypatch):
+    def fail_internally(spec):
+        raise _InjectedCompilerFault("injected compiler fault")
+
+    monkeypatch.setattr(compiler_module, "_phase2_fingerprints", fail_internally)
+    with pytest.raises(_InjectedCompilerFault, match="injected compiler fault"):
+        compile_spec(valid_spec())
+
+
+def test_hostile_type_name_is_refused_as_invalid_input():
     with pytest.raises(SpecValidationError, match="TransactionSpec"):
         compile_spec(_HostileValue())  # type: ignore[arg-type]
 
 
-def test_uninitialized_transaction_spec_is_rejected():
-    with pytest.raises(SpecValidationError):
+def test_uninitialized_transaction_spec_names_the_missing_field():
+    with pytest.raises(SpecValidationError) as exc_info:
         compile_spec(object.__new__(TransactionSpec))
+    assert "spec.schema_version" in str(exc_info.value)
+    assert "missing" in str(exc_info.value)
 
 
 @pytest.mark.parametrize(
-    "spec",
+    ("spec", "missing_field"),
     [
-        valid_spec(initial_surface=(object.__new__(SurfaceEntry),)),
-        valid_spec(effects=(object.__new__(CreateFileNoClobber),)),
-        valid_spec(final_surface=(SurfaceEntry(path="a.txt", state=object.__new__(FileState)),)),
-        valid_spec(dependencies=(object.__new__(Dependency),)),
+        (valid_spec(initial_surface=(object.__new__(SurfaceEntry),)), "initial_surface[0].path"),
+        (valid_spec(effects=(object.__new__(CreateFileNoClobber),)), "effects[0].effect_id"),
+        (
+            valid_spec(
+                final_surface=(
+                    SurfaceEntry(path="a.txt", state=object.__new__(FileState)),
+                )
+            ),
+            "final_surface[0].state.content_hash",
+        ),
+        (valid_spec(dependencies=(object.__new__(Dependency),)), "dependencies[0].before"),
     ],
 )
-def test_uninitialized_nested_model_members_are_rejected(spec):
-    with pytest.raises(SpecValidationError):
+def test_uninitialized_nested_model_members_name_the_missing_field(spec, missing_field):
+    with pytest.raises(SpecValidationError) as exc_info:
         compile_spec(spec)
+    assert missing_field in str(exc_info.value)
+    assert "missing" in str(exc_info.value)
 
 
 def test_unknown_schema_version_is_rejected():
@@ -75,6 +118,65 @@ def test_bool_schema_version_is_rejected():
     # bool subclasses int; True == 1 must not pass as the schema version.
     with pytest.raises(SpecValidationError, match="schema_version"):
         compile_spec(valid_spec(schema_version=True))
+
+
+@pytest.fixture(params=[sys.int_info.default_max_str_digits, 0])
+def int_digit_limit(request):
+    previous = sys.get_int_max_str_digits()
+    sys.set_int_max_str_digits(request.param)
+    try:
+        yield
+    finally:
+        sys.set_int_max_str_digits(previous)
+
+
+def _huge_integer() -> int:
+    return 10 ** (sys.int_info.default_max_str_digits + 1000)
+
+
+def _spec_with_mode(mode: int):
+    state = DirectoryState(mode=mode)
+    return valid_spec(
+        initial_surface=(SurfaceEntry(path="dir", state=ABSENT),),
+        final_surface=(SurfaceEntry(path="dir", state=state),),
+        effects=(CreateDirectory(effect_id="e1", path="dir", post=state),),
+    )
+
+
+def _spec_with_byte_len(byte_len: int):
+    state = FileState(content_hash=F.content_hash, mode=F.mode, byte_len=byte_len)
+    return valid_spec(
+        final_surface=(SurfaceEntry(path="a.txt", state=state),),
+        effects=(CreateFileNoClobber(effect_id="e1", path="a.txt", post=state),),
+    )
+
+
+def test_huge_schema_version_has_fixed_diagnostic(int_digit_limit):
+    with pytest.raises(SpecValidationError) as exc_info:
+        compile_spec(valid_spec(schema_version=_huge_integer()))
+    assert str(exc_info.value) == f"unsupported schema_version; expected {SCHEMA_VERSION}"
+
+
+def test_huge_mode_has_fixed_diagnostic(int_digit_limit):
+    with pytest.raises(SpecValidationError) as exc_info:
+        compile_spec(_spec_with_mode(_huge_integer()))
+    assert str(exc_info.value) == "final_surface[0].state.mode must be permission bits in 0..0o7777"
+
+
+def test_huge_byte_len_has_fixed_diagnostic(int_digit_limit):
+    with pytest.raises(SpecValidationError) as exc_info:
+        compile_spec(_spec_with_byte_len(_huge_integer()))
+    assert str(exc_info.value) == "final_surface[0].state.byte_len must be in 0..2**63 - 1"
+
+
+def test_maximum_sqlite_byte_len_compiles_and_round_trips():
+    compiled = compile_spec(_spec_with_byte_len(MAX_SQLITE_INTEGER))
+    assert from_canonical_bytes(canonical_bytes(compiled.spec)) == compiled.spec
+
+
+def test_byte_len_above_sqlite_integer_domain_is_rejected():
+    with pytest.raises(SpecValidationError, match=r"0\.\.2\*\*63 - 1"):
+        compile_spec(_spec_with_byte_len(MAX_SQLITE_INTEGER + 1))
 
 
 def test_empty_effect_sequence_is_rejected():

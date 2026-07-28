@@ -197,6 +197,20 @@ def test_duplicate_effect_ids_are_rejected():
         ))
 
 
+def test_portability_equivalent_effect_ids_are_rejected():
+    with pytest.raises(SpecValidationError, match="portability-equivalent effect_id"):
+        compile_spec(
+            _spec(
+                {"a": ABSENT, "b": ABSENT},
+                {"a": F, "b": F},
+                (
+                    CreateFileNoClobber(effect_id="e1", path="a", post=F),
+                    CreateFileNoClobber(effect_id="E1", path="b", post=F),
+                ),
+            )
+        )
+
+
 def test_duplicate_ids_are_refused_before_dependencies_are_validated():
     # The forced phase 6 -> phase 7 order, locked. Phase 7 resolves each endpoint through
     # {effect_id: index}, which silently keeps only the last effect carrying a duplicated
@@ -271,3 +285,16 @@ def test_duplicate_surface_path_is_rejected_not_deduplicated():
                 SurfaceEntry(path="a.txt", state=F),
             ),
         ))
+
+
+def test_duplicate_surface_refuses_before_surface_maps_collapse_it():
+    with pytest.raises(SpecValidationError, match="duplicate path"):
+        compile_spec(
+            valid_spec(
+                initial_surface=(
+                    SurfaceEntry(path="a.txt", state=ABSENT),
+                    SurfaceEntry(path="a.txt", state=F),
+                ),
+                final_surface=(SurfaceEntry(path="a.txt", state=F),),
+            )
+        )

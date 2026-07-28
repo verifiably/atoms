@@ -1,5 +1,9 @@
+import sys
+
 import pytest
 
+import atoms.core.compiler as compiler_module
+import atoms.core.paths as paths_module
 from atoms.core.compiler import compile_spec
 from atoms.core.effects import (
     CreateDirectory,
@@ -73,7 +77,7 @@ def test_surface_path_with_no_effect_is_rejected():
 
 
 def test_effect_path_missing_from_the_initial_surface_is_rejected():
-    with pytest.raises(SpecValidationError, match="initial_surface"):
+    with pytest.raises(SpecValidationError, match="initial_surface omits"):
         compile_spec(
             _spec(
                 {},
@@ -127,6 +131,26 @@ def test_final_surface_disagreeing_with_the_last_postcondition_is_rejected():
                 (ReplaceFile(effect_id="e1", path="a", pre=F, post=G),),
             )
         )
+
+
+# --- phases 12-13: iterative tree construction ---
+
+
+def test_prefix_materializing_ancestors_api_is_absent():
+    assert not hasattr(compiler_module, "ancestors")
+    assert not hasattr(paths_module, "ancestors")
+
+
+def test_tree_validation_has_no_python_recursion_depth_limit():
+    depth = sys.getrecursionlimit() + 100
+    path = "/".join(f"d{i}" for i in range(depth))
+    compile_spec(
+        _spec(
+            {path: ABSENT},
+            {path: F},
+            (CreateFileNoClobber(effect_id="e1", path=path, post=F),),
+        )
+    )
 
 
 # --- phase 12: surface tree consistency ---

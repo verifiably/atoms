@@ -44,17 +44,6 @@ def require_rel_path(kind: str, value: str) -> str:
     return value
 
 
-def path_equivalence_key(path: str) -> str:
-    """Unicode caseless-matching key for a path.
-
-    Two paths sharing a key may name one entry on a case- or normalization-insensitive
-    volume. This is a deliberately coarse, whole-path approximation: the authoritative
-    question is per parent directory and belongs to A4 (design §5.4).
-    """
-    return unicodedata.normalize("NFC", unicodedata.normalize("NFC", path).casefold())
-
-
-def ancestors(path: str) -> tuple[str, ...]:
-    """Return ``path``'s proper ancestors, outermost first."""
-    parts = path.split("/")
-    return tuple("/".join(parts[:i]) for i in range(1, len(parts)))
+def portability_equivalence_key(value: str) -> str:
+    """Return A2's fixed Unicode portability key for a path or effect ID."""
+    return unicodedata.normalize("NFC", unicodedata.normalize("NFC", value).casefold())
