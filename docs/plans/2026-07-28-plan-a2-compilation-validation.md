@@ -784,6 +784,14 @@ def test_symlink_target_with_surrogate_is_rejected():
         compile_spec(valid_spec(initial_surface=(SurfaceEntry(path="a.txt", state=bad),)))
 
 
+def test_symlink_target_with_nul_is_rejected():
+    # Symlink targets are opaque rather than project-relative, but NUL still cannot
+    # reach the filesystem representation.
+    bad = SymlinkState(target="a\x00b", mode=0o777)
+    with pytest.raises(SpecValidationError, match="NUL"):
+        compile_spec(valid_spec(initial_surface=(SurfaceEntry(path="a.txt", state=bad),)))
+
+
 def test_symlink_target_may_be_absolute_or_contain_dotdot():
     # A target is opaque bytes the engine fingerprints, not a path it resolves (§6),
     # so the project-relative grammar must NOT apply to it.
@@ -2104,7 +2112,7 @@ UNICODE_SAMPLES = [
     "a" * 300,                  # longer than any real NAME_MAX; admitted here (ledger #4)
     " leading and trailing ",
     "tab\tnewline\n",
-    ".#~notthesigil",           # near the reserved scratch sigil without matching it
+    ".#nottilde",               # near the reserved scratch sigil without matching it
     "..dotdot",
 ]
 
