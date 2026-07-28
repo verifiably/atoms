@@ -723,8 +723,9 @@ of the earlier design. Table shapes (informative):
 
 - `transaction(txid PRIMARY KEY, schema_version, spec_json, state, committed, rollback_result,
   halt_diagnostic, …)` — one row per transaction; `state` is the §8.1 machine; `committed` is the
-  separate durable commit decision retained through `HALTED`; `spec_json` is the immutable canonical
-  `TransactionSpec`, written once.
+  separate durable commit decision retained through `HALTED`; `halt_diagnostic` is A3's token-free
+  stable diagnostic shape, not a serialization of snapshot-local identity tokens; `spec_json` is the
+  immutable canonical `TransactionSpec`, written once.
 - `effect(txid, effect_id, variant, journal_state, …, PRIMARY KEY(txid, effect_id))` — per-effect
   forward/reverse journal state (§8.2–§8.3).
 - `blob(digest PRIMARY KEY, byte_len, refcount)` — the content-addressed blob index; the bytes live
@@ -816,8 +817,9 @@ finds any noncommitted active transaction. `HALTED` preserves the record, scratc
 durable commit decision (if any), and diagnostic classification. A halt after `COMMITTED` never
 licenses rollback; it preserves the final state and reports incomplete cleanup. The halt transition
 does not clear the separate `committed` value. Its diagnostic freezes the pre-halt transaction state
-and commit decision; later recovery returns that stored diagnostic rather than recomputing an origin
-state of `HALTED`.
+and commit decision, the full per-effect journal vector, token-free expected/observed state, and the
+named-slot identity relations used by classification — never the snapshot-local tokens themselves.
+Later recovery returns that stored diagnostic rather than recomputing an origin state of `HALTED`.
 
 ### 8.2 Forward effect states
 
@@ -865,14 +867,17 @@ are the exact A2 `CompiledSpec`, A4's resolved logical topology in production, t
 diagnostic, the per-effect `journal_state` rows, and coherent logical observations of every persistent
 path and effect scratch role. Regular-file and directory observations carry opaque snapshot-local entry
 identities; symlinks carry only their `lstat` + `readlink` fingerprint and are never identity-decided.
-File staging observations also carry their exact/prefix/diverged relation to the planned postimage, and
-directory observations identify children outside the resolved topology. Because SQLite gives a single
-crash-consistent metadata state on open, there is no partial journal to
-reconcile before classification begins. Comparing each occurrence independently against the single live
-entry would misread a repeated-path timeline (§5.3), and classifying a multi-path effect (e.g.
-`MoveNoClobber` over source, destination, and anchor, §9.4) per path could yield contradictory
-verdicts. Journal state gates attribution: an effect can only have mutated a path once it is durably
-`STARTED`.
+File staging observations carry their exact/prefix/diverged relation to the planned postimage only for
+a present `CreateFileNoClobber` staging file while `STARTED`, or a present `ReplaceFile` staging file
+while `STARTED` and live is exact `pre`. Those are the cases where the forward classifier can consume
+construction evidence. Displaced preimages, reverse quarantines, and committed-cleanup scratch are
+decided from exact fingerprints and atomic tuples without an unnecessary planned-blob comparison.
+Directory observations identify children outside the resolved topology. Because SQLite gives a single
+crash-consistent metadata state on open, there is no partial journal to reconcile before
+classification begins. Comparing each occurrence independently against the single live entry would
+misread a repeated-path timeline (§5.3), and classifying a multi-path effect (e.g. `MoveNoClobber` over
+source, destination, and anchor, §9.4) per path could yield contradictory verdicts. Journal state gates
+attribution: an effect can only have mutated a path once it is durably `STARTED`.
 
 **Per-path frontier.** For each path the engine gathers that path's ordered occurrences with their
 durable journal states; the direction depends on the transaction state (§8.1):
@@ -925,6 +930,9 @@ Transaction state, commit decision, and active binding are classified jointly. A
 or `ROLLED_BACK` record needs no recovery. A detached `PREPARED`, `APPLYING`, `APPLIED`, or
 `ROLLING_BACK` record is contradictory durable metadata: recovery records a halt if possible, never
 reattaches the active pointer, and performs no project or scratch mutation.
+Any transaction-state/commit-decision mismatch likewise halts with A3's closed
+`COMMIT_DECISION_CONFLICT` reason; an illegal journal vector halts with
+`JOURNAL_TOPOLOGY_INVALID`.
 
 Recovery classifies every path's whole timeline and every in-flight effect's joint tuple before
 performing any mutation, so an early repair cannot destroy evidence needed to recognize a later
@@ -969,6 +977,12 @@ A crash at any point leaves a classifiable tuple of live path plus stable stagin
 exchanges the retained preimage back when the live postimage is still authoritative. Committed cleanup
 removes the displaced entry only if it still matches the validated preimage; divergence is preserved
 and reported rather than deleted.
+
+If the declared `pre` and `post` fingerprints are equal, recovery cannot tell the two sides of a
+completed exchange apart by state. It therefore leaves the exact live state in place and removes the
+exact staging state, which restores the declared surface without promising inode provenance (§3.2).
+A different staging state that is not attributable planned-post construction evidence is not treated
+as transfer evidence in this no-op case; both entries are preserved and recovery halts.
 
 ### 9.2 `CreateFileNoClobber`
 
@@ -1186,9 +1200,10 @@ Caught process-local failures, including cancellation, `KeyboardInterrupt`, and 
 rollback before being re-raised. `SIGKILL`, power loss, and machine failure do not unwind Python and
 are exercised only through fresh-process recovery tests.
 
-Recovery and rollback diagnostics identify the transaction, effect, paths, journal state, expected
-states, observed states, and the non-mutating operator action required next. There is no silent
-fallback or automatic discharge of a halt.
+Recovery and rollback diagnostics identify the transaction, effect, paths, full journal vector,
+token-free expected and observed states, named-slot identity relations, A3's closed halt reason, and
+the non-mutating operator action required next. They never serialize snapshot-local identity tokens.
+There is no silent fallback or automatic discharge of a halt.
 
 ## 12. Consumers
 
@@ -1257,10 +1272,12 @@ halt plan rather than silent reclassification.
 
 The reducer applies the same semantic steps to the logical snapshot. It models identity-preserving
 transfers, removals, preserved external blockers, resolved directory occupancy, journal transitions,
-the separate commit decision, the frozen first-halt diagnostic, and active detachment, but no syscall
-or durability barrier. Applying classification and reduction twice reaches a fixed point: a detached
-terminal snapshot is `NO_RECOVERY`, and an already halted snapshot preserves the exact commit decision,
-diagnostic, and evidence from its first halt.
+the separate commit decision, the token-free frozen first-halt diagnostic, and active detachment, but
+no syscall or durability barrier. Applying classification and reduction twice reaches a fixed point: a
+detached terminal snapshot is `NO_RECOVERY`, and an already halted snapshot preserves the exact commit
+decision and token-free diagnostic from its first halt. Across a process restart, surface evidence is
+compared up to renaming of regenerated snapshot-local identity tokens; the diagnostic itself remains
+exactly equal.
 
 Table and property tests cover every variant, forward/reverse state, named intermediate, and
 unattributable state. Generated valid effect sequences prove:

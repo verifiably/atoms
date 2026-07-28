@@ -171,6 +171,15 @@ JournalState:
 RollbackResult:
     RESTORED
     EXTERNAL_DRIFT_PRESERVED
+
+HaltReason:
+    JOURNAL_TOPOLOGY_INVALID
+    COMMIT_DECISION_CONFLICT
+    ACTIVE_BINDING_MISSING
+    EFFECT_TUPLE_UNATTRIBUTABLE
+    DIRECTORY_NOT_EMPTY
+    COMMITTED_SURFACE_MISMATCH
+    PLAN_PRECONDITION_CHANGED
 ```
 
 `CommitDecision` models §7.2's durable `committed` column independently from `TransactionState`. It
@@ -185,8 +194,9 @@ detachment cannot erase whether the engine owes a clean rollback outcome or `Pre
 
 `HaltDiagnostic` is absent before the first halt and present exactly when `transaction_state` is
 `HALTED`. It freezes the pre-halt transaction state, the unchanged `CommitDecision`, the journal
-frontier, expected and observed evidence, reason code, and operator action. A second pass returns that
-stored diagnostic rather than recomputing it with `HALTED` as the origin state.
+state vector in compiled effect order, token-free expected and observed evidence, one closed
+`HaltReason`, and the operator action. A second pass returns that stored diagnostic rather than
+recomputing it with `HALTED` as the origin state.
 
 ### 5.2 Logical scratch roles
 
@@ -256,8 +266,8 @@ This lets the reducer prove that reversing declared descendants makes a transact
 empty while still refusing removal when any undeclared entry remains. The directory evidence is
 obtained from one descriptor-coherent enumeration by A6/A7.
 
-Every file-valued `STAGING` observation also carries its coherent relation to that effect's planned
-postimage:
+Some forward-construction `STAGING` observations also carry their coherent relation to that effect's
+planned postimage:
 
 ```text
 FileBuildRelation:
@@ -269,8 +279,18 @@ FileBuildRelation:
 A3 cannot derive `STRICT_PREFIX` from a digest and byte length. A6/A7 compares the candidate stream
 against the planned blob and produces this evidence from the same opened object used for the state and
 identity observation. The relation is evidence, not a recovery verdict: A3 decides whether it denotes
-incomplete construction, a displaced preimage, divergence, or an unattributable object in the current
-joint tuple.
+incomplete construction, divergence, or an unattributable object in the current joint tuple.
+
+The relation is required only where the forward classifier can consume construction evidence:
+
+- a present file in `CreateFileNoClobber`'s `STAGING` while that effect is `STARTED`; or
+- a present file in `ReplaceFile`'s `STAGING` while that effect is `STARTED` and the live entry is the
+  exact declared `pre`.
+
+It is absent everywhere else. In particular, a displaced preimage retained by a completed
+`ReplaceFile`, a quarantined postimage during reverse settlement, and committed-cleanup scratch are
+classified by their exact fingerprints and atomic tuple, so A6/A7 does not stream-compare those files
+against the planned blob.
 
 ### 5.5 Recovery snapshot
 
@@ -287,9 +307,9 @@ ScratchObservation(
 )
 ```
 
-`file_build_relation` is present exactly for a present file in a `STAGING` slot and absent for every
-other entry/role combination. The snapshot factory validates this invariant rather than allowing an
-irrelevant or missing relation into classification.
+`file_build_relation` is present exactly in the two forward-construction cases in §5.4 and absent for
+every other entry/role/journal combination. The snapshot factory validates this invariant rather than
+allowing irrelevant evidence or omitting evidence the classifier will read.
 
 `RecoverySnapshot` is frozen and complete:
 
@@ -304,7 +324,10 @@ irrelevant or missing relation into classification.
   halt diagnostic are explicit.
 
 Missing, extra, duplicated, or wrongly typed members are refused as malformed internal input. Exact
-runtime types define membership in every closed union; subclasses are not members.
+runtime types define membership in every closed union; subclasses are not members. For a `HALTED`
+input, the current commit decision and journal vector must equal the values frozen in
+`halt_diagnostic`; a mismatch is malformed persisted input and is refused as `ProtocolError`, not
+normalized into a second halt.
 
 ### 5.6 Joint observation
 
@@ -341,7 +364,7 @@ destroy early evidence before discovering a later conflict.
 | `ROLLING_BACK` | `DONE* STARTED? PENDING*` **or** `DONE* UNDO_STARTED? UNDONE* PENDING*` | Resume from the one forward-or-reverse frontier |
 | `COMMITTED` | all `DONE` | Rollback forbidden; verify final surface, clean retained scratch, detach |
 | `ROLLED_BACK` | `UNDONE* PENDING*` | Detach metadata only; never mutate project or scratch |
-| `HALTED` | the frozen journal topology recorded by the first halt | Stable halt; no further state change |
+| `HALTED` | not re-derived; the current vector must equal the diagnostic's frozen full journal vector | Stable halt; no further state change |
 
 The two `ROLLING_BACK` branches are exclusive. A forward `STARTED` is the highest executed effect and
 must be settled before any reverse effect, so `STARTED` followed by `UNDONE` is unreachable.
@@ -358,6 +381,11 @@ The state, commit decision, and active binding are validated jointly:
 - a detached `COMMITTED` or `ROLLED_BACK` record is `NO_RECOVERY`; and
 - a detached `PREPARED`, `APPLYING`, `APPLIED`, or `ROLLING_BACK` record produces
   `ACTIVE_BINDING_MISSING` and never reattaches itself.
+
+Any state/commit-decision combination outside that matrix produces a halt with
+`COMMIT_DECISION_CONFLICT`. Any journal vector outside the selected state's legal language produces
+`JOURNAL_TOPOLOGY_INVALID`. `HaltReason` is the closed reason-code vocabulary in §5.1; classifiers may
+not invent free-form codes.
 
 An already `HALTED` snapshot returns its frozen halt diagnostic without changing project state,
 scratch state, commit decision, or diagnostic. If its active binding is unexpectedly absent, A3 still
@@ -462,9 +490,10 @@ the full step count. Prefix reduction is pure and grants no execution authority.
 
 Authorization binds the plan, mutating step index, derived prefix snapshot, and fresh evidence. A
 mismatch halt uses
-`reduce_recovery_plan_prefix(snapshot, plan, completed_steps=step_index)` as that prefix, with the
-conflicting observation substituted at the selected step; it is not incorrectly bound to the plan's
-original source snapshot. Held descriptors and atomic capabilities close the remaining
+`reduce_recovery_plan_prefix(plan.bound_snapshot, plan, completed_steps=step_index)` as that prefix,
+where `plan.bound_snapshot` denotes the plan's value-equal bound source snapshot. The conflicting
+observation is substituted at the selected step; the mismatch halt is not incorrectly bound to the
+plan's original, unreduced source state. Held descriptors and atomic capabilities close the remaining
 observation-to-operation window according to §§6 and 9 of the authority design.
 
 ### 7.4 Halt diagnostics
@@ -474,11 +503,22 @@ A halt plan contains no project or scratch mutation. A first halt may persist on
 - the transition to transaction state `HALTED`; and
 - its structured diagnostic.
 
-The diagnostic contains the pre-halt transaction state, preserved commit decision, effect and logical
-paths when applicable, journal state, expected and observed tuples, a stable reason code, and a
-non-mutating operator action. Human prose is derived from this structure and is not the machine
-contract. Classification of an already halted snapshot reuses this exact stored diagnostic; it never
-recomputes the origin state as `HALTED`.
+The diagnostic contains the pre-halt transaction state, preserved commit decision, full journal state
+vector in compiled effect order, effect and logical paths when applicable, token-free expected and
+observed tuple projections, one `HaltReason`, and a non-mutating operator action. Tuple projections
+retain exact path states, entry kinds, prefix/occupancy facts, and the identity relations the
+classifier used between named slots:
+
+```text
+DiagnosticIdentityRelation(left_slot, right_slot, relation: SAME | DIFFERENT)
+```
+
+They never retain, serialize, log, or later compare `EntryIdentity` tokens themselves. Named-slot
+relations are stable data, round-trip through A5, and remain comparable across process restarts even
+though a new recovery observation creates a new token universe. Human prose is derived from this
+structure and is not the machine contract. Classification of an already halted snapshot reuses this
+exact stored diagnostic; it never recomputes the origin state as `HALTED` or mixes diagnostic evidence
+with the current snapshot's identity tokens.
 
 ## 8. Abstract reducer
 
@@ -518,6 +558,10 @@ fixed_snapshot = apply_recovery_plan(
 assert fixed_snapshot == next_snapshot
 ```
 
+That equality is literal for repeated pure reduction of one snapshot. Across a process restart, newly
+captured `EntryIdentity` values may be alpha-renamed; A8 compares surface evidence up to that renaming
+while requiring exact equality of the token-free frozen diagnostic.
+
 ## 9. Variant classifiers
 
 Notation below:
@@ -539,6 +583,23 @@ rules is foreign or unattributable and is preserved.
 Every tuple not listed is unattributable and halts.
 
 ### 9.1 `ReplaceFile`: `(live, staging)`
+
+When `pre == post`, this table uses the name `same` and does not dispatch through the overlapping
+general rows below:
+
+| No-op tuple | Classification and settlement |
+| --- | --- |
+| `(same, A)` while forward `STARTED` | no project mutation is required |
+| `(same, prefix)` or `(same, same)` while forward `STARTED` | remove attributable construction staging and leave live unchanged |
+| `(same, same)` while `UNDO_STARTED` or uncommitted `DONE` | remove staging and leave live unchanged |
+| `(same, A)` while `UNDO_STARTED` | reverse settlement is already complete |
+| `(same, A)` while uncommitted `DONE` | halt; forward `DONE` requires the retained displaced entry even when its fingerprint equals `post` |
+| `(same, same)` or `(same, A)` during committed cleanup | remove staging if present; retain live |
+| `(same, X)` | halt and preserve both; with no state change, the tuple does not prove that exchange displaced `X` |
+
+This precedence restores the declared state for both sides of the otherwise indistinguishable
+exchange. It deliberately makes no inode-provenance promise, matching authority §3.2. The general rows
+below apply only when `pre != post`.
 
 Forward `STARTED`:
 
@@ -711,6 +772,8 @@ Bounded exhaustive generators cover:
 - every legal and illegal journal topology for short transactions;
 - every transaction-state × commit-decision × active-binding combination;
 - repeated-path timelines;
+- `ReplaceFile` with both distinct and equal `pre`/`post`;
+- present and absent `file_build_relation` across every variant/journal/live-state combination;
 - every equality partition of move and directory identity tokens;
 - exact, prefix, diverged, absent, and wrong-kind observations;
 - lexical and A4-resolved ancestor topologies; and
@@ -730,9 +793,12 @@ Properties lock:
 - rollback restoration or explicit preserved drift;
 - committed recovery never emits rollback;
 - a committed halt retains its commit decision and frozen first-halt diagnostic;
+- halt diagnostics round-trip without identity tokens and remain equal across a regenerated token
+  universe;
 - halt preserves filesystem evidence;
 - `dependencies` never affect ordering;
 - plan/source binding and exact step authorization;
+- construction evidence is required only in §5.4's two forward cases;
 - identity-token renaming invariance;
 - reducer convergence and second-pass idempotence;
 - totality for every well-formed generated snapshot; and
@@ -747,6 +813,8 @@ Mutation checks must demonstrate that the tests fail when:
 - a stale step is authorized;
 - a non-mutating step receives filesystem authorization;
 - a symlink is given decisive opaque identity;
+- a no-op replace is dispatched through the overlapping general rows;
+- a completed replace requires a planned-blob relation for its displaced preimage;
 - resolved topology is replaced by lexical topology;
 - scratch absence is treated uniformly across variants; or
 - the reducer omits a reverse intermediate.
@@ -758,7 +826,7 @@ equivalence. It also creates downstream obligations:
 
 - A4 constructs and retains the resolved logical topology A3 consumes in production.
 - A5 persists A3's transaction/effect transitions, separate commit decision, rollback result, and
-  frozen first-halt diagnostic in plan order.
+  token-free frozen first-halt diagnostic in plan order.
 - A6/A7 produce coherent identity, prefix, and directory-occupancy evidence.
 - A7 executes only A3-authorized steps and does not rederive recovery decisions.
 - A8 tests the real executor against A3's decisions and fixed points.
