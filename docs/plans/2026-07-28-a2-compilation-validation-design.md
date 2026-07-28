@@ -30,13 +30,13 @@ library.
 **A2 establishes the trust boundary for:**
 
 - effect-ID uniqueness and dependency validity;
-- effect-ID distinctness under the scratch portability equivalence
-  `NFC(casefold(NFC(effect_id)))`;
+- effect-ID distinctness under
+  `portability_equivalence_key(effect_id)`;
 - exact per-variant shape validation;
 - safe identifiers and the project-relative path grammar;
 - reserved `.#~` scratch-name rejection, under case- and NFC/NFD-equivalence semantics;
-- lexical distinctness of declared paths under Unicode caseless matching, so two spellings of one entry
-  cannot compile as two timelines;
+- lexical distinctness of declared paths under
+  `portability_equivalence_key(path)`, so two spellings of one entry cannot compile as two timelines;
 - UTF-8 encodability of every string that reaches the durable canonical form;
 - fingerprint well-formedness (hash spelling, signed-64-bit byte lengths, permission-only modes);
 - continuous repeated-path timelines (§5.3);
@@ -146,7 +146,7 @@ more than one unit's worth of responsibility:
 
 | Module | Holds | Consumes |
 | --- | --- | --- |
-| `paths.py` | The project-relative path grammar. Purely lexical. | `errors`, `scratch` |
+| `paths.py` | The project-relative path grammar and shared `portability_equivalence_key`. Purely lexical. | `errors`, `scratch` |
 | `timeline.py` | `TimelineOccurrence`, `PathTimeline`, timeline construction and the continuity rule. | `errors`, `effects`, `fingerprint` |
 | `compiler.py` | `CompiledSpec`, `compile_spec`, and the phase sequence. | all of the above, plus `spec`, `identifiers` |
 
@@ -200,7 +200,8 @@ which violates §6's error contract:
 Top level:
 
 - `spec` is a `TransactionSpec`.
-- `schema_version` is an integer equal to `SCHEMA_VERSION`.
+- `schema_version` is an integer equal to `SCHEMA_VERSION`. An unknown integer is refused with a fixed
+  expected-version diagnostic that never interpolates or formats the caller value.
 - `consumer_tag` satisfies A1's safe-identifier grammar (`require_valid_identifier`).
 - `intent_digest` matches `^sha256:[0-9a-f]{64}$`.
 - `initial_surface` and `final_surface` are tuples of `SurfaceEntry`.
@@ -225,8 +226,18 @@ Nested, for every element of those tuples:
 This phase is exhaustive by construction rather than by inspection: `TransactionSpec` and its members are
 plain frozen dataclasses that perform no runtime type checking, so a caller who bypasses `build_spec` can
 place any object in any field. Making phase 1 total is what lets phases 2 onward read `effect.path` or
-`state.mode` directly, with no defensive checks and no risk of the `AttributeError` or `TypeError` that
-§6 prohibits.
+`state.mode` directly without malformed model data reaching an incidental operation.
+
+Exact dataclass type does not imply initialized slots: `object.__new__(TransactionSpec)` and the
+corresponding nested A1 dataclasses have the expected type but no field values. Phase 1 therefore reads
+each required field as `getattr(obj, field_name, _MISSING)` and raises an explicit
+`SpecValidationError` when the sentinel is returned. It does not rely on the pipeline-wide exception
+normalization prohibited by §6.
+
+Diagnostics that name a runtime type use one `_type_name(value)` helper. The helper evaluates
+`value_type = type(value)` outside its `try`; the `try` covers only `value_type.__name__` and returns a
+fixed fallback if a hostile metaclass raises during that lookup. No later validation work shares that
+`try`, so an unrelated internal exception cannot be mistaken for a hostile type-name refusal.
 
 The split between phase 1 and phase 5 is deliberate: phase 1 asks "is this a well-typed value at all",
 phase 5 asks "is this variant's choice of state legal".
@@ -244,7 +255,8 @@ Applied to every `PathState` reachable from the surfaces and from the effects.
   integer size.
 - Every `mode` (`FileState`, `DirectoryState`, `SymlinkState`) is an integer in `0 .. 0o7777`.
   Permission bits only, never type bits. The range admits setuid, setgid, and sticky, because a setgid
-  directory is a legitimate declared postcondition.
+  directory is a legitimate declared postcondition. Its refusal diagnostic contains only those fixed
+  bounds; it never formats the rejected value as decimal, octal, hexadecimal, or binary.
 - `SymlinkState.target` is non-empty, contains no NUL, and is encodable as UTF-8. It is **not** subject
   to the project-relative path grammar of phase 3: a symlink target may legitimately be absolute or
   contain `..`, and the engine treats it as opaque bytes it fingerprints rather than a path it resolves
@@ -272,7 +284,8 @@ A path is valid when it is:
 surrogates — from `surrogateescape` decoding of an undecodable OS pathname, or from a JSON document
 containing a lone `\ud800`. Such a string survives every other rule here, but A1's `canonical_bytes`
 raises `UnicodeEncodeError` on it, so a specification that compiled successfully could not be durably
-serialized. That would break both the totality claim of §6 and the canonical-output guarantee of §7.
+serialized. That would break both the explicit invalid-specification refusal contract of §6 and the
+canonical-output guarantee of §7.
 Verified against the shipped A1 encoder: a path or symlink target containing `\ud800` raises
 `UnicodeEncodeError: 'utf-8' codec can't encode character '\ud800'`. Compilation must refuse it with
 `SpecValidationError` instead.
@@ -287,12 +300,15 @@ foreign debris and refusing to operate beneath it is the conservative reading.
 ### Phase 4 — Path alias distinctness
 
 Across the union of all declared paths — every effect path and every `SurfaceEntry.path` — no two
-*distinct spellings* may share a name-equivalence key. The key is Unicode caseless matching applied to
-the whole path:
+*distinct spellings* may share `portability_equivalence_key(path)`. The shared key is Unicode caseless
+matching applied to the whole value:
 
 ```
-key(p) = NFC( casefold( NFC(p) ) )
+portability_equivalence_key(value) = NFC( casefold( NFC(value) ) )
 ```
+
+`paths.py` exposes that one helper for both whole paths and effect IDs. The former
+`path_equivalence_key` name is removed, not retained as an alias or compatibility wrapper.
 
 Two declared paths that are byte-identical are of course one path; two that differ but share a key —
 `docs/a.md` and `docs/A.md`, or an NFC and an NFD spelling of `café.txt` — are refused.
@@ -376,9 +392,10 @@ continuous and A2 adds no rule the design does not call for.
 ### Phase 6 — Effect-ID uniqueness
 
 No effect ID appears twice by exact string, and no two distinct IDs share
-`NFC(casefold(NFC(effect_id)))`. The second rule is the portability equivalence applied to the
-effect-ID field embedded in `.#~<txid>.<effect-id>.<role>`. With exact-only uniqueness, `e1` and `E1`
-would compile yet generate same-parent scratch leaves that alias on an insensitive filesystem.
+`portability_equivalence_key(effect_id)`. This is the same helper phase 4 applies to whole paths, now
+applied to the effect-ID field embedded in `.#~<txid>.<effect-id>.<role>`. With exact-only uniqueness,
+`e1` and `E1` would compile yet generate same-parent scratch leaves that alias on an insensitive
+filesystem.
 
 Transaction-ID regeneration does not repair that intrinsic collision: both leaves receive the same new
 transaction-ID prefix and remain aliases. A4 still proves the fully instantiated scratch-leaf set under
@@ -489,33 +506,50 @@ effect *sequence*, and neither implies the other.
 
 The compiler inserts each `CreateDirectory` path into a component trie whose terminal stores the
 creator's path and effect index. It then walks each occurrence's proper-ancestor components once,
-checking creator indices encountered along that route. It does not call `ancestors(path)` or materialize
-joined prefixes. The phase is linear in the components across created-directory paths and effect
-occurrences, with no component-count or lexical path-length ceiling.
+checking creator indices encountered along that route. It does not expose or call an `ancestors()`
+helper and does not materialize joined prefixes; the now-dead helper and its tests are removed rather
+than kept for compatibility. The phase is linear in the components across created-directory paths and
+effect occurrences, with no component-count or lexical path-length ceiling.
 
 ## 6. Error contract
 
-Every malformed specification raises `SpecValidationError` — A1's existing exception, unchanged. No
-`TypeError`, `KeyError`, `AttributeError`, or assertion escapes `compile_spec` on any input, including a
-`TransactionSpec` constructed directly with ill-typed fields rather than through `build_spec`.
+Every specification invalid under the thirteen declared phases raises `SpecValidationError` — A1's
+existing exception, unchanged. Caller/model defects are recognized by explicit checks: this includes
+wrong scalar or member types, exact A1 dataclass instances with uninitialized slots, hostile runtime
+type-name lookup, and every semantic rule in phases 2–13.
 
-That totality promise is scoped to `compile_spec`. Misusing the proof type's guarded constructor or
-`dataclasses.replace` raises `TypeError` by design; mutating a compiled proof raises
-`dataclasses.FrozenInstanceError`. Those are API-misuse refusals, not malformed-specification results.
+`compile_spec` does **not** promise to convert every arbitrary runtime failure into
+`SpecValidationError`. The phase pipeline has no blanket `try/except Exception`. An unexpected internal
+exception — a programming fault, a failed invariant in compiler code, or a deliberately injected test
+fault — propagates unchanged so it cannot be misreported as a caller's specification error.
 
-Totality is load-bearing in two directions, and phases 1 and 3 are what secure it:
+The only broad catch used for diagnostics is inside `_type_name`, and its `try` surrounds only
+`value_type.__name__` after `value_type = type(value)` has completed. Missing slots are not handled by a
+catch at all: phase 1 uses `getattr(obj, field_name, _MISSING)` and raises `SpecValidationError`
+explicitly when the sentinel is returned. After phase 1 succeeds, the later phases may rely on the
+closed, initialized model shape it established.
 
-- **Nothing leaks out of `compile_spec`.** Phase 1's exhaustive typing is what makes this true; without
-  it, a `path` field holding an `int` would reach phase 3 and raise `AttributeError` from `startswith`.
-- **Nothing that compiles can fail downstream.** A `CompiledSpec` must be durably serializable, so phase
-  3's UTF-8 rule closes the case where compilation succeeds but `canonical_bytes` then raises
-  `UnicodeEncodeError`. "Compilation succeeded" has to mean the specification is usable, not merely
-  well-shaped.
+This explicit boundary is load-bearing in two directions:
+
+- **Malformed model values are refused deliberately.** A `path` field holding an `int` is rejected in
+  phase 1 rather than reaching `startswith`; an uninitialized field is rejected as missing rather than
+  leaking incidental `AttributeError`.
+- **Accepted values satisfy downstream serialization preconditions.** A `CompiledSpec` must be durably
+  serializable, so phase 3's UTF-8 rule closes the case where compilation succeeds but
+  `canonical_bytes` then raises `UnicodeEncodeError`. "Compilation succeeded" means the specification
+  passed every declared A2 rule, not that unrelated internal exceptions have been normalized.
+
+Misusing the proof type's guarded constructor or `dataclasses.replace` raises `TypeError` by design;
+mutating a compiled proof raises `dataclasses.FrozenInstanceError`. Those are API-misuse refusals, not
+malformed-specification results.
 
 The exception carries a formatted message naming the violated rule and, where applicable, the offending
-effect ID and path. It gains **no** structured attributes. A1's decoder already establishes
-message-only refusal, its tests already assert with `pytest.raises(..., match=...)`, and a wider error
-surface would become an unnecessary contract for compilation callers and the A3/A4 seam.
+effect ID and path. Caller integers outside their allowed domains are the exception to value echoing:
+`schema_version`, `mode`, and `byte_len` diagnostics contain only fixed expected values or bounds and
+never format the rejected integer in any base. `SpecValidationError` gains **no** structured
+attributes. A1's decoder already establishes message-only refusal, its tests already assert with
+`pytest.raises(..., match=...)`, and a wider error surface would become an unnecessary contract for
+compilation callers and the A3/A4 seam.
 
 ## 7. Decisions recorded
 
@@ -549,10 +583,12 @@ It is now explicit: §5.4 gains the requirement that a specification declare at 
 enforces it in phase 1, which is the only phase that can. Consumers computing an empty change set skip the
 engine rather than transacting over nothing.
 
-**Compilation is total and pure.** `compile_spec` reads nothing outside its argument. Compiling the same
-specification twice yields equal `CompiledSpec` values and byte-identical `canonical_bytes(compiled.spec)`,
-satisfying §13.3's "validate a spec twice, require identical canonical output". Compilation is also
-idempotent: `compile_spec(compile_spec(s).spec) == compile_spec(s)`.
+**Compilation is pure and deterministic, while refusal is explicit.** `compile_spec` reads nothing
+outside its argument. Compiling the same valid specification twice yields equal `CompiledSpec` values
+and byte-identical `canonical_bytes(compiled.spec)`, satisfying §13.3's "validate a spec twice, require
+identical canonical output". Compilation is also idempotent:
+`compile_spec(compile_spec(s).spec) == compile_spec(s)`. Invalid specifications are covered by explicit
+phase checks; purity and determinism do not justify catching and relabeling unexpected internal faults.
 
 **Compilation proof is staged, not universal.** `CompiledSpec` means only that A2's pure rules passed.
 It deliberately carries no project root, metadata-root identity, lookup policy, resolved topology,
@@ -573,17 +609,25 @@ do not pin error order between independent phases. Beyond per-rule coverage:
 - **Proof construction and freezing.** `compile_spec` returns `CompiledSpec`; ordinary direct
   construction and `dataclasses.replace` raise `TypeError`; field assignment raises the exact
   `dataclasses.FrozenInstanceError`.
-- **Signed-64-bit byte length.** `2**63 - 1` compiles and survives
-  `from_canonical_bytes(canonical_bytes(...))`; `2**63` refuses. A thousands-of-digits value refuses
-  under `sys.int_info.default_max_str_digits` and `0`, proving the diagnostic never formats the rejected
-  value.
+- **Size-independent caller-integer diagnostics.** `schema_version`, `mode`, and `byte_len` each refuse
+  a thousands-of-digits integer under `sys.int_info.default_max_str_digits` and `0`, with the same
+  fixed diagnostic in both settings. `byte_len == 2**63 - 1` compiles and survives
+  `from_canonical_bytes(canonical_bytes(...))`; `2**63` refuses.
+- **Explicit error boundary.** A monkeypatched internal phase raises a test-only exception and that
+  exact exception escapes unchanged. Separately, a value whose metaclass raises on `__name__` and exact
+  A1 dataclass instances created by `object.__new__` with uninitialized slots are refused with
+  `SpecValidationError`. These tests jointly prohibit both incidental caller-error leaks and blanket
+  pipeline normalization.
 - **Effect-ID portability equivalence.** Distinct safe IDs `e1` and `E1` on otherwise independent effects
   refuse even though exact-string uniqueness passes. Exact duplicates still surface before dependency
   resolution.
 - **Linear tree validation.** A path deeper than `sys.getrecursionlimit()` compiles when otherwise
-  valid; a source inspection/assertion confirms phases 12–13 use the iterative component-trie helpers
-  and no longer call the prefix-materializing `ancestors`. The algorithmic proof is the one-split,
-  one-insert, one-walk accounting in §5, not a wall-clock threshold.
+  valid; a standing assertion confirms the compiler and path module have no `ancestors` attribute after
+  the iterative component-trie rewrite. The algorithmic proof is the one-split, one-insert, one-walk
+  accounting in §5, not a wall-clock threshold. The trie code imports the dataclass field factory under
+  a non-colliding name, uses postponed direct `_PathTrieNode` annotations, and passes Ruff and Pyright.
+- **One portability-key API.** Path and effect-ID tests import
+  `portability_equivalence_key`; `path_equivalence_key` is absent rather than retained as an alias.
 - **Stable precedence only.** Multi-violation cases lock phase 1 before interpretation, phase 6 before
   phase 7, phase 8 before surface-map consumers, and phase 10 before phase 11. No test is added solely
   for the other adjacent pairs.
@@ -610,8 +654,9 @@ do not pin error order between independent phases. Beyond per-rule coverage:
   directly rather than through `build_spec`, with ill-typed and unsorted fields, proving `compile_spec`
   is a real boundary and not a checker that trusts its constructor. This is the test that proves the
   error contract of §6. It covers a wrong type at **every** nesting depth — a non-`str` effect path, a
-  non-`PathState` in `pre`, a `bool` mode, a non-`SurfaceEntry` in a surface tuple — each asserted to
-  raise `SpecValidationError` rather than `AttributeError` or `TypeError`.
+  non-`PathState` in `pre`, a `bool` mode, a non-`SurfaceEntry` in a surface tuple — plus missing slots
+  at every model nesting level, each asserted to raise `SpecValidationError` through an explicit phase
+  1 check.
 - **Determinism and idempotence.** Compile twice, require equal compiled values and identical canonical
   bytes; compile a compiled spec, require an equal result.
 - **A1 interoperability.** `from_canonical_bytes(canonical_bytes(compiled.spec)) == compiled.spec`, so

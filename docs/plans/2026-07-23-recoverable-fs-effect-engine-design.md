@@ -323,7 +323,8 @@ A2 is pure and proves only rules decidable from the value:
 - the specification declares at least one effect — a zero-effect transaction is refused rather than
   committed as a no-op;
 - effect IDs are valid, exact-string unique, and pairwise distinct under
-  `NFC(casefold(NFC(effect_id)))`, the portability equivalence used by generated scratch leaves;
+  `portability_equivalence_key(effect_id)`, the portability equivalence used by generated scratch
+  leaves;
 - dependency endpoints and ordering are complete;
 - each effect's shapes are legal for its variant;
 - every `FileState.byte_len` fits SQLite's signed `INTEGER` domain:
@@ -335,8 +336,8 @@ A2 is pure and proves only rules decidable from the value:
 - the effect surface equals the declared transition surface exactly, with no omitted or undeclared path;
 - persistent paths obey the project-relative lexical grammar and cannot occupy the reserved scratch
   grammar;
-- distinct persistent path spellings are refused when their **whole-path** portability keys
-  `NFC(casefold(NFC(path)))` match;
+- distinct persistent path spellings are refused when their **whole-path**
+  `portability_equivalence_key(path)` values match;
 - the lexical initial/final trees are surface-consistent, and every lexically recognized
   transaction-created directory precedes effects beneath it.
 
@@ -347,12 +348,30 @@ free of the NFC/casefold aliases it knows about on both sensitive and insensitiv
 only a filter. A4 may not treat successful A2 compilation as evidence of actual per-directory
 distinctness or topology.
 
+The one shared pure helper is
+`portability_equivalence_key(value: str) -> str`, defined as
+`NFC(casefold(NFC(value)))`. A2 applies it unchanged to whole paths and effect IDs. There is no
+path-specific key alias or compatibility wrapper.
+
 A2's surface-tree and created-directory-order checks must be linear in the total number of characters
 and components across their declared inputs. They build a component trie, or use an equivalent
 single-pass component traversal, and never materialize every prefix string for every path. Traversal is
 iterative so Python's recursion limit does not become an arbitrary lexical path-depth limit. A2 imposes
 no `NAME_MAX`, `PATH_MAX`, component-count, or total-path-length limit; real filesystem limits belong to
 A4.
+
+Every specification invalid under A2's declared phases is refused explicitly with
+`SpecValidationError`. `compile_spec` does not wrap the pipeline in `except Exception`: an unexpected
+internal fault propagates unchanged and is never relabeled as caller error. Phase 1 still handles
+adversarial model shapes deliberately. A diagnostic type name is obtained through `_type_name`, whose
+`try` covers only `type(value).__name__` lookup; exact dataclass instances manufactured with
+`object.__new__` are read with `getattr(obj, field_name, _MISSING)` and a missing field is refused
+explicitly before later phases run.
+
+Diagnostics for caller-supplied integers are size-independent. An unknown `schema_version` reports the
+fixed expected version, an invalid `mode` reports the fixed `0..0o7777` bounds, and an invalid
+`byte_len` reports the fixed signed-64-bit bounds. No out-of-domain caller integer is formatted in
+decimal, octal, hexadecimal, or binary on its refusal path.
 
 #### A4: rooted project approval
 
@@ -1249,15 +1268,23 @@ The A2 suite additionally proves:
 - `compile_spec` is the ordinary construction authority: direct `CompiledSpec(...)` and
   `dataclasses.replace(compiled, ...)` raise `TypeError`, while field assignment raises the exact
   `dataclasses.FrozenInstanceError`;
-- `FileState.byte_len` accepts `2**63 - 1`, rejects `2**63`, and rejects an integer with thousands of
-  digits without interpolating that integer into a diagnostic, under both Python's default
-  `int_max_str_digits` limit and the disabled (`0`) setting; the accepted maximum survives canonical
+- `schema_version`, `mode`, and `FileState.byte_len` each reject an integer with thousands of digits
+  without formatting that integer, under both Python's default `int_max_str_digits` limit and the
+  disabled (`0`) setting; their diagnostics name only the fixed expected version or fixed bounds.
+  `byte_len` accepts `2**63 - 1`, rejects `2**63`, and the accepted maximum survives canonical
   encode/decode;
-- distinct effect IDs that share `NFC(casefold(NFC(id)))` are refused, even though their exact strings
-  differ;
+- distinct effect IDs that share `portability_equivalence_key(id)` are refused, even though their
+  exact strings differ;
 - surface-tree and created-directory-order validation use iterative component tries (or an equivalent
   traversal), visit each input component a constant number of times, and accept a lexically valid path
-  deeper than Python's recursion limit; and
+  deeper than Python's recursion limit; the compiler has no `ancestors` attribute after the rewrite,
+  and the dead `ancestors()` API and its tests are removed rather than retained behind a wrapper;
+- paths and effect IDs use the single `portability_equivalence_key` helper; the old
+  `path_equivalence_key` name is absent rather than retained as an alias;
+- hostile `type(value).__name__` behavior and exact dataclass instances with uninitialized slots are
+  refused by phase 1 with `SpecValidationError`, while a test-injected unexpected internal exception
+  escapes `compile_spec` unchanged, proving that the pipeline has no blanket exception normalization;
+  and
 - tests pin only the load-bearing refusal precedence declared by A2: structural typing before any field
   interpretation, duplicate effect IDs before dependency resolution, duplicate surfaces before map
   construction, and exact coverage before endpoint lookup. The thirteen phase numbers do not promise

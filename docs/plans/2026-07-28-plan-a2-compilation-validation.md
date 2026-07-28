@@ -24,7 +24,8 @@
 - **Tooling:** `ruff` line-length 120; `pyright` `typeCheckingMode = "basic"`; `pytest` `addopts = "-q"`.
 - **Content hashes** are `sha256:<64 lowercase hex>`. **Modes** are permission bits only, `0 .. 0o7777`, never type bits.
 - **A1 is frozen.** Do not modify any existing module under `atoms/core/`. A2 only adds files.
-- **Every refusal is `SpecValidationError`.** No `TypeError`, `KeyError`, `AttributeError`, or assertion may escape `compile_spec` on any input.
+- **Invalid specifications are refused explicitly with `SpecValidationError`.** Unexpected internal
+  exceptions propagate unchanged; `compile_spec` has no blanket exception-normalization wrapper.
 - No AI-attribution trailers on commits/PRs/comments. Docs use `~/d/` (never `/home/keith/` or `/mnt/ssd/`).
 
 ## Phase-to-task map
@@ -2435,8 +2436,9 @@ both rules, asserting which refusal surfaces.
 
 **Status:** Written authority amendment complete; production steps are blocked on owner approval.
 
-This section preserves Tasks 1–6 as history while making the remaining work executable. It supersedes
-four historical claims above:
+Owner review of commit `7b2f71f` approved the staged-proof architecture with the corrections encoded
+below. This section preserves Tasks 1–6 as history while making the remaining work executable. It is
+the sole executable plan and supersedes every conflicting historical claim or snippet above, including:
 
 | Historical claim | Corrected contract |
 | --- | --- |
@@ -2444,10 +2446,13 @@ four historical claims above:
 | `FileState.byte_len >= 0` | `0 <= byte_len <= 2**63 - 1`, refused before any rejected integer is formatted |
 | Phases 12–13 repeatedly call `ancestors(path)` | Both use iterative component tries and are linear in the characters/components they consume |
 | All thirteen phases have stable first-error order | Only the four load-bearing precedence edges in the amended design §5 are stable |
+| Every arbitrary exception is relabeled as `SpecValidationError` | Explicit phase checks refuse invalid specifications; unexpected internal exceptions propagate unchanged |
+| Only huge `byte_len` diagnostics need protection | `schema_version`, `mode`, and `byte_len` all use fixed, size-independent refusal messages |
+| Paths and effect IDs use a path-specific key, with `ancestors()` retained as a utility | Both use `portability_equivalence_key`; `path_equivalence_key` and the dead `ancestors()` API are removed without aliases |
 
-The A2 correction touches only the existing A2 modules and tests. It does not implement A4, add a
-compatibility layer, introduce a `Unified` type, impose a lexical path-length limit, or modify A1 model
-files.
+The A2 correction touches only the existing A2 modules and tests, including `paths.py` and
+`test_paths.py` for the API removals. It does not implement A4, add a compatibility layer, introduce a
+`Unified` type, impose a lexical path-length limit, or modify A1 model files.
 
 ### Stage 1 gate: written authority
 
@@ -2563,21 +2568,294 @@ Run: `uv run pytest tests/test_compiler_structure.py -k "frozen or ordinary_dire
 
 Expected: all selected tests pass.
 
-### Task 8: Bound byte lengths and make effect IDs scratch-distinct
+### Task 8: Make caller refusal explicit and canonicalize bounded diagnostics and keys
 
 **Files:**
 - Modify: `python/src/atoms/core/compiler.py`
+- Modify: `python/src/atoms/core/paths.py`
 - Test: `python/tests/test_compiler_structure.py`
 - Test: `python/tests/test_compiler_paths.py`
+- Test: `python/tests/test_paths.py`
 
-#### 8A — signed-64-bit `byte_len`
+#### 8A — explicit caller/model refusal without pipeline normalization
 
-- [ ] **Step 1: Write failing boundary and diagnostic tests**
+- [ ] **Step 1: Write the failing exception-boundary and missing-slot tests**
 
-Add imports of `sys`, `canonical_bytes`, and `from_canonical_bytes`, then add:
+Add `import atoms.core.compiler as compiler_module`. Replace the hostile-type and uninitialized-slot
+tests with the explicit assertions below, and add the injected-fault test:
+
+```python
+class _InjectedCompilerFault(RuntimeError):
+    pass
+
+
+def test_unexpected_internal_fault_propagates_unchanged(monkeypatch):
+    def fail_internally(spec):
+        raise _InjectedCompilerFault("injected compiler fault")
+
+    monkeypatch.setattr(compiler_module, "_phase2_fingerprints", fail_internally)
+    with pytest.raises(_InjectedCompilerFault, match="injected compiler fault"):
+        compile_spec(valid_spec())
+
+
+def test_hostile_type_name_is_refused_as_invalid_input():
+    with pytest.raises(SpecValidationError, match="TransactionSpec"):
+        compile_spec(_HostileValue())  # type: ignore[arg-type]
+
+
+def test_uninitialized_transaction_spec_names_the_missing_field():
+    with pytest.raises(SpecValidationError) as exc_info:
+        compile_spec(object.__new__(TransactionSpec))
+    assert "spec.schema_version" in str(exc_info.value)
+    assert "missing" in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("spec", "missing_field"),
+    [
+        (valid_spec(initial_surface=(object.__new__(SurfaceEntry),)), "initial_surface[0].path"),
+        (valid_spec(effects=(object.__new__(CreateFileNoClobber),)), "effects[0].effect_id"),
+        (
+            valid_spec(
+                final_surface=(
+                    SurfaceEntry(path="a.txt", state=object.__new__(FileState)),
+                )
+            ),
+            "final_surface[0].state.content_hash",
+        ),
+        (valid_spec(dependencies=(object.__new__(Dependency),)), "dependencies[0].before"),
+    ],
+)
+def test_uninitialized_nested_model_members_name_the_missing_field(spec, missing_field):
+    with pytest.raises(SpecValidationError) as exc_info:
+        compile_spec(spec)
+    assert missing_field in str(exc_info.value)
+    assert "missing" in str(exc_info.value)
+```
+
+- [ ] **Step 2: Run the focused tests and observe red**
+
+Run:
+
+```bash
+uv run pytest tests/test_compiler_structure.py \
+  -k "unexpected_internal_fault or hostile_type_name or uninitialized" -v
+```
+
+Expected before implementation: the injected fault is relabeled as `SpecValidationError`, and the
+uninitialized objects receive only the blanket “structurally invalid” message instead of an explicit
+missing-field refusal.
+
+- [ ] **Step 3: Add narrowly scoped diagnostics and explicit required-field reads**
+
+Add beside `_require`:
+
+```python
+_MISSING = object()
+
+
+def _type_name(value: object) -> str:
+    value_type = type(value)
+    try:
+        return value_type.__name__
+    except Exception:
+        return "<type name unavailable>"
+
+
+def _required_field(obj: object, field_name: str, what: str) -> Any:
+    value = getattr(obj, field_name, _MISSING)
+    _require(value is not _MISSING, f"{what}.{field_name} is missing")
+    return value
+```
+
+The `try` above is permitted only around `value_type.__name__`; do not move `type(value)`, field access,
+or any validation phase into it.
+
+Replace `_require_state_structure` and `_phase1_structure` with:
+
+```python
+def _require_state_structure(state: Any, what: str) -> None:
+    _require(
+        type(state) in _STATE_STR_FIELDS,
+        f"{what} must be one of the four path states, got {_type_name(state)}",
+    )
+    for field_name in _STATE_STR_FIELDS[type(state)]:
+        value = _required_field(state, field_name, what)
+        _require_str(value, f"{what}.{field_name}")
+    for field_name in _STATE_INT_FIELDS[type(state)]:
+        value = _required_field(state, field_name, what)
+        _require_int(value, f"{what}.{field_name}")
+
+
+def _phase1_structure(spec: TransactionSpec) -> None:
+    """Exhaustively type and initialize-check the closed A1 model."""
+    _require(
+        type(spec) is TransactionSpec,
+        f"spec must be a TransactionSpec, got {_type_name(spec)}",
+    )
+
+    schema_version = _require_int(
+        _required_field(spec, "schema_version", "spec"),
+        "schema_version",
+    )
+    _require(
+        schema_version == SCHEMA_VERSION,
+        f"unsupported schema_version; expected {SCHEMA_VERSION}",
+    )
+    consumer_tag = _require_str(
+        _required_field(spec, "consumer_tag", "spec"),
+        "consumer_tag",
+    )
+    require_valid_identifier("consumer_tag", consumer_tag)
+    intent_digest = _require_str(
+        _required_field(spec, "intent_digest", "spec"),
+        "intent_digest",
+    )
+    _require(
+        SHA256_DIGEST.fullmatch(intent_digest) is not None,
+        f"intent_digest {intent_digest!r} must match sha256:<64 lowercase hex>",
+    )
+
+    for label in ("initial_surface", "final_surface"):
+        entries = _require_tuple(_required_field(spec, label, "spec"), label)
+        for index, entry in enumerate(entries):
+            what = f"{label}[{index}]"
+            _require(
+                type(entry) is SurfaceEntry,
+                f"{what} must be a SurfaceEntry, got {_type_name(entry)}",
+            )
+            _require_str(
+                _required_field(entry, "path", what),
+                f"{what}.path",
+            )
+            _require_state_structure(
+                _required_field(entry, "state", what),
+                f"{what}.state",
+            )
+
+    effects = _require_tuple(_required_field(spec, "effects", "spec"), "effects")
+    _require(effects, "spec must declare at least one effect")
+    for index, effect in enumerate(effects):
+        what = f"effects[{index}]"
+        _require(
+            type(effect) in _EFFECT_FIELDS,
+            f"{what} must be one of the five effect variants, got {_type_name(effect)}",
+        )
+        _require_str(
+            _required_field(effect, "effect_id", what),
+            f"{what}.effect_id",
+        )
+        path_fields, state_fields = _EFFECT_FIELDS[type(effect)]
+        for field_name in path_fields:
+            _require_str(
+                _required_field(effect, field_name, what),
+                f"{what}.{field_name}",
+            )
+        for field_name in state_fields:
+            _require_state_structure(
+                _required_field(effect, field_name, what),
+                f"{what}.{field_name}",
+            )
+
+    dependencies = _require_tuple(
+        _required_field(spec, "dependencies", "spec"),
+        "dependencies",
+    )
+    for index, dependency in enumerate(dependencies):
+        what = f"dependencies[{index}]"
+        _require(
+            type(dependency) is Dependency,
+            f"{what} must be a Dependency, got {_type_name(dependency)}",
+        )
+        _require_str(
+            _required_field(dependency, "before", what),
+            f"{what}.before",
+        )
+        _require_str(
+            _required_field(dependency, "after", what),
+            f"{what}.after",
+        )
+```
+
+Replace the two phase-5 diagnostic uses of `type(value).__name__` with `_type_name(value)`. Task 9's
+phase-12 replacement does the same for its ancestor-state diagnostic.
+
+- [ ] **Step 4: Remove the pipeline-wide exception wrapper**
+
+Replace `compile_spec` with the same phase sequence and no catch:
+
+```python
+def compile_spec(spec: TransactionSpec) -> CompiledSpec:
+    """Validate ``spec`` and return A2's frozen filesystem-independent proof."""
+    _phase1_structure(spec)
+    _phase2_fingerprints(spec)
+    _phase3_path_grammar(spec)
+    _phase4_alias_distinctness(spec)
+    _phase5_variant_shapes(spec)
+    _phase6_unique_effect_ids(spec)
+    _phase7_dependencies(spec)
+    _phase8_surface_shape(spec)
+
+    timelines = build_timelines(spec.effects)
+    initial = _surface_map(spec, "initial_surface")
+    final = _surface_map(spec, "final_surface")
+
+    _phase10_coverage(timelines, initial, final)
+    _phase11_endpoints(timelines, initial, final)
+    _phase12_surface_tree(initial, "initial_surface")
+    _phase12_surface_tree(final, "final_surface")
+    _phase13_ancestor_ordering(spec)
+
+    return _new_compiled_spec(spec=_canonicalize(spec), timelines=timelines)
+```
+
+Delete both `except SpecValidationError` and `except Exception` blocks. Do not add another wrapper around
+the whole function or phase sequence.
+
+- [ ] **Step 5: Re-run the focused tests and observe green**
+
+Run:
+
+```bash
+uv run pytest tests/test_compiler_structure.py \
+  -k "unexpected_internal_fault or hostile_type_name or uninitialized" -v
+```
+
+Expected: caller/model defects raise `SpecValidationError`; the injected `_InjectedCompilerFault`
+escapes unchanged.
+
+#### 8B — size-independent `schema_version`, `mode`, and `byte_len` diagnostics
+
+- [ ] **Step 6: Write failing integer-domain tests**
+
+Add imports of `sys`, `CreateDirectory`, `canonical_bytes`, `from_canonical_bytes`, and
+`SCHEMA_VERSION`, then add:
 
 ```python
 MAX_SQLITE_INTEGER = 2**63 - 1
+
+
+@pytest.fixture(params=[sys.int_info.default_max_str_digits, 0])
+def int_digit_limit(request):
+    previous = sys.get_int_max_str_digits()
+    sys.set_int_max_str_digits(request.param)
+    try:
+        yield
+    finally:
+        sys.set_int_max_str_digits(previous)
+
+
+def _huge_integer() -> int:
+    return 10 ** (sys.int_info.default_max_str_digits + 1000)
+
+
+def _spec_with_mode(mode: int):
+    state = DirectoryState(mode=mode)
+    return valid_spec(
+        initial_surface=(SurfaceEntry(path="dir", state=ABSENT),),
+        final_surface=(SurfaceEntry(path="dir", state=state),),
+        effects=(CreateDirectory(effect_id="e1", path="dir", post=state),),
+    )
 
 
 def _spec_with_byte_len(byte_len: int):
@@ -2588,6 +2866,24 @@ def _spec_with_byte_len(byte_len: int):
     )
 
 
+def test_huge_schema_version_has_fixed_diagnostic(int_digit_limit):
+    with pytest.raises(
+        SpecValidationError,
+        match=rf"unsupported schema_version; expected {SCHEMA_VERSION}",
+    ):
+        compile_spec(valid_spec(schema_version=_huge_integer()))
+
+
+def test_huge_mode_has_fixed_diagnostic(int_digit_limit):
+    with pytest.raises(SpecValidationError, match=r"0\.\.0o7777"):
+        compile_spec(_spec_with_mode(_huge_integer()))
+
+
+def test_huge_byte_len_has_fixed_diagnostic(int_digit_limit):
+    with pytest.raises(SpecValidationError, match=r"0\.\.2\*\*63 - 1"):
+        compile_spec(_spec_with_byte_len(_huge_integer()))
+
+
 def test_maximum_sqlite_byte_len_compiles_and_round_trips():
     compiled = compile_spec(_spec_with_byte_len(MAX_SQLITE_INTEGER))
     assert from_canonical_bytes(canonical_bytes(compiled.spec)) == compiled.spec
@@ -2596,28 +2892,21 @@ def test_maximum_sqlite_byte_len_compiles_and_round_trips():
 def test_byte_len_above_sqlite_integer_domain_is_rejected():
     with pytest.raises(SpecValidationError, match=r"0\.\.2\*\*63 - 1"):
         compile_spec(_spec_with_byte_len(MAX_SQLITE_INTEGER + 1))
-
-
-@pytest.mark.parametrize("digit_limit", [sys.int_info.default_max_str_digits, 0])
-def test_huge_byte_len_refuses_without_formatting_it(digit_limit):
-    previous = sys.get_int_max_str_digits()
-    try:
-        sys.set_int_max_str_digits(digit_limit)
-        huge = 10 ** (sys.int_info.default_max_str_digits + 1000)
-        with pytest.raises(SpecValidationError, match=r"0\.\.2\*\*63 - 1"):
-            compile_spec(_spec_with_byte_len(huge))
-    finally:
-        sys.set_int_max_str_digits(previous)
 ```
 
-- [ ] **Step 2: Run red**
+- [ ] **Step 7: Run the integer tests and observe red**
 
-Run: `uv run pytest tests/test_compiler_structure.py -k "sqlite_byte_len or huge_byte_len" -v`
+Run:
 
-Expected: the maximum compiles, while the out-of-range cases fail because the current compiler accepts
-them (or leaks while formatting the huge integer under the default digit limit).
+```bash
+uv run pytest tests/test_compiler_structure.py \
+  -k "huge_schema_version or huge_mode or huge_byte_len or maximum_sqlite or above_sqlite" -v
+```
 
-- [ ] **Step 3: Add the bound before every value-formatting branch**
+Expected before implementation: huge `schema_version` and `mode` leak while formatting the diagnostic;
+the byte-length bound is absent.
+
+- [ ] **Step 8: Use fixed diagnostics before any caller-integer formatting**
 
 Add beside `MAX_MODE`:
 
@@ -2625,28 +2914,67 @@ Add beside `MAX_MODE`:
 MAX_SQLITE_INTEGER = 2**63 - 1
 ```
 
-At the start of the `FileState` branch in `_phase2_fingerprints`, after the hash spelling check and
-before the empty-file cross-check:
+The phase-1 schema check remains exactly:
 
 ```python
 _require(
-    0 <= state.byte_len <= MAX_SQLITE_INTEGER,
-    f"{what}.byte_len must be in 0..2**63 - 1",
+    schema_version == SCHEMA_VERSION,
+    f"unsupported schema_version; expected {SCHEMA_VERSION}",
 )
 ```
 
-Remove the old non-negative check whose message interpolates `state.byte_len`. No refusal path may
-format the rejected integer.
+In `_phase2_fingerprints`, replace the integer-domain checks with:
 
-- [ ] **Step 4: Run green**
+```python
+if isinstance(state, FileState):
+    _require(
+        SHA256_DIGEST.fullmatch(state.content_hash) is not None,
+        f"{what}.content_hash {state.content_hash!r} must match sha256:<64 lowercase hex>",
+    )
+    _require(
+        0 <= state.byte_len <= MAX_SQLITE_INTEGER,
+        f"{what}.byte_len must be in 0..2**63 - 1",
+    )
+    is_empty_hash = state.content_hash == EMPTY_CONTENT_HASH
+    _require(
+        is_empty_hash == (state.byte_len == 0),
+        f"{what} is inconsistent: byte_len 0 requires the empty-content hash and vice versa",
+    )
 
-Run: `uv run pytest tests/test_compiler_structure.py -k "byte_len" -v`
+if isinstance(state, (FileState, DirectoryState, SymlinkState)):
+    _require(
+        0 <= state.mode <= MAX_MODE,
+        f"{what}.mode must be permission bits in 0..0o7777",
+    )
+```
 
-Expected: all byte-length tests pass.
+No refusal path may interpolate or format an out-of-domain `schema_version`, `mode`, or `byte_len` in
+decimal, octal, hexadecimal, or binary.
 
-#### 8B — portability-equivalent effect IDs
+- [ ] **Step 9: Run all structure tests**
 
-- [ ] **Step 5: Write the failing intrinsic-collision test**
+Run: `uv run pytest tests/test_compiler_structure.py -v`
+
+Expected: all structure tests pass, including both digit-limit settings and the accepted signed-64-bit
+round trip.
+
+#### 8C — one portability key for paths and effect IDs
+
+- [ ] **Step 10: Write the renamed-API and intrinsic-collision tests**
+
+In `test_paths.py`, import the module plus the new helper:
+
+```python
+import atoms.core.paths as paths_module
+from atoms.core.paths import portability_equivalence_key, require_rel_path
+```
+
+Rename the equivalence-key tests to call `portability_equivalence_key`, and add:
+
+```python
+def test_old_path_equivalence_key_is_not_exposed():
+    assert not hasattr(paths_module, "path_equivalence_key")
+```
 
 Add to `test_compiler_paths.py`:
 
@@ -2665,13 +2993,31 @@ def test_portability_equivalent_effect_ids_are_rejected():
         )
 ```
 
-- [ ] **Step 6: Run red**
+- [ ] **Step 11: Run the key tests and observe red**
 
-Run: `uv run pytest tests/test_compiler_paths.py -k "portability_equivalent_effect_ids" -v`
+Run:
 
-Expected: FAIL because exact-string uniqueness currently accepts `e1` and `E1`.
+```bash
+uv run pytest tests/test_paths.py tests/test_compiler_paths.py \
+  -k "equivalence_key or portability_equivalent_effect_ids" -v
+```
 
-- [ ] **Step 7: Extend phase 6 without weakening exact-duplicate precedence**
+Expected before implementation: test collection cannot import `portability_equivalence_key`, and exact
+effect-ID uniqueness still accepts `e1` with `E1`.
+
+- [ ] **Step 12: Rename the helper with no alias and use it in phases 4 and 6**
+
+In `paths.py`, replace `path_equivalence_key` with:
+
+```python
+def portability_equivalence_key(value: str) -> str:
+    """Return A2's fixed Unicode portability key for a path or effect ID."""
+    return unicodedata.normalize("NFC", unicodedata.normalize("NFC", value).casefold())
+```
+
+Do not retain `path_equivalence_key` as an alias or wrapper. In `compiler.py`, import
+`portability_equivalence_key` and replace the phase-4 call with
+`portability_equivalence_key(path)`.
 
 Replace `_phase6_unique_effect_ids` with:
 
@@ -2686,7 +3032,7 @@ def _phase6_unique_effect_ids(spec: TransactionSpec) -> None:
         )
         exact_seen.add(effect.effect_id)
 
-        key = path_equivalence_key(effect.effect_id)
+        key = portability_equivalence_key(effect.effect_id)
         previous = first_by_portability_key.setdefault(key, effect.effect_id)
         _require(
             previous == effect.effect_id,
@@ -2695,52 +3041,39 @@ def _phase6_unique_effect_ids(spec: TransactionSpec) -> None:
         )
 ```
 
-Exact duplicates are checked first so the existing phase 6 → phase 7 precedence test retains its
-documented message.
+Exact duplicates stay first so the phase 6 → phase 7 precedence diagnostic remains stable.
+`ancestors` remains temporarily until Task 9 removes its last compiler consumers and deletes the API in
+one green change.
 
-- [ ] **Step 8: Run green**
+- [ ] **Step 13: Run the path and effect-ID suites**
 
-Run: `uv run pytest tests/test_compiler_paths.py -k "effect_id" -v`
+Run: `uv run pytest tests/test_paths.py tests/test_compiler_paths.py -v`
 
-Expected: all effect-ID tests pass.
+Expected: all selected tests pass; `path_equivalence_key` is absent and both path and effect-ID
+equivalence use the shared helper.
 
 ### Task 9: Make phases 12–13 linear
 
 **Files:**
 - Modify: `python/src/atoms/core/compiler.py`
+- Modify: `python/src/atoms/core/paths.py`
 - Test: `python/tests/test_compiler_timelines.py`
+- Test: `python/tests/test_paths.py`
 
 **Complexity contract:** Let `C_surface` be the sum of component counts/characters in one surface and
 `C_effect` the sum across created-directory paths and effect occurrences. Phase 12 is `O(C_surface)`;
 phase 13 is `O(C_effect)` with average-constant dict lookup. Neither recursion nor repeated joined
 prefix strings is allowed.
 
-- [ ] **Step 1: Add a deep-path failing test**
+- [ ] **Step 1: Add standing API-removal and deep-path failing tests**
 
-Add `import sys`, `import atoms.core.compiler as compiler_module`, and:
+Add `import sys`, `import atoms.core.compiler as compiler_module`, and
+`import atoms.core.paths as paths_module`, then add:
 
 ```python
-def test_tree_validation_does_not_materialize_prefix_paths(monkeypatch):
-    def reject_prefix_materialization(path):
-        raise AssertionError(f"materialized prefixes for {path!r}")
-
-    monkeypatch.setattr(
-        compiler_module,
-        "ancestors",
-        reject_prefix_materialization,
-        raising=False,
-    )
-    compile_spec(
-        _spec(
-            {"a": ABSENT, "a/b": ABSENT, "a/b/f": ABSENT},
-            {"a": D, "a/b": D, "a/b/f": F},
-            (
-                CreateDirectory(effect_id="e1", path="a", post=D),
-                CreateDirectory(effect_id="e2", path="a/b", post=D),
-                CreateFileNoClobber(effect_id="e3", path="a/b/f", post=F),
-            ),
-        )
-    )
+def test_prefix_materializing_ancestors_api_is_absent():
+    assert not hasattr(compiler_module, "ancestors")
+    assert not hasattr(paths_module, "ancestors")
 
 
 def test_tree_validation_has_no_python_recursion_depth_limit():
@@ -2755,20 +3088,28 @@ def test_tree_validation_has_no_python_recursion_depth_limit():
     )
 ```
 
-The first test is red against the current compiler because both phases call `ancestors`; after the
-refactor the injected name is unused. The second protects the iterative requirement. The linearity
-proof comes from the component accounting and implementation inspection below, not a flaky wall-clock
-threshold.
+The first test is red while either the compiler import or the dead path helper remains. Unlike the old
+`monkeypatch(..., raising=False)` case, it is a permanent assertion about the post-refactor module
+surface. The second test protects the iterative requirement. The linearity proof comes from the
+component accounting and implementation inspection below, not a flaky wall-clock threshold.
 
-- [ ] **Step 2: Add trie helpers and remove prefix materialization**
+- [ ] **Step 2: Add lint-clean trie helpers and remove the dead API**
 
-Change the import to `from dataclasses import dataclass, field`, remove `ancestors` from the
-`atoms.core.paths` import, and add:
+Change the compiler import to:
+
+```python
+from dataclasses import dataclass, field as dataclass_field
+```
+
+Remove `ancestors` from the compiler's `atoms.core.paths` import. In `paths.py`, delete the
+`ancestors()` function completely; in `test_paths.py`, delete
+`test_ancestors_are_proper_and_outermost_first` and keep no compatibility test for its old behavior.
+Then add:
 
 ```python
 @dataclass(slots=True)
 class _PathTrieNode:
-    children: dict[str, "_PathTrieNode"] = field(default_factory=dict)
+    children: dict[str, _PathTrieNode] = dataclass_field(default_factory=dict)
     surface: tuple[str, PathState] | None = None
     creator: tuple[str, int] | None = None
 
@@ -2804,7 +3145,7 @@ def _phase12_surface_tree(surface: dict[str, PathState], label: str) -> None:
                 _require(
                     isinstance(state, AbsentState),
                     f"{label} declares {path!r} beneath {ancestor_path!r}, which is "
-                    f"{type(ancestor_state).__name__} and so cannot contain entries; "
+                    f"{_type_name(ancestor_state)} and so cannot contain entries; "
                     f"{path!r} must be declared absent",
                 )
             next_constraint = None if isinstance(state, DirectoryState) else (path, state)
@@ -2844,23 +3185,44 @@ def _phase13_ancestor_ordering(spec: TransactionSpec) -> None:
                 )
 ```
 
-- [ ] **Step 3: Run the focused tree suite**
+- [ ] **Step 3: Run the focused tree and path suites**
 
-Run: `uv run pytest tests/test_compiler_timelines.py -k "tree or ancestor or directory_creation or nested_creation or ordering" -v`
+Run:
 
-Expected: all selected tests pass, including the path deeper than the recursion limit.
+```bash
+uv run pytest tests/test_compiler_timelines.py tests/test_paths.py \
+  -k "tree or ancestor or directory_creation or nested_creation or ordering or equivalence_key" -v
+```
+
+Expected: all selected tests pass, including the standing attribute-absence assertion and the path
+deeper than the recursion limit.
 
 - [ ] **Step 4: Inspect the complexity construction**
 
 Run:
 
 ```bash
-rg -n "ancestors|join\\(" src/atoms/core/compiler.py
+rg -n "ancestors|path_equivalence_key|join\\(" src/atoms/core
 ```
 
-Expected: no matches. Inspect `_insert_path`, `_phase12_surface_tree`, and
+Expected: no matches. This proves the dead helper and old key name are absent from production source,
+not hidden behind aliases. Inspect `_insert_path`, `_phase12_surface_tree`, and
 `_phase13_ancestor_ordering`: each loop advances by one input component and no loop rebuilds a prefix.
 Do not replace this inspection with a timing assertion, and do not add a lexical length limit.
+
+- [ ] **Step 5: Verify the trie boundary is lint- and type-clean**
+
+Run from `python/`:
+
+```bash
+uv run ruff check src/atoms/core/compiler.py src/atoms/core/paths.py \
+  tests/test_compiler_timelines.py tests/test_paths.py
+uv run pyright
+```
+
+Expected: zero Ruff diagnostics and zero Pyright errors. The field factory remains imported as
+`dataclass_field`, the existing `for field in ...` loops cannot collide with it, and the
+postponed trie annotation is `dict[str, _PathTrieNode]` without quotes.
 
 ### Task 10: Lock only load-bearing precedence and refresh boundary wording
 
@@ -2917,8 +3279,9 @@ Expected: all selected tests pass.
 - [ ] **Step 4: Correct source and status wording after all production tests are green**
 
 In `compiler.py`, state that `CompiledSpec` proves A2 rules, A4 produces `ProjectApprovedSpec`, and only
-the four named precedence edges are stable. Remove every claim that A3–A8 may trust raw
-`CompiledSpec`.
+the four named precedence edges are stable. State that invalid specifications are refused through
+explicit `SpecValidationError` checks while unexpected internal faults propagate unchanged. Remove
+every claim that A3–A8 may trust raw `CompiledSpec` or that every arbitrary exception is normalized.
 
 Update status text as follows:
 
@@ -2939,7 +3302,7 @@ Run from `python/`:
 
 ```bash
 uv run pytest tests/test_compiler_structure.py tests/test_compiler_paths.py \
-  tests/test_compiler_timelines.py tests/test_compiler_properties.py -v
+  tests/test_compiler_timelines.py tests/test_compiler_properties.py tests/test_paths.py -v
 ```
 
 Expected: all selected tests pass.
@@ -2961,21 +3324,22 @@ claiming completion.
 git status --short
 git diff --check
 git diff --stat
-git diff -- python/src/atoms/core/compiler.py python/tests \
+git diff -- python/src/atoms/core/compiler.py python/src/atoms/core/paths.py python/tests \
   README.md AGENTS.md docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md \
   docs/plans/2026-07-28-a2-compilation-validation-design.md
 ```
 
-Expected: only the A2 compiler/tests and named status documents change; no A1 model file, A4
-implementation, compatibility layer, or unrelated refactor appears.
+Expected: only the A2 compiler/path helper, their tests, and named status documents change; no A1 model
+file, A4 implementation, compatibility layer, or unrelated refactor appears.
 
 - [ ] **Step 4: Commit the production correction separately**
 
 ```bash
-git add python/src/atoms/core/compiler.py \
+git add python/src/atoms/core/compiler.py python/src/atoms/core/paths.py \
   python/tests/test_compiler_structure.py \
   python/tests/test_compiler_paths.py \
   python/tests/test_compiler_timelines.py \
+  python/tests/test_paths.py \
   README.md AGENTS.md \
   docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md \
   docs/plans/2026-07-28-a2-compilation-validation-design.md
