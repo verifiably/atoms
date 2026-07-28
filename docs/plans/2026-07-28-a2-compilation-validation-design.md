@@ -31,6 +31,9 @@ library.
 - exact per-variant shape validation;
 - safe identifiers and the project-relative path grammar;
 - reserved `.#~` scratch-name rejection, under case- and NFC/NFD-equivalence semantics;
+- lexical distinctness of declared paths under Unicode caseless matching, so two spellings of one entry
+  cannot compile as two timelines;
+- UTF-8 encodability of every string that reaches the durable canonical form;
 - fingerprint well-formedness (hash spelling, byte lengths, permission-only modes);
 - continuous repeated-path timelines (§5.3);
 - initial/final surface agreement and exact effect-surface coverage;
@@ -39,6 +42,12 @@ library.
 **Deferred to A4, unchanged:**
 
 - root and metadata-directory identity, compared by `st_dev`/`st_ino` rather than spelling (§5.4);
+- **filesystem-aware path aliasing** — whether two declared paths that A2's lexical key treats as
+  distinct nonetheless name one entry on this volume, compared by `st_dev`/`st_ino`. A2 refuses the
+  lexically detectable cases (phase 4); A4 owes the volume-specific remainder, and the residual it
+  cannot reach — two paths both declared `ABSENT`, which have no inodes to compare — is contained by the
+  fail-closed `O_EXCL` / no-clobber guard at mutation time, exactly as §5.1 argues for scratch
+  collisions;
 - ancestor symlink and mount traversal (`anchored_traversal`, §6);
 - platform capability availability and the per-mount probe (§5.5);
 - durability-allowlist membership;
@@ -82,7 +91,7 @@ effect)`. A1's `occurrences()` already returns a variant's occurrences in a fixe
 
 ## 4. Module layout
 
-Three modules under `python/src/atoms/core/`, rather than one, because twelve rules in a single file is
+Three modules under `python/src/atoms/core/`, rather than one, because thirteen rules in a single file is
 more than one unit's worth of responsibility:
 
 | Module | Holds | Consumes |
@@ -99,24 +108,50 @@ Compilation proceeds in fail-early phases. **The phase order is part of the cont
 which violation surfaces first when a specification breaks several rules at once, which is what makes
 error assertions in the test suite stable.
 
-Two ordering constraints are forced rather than chosen. Duplicate effect IDs (phase 5) must be rejected
-before dependency endpoints are resolved (phase 6), or an ID would not identify one effect. Exact
-coverage (phase 9) must be proven before timeline endpoints are compared against the surfaces (phase 10),
-or the endpoint comparison could look up a path that no surface declares.
+Three ordering constraints are forced rather than chosen. Every field must be type-checked (phase 1)
+before any later phase interprets one, or a wrong-typed field would raise the exceptions §6 forbids.
+Duplicate effect IDs (phase 6) must be rejected before dependency endpoints are resolved (phase 7), or an
+ID would not identify one effect. Exact coverage (phase 10) must be proven before timeline endpoints are
+compared against the surfaces (phase 11), or the endpoint comparison could look up a path that no surface
+declares.
 
-### Phase 1 — Structure and header
+### Phase 1 — Exhaustive structural typing
 
-Exact runtime types on every container and scalar. `bool` is refused wherever an integer is required,
+Every value reachable from the specification is checked against its declared type, **recursively and
+exhaustively, before any later phase reads it**. `bool` is refused wherever an integer is required,
 mirroring A1's decoder, since `bool` subclasses `int`.
+
+Top level:
 
 - `spec` is a `TransactionSpec`.
 - `schema_version` is an integer equal to `SCHEMA_VERSION`.
 - `consumer_tag` satisfies A1's safe-identifier grammar (`require_valid_identifier`).
 - `intent_digest` matches `^sha256:[0-9a-f]{64}$`.
-- `initial_surface` and `final_surface` are tuples of `SurfaceEntry`, each with a `str` path and a state
-  that is one of the four `PathState` classes.
+- `initial_surface` and `final_surface` are tuples of `SurfaceEntry`.
 - `effects` is a tuple whose every member is one of the five effect variants.
-- `dependencies` is a tuple of `Dependency`, each with `str` endpoints.
+- `dependencies` is a tuple of `Dependency`.
+
+Nested, for every element of those tuples:
+
+- `SurfaceEntry.path` is a `str`; `SurfaceEntry.state` is an instance of one of the four `PathState`
+  classes.
+- `Dependency.before` and `.after` are `str`.
+- Each effect's `effect_id` is a `str`, and each of its path-valued fields (`path`, or `source` and
+  `destination` for `MoveNoClobber`) is a `str`.
+- Each effect's state-valued fields (`pre`, `post`, `source_pre`) hold an instance of one of the four
+  `PathState` classes. **Which** subclass each field may legally hold is phase 5's question, not this
+  one; phase 1 establishes only that the value is a path state at all.
+- Within every `PathState` encountered: `content_hash` and `target` are `str`; `mode` and `byte_len` are
+  integers and not `bool`.
+
+This phase is exhaustive by construction rather than by inspection: `TransactionSpec` and its members are
+plain frozen dataclasses that perform no runtime type checking, so a caller who bypasses `build_spec` can
+place any object in any field. Making phase 1 total is what lets phases 2 onward read `effect.path` or
+`state.mode` directly, with no defensive checks and no risk of the `AttributeError` or `TypeError` that
+§6 prohibits.
+
+The split between phase 1 and phase 5 is deliberate: phase 1 asks "is this a well-typed value at all",
+phase 5 asks "is this variant's choice of state legal".
 
 ### Phase 2 — Fingerprints
 
@@ -127,9 +162,10 @@ Applied to every `PathState` reachable from the surfaces and from the effects.
 - Every `mode` (`FileState`, `DirectoryState`, `SymlinkState`) is an integer in `0 .. 0o7777`.
   Permission bits only, never type bits. The range admits setuid, setgid, and sticky, because a setgid
   directory is a legitimate declared postcondition.
-- `SymlinkState.target` is a non-empty string containing no NUL. It is **not** subject to the
-  project-relative path grammar of phase 3: a symlink target may legitimately be absolute or contain
-  `..`, and the engine treats it as opaque bytes it fingerprints rather than a path it resolves (§6).
+- `SymlinkState.target` is non-empty, contains no NUL, and is encodable as UTF-8. It is **not** subject
+  to the project-relative path grammar of phase 3: a symlink target may legitimately be absolute or
+  contain `..`, and the engine treats it as opaque bytes it fingerprints rather than a path it resolves
+  (§6).
 - Empty-file cross-check: `byte_len == 0` if and only if `content_hash` is the SHA-256 of the empty
   string (`sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`).
 
@@ -142,11 +178,21 @@ Applied to every effect path (`ReplaceFile.path`, `CreateFileNoClobber.path`, `D
 A path is valid when it is:
 
 - non-empty and free of NUL;
+- **encodable as UTF-8**;
 - without a leading `/` (project-relative, never absolute);
 - without a trailing `/`;
 - free of empty components — `a//b` is refused;
 - free of any `.` or `..` component;
 - free of any component for which `aliases_scratch_sigil` is true.
+
+**UTF-8 encodability is a durability requirement, not a stylistic one.** A Python `str` may hold unpaired
+surrogates — from `surrogateescape` decoding of an undecodable OS pathname, or from a JSON document
+containing a lone `\ud800`. Such a string survives every other rule here, but A1's `canonical_bytes`
+raises `UnicodeEncodeError` on it, so a specification that compiled successfully could not be durably
+serialized. That would break both the totality claim of §6 and the canonical-output guarantee of §7.
+Verified against the shipped A1 encoder: a path or symlink target containing `\ud800` raises
+`UnicodeEncodeError: 'utf-8' codec can't encode character '\ud800'`. Compilation must refuse it with
+`SpecValidationError` instead.
 
 The scratch check applies to **every** component, not only the leaf, and uses the equivalence-aware
 predicate rather than the plain prefix test. §5.1 requires the case- and NFC/NFD-normalization semantics,
@@ -155,7 +201,43 @@ and §13.3 makes that an explicit conformance obligation. Checking every compone
 scratch directory in a live parent (§9.5 stages directory creation in `work/`), so such a component is
 foreign debris and refusing to operate beneath it is the conservative reading.
 
-### Phase 4 — Effect ID and exact variant shape
+### Phase 4 — Path alias distinctness
+
+Across the union of all declared paths — every effect path and every `SurfaceEntry.path` — no two
+*distinct spellings* may share a name-equivalence key. The key is Unicode caseless matching applied to
+the whole path:
+
+```
+key(p) = NFC( casefold( NFC(p) ) )
+```
+
+Two declared paths that are byte-identical are of course one path; two that differ but share a key —
+`docs/a.md` and `docs/A.md`, or an NFC and an NFD spelling of `café.txt` — are refused.
+
+**Why this is A2's problem.** Without it, a specification declaring effects on both `a` and `A` compiles
+as two independent timelines. On a case-insensitive or normalization-insensitive volume — the macOS
+default — those timelines address one directory entry, so each one's preconditions and its recovery
+frontier are computed against a state the other effect is concurrently changing. Every downstream
+guarantee is derived per-timeline, so this corrupts the model itself, not merely the outcome.
+
+**Why refuse rather than resolve.** Whether two spellings actually alias is a property of the volume, so
+A2 cannot decide it. Refusing the whole equivalence class is the conservative direction: it costs only
+specifications that declare two case- or normalization-variant spellings of one path in a single
+transaction, which has no legitimate use even on a case-sensitive volume, and it buys a portability
+property worth having — **a specification that compiles is safe to execute on either kind of volume.**
+Resolving instead of refusing would mean silently merging two declared timelines, which is precisely the
+silent fallback this codebase forbids.
+
+**What remains A4's.** The key above is a fixed approximation of one volume's folding. A filesystem may
+alias two paths this key treats as distinct (a locale-sensitive fold, or HFS+'s particular normalization),
+so A4 still owes a filesystem-aware identity check by `st_dev`/`st_ino` over the resolved paths. That
+check has a hole A4 cannot close by itself: two paths both declared `ABSENT` have no inodes to compare.
+The residual is contained rather than unhandled — the authoritative guard is the same one §5.1 relies on
+for scratch collisions, namely that the `O_EXCL` creation or no-clobber transfer fails closed at mutation
+time, so a second create against an entry the first already made refuses instead of clobbering. A2's
+lexical rule shrinks that residual to aliases no reasonable consumer produces.
+
+### Phase 5 — Effect ID and exact variant shape
 
 - `effect_id` satisfies `require_valid_identifier`, the same predicate A1's `scratch_leaf` applies before
   interpolating an ID into a pathname component.
@@ -171,70 +253,85 @@ builder, which would otherwise have to invent an order between two occurrences i
 A `ReplaceFile` whose `pre` equals its `post` is well-formed and permitted; it keeps the timeline
 continuous and A2 adds no rule the design does not call for.
 
-### Phase 5 — Duplicate effect IDs
+### Phase 6 — Duplicate effect IDs
 
 No effect ID appears twice.
 
-### Phase 6 — Dependencies
+### Phase 7 — Dependencies
 
 - `before` and `after` each name a declared effect ID.
 - `before != after` — no self-edge.
 - No `(before, after)` pair appears twice.
 - `before` precedes `after` in the authoritative effect order.
 
-### Phase 7 — Surface well-formedness
+### Phase 8 — Surface well-formedness
 
 Within each surface independently, no path appears twice. Duplicates are **rejected**, never silently
 deduplicated: two entries for one path with conflicting states are a consumer error, and collapsing them
 would be exactly the silent fallback this codebase forbids.
 
-### Phase 8 — Timelines
+### Phase 9 — Timelines
 
 Occurrences are grouped by path in the authoritative order. For each path, every consecutive pair must
 satisfy `occurrence[i].post == occurrence[i + 1].pre` — the continuity requirement of §5.3. Equality is
 structural, over A1's frozen state dataclasses.
 
 A path touched by exactly one effect forms a one-occurrence timeline, which is trivially continuous and
-still subject to phase 10.
+still subject to phase 11.
 
-### Phase 9 — Exact coverage
+### Phase 10 — Exact coverage
 
 The set of paths appearing in any effect occurrence, the set of `initial_surface` paths, and the set of
 `final_surface` paths are all equal. This is §5.4's "the effect surface equals the declared transition
 surface exactly; no persistent path is omitted or undeclared".
 
-### Phase 10 — Timeline endpoints
+### Phase 11 — Timeline endpoints
 
 For every timeline: its first occurrence's `pre` equals the declared `initial_surface` state for that
 path, and its last occurrence's `post` equals the declared `final_surface` state.
 
-### Phase 11 — Surface tree consistency
+### Phase 12 — Surface tree consistency
 
 Applied to the initial and final surfaces independently. For declared paths `p` and `q` where `q` is
 strictly beneath `p` (that is, `q` starts with `p + "/"`):
 
-- if `p` is `ABSENT`, then `q` must be `ABSENT` — nothing can exist beneath a directory that does not;
-- if `p` is a `FILE` or a `SYMLINK`, the specification is refused outright — nothing can exist beneath a
-  non-directory;
-- if `p` is a `DIRECTORY`, `q` is unconstrained.
+- if `p` is a `DIRECTORY`, `q` is unconstrained;
+- otherwise — `p` is `ABSENT`, a `FILE`, or a `SYMLINK` — `q` must be `ABSENT`, because nothing can exist
+  beneath a path that is not a directory.
 
 This is a property of the two declared surfaces alone and makes no reference to effects. It catches
 contradictory specifications that the per-effect rules accept — for instance `CreateDirectory("a/b")`
 together with `DeletePath("a/b/c", pre=FileState(...))`, where `a/b` is declared absent initially and so
 `a/b/c` cannot be a file.
 
+**A non-directory ancestor constrains its descendants; it does not forbid them.** An earlier draft of
+this rule refused any declared descendant beneath a declared file or symlink outright, which wrongly
+rejected a structurally valid transition — an ancestor whose *type changes* during the transaction:
+
+```
+DeletePath("p", pre=FileState(...))          # p: FILE      -> ABSENT
+CreateDirectory("p", post=DirectoryState(…)) # p: ABSENT    -> DIRECTORY
+CreateFileNoClobber("p/q", post=FileState(…))# p/q: ABSENT  -> FILE
+```
+
+Both timelines are continuous, and the surfaces `{p: FILE, p/q: ABSENT}` → `{p: DIRECTORY, p/q: FILE}`
+are consistent: `p/q` is absent initially precisely *because* `p` is a file then. Ancestor type change is
+expressible in the closed effect set of §5.2 and is not a case the design excludes, so A2 must not
+exclude it either. The single clause above admits it while still refusing the contradiction, and phase 13
+supplies the ordering that makes it executable.
+
 The rule constrains only pairs where **both** paths are declared in that surface. An ancestor the
 specification never mentions carries no constraint here: whether it exists and is a directory is a live
 filesystem question, and answering it is A4's guarded traversal, not A2's.
 
-### Phase 12 — Created-directory ancestor ordering
+### Phase 13 — Created-directory ancestor ordering
 
 For every `CreateDirectory` effect with path `P`, every effect with an occurrence on a path strictly
 beneath `P` must appear later in the authoritative effect order. Outer creation precedes every affected
 descendant, as §6 and §9.5 require, so that each descendant executes relative to a parent descriptor the
 engine itself created and verified.
 
-This stays separate from phase 11: phase 11 constrains the declared *states*, phase 12 constrains the
+This stays separate from phase 12: phase 12 constrains the declared *states*, phase 13 constrains the
 effect *sequence*, and neither implies the other.
 
 ## 6. Error contract
@@ -242,6 +339,15 @@ effect *sequence*, and neither implies the other.
 Every malformed specification raises `SpecValidationError` — A1's existing exception, unchanged. No
 `TypeError`, `KeyError`, `AttributeError`, or assertion escapes `compile_spec` on any input, including a
 `TransactionSpec` constructed directly with ill-typed fields rather than through `build_spec`.
+
+Totality is load-bearing in two directions, and phases 1 and 3 are what secure it:
+
+- **Nothing leaks out of `compile_spec`.** Phase 1's exhaustive typing is what makes this true; without
+  it, a `path` field holding an `int` would reach phase 3 and raise `AttributeError` from `startswith`.
+- **Nothing that compiles can fail downstream.** A `CompiledSpec` must be durably serializable, so phase
+  3's UTF-8 rule closes the case where compilation succeeds but `canonical_bytes` then raises
+  `UnicodeEncodeError`. "Compilation succeeded" has to mean the specification is usable, not merely
+  well-shaped.
 
 The exception carries a formatted message naming the violated rule and, where applicable, the offending
 effect ID and path. It gains **no** structured attributes. A1's decoder already establishes
@@ -260,7 +366,7 @@ cross-check. The bullet is reassigned, not dropped.
 
 **The effects sequence is authoritative; dependencies are a redundancy assertion.** §5.1 provides
 dependencies "where sequence alone is insufficient", but A2 requires every dependency edge to agree with
-the effect sequence (phase 6), so in a compiled spec they carry no scheduling information. They are a
+the effect sequence (phase 7), so in a compiled spec they carry no scheduling information. They are a
 consumer-declared assertion that A2 checks. A7's executor follows the sequence and does not consult
 `dependencies` for ordering.
 
@@ -279,10 +385,24 @@ documented phase order is actually pinned. Beyond per-rule coverage:
   continuity can fail.
 - **All five variants.** One specification exercising `ReplaceFile`, `CreateFileNoClobber`, `DeletePath`
   (file and symlink preconditions), `MoveNoClobber`, and `CreateDirectory` together.
+- **Ancestor type change.** The `DeletePath("p")` → `CreateDirectory("p")` → `CreateFileNoClobber("p/q")`
+  sequence of phase 12 compiles. The contradiction it must stay distinguished from — `p` declared `FILE`
+  initially *and* `p/q` declared `FILE` initially — is refused. The reverse direction (a directory
+  becoming a file) is not expressible in the closed effect set of §5.2, since `DeletePath` does not
+  accept directories, so it is not a case A2 can reach.
+- **Path alias distinctness.** A specification declaring both `docs/a.md` and `docs/A.md`, and one
+  declaring NFC and NFD spellings of `café.txt`, are each refused; the byte-identical single-spelling
+  case compiles.
+- **UTF-8 encodability.** A path and a symlink target each containing an unpaired surrogate are refused
+  with `SpecValidationError`. Paired with a regression test asserting that **every** specification
+  `compile_spec` accepts can be passed to `canonical_bytes` without raising — the property the rule
+  exists to protect.
 - **Directly-constructed malformed dataclasses.** Specifications built by calling `TransactionSpec(...)`
   directly rather than through `build_spec`, with ill-typed and unsorted fields, proving `compile_spec`
   is a real boundary and not a checker that trusts its constructor. This is the test that proves the
-  error contract of §6.
+  error contract of §6. It covers a wrong type at **every** nesting depth — a non-`str` effect path, a
+  non-`PathState` in `pre`, a `bool` mode, a non-`SurfaceEntry` in a surface tuple — each asserted to
+  raise `SpecValidationError` rather than `AttributeError` or `TypeError`.
 - **Determinism and idempotence.** Compile twice, require equal compiled values and identical canonical
   bytes; compile a compiled spec, require an equal result.
 - **A1 interoperability.** `from_canonical_bytes(canonical_bytes(compiled.spec)) == compiled.spec`, so
@@ -293,5 +413,25 @@ documented phase order is actually pinned. Beyond per-rule coverage:
 
 ## 9. Open items
 
-None. The two decisions design §14 defers — the durability-allowlist configuration tuples and the SQLite
-I/O layer — belong to A4 and A5 respectively and are untouched here.
+**Is a zero-effect transaction valid?** A specification with no effects and empty surfaces satisfies
+every phase above vacuously: coverage compares three empty sets, and there are no timelines to check. A2
+would compile it, and the engine would take the project lock, write a durable record, and commit having
+mutated nothing.
+
+Design §13.3's "reject missing effects" does **not** settle this. In context that phrase sits in a list of
+coverage-divergence cases — "missing effects, extra effects, invalid ordering, malformed timelines,
+payload/mode mismatches, path escapes, and initial/final surface divergence" — where "missing" and "extra"
+are the two directions of a declared surface not matching the effect surface. That is phase 10, and phase
+10 already implements it. Nothing in the authority design speaks to a transaction that declares nothing at
+all.
+
+So this is a genuine gap in the authority design rather than an A2 omission, and it needs a line there
+either way. Pending that decision, A2 does not yet fix a rule. The two options:
+
+- **Reject** an empty effect sequence in phase 1, consistent with fail-early and with not running the
+  durable machinery for a guaranteed no-op. A consumer that computes an empty change set handles that
+  case itself rather than paying for a transaction.
+- **Accept** it as a well-formed no-op, which is trivially safe and spares consumers a special case.
+
+The remaining two decisions design §14 defers — the durability-allowlist configuration tuples and the
+SQLite I/O layer — belong to A4 and A5 respectively and are untouched here.
