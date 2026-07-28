@@ -2658,7 +2658,7 @@ def _type_name(value: object) -> str:
     value_type = type(value)
     try:
         return value_type.__name__
-    except Exception:
+    except Exception:  # noqa: BLE001 - contain hostile metaclass behavior at name lookup
         return "<type name unavailable>"
 
 
@@ -2962,10 +2962,13 @@ round trip.
 
 - [ ] **Step 10: Write the renamed-API and intrinsic-collision tests**
 
-In `test_paths.py`, import the module plus the new helper:
+In `test_paths.py`, place the plain module import in the first-party import block before every
+`from atoms...` import, then import the new helper:
 
 ```python
 import atoms.core.paths as paths_module
+
+from atoms.core.errors import SpecValidationError
 from atoms.core.paths import portability_equivalence_key, require_rel_path
 ```
 
@@ -3067,8 +3070,15 @@ prefix strings is allowed.
 
 - [ ] **Step 1: Add standing API-removal and deep-path failing tests**
 
-Add `import sys`, `import atoms.core.compiler as compiler_module`, and
-`import atoms.core.paths as paths_module`, then add:
+Add `import sys`. In the first-party import block, place the two plain module imports before every
+`from atoms...` import:
+
+```python
+import atoms.core.compiler as compiler_module
+import atoms.core.paths as paths_module
+```
+
+Then add:
 
 ```python
 def test_prefix_materializing_ancestors_api_is_absent():
@@ -3095,10 +3105,11 @@ component accounting and implementation inspection below, not a flaky wall-clock
 
 - [ ] **Step 2: Add lint-clean trie helpers and remove the dead API**
 
-Change the compiler import to:
+Change the compiler imports to the two-line form required by Ruff's configured isort behavior:
 
 ```python
-from dataclasses import dataclass, field as dataclass_field
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 ```
 
 Remove `ancestors` from the compiler's `atoms.core.paths` import. In `paths.py`, delete the
