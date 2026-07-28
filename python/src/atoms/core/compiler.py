@@ -20,6 +20,7 @@ from atoms.core.effects import (
     DeletePath,
     MoveNoClobber,
     ReplaceFile,
+    occurrences,
 )
 from atoms.core.errors import SpecValidationError
 from atoms.core.fingerprint import (
@@ -30,7 +31,7 @@ from atoms.core.fingerprint import (
     SymlinkState,
 )
 from atoms.core.identifiers import require_valid_identifier
-from atoms.core.paths import path_equivalence_key, require_rel_path
+from atoms.core.paths import ancestors, path_equivalence_key, require_rel_path
 from atoms.core.spec import SCHEMA_VERSION, Dependency, SurfaceEntry, TransactionSpec
 from atoms.core.timeline import PathTimeline, build_timelines
 
@@ -304,6 +305,83 @@ def _phase8_surface_shape(spec: TransactionSpec) -> None:
             seen.add(entry.path)
 
 
+def _surface_map(spec: TransactionSpec, label: str) -> dict[str, PathState]:
+    return {entry.path: entry.state for entry in getattr(spec, label)}
+
+
+def _phase10_coverage(
+    timelines: tuple[PathTimeline, ...],
+    initial: dict[str, PathState],
+    final: dict[str, PathState],
+) -> None:
+    effect_paths = {timeline.path for timeline in timelines}
+    for label, declared in (("initial_surface", initial), ("final_surface", final)):
+        undeclared = sorted(effect_paths - set(declared))
+        _require(
+            not undeclared,
+            f"{label} omits {len(undeclared)} path(s) that an effect mutates: {undeclared}",
+        )
+        untouched = sorted(set(declared) - effect_paths)
+        _require(
+            not untouched,
+            f"{label} declares {len(untouched)} path(s) that no effect mutates: {untouched}",
+        )
+
+
+def _phase11_endpoints(
+    timelines: tuple[PathTimeline, ...],
+    initial: dict[str, PathState],
+    final: dict[str, PathState],
+) -> None:
+    for timeline in timelines:
+        first = timeline.occurrences[0]
+        last = timeline.occurrences[-1]
+        _require(
+            first.pre == initial[timeline.path],
+            f"path {timeline.path!r} declares an initial state of {initial[timeline.path]!r} "
+            f"but effect {first.effect_id!r} expects {first.pre!r}",
+        )
+        _require(
+            last.post == final[timeline.path],
+            f"path {timeline.path!r} declares a final state of {final[timeline.path]!r} "
+            f"but effect {last.effect_id!r} leaves it {last.post!r}",
+        )
+
+
+def _phase12_surface_tree(surface: dict[str, PathState], label: str) -> None:
+    for path in sorted(surface):
+        for ancestor in ancestors(path):
+            ancestor_state = surface.get(ancestor)
+            if ancestor_state is None or isinstance(ancestor_state, DirectoryState):
+                continue
+            _require(
+                isinstance(surface[path], AbsentState),
+                f"{label} declares {path!r} beneath {ancestor!r}, which is "
+                f"{type(ancestor_state).__name__} and so cannot contain entries; "
+                f"{path!r} must be declared absent",
+            )
+
+
+def _phase13_ancestor_ordering(spec: TransactionSpec) -> None:
+    created = {
+        effect.path: index
+        for index, effect in enumerate(spec.effects)
+        if isinstance(effect, CreateDirectory)
+    }
+    if not created:
+        return
+    for index, effect in enumerate(spec.effects):
+        for occurrence in occurrences(effect):
+            for ancestor in ancestors(occurrence.path):
+                creator = created.get(ancestor)
+                _require(
+                    creator is None or creator < index,
+                    f"effect {effect.effect_id!r} touches {occurrence.path!r} beneath {ancestor!r}, "
+                    f"which this transaction creates later; outer directory creation must come before "
+                    f"every affected descendant",
+                )
+
+
 def _canonicalize(spec: TransactionSpec) -> TransactionSpec:
     """Sort the set-like fields. Effect order is authoritative and never changed."""
     return TransactionSpec(
@@ -332,7 +410,18 @@ def compile_spec(spec: TransactionSpec) -> CompiledSpec:
         _phase6_unique_effect_ids(spec)
         _phase7_dependencies(spec)
         _phase8_surface_shape(spec)
+
         timelines = build_timelines(spec.effects)
+
+        initial = _surface_map(spec, "initial_surface")
+        final = _surface_map(spec, "final_surface")
+
+        _phase10_coverage(timelines, initial, final)
+        _phase11_endpoints(timelines, initial, final)
+        _phase12_surface_tree(initial, "initial_surface")
+        _phase12_surface_tree(final, "final_surface")
+        _phase13_ancestor_ordering(spec)
+
         return CompiledSpec(spec=_canonicalize(spec), timelines=timelines)
     except SpecValidationError:
         raise
