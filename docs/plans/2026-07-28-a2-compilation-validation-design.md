@@ -1,7 +1,7 @@
 # A2 — Filesystem-independent compilation validation and repeated-path timelines
 
 **Date:** 2026-07-28
-**Status:** Design, approved for planning
+**Status:** Implemented (2026-07-28)
 **Refines:** [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md) §5.3, §5.4, §13.3
 **Depends on:** [`2026-07-23-plan-a1-core-model.md`](2026-07-23-plan-a1-core-model.md) (implemented)
 
