@@ -477,6 +477,14 @@ runtime type checking, so a caller bypassing `build_spec` can put any object in 
 phase reads those fields directly with no defensive checks, so anything phase 1 misses becomes an
 `AttributeError` or `TypeError` escaping `compile_spec` — which §6 of the design forbids.
 
+**Every gate tests the exact runtime type, never `isinstance`.** The model is closed, so a subclass is
+not a member. Under `isinstance` a subclass passes the gate and then breaks a later phase — by
+overriding a method a phase calls, by yielding different members on a second iteration, or by missing
+from the `type(...)`-keyed variant tables that phases 1, 3, and 5 index. Writing the gates as
+`type(x) is C` and `type(x) in _TABLE` keeps those tables total by construction; it is also what refuses
+`bool` where an integer is required, without a `bool` special case. The design's §5 phase 1 states this
+contract.
+
 **Files:**
 - Create: `python/src/atoms/core/compiler.py`
 - Create: `python/tests/support.py`
@@ -551,6 +559,8 @@ def valid_spec(**overrides) -> TransactionSpec:
 `python/tests/test_compiler_structure.py`:
 
 ```python
+from dataclasses import dataclass
+
 import pytest
 
 from atoms.core.compiler import CompiledSpec, compile_spec
@@ -665,6 +675,55 @@ def test_non_dependency_in_dependencies_is_rejected():
 def test_non_str_dependency_endpoint_is_rejected():
     with pytest.raises(SpecValidationError, match="dependencies"):
         compile_spec(valid_spec(dependencies=(Dependency(before="e1", after=2),)))  # type: ignore[arg-type]
+
+
+# --- phase 1: the model is closed, so a subclass is not a member ---
+#
+# Each of these passes an `isinstance` gate. Without the exact-type rule, the first two
+# reach a `type(...)`-keyed field table and raise KeyError, and the third reaches
+# `require_rel_path` and raises whatever the subclass chose to raise. All three would
+# break the "nothing but SpecValidationError escapes" contract.
+
+
+@dataclass(frozen=True, slots=True)
+class _EffectSubclass(CreateFileNoClobber):
+    pass
+
+
+class _StateSubclass(FileState):
+    pass
+
+
+class _PathSubclass(str):
+    def startswith(self, *args, **kwargs):  # pragma: no cover - phase 1 refuses first
+        raise RuntimeError("a str subclass reached the path grammar")
+
+
+def test_effect_subclass_is_rejected():
+    with pytest.raises(SpecValidationError, match="five effect variants"):
+        compile_spec(valid_spec(effects=(_EffectSubclass(effect_id="e1", path="a.txt", post=F),)))
+
+
+def test_path_state_subclass_is_rejected():
+    bad = _StateSubclass(content_hash=F.content_hash, mode=0o644, byte_len=3)
+    with pytest.raises(SpecValidationError, match="four path states"):
+        compile_spec(valid_spec(final_surface=(SurfaceEntry(path="a.txt", state=bad),)))
+
+
+def test_str_subclass_is_rejected_before_a_later_phase_calls_a_method_on_it():
+    evil = _PathSubclass("a.txt")
+    with pytest.raises(SpecValidationError, match="must be a string"):
+        compile_spec(valid_spec(effects=(CreateFileNoClobber(effect_id="e1", path=evil, post=F),)))
+
+
+def test_tuple_subclass_container_is_rejected():
+    # A tuple subclass may yield different members on each pass, so validating the pass
+    # phase 1 sees would not bind the pass a later phase reads.
+    class _TupleSubclass(tuple):
+        pass
+
+    with pytest.raises(SpecValidationError, match="effects must be a tuple"):
+        compile_spec(valid_spec(effects=_TupleSubclass(valid_spec().effects)))
 
 
 # --- phase 2: fingerprints ---
@@ -821,10 +880,9 @@ EMPTY_CONTENT_HASH = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca49
 
 MAX_MODE = 0o7777
 
-_STATE_CLASSES = (AbsentState, FileState, DirectoryState, SymlinkState)
-_EFFECT_CLASSES = (ReplaceFile, CreateFileNoClobber, DeletePath, MoveNoClobber, CreateDirectory)
-
 # Per variant: the path-valued field names and the state-valued field names.
+# Membership in this table is also phase 1's variant gate: the effect set is closed, so
+# being a key here is exactly what it means to be an effect.
 _EFFECT_FIELDS: dict[type, tuple[tuple[str, ...], tuple[str, ...]]] = {
     ReplaceFile: (("path",), ("pre", "post")),
     CreateFileNoClobber: (("path",), ("post",)),
@@ -861,29 +919,37 @@ def _require(condition: object, message: str) -> None:
         raise SpecValidationError(message)
 
 
+# Every gate below tests the exact runtime type rather than `isinstance`. The model is
+# closed: the four states, the five variants, and the scalars they hold are the whole
+# vocabulary, and nothing downstream is written to survive a member it has never seen.
+# A subclass would pass an `isinstance` gate and then break a later phase in a way the
+# error contract forbids — by overriding a method a phase calls (`str.startswith`,
+# `Dependency.__lt__`), by returning different members on each pass (a `tuple`
+# subclass), or by missing from the field tables that phases 1, 3, and 5 index by
+# `type(...)`. Requiring the exact type keeps those tables total by construction.
+
+
 def _require_str(value: Any, what: str) -> str:
-    _require(isinstance(value, str), f"{what} must be a string, got {type(value).__name__}")
+    _require(type(value) is str, f"{what} must be a string, got {type(value).__name__}")
     return value
 
 
 def _require_int(value: Any, what: str) -> int:
-    # bool subclasses int; refuse it where a true integer is required.
-    _require(
-        isinstance(value, int) and not isinstance(value, bool),
-        f"{what} must be an integer, got {type(value).__name__}",
-    )
+    # Exact type also refuses bool, which subclasses int and compares equal to 0 and 1.
+    _require(type(value) is int, f"{what} must be an integer, got {type(value).__name__}")
     return value
 
 
 def _require_tuple(value: Any, what: str) -> tuple[Any, ...]:
-    _require(isinstance(value, tuple), f"{what} must be a tuple, got {type(value).__name__}")
+    _require(type(value) is tuple, f"{what} must be a tuple, got {type(value).__name__}")
     return value
 
 
 def _require_state_structure(state: Any, what: str) -> None:
+    # `type(...) in` is both the exact-type gate and the guard the two lookups need.
     _require(
-        isinstance(state, _STATE_CLASSES),
-        f"{what} must be a path state, got {type(state).__name__}",
+        type(state) in _STATE_STR_FIELDS,
+        f"{what} must be one of the four path states, got {type(state).__name__}",
     )
     for field in _STATE_STR_FIELDS[type(state)]:
         _require_str(getattr(state, field), f"{what}.{field}")
@@ -893,7 +959,7 @@ def _require_state_structure(state: Any, what: str) -> None:
 
 def _phase1_structure(spec: TransactionSpec) -> None:
     """Exhaustive structural typing. Every later phase reads fields with no defensive checks."""
-    _require(isinstance(spec, TransactionSpec), f"spec must be a TransactionSpec, got {type(spec).__name__}")
+    _require(type(spec) is TransactionSpec, f"spec must be a TransactionSpec, got {type(spec).__name__}")
     _require_int(spec.schema_version, "schema_version")
     _require(
         spec.schema_version == SCHEMA_VERSION,
@@ -909,7 +975,7 @@ def _phase1_structure(spec: TransactionSpec) -> None:
         for index, entry in enumerate(_require_tuple(getattr(spec, label), label)):
             what = f"{label}[{index}]"
             _require(
-                isinstance(entry, SurfaceEntry),
+                type(entry) is SurfaceEntry,
                 f"{what} must be a SurfaceEntry, got {type(entry).__name__}",
             )
             _require_str(entry.path, f"{what}.path")
@@ -920,7 +986,7 @@ def _phase1_structure(spec: TransactionSpec) -> None:
     for index, effect in enumerate(effects):
         what = f"effects[{index}]"
         _require(
-            isinstance(effect, _EFFECT_CLASSES),
+            type(effect) in _EFFECT_FIELDS,
             f"{what} must be one of the five effect variants, got {type(effect).__name__}",
         )
         _require_str(effect.effect_id, f"{what}.effect_id")
@@ -933,7 +999,7 @@ def _phase1_structure(spec: TransactionSpec) -> None:
     for index, dependency in enumerate(_require_tuple(spec.dependencies, "dependencies")):
         what = f"dependencies[{index}]"
         _require(
-            isinstance(dependency, Dependency),
+            type(dependency) is Dependency,
             f"{what} must be a Dependency, got {type(dependency).__name__}",
         )
         _require_str(dependency.before, f"{what}.before")
@@ -1237,6 +1303,23 @@ def test_duplicate_effect_ids_are_rejected():
                 CreateFileNoClobber(effect_id="dup", path="a", post=F),
                 CreateFileNoClobber(effect_id="dup", path="b", post=F),
             ),
+        ))
+
+
+def test_duplicate_ids_are_refused_before_dependencies_are_validated():
+    # The forced phase 6 -> phase 7 order, locked. Phase 7 resolves each endpoint through
+    # {effect_id: index}, which silently keeps only the last effect carrying a duplicated
+    # ID, so every dependency verdict about that ID would be arbitrary. This specification
+    # violates both rules at once; the duplicate is what must surface.
+    with pytest.raises(SpecValidationError, match="duplicate effect_id"):
+        compile_spec(_spec(
+            {"a": ABSENT, "b": ABSENT},
+            {"a": F, "b": F},
+            (
+                CreateFileNoClobber(effect_id="dup", path="a", post=F),
+                CreateFileNoClobber(effect_id="dup", path="b", post=F),
+            ),
+            [("dup", "ghost")],
         ))
 
 
@@ -1886,7 +1969,12 @@ serializability of anything accepted, determinism, and A1 round-trip interoperab
 
 The totality test is the important one. It asserts the **property** — everything `compile_spec` accepts
 survives `canonical_bytes` — rather than only the surrogate special case, so a future rule that admits
-another unserializable value fails here.
+another unserializable value fails here. A handful of handcrafted specifications cannot carry that claim,
+so the property is driven as a matrix: an adversarial string corpus crossed with every position where a
+caller supplies a string freely — leaf path, interior path component, move source, move destination,
+symlink target, effect ID, consumer tag. Refusal is an acceptable outcome at any cell; silent acceptance
+of a value that will not encode is not. A companion test asserts each site still admits *something*, so
+a future rule that refuses everything cannot make the matrix pass vacuously.
 
 **Files:**
 - Test: `python/tests/test_compiler_properties.py`
@@ -1916,7 +2004,7 @@ from atoms.core.effects import (
     ReplaceFile,
 )
 from atoms.core.errors import SpecValidationError
-from atoms.core.fingerprint import ABSENT
+from atoms.core.fingerprint import ABSENT, SymlinkState
 from atoms.core.spec import TransactionSpec, build_spec
 from tests.support import DIGEST, EMPTY, D, F, G, L
 
@@ -1984,13 +2072,147 @@ CORPUS = [_all_variants_spec, _repeated_path_spec, _ancestor_change_spec]
 
 
 # --- totality: nothing accepted can fail downstream ---
+#
+# The property the UTF-8 rule exists to protect: "compilation succeeded" must mean the
+# specification is usable, not merely well-shaped. Three handcrafted specifications
+# demonstrate that across the structural variety; they do not establish it. The matrix
+# below does the establishing, by driving a corpus of adversarial strings through every
+# position where a caller supplies one freely.
 
 @pytest.mark.parametrize("make_spec", CORPUS)
-def test_everything_accepted_is_durably_serializable(make_spec):
-    # The property the UTF-8 rule exists to protect: "compilation succeeded" must mean
-    # the spec is usable, not merely well-shaped.
+def test_structurally_varied_specs_are_durably_serializable(make_spec):
     compiled = compile_spec(make_spec())
-    assert canonical_bytes(compiled.spec)
+    assert from_canonical_bytes(canonical_bytes(compiled.spec)) == compiled.spec
+
+
+# Written as escapes, not literal characters: several of these samples are visually
+# identical to one another, and the difference between them is the whole point.
+UNICODE_SAMPLES = [
+    "plain",
+    "caf\u00e9",                # precomposed (NFC)
+    "cafe\u0301",               # decomposed (NFD) - same text, different code points
+    "\u00df",                   # sharp s, whose casefold is longer than itself
+    "\u0130",                   # dotted capital I, whose casefold crosses normal forms
+    "\U0001f600",               # astral plane, correctly paired
+    "\ufeff",                   # zero-width no-break space as an entire name
+    "\ufffd",                   # the replacement character, arriving as real content
+    "\ufffe",                   # a noncharacter
+    "\u202e",                   # right-to-left override
+    "\ud800",                   # lone high surrogate - not UTF-8 encodable
+    "\udfff",                   # lone low surrogate - not UTF-8 encodable
+    "\ud800\udc00",             # a surrogate pair spelled as two lone code points
+    "a" * 300,                  # longer than any real NAME_MAX; admitted here (ledger #4)
+    " leading and trailing ",
+    "tab\tnewline\n",
+    ".#~notthesigil",           # near the reserved scratch sigil without matching it
+    "..dotdot",
+]
+
+
+def _site_leaf_path(sample):
+    return _spec(
+        {sample: ABSENT},
+        {sample: F},
+        (CreateFileNoClobber(effect_id="e1", path=sample, post=F),),
+    )
+
+
+def _site_directory_component(sample):
+    leaf = f"{sample}/leaf.txt"
+    return _spec(
+        {sample: ABSENT, leaf: ABSENT},
+        {sample: D, leaf: F},
+        (
+            CreateDirectory(effect_id="e1", path=sample, post=D),
+            CreateFileNoClobber(effect_id="e2", path=leaf, post=F),
+        ),
+    )
+
+
+def _site_move_source(sample):
+    return _spec(
+        {sample: F, "dst": ABSENT},
+        {sample: ABSENT, "dst": F},
+        (MoveNoClobber(effect_id="e1", source=sample, destination="dst", source_pre=F),),
+    )
+
+
+def _site_move_destination(sample):
+    return _spec(
+        {"src": F, sample: ABSENT},
+        {"src": ABSENT, sample: F},
+        (MoveNoClobber(effect_id="e1", source="src", destination=sample, source_pre=F),),
+    )
+
+
+def _site_symlink_target(sample):
+    link = SymlinkState(target=sample, mode=0o777)
+    return _spec(
+        {"lnk": link},
+        {"lnk": ABSENT},
+        (DeletePath(effect_id="e1", path="lnk", pre=link),),
+    )
+
+
+def _site_effect_id(sample):
+    return _spec(
+        {"a.txt": ABSENT},
+        {"a.txt": F},
+        (CreateFileNoClobber(effect_id=sample, path="a.txt", post=F),),
+    )
+
+
+def _site_consumer_tag(sample):
+    base = _all_variants_spec()
+    return TransactionSpec(
+        schema_version=base.schema_version,
+        consumer_tag=sample,
+        intent_digest=base.intent_digest,
+        initial_surface=base.initial_surface,
+        final_surface=base.final_surface,
+        effects=base.effects,
+        dependencies=base.dependencies,
+    )
+
+
+SITES = [
+    _site_leaf_path,
+    _site_directory_component,
+    _site_move_source,
+    _site_move_destination,
+    _site_symlink_target,
+    _site_effect_id,
+    _site_consumer_tag,
+]
+
+
+def _compiles(site, sample) -> bool:
+    try:
+        compile_spec(site(sample))
+    except SpecValidationError:
+        return False
+    return True
+
+
+@pytest.mark.parametrize("sample", UNICODE_SAMPLES, ids=lambda s: ascii(s)[:28])
+@pytest.mark.parametrize("site", SITES, ids=lambda f: f.__name__)
+def test_every_accepted_string_survives_the_durable_format(site, sample):
+    # Refusal is a valid outcome at every site. Acceptance is a promise: the value must
+    # encode, and decode back to exactly the specification that was compiled.
+    try:
+        compiled = compile_spec(site(sample))
+    except SpecValidationError:
+        return
+    assert from_canonical_bytes(canonical_bytes(compiled.spec)) == compiled.spec
+
+
+def test_the_string_corpus_is_not_degenerate():
+    # A rule that refused every sample would leave the matrix above passing vacuously.
+    # Each site must still admit something, so each site is really exercising acceptance.
+    for site in SITES:
+        assert any(_compiles(site, sample) for sample in UNICODE_SAMPLES), (
+            f"{site.__name__} accepted no sample; the matrix no longer proves anything there"
+        )
 
 
 # --- totality: nothing but SpecValidationError escapes ---
@@ -2179,7 +2401,16 @@ Task 3 and reused by Tasks 4 and 5. `tests/support.py`'s `F`, `G`, `D`, `L`, `EM
 `SurfaceEntry`, `Dependency`, `TransactionSpec`, `build_spec`, `occurrences`, `require_valid_identifier`,
 `aliases_scratch_sigil`, `canonical_bytes`, `from_canonical_bytes` — match the shipped source verbatim.
 
-**Ordering hazards the plan encodes.** Phase 1 must precede `build_timelines`, because A1's
-`occurrences` is a `singledispatch` raising `TypeError` on a non-variant (Tasks 2 and 3 both state this).
-Phase 6 must precede phase 7, or an effect ID would not identify one effect. Phase 10 must precede
-phase 11, or the endpoint lookup could miss a path (Task 5 states this).
+**Ordering hazards the plan encodes.** Each of the three forced orderings is stated where it is
+implemented *and* locked by a test that fails if the two phases are swapped — a specification breaking
+both rules, asserting which refusal surfaces.
+
+- Phase 1 before `build_timelines`: A1's `occurrences` is a `singledispatch` raising `TypeError` on a
+  non-variant (Tasks 2 and 3 both state this). Locked by `test_only_spec_validation_error_escapes`,
+  whose `{"effects": (None,)}` case reaches `build_timelines` if phase 1 is skipped.
+- Phase 6 before phase 7: phase 7 resolves endpoints through `{effect_id: index}`, which silently keeps
+  only the last effect carrying a duplicated ID. Locked by
+  `test_duplicate_ids_are_refused_before_dependencies_are_validated` (Task 4).
+- Phase 10 before phase 11: phase 11 indexes the surface maps directly, so an undeclared path would
+  raise `KeyError` rather than a refusal (Task 5 states this). Locked by the phase 10 "omits" tests,
+  which produce exactly that specification.

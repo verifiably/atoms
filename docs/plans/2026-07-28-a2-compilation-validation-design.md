@@ -114,11 +114,32 @@ ID would not identify one effect. Exact coverage (phase 10) must be proven befor
 compared against the surfaces (phase 11), or the endpoint comparison could look up a path that no surface
 declares.
 
+Each forced constraint carries a test obligation: a specification that violates **both** rules, asserting
+that the earlier phase's refusal is the one that surfaces. Per-rule tests do not discharge it — a suite
+whose duplicate-ID cases declare no dependencies and whose dependency cases use unique IDs stays green
+under a swap, leaving a contractual order unverified.
+
 ### Phase 1 — Exhaustive structural typing
 
 Every value reachable from the specification is checked against its declared type, **recursively and
-exhaustively, before any later phase reads it**. `bool` is refused wherever an integer is required,
-mirroring A1's decoder, since `bool` subclasses `int`.
+exhaustively, before any later phase reads it**, and against its **exact runtime type** rather than by
+`isinstance`. The model is closed: the four path states, the five effect variants, and the scalars they
+hold are the entire vocabulary, so a subclass is not a member. This is what refuses `bool` where an
+integer is required — mirroring A1's decoder, since `bool` subclasses `int` — but the rule is general,
+not a `bool` special case.
+
+A subclass would pass an `isinstance` gate and then break a later phase in one of three ways, each of
+which violates §6's error contract:
+
+- **By overriding a method a phase calls.** A `str` subclass may define `startswith`, `__eq__`, or
+  `__hash__` however it likes; the path grammar, the alias key, and every set membership test in phases 3
+  through 13 would then be operating on values that answer questions differently than `str` does. A
+  `Dependency` subclass may override the comparison that canonical ordering sorts on.
+- **By not being stable across passes.** A `tuple` subclass may yield different members each time it is
+  iterated, so the pass phase 1 validated would not be the pass a later phase reads.
+- **By being absent from the variant tables.** Phases 1, 3, and 5 dispatch on the variant by exact type
+  to find its path-valued and state-valued fields. Requiring the exact type is what keeps those tables
+  total; under `isinstance` an admitted subclass reaches a lookup that has no entry for it.
 
 Top level:
 
@@ -135,14 +156,13 @@ through 13 are all vacuously satisfied, so refusing here is the only place it ca
 
 Nested, for every element of those tuples:
 
-- `SurfaceEntry.path` is a `str`; `SurfaceEntry.state` is an instance of one of the four `PathState`
-  classes.
+- `SurfaceEntry.path` is a `str`; `SurfaceEntry.state` is one of the four `PathState` classes.
 - `Dependency.before` and `.after` are `str`.
 - Each effect's `effect_id` is a `str`, and each of its path-valued fields (`path`, or `source` and
   `destination` for `MoveNoClobber`) is a `str`.
-- Each effect's state-valued fields (`pre`, `post`, `source_pre`) hold an instance of one of the four
-  `PathState` classes. **Which** subclass each field may legally hold is phase 5's question, not this
-  one; phase 1 establishes only that the value is a path state at all.
+- Each effect's state-valued fields (`pre`, `post`, `source_pre`) hold one of the four `PathState`
+  classes. **Which** of the four each field may legally hold is phase 5's question, not this one; phase 1
+  establishes only that the value is a path state at all.
 - Within every `PathState` encountered: `content_hash` and `target` are `str`; `mode` and `byte_len` are
   integers and not `bool`.
 
