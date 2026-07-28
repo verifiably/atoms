@@ -30,6 +30,7 @@ from atoms.core.fingerprint import (
     SymlinkState,
 )
 from atoms.core.identifiers import require_valid_identifier
+from atoms.core.paths import path_equivalence_key, require_rel_path
 from atoms.core.spec import SCHEMA_VERSION, Dependency, SurfaceEntry, TransactionSpec
 from atoms.core.timeline import PathTimeline, build_timelines
 
@@ -49,6 +50,15 @@ _EFFECT_FIELDS: dict[type, tuple[tuple[str, ...], tuple[str, ...]]] = {
     DeletePath: (("path",), ("pre",)),
     MoveNoClobber: (("source", "destination"), ("source_pre",)),
     CreateDirectory: (("path",), ("post",)),
+}
+
+# Per variant: which state classes each state-valued field may legally hold (phase 5).
+_ALLOWED_STATES: dict[type, dict[str, tuple[type, ...]]] = {
+    ReplaceFile: {"pre": (FileState,), "post": (FileState,)},
+    CreateFileNoClobber: {"post": (FileState,)},
+    DeletePath: {"pre": (FileState, SymlinkState)},
+    MoveNoClobber: {"source_pre": (FileState,)},
+    CreateDirectory: {"post": (DirectoryState,)},
 }
 
 # Per state class: the scalar field names, by kind.
@@ -209,6 +219,91 @@ def _phase2_fingerprints(spec: TransactionSpec) -> None:
             )
 
 
+def _declared_paths(spec: TransactionSpec) -> list[tuple[str, str]]:
+    """Every declared path with a context label, in a deterministic order."""
+    found: list[tuple[str, str]] = []
+    for label in ("initial_surface", "final_surface"):
+        for index, entry in enumerate(getattr(spec, label)):
+            found.append((entry.path, f"{label}[{index}].path"))
+    for index, effect in enumerate(spec.effects):
+        path_fields, _ = _EFFECT_FIELDS[type(effect)]
+        for field in path_fields:
+            found.append((getattr(effect, field), f"effects[{index}].{field}"))
+    return found
+
+
+def _phase3_path_grammar(spec: TransactionSpec) -> None:
+    for path, what in _declared_paths(spec):
+        require_rel_path(what, path)
+
+
+def _phase4_alias_distinctness(spec: TransactionSpec) -> None:
+    first_seen: dict[str, str] = {}
+    for path in sorted({path for path, _ in _declared_paths(spec)}):
+        key = path_equivalence_key(path)
+        previous = first_seen.setdefault(key, path)
+        _require(
+            previous == path,
+            f"declared paths {previous!r} and {path!r} alias one another under Unicode "
+            f"caseless matching; they may name a single entry on a case- or "
+            f"normalization-insensitive volume",
+        )
+
+
+def _phase5_variant_shapes(spec: TransactionSpec) -> None:
+    for index, effect in enumerate(spec.effects):
+        what = f"effects[{index}]"
+        require_valid_identifier(f"{what}.effect_id", effect.effect_id)
+        for field, allowed in _ALLOWED_STATES[type(effect)].items():
+            state = getattr(effect, field)
+            _require(
+                isinstance(state, allowed),
+                f"{what} is a {type(effect).__name__}, whose {field!r} may not hold a "
+                f"{type(state).__name__}",
+            )
+        if isinstance(effect, MoveNoClobber):
+            _require(
+                effect.source != effect.destination,
+                f"{what} moves {effect.source!r} onto itself; source and destination must differ",
+            )
+
+
+def _phase6_unique_effect_ids(spec: TransactionSpec) -> None:
+    seen: set[str] = set()
+    for effect in spec.effects:
+        _require(effect.effect_id not in seen, f"duplicate effect_id: {effect.effect_id!r}")
+        seen.add(effect.effect_id)
+
+
+def _phase7_dependencies(spec: TransactionSpec) -> None:
+    order = {effect.effect_id: index for index, effect in enumerate(spec.effects)}
+    seen: set[tuple[str, str]] = set()
+    for index, dependency in enumerate(spec.dependencies):
+        what = f"dependencies[{index}]"
+        for endpoint in (dependency.before, dependency.after):
+            _require(endpoint in order, f"{what} names unknown effect {endpoint!r}")
+        _require(
+            dependency.before != dependency.after,
+            f"{what} makes effect {dependency.before!r} depend on itself",
+        )
+        edge = (dependency.before, dependency.after)
+        _require(edge not in seen, f"duplicate dependency: {dependency.before!r} -> {dependency.after!r}")
+        seen.add(edge)
+        _require(
+            order[dependency.before] < order[dependency.after],
+            f"{what} requires {dependency.before!r} before {dependency.after!r}, but the "
+            f"authoritative effect order places it after",
+        )
+
+
+def _phase8_surface_shape(spec: TransactionSpec) -> None:
+    for label in ("initial_surface", "final_surface"):
+        seen: set[str] = set()
+        for entry in getattr(spec, label):
+            _require(entry.path not in seen, f"{label} declares a duplicate path: {entry.path!r}")
+            seen.add(entry.path)
+
+
 def _canonicalize(spec: TransactionSpec) -> TransactionSpec:
     """Sort the set-like fields. Effect order is authoritative and never changed."""
     return TransactionSpec(
@@ -231,6 +326,12 @@ def compile_spec(spec: TransactionSpec) -> CompiledSpec:
     try:
         _phase1_structure(spec)
         _phase2_fingerprints(spec)
+        _phase3_path_grammar(spec)
+        _phase4_alias_distinctness(spec)
+        _phase5_variant_shapes(spec)
+        _phase6_unique_effect_ids(spec)
+        _phase7_dependencies(spec)
+        _phase8_surface_shape(spec)
         timelines = build_timelines(spec.effects)
         return CompiledSpec(spec=_canonicalize(spec), timelines=timelines)
     except SpecValidationError:
