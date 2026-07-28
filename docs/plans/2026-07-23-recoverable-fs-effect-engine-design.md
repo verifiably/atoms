@@ -278,6 +278,18 @@ Before any metadata or blob write, validation proves:
   root descriptor's `st_dev`/`st_ino`, so a case- or Unicode-normalization alias (an upper-case spelling
   on a case-insensitive volume — the macOS default — or an NFC/NFD variant) cannot slip an effect into
   the metadata store that a lexical prefix check would miss;
+- declared persistent paths name **pairwise distinct entries on the project-root volume**, checked
+  against that volume's actual name equivalence — probed per mount (§5.5) — and not by spelling alone.
+  Two declared paths the volume folds together compile as two independent timelines while addressing one
+  directory entry, so each timeline's occurrence-local preconditions and its recovery classification are
+  computed against state the other timeline is mutating. This check must cover paths declared **absent**,
+  where there is no inode to compare and identity-by-`st_dev`/`st_ino` therefore does not apply; a
+  same-volume folding probe supplies the equivalence instead. The mutation-time no-clobber guard does
+  **not** contain this case: a transaction may create, delete, and re-create through aliased names in
+  sequence — `create x`, `delete x`, `create y` — whereupon every `O_EXCL` and no-clobber transfer
+  succeeds, because the entry is absent each time one runs, while the declared final states (`x` absent,
+  `y` present) remain jointly unsatisfiable on a single entry. The equivalence must therefore be
+  established at compilation, before any capture or mutation;
 - every engine scratch name occupies the reserved scratch grammar (§5.1), and no persistent path
   matches that grammar, so scratch and persistent paths are provably disjoint independently of the
   runtime transaction ID;
@@ -403,6 +415,29 @@ effect executes, each `CreateDirectory` that produced one of its ancestors has a
 descriptor to the directory it published and handed it down as the descendant's parent descriptor.
 Descendant effects therefore mutate relative to a descriptor the engine itself created, never by
 re-resolving the ancestor chain from the root.
+
+A second case reaches the same place by a different route: the ancestor **exists but is not a
+directory**. A transaction may declare an ancestor as a file or symlink initially, delete it, and create
+a directory in its place, then act on a path beneath it — `DeletePath("p")`, `CreateDirectory("p")`,
+`CreateFileNoClobber("p/q")`. Compilation admits this: `p`'s timeline is continuous
+(`FILE → ABSENT → DIRECTORY`), and the surface rule requiring a declared descendant of a non-directory to
+be declared absent is satisfied, since `p/q` is absent precisely *because* `p` is a file. The
+first-missing-component procedure above does not apply, because no component of `p/q` is missing where
+traversal stops — guarded traversal fails at `p` itself with `ENOTDIR`, and there is no descriptor
+against which `q` could be looked up.
+
+The descendant's absence is therefore **inferred from the ancestor's verified state rather than probed**.
+Capture already opens the declared ancestor and validates its exact fingerprint — `O_RDONLY | O_NOFOLLOW`
+plus `fstat` and a content hash for a file, `symlink_fingerprint` for a symlink — and a verified regular
+file or symlink cannot contain entries, so nothing can exist beneath it. The inference is stronger than
+the lookup it replaces, not weaker: it rests on a descriptor-coherent observation of the ancestor rather
+than on a negative lookup. As everywhere in this section, capture-time verification is not
+compare-and-swap authority; if the ancestor is swapped for a directory before execution, the destructive
+transfer that deletes it validates the transferred object against the frozen fingerprint and refuses or
+halts rather than proceeding. Execution ordering then follows the missing-ancestor case exactly:
+timeline continuity forces the ancestor's deletion and re-creation to precede any descendant effect, and
+§9.5 hands the newly published directory's verified descriptor down as the descendant's parent
+descriptor, so the descendant never re-resolves the ancestor chain.
 
 For a regular file:
 

@@ -43,11 +43,10 @@ library.
 
 - root and metadata-directory identity, compared by `st_dev`/`st_ino` rather than spelling (§5.4);
 - **filesystem-aware path aliasing** — whether two declared paths that A2's lexical key treats as
-  distinct nonetheless name one entry on this volume, compared by `st_dev`/`st_ino`. A2 refuses the
-  lexically detectable cases (phase 4); A4 owes the volume-specific remainder, and the residual it
-  cannot reach — two paths both declared `ABSENT`, which have no inodes to compare — is contained by the
-  fail-closed `O_EXCL` / no-clobber guard at mutation time, exactly as §5.1 argues for scratch
-  collisions;
+  distinct nonetheless name one entry on this volume. A2 refuses the lexically detectable cases
+  (phase 4); A4 owes the volume-specific remainder via a per-mount folding probe, including for paths
+  declared `ABSENT`, where there is no inode to compare and the mutation-time no-clobber guard does not
+  contain the case. Now an explicit §5.4 obligation;
 - ancestor symlink and mount traversal (`anchored_traversal`, §6);
 - platform capability availability and the per-mount probe (§5.5);
 - durability-allowlist membership;
@@ -232,13 +231,32 @@ Resolving instead of refusing would mean silently merging two declared timelines
 silent fallback this codebase forbids.
 
 **What remains A4's.** The key above is a fixed approximation of one volume's folding. A filesystem may
-alias two paths this key treats as distinct (a locale-sensitive fold, or HFS+'s particular normalization),
-so A4 still owes a filesystem-aware identity check by `st_dev`/`st_ino` over the resolved paths. That
-check has a hole A4 cannot close by itself: two paths both declared `ABSENT` have no inodes to compare.
-The residual is contained rather than unhandled — the authoritative guard is the same one §5.1 relies on
-for scratch collisions, namely that the `O_EXCL` creation or no-clobber transfer fails closed at mutation
-time, so a second create against an entry the first already made refuses instead of clobbering. A2's
-lexical rule shrinks that residual to aliases no reasonable consumer produces.
+alias two paths this key treats as distinct — a locale-sensitive fold, or HFS+'s particular
+normalization — so phase 4 is a conservative first filter, never a proof of distinctness. A4 owes the
+real check against the volume's actual name equivalence, and §5.4 now carries it as an explicit
+compilation obligation.
+
+That check cannot be identity-by-`st_dev`/`st_ino` alone, because a path declared `ABSENT` has no inode
+to compare. **Nor is the mutation-time no-clobber guard a sufficient backstop** — an earlier draft of
+this section claimed it was, and that was wrong. The guard contains an aliased pair only while the entry
+one timeline created is still present when the other tries to create it. This sequence defeats it:
+
+```
+CreateFileNoClobber("x", post=F)   # x: ABSENT -> F
+DeletePath("x", pre=F)             # x: F      -> ABSENT
+CreateFileNoClobber("y", post=G)   # y: ABSENT -> G      (y aliases x)
+```
+
+Both paths are declared absent initially, both lexical timelines are continuous, and every `O_EXCL` and
+no-clobber transfer succeeds, because the shared entry is genuinely absent at the moment each one runs.
+Yet the declared final states — `x` absent, `y` present — are not jointly satisfiable by one entry, and a
+crash mid-sequence hands the per-path recovery classifier contradictory observations of that entry. The
+guard never fires, so nothing refuses.
+
+A4 therefore needs a **positive** equivalence determination for absent names — a same-volume folding
+probe, the same shape of per-mount probe §5.5 already specifies for capabilities — established at
+compilation, before any capture or mutation. A2's lexical rule shrinks the input to that check; it does
+not substitute for it.
 
 ### Phase 5 — Effect ID and exact variant shape
 
@@ -322,6 +340,16 @@ are consistent: `p/q` is absent initially precisely *because* `p` is a file then
 expressible in the closed effect set of §5.2 and is not a case the design excludes, so A2 must not
 exclude it either. The single clause above admits it while still refusing the contradiction, and phase 13
 supplies the ordering that makes it executable.
+
+**Admitting it obliges A4 to capture it, and §6 has been amended accordingly.** §6's absence-capture
+procedure originally covered only a *missing* ancestor — open the deepest existing ancestor, confirm the
+first missing component is absent. That does not reach this case: `p` exists as a regular file, so
+guarded traversal toward `p/q`'s parent fails at `p` with `ENOTDIR`, and no component of `p/q` is missing
+where traversal stops. §6 now carries a second case in which the descendant's absence is **inferred from
+the ancestor's verified fingerprint** rather than probed — a descriptor-coherent observation that `p` is a
+regular file already proves nothing exists beneath it — with §9.5's published-directory descriptor handed
+down to the descendant exactly as in the missing-ancestor case. A2 must not admit a transition the
+capture contract cannot express, so the two land together.
 
 The rule constrains only pairs where **both** paths are declared in that surface. An ancestor the
 specification never mentions carries no constraint here: whether it exists and is a directory is a live
