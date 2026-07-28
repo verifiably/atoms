@@ -1,5 +1,7 @@
 # Plan A1 — Core transaction model, vocabulary, and canonical form
 
+**Status:** Implemented (2026-07-28). All eight tasks landed in `python/src/atoms/core/`; 82 tests pass with `ruff` and `pyright` clean. Successor: Plan A2 (compilation validation).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build the pure, in-memory core of the `atoms` engine — the `TransactionSpec` data model, the five effect variants, the semantic capability vocabulary, the reserved scratch grammar with a bounded safe-identifier grammar, and the durable canonical format (deterministic encode **and** strict decode) — with zero filesystem, SQLite, or platform dependency.
@@ -57,7 +59,7 @@ Scaffolding for the whole `python/` subtree is folded here because every later t
 - Consumes: nothing.
 - Produces: exception classes `AtomsError`, `ProtocolError(AtomsError)`, `SpecValidationError(AtomsError)`, `PreconditionRefused(AtomsError)`, `CapabilityUnavailable(AtomsError)`, `TransactionHalted(AtomsError)`. Package import path `atoms.core`, shipped as an inline-typed (PEP 561) distribution mirroring `nodes-core`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `python/tests/test_errors.py`:
 
@@ -90,12 +92,12 @@ def test_errors_carry_a_message():
         raise CapabilityUnavailable("atomic_exchange missing on volume")
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run (from `python/`): `uv run pytest tests/test_errors.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'atoms'` (package not yet built/installed).
 
-- [ ] **Step 3: Create the scaffold**
+- [x] **Step 3: Create the scaffold**
 
 `python/pyproject.toml`:
 
@@ -196,7 +198,7 @@ Pure model for the atoms recoverable filesystem effect engine. See `~/d/atoms/RE
 
 `python/LICENSE`: copy the repository-root license so `license-files = ["LICENSE"]` resolves within `python/` (nodes keeps the same file in both places). Run from the repo root: `cp LICENSE python/LICENSE`.
 
-- [ ] **Step 3b: Add the source-marker sanity test**
+- [x] **Step 3b: Add the source-marker sanity test**
 
 `python/tests/test_packaging.py`:
 
@@ -214,12 +216,12 @@ def test_py_typed_marker_present_in_source_package():
     assert marker.is_file(), "PEP 561 py.typed marker must sit in atoms.core"
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run (from `python/`): `uv run pytest tests/test_errors.py tests/test_packaging.py -v`
 Expected: PASS (all three tests). `uv run` builds/installs the editable package on first invocation. This only proves the marker exists in the source tree — the wheel-shipping proof is the next step.
 
-- [ ] **Step 4b: Build the wheel and prove the typed-distribution surface ships**
+- [x] **Step 4b: Build the wheel and prove the typed-distribution surface ships**
 
 The editable install cannot show what a *published* wheel contains. Build one and inspect its ZIP and `METADATA` directly, so `py.typed` and the metadata-2.5 `Import-Name`/`Import-Namespace`/`License-File` fields are proven present in the actual artifact. Run from `python/`:
 
@@ -241,12 +243,12 @@ print('OK:', whl.rsplit('/', 1)[-1], '— py.typed + metadata-2.5 fields present
 
 Expected: prints `OK: atoms_core-0.1.0-…whl — py.typed + metadata-2.5 fields present`. If `Import-Name`/`Import-Namespace` are absent, `core-metadata-version = "2.5"` was not applied; if `License-File` is absent, `license-files` / `python/LICENSE` is missing. Add `dist/` to `python/.gitignore` in this step (create the file with a single `dist/` line) so build output is not committed.
 
-- [ ] **Step 5: Lint and type-check the new files**
+- [x] **Step 5: Lint and type-check the new files**
 
 Run (from `python/`): `uv run ruff check` then `uv run pyright`
 Expected: no errors.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add python/
@@ -270,7 +272,7 @@ git commit -m "feat(core): scaffold atoms-core package and error hierarchy"
   - `ABSENT: AbsentState` singleton.
   - `kind_of(state: PathState) -> PathKind`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `python/tests/test_fingerprint.py`:
 
@@ -307,12 +309,12 @@ def test_kind_of_maps_every_variant():
     assert kind_of(SymlinkState(target="../x", mode=0o777)) is PathKind.SYMLINK
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `uv run pytest tests/test_fingerprint.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'atoms.core.fingerprint'`.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 `python/src/atoms/core/fingerprint.py`:
 
@@ -378,12 +380,12 @@ def kind_of(state: PathState) -> PathKind:
             return PathKind.SYMLINK
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `uv run pytest tests/test_fingerprint.py -v`
 Expected: PASS.
 
-- [ ] **Step 5: Lint, type-check, commit**
+- [x] **Step 5: Lint, type-check, commit**
 
 ```bash
 uv run ruff check && uv run pyright
@@ -417,7 +419,7 @@ It also fixes a distinct hazard: `scratch_leaf` interpolates a `txid`, a **consu
   - `aliases_scratch_sigil(leaf: str) -> bool` — equivalence-aware test across `{leaf, NFC, NFD, casefold}`.
   - `scratch_leaf(txid: str, effect_id: str, role: str) -> str` — validates each part via `require_valid_identifier`, then builds `f"{SCRATCH_SIGIL}{txid}.{effect_id}.{role}"`.
 
-- [ ] **Step 1: Write the failing identifier test**
+- [x] **Step 1: Write the failing identifier test**
 
 `python/tests/test_identifiers.py`:
 
@@ -447,12 +449,12 @@ def test_rejects_unsafe_identifiers(bad):
         require_valid_identifier("effect_id", bad)
 ```
 
-- [ ] **Step 2: Run it and verify it fails**
+- [x] **Step 2: Run it and verify it fails**
 
 Run: `uv run pytest tests/test_identifiers.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'atoms.core.identifiers'`.
 
-- [ ] **Step 3: Implement `identifiers.py`**
+- [x] **Step 3: Implement `identifiers.py`**
 
 `python/src/atoms/core/identifiers.py`:
 
@@ -486,12 +488,12 @@ def require_valid_identifier(kind: str, value: str) -> str:
     return value
 ```
 
-- [ ] **Step 4: Run it and verify it passes**
+- [x] **Step 4: Run it and verify it passes**
 
 Run: `uv run pytest tests/test_identifiers.py -v`
 Expected: PASS.
 
-- [ ] **Step 5: Write the failing scratch test**
+- [x] **Step 5: Write the failing scratch test**
 
 `python/tests/test_scratch.py`:
 
@@ -558,12 +560,12 @@ def test_scratch_leaf_rejects_unsafe_effect_id():
         scratch_leaf("deadbeef", "e07", "x" * 65)
 ```
 
-- [ ] **Step 6: Run test to verify it fails**
+- [x] **Step 6: Run test to verify it fails**
 
 Run: `uv run pytest tests/test_scratch.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'atoms.core.scratch'`.
 
-- [ ] **Step 7: Write minimal implementation**
+- [x] **Step 7: Write minimal implementation**
 
 `python/src/atoms/core/scratch.py`:
 
@@ -623,12 +625,12 @@ def scratch_leaf(txid: str, effect_id: str, role: str) -> str:
     return f"{SCRATCH_SIGIL}{txid}.{effect_id}.{role}"
 ```
 
-- [ ] **Step 8: Run test to verify it passes**
+- [x] **Step 8: Run test to verify it passes**
 
 Run: `uv run pytest tests/test_scratch.py -v`
 Expected: PASS.
 
-- [ ] **Step 9: Lint, type-check, commit**
+- [x] **Step 9: Lint, type-check, commit**
 
 ```bash
 uv run ruff check && uv run pyright
@@ -655,7 +657,7 @@ git commit -m "feat(core): scratch grammar with letter-free sigil + bounded safe
   - `occurrences(effect: Effect) -> tuple[Occurrence, ...]` (`singledispatch`), enumerating every `(path, pre, post, role)` the variant touches, with roles `"target"`, `"source"`, `"destination"`.
   - `effect_id_of(effect: Effect) -> str`, `variant_name(effect: Effect) -> str`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `python/tests/test_effects.py`:
 
@@ -716,12 +718,12 @@ def test_create_directory_is_absent_to_dir():
     assert occurrences(e) == (Occurrence(path="sub", pre=ABSENT, post=d, role="target"),)
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `uv run pytest tests/test_effects.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'atoms.core.effects'`.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 `python/src/atoms/core/effects.py`:
 
@@ -835,12 +837,12 @@ def variant_name(effect: Effect) -> str:
     return type(effect).__name__
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `uv run pytest tests/test_effects.py -v`
 Expected: PASS.
 
-- [ ] **Step 5: Lint, type-check, commit**
+- [x] **Step 5: Lint, type-check, commit**
 
 ```bash
 uv run ruff check && uv run pyright
@@ -866,7 +868,7 @@ Implements design §5.5's semantic capability set as data: the always-required t
   - `variant_capabilities(effect: Effect) -> frozenset[Capability]`.
   - `required_capabilities(effects: Iterable[Effect]) -> frozenset[Capability]` = `ALWAYS_REQUIRED ∪ union(variant_capabilities)`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `python/tests/test_capabilities.py`:
 
@@ -945,12 +947,12 @@ def test_required_is_union_over_effects():
     )
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `uv run pytest tests/test_capabilities.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'atoms.core.capabilities'`.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 `python/src/atoms/core/capabilities.py`:
 
@@ -1042,12 +1044,12 @@ def required_capabilities(effects: Iterable[Effect]) -> frozenset[Capability]:
     return frozenset(caps)
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `uv run pytest tests/test_capabilities.py -v`
 Expected: PASS.
 
-- [ ] **Step 5: Lint, type-check, commit**
+- [x] **Step 5: Lint, type-check, commit**
 
 ```bash
 uv run ruff check && uv run pyright
@@ -1074,7 +1076,7 @@ git commit -m "feat(core): semantic capability vocabulary and per-variant deriva
   - `TransactionSpec(schema_version, consumer_tag, intent_digest, initial_surface: tuple[SurfaceEntry, ...], final_surface: tuple[SurfaceEntry, ...], effects: tuple[Effect, ...], dependencies: tuple[Dependency, ...])` frozen dataclass, with method `required_capabilities(self) -> frozenset[Capability]`.
   - `build_spec(*, consumer_tag, intent_digest, initial_surface: Mapping[str, PathState], final_surface: Mapping[str, PathState], effects: Sequence[Effect], dependencies: Iterable[tuple[str, str]] = ()) -> TransactionSpec`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `python/tests/test_spec.py`:
 
@@ -1154,12 +1156,12 @@ def test_required_capabilities_derives_from_effects():
     assert Capability.ATOMIC_EXCHANGE in caps
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `uv run pytest tests/test_spec.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'atoms.core.spec'`.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 `python/src/atoms/core/spec.py`:
 
@@ -1235,12 +1237,12 @@ def build_spec(
 
 Note: `sorted(Dependency(...))` requires `Dependency` to be order-comparable. `@dataclass(frozen=True, slots=True)` is not ordered by default; add `order=True` to the `Dependency` decorator (`@dataclass(frozen=True, slots=True, order=True)`) so the sort is well-defined. Apply that change to `Dependency` before running the test.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `uv run pytest tests/test_spec.py -v`
 Expected: PASS.
 
-- [ ] **Step 5: Lint, type-check, commit**
+- [x] **Step 5: Lint, type-check, commit**
 
 ```bash
 uv run ruff check && uv run pyright
@@ -1268,7 +1270,7 @@ Implements the byte-stable encoding the design relies on twice: §13.3 (validate
   - `canonical_json(spec: TransactionSpec) -> str` — `json.dumps(canonical_obj(spec), sort_keys=True, separators=(",", ":"), ensure_ascii=False)`.
   - `canonical_bytes(spec: TransactionSpec) -> bytes` — UTF-8 of `canonical_json`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `python/tests/test_canonical.py`:
 
@@ -1431,12 +1433,12 @@ def test_golden_bytes_lock_the_durable_contract():
     assert canonical_bytes(_all_variants_spec()) == fixture.read_bytes()
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `uv run pytest tests/test_canonical.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'atoms.core.canonical'`.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 `python/src/atoms/core/canonical.py`:
 
@@ -1562,7 +1564,7 @@ def canonical_bytes(spec: TransactionSpec) -> bytes:
     return canonical_json(spec).encode("utf-8")
 ```
 
-- [ ] **Step 4: Generate the golden fixture**
+- [x] **Step 4: Generate the golden fixture**
 
 `test_golden_bytes_lock_the_durable_contract` needs the fixture to exist. Generate it once from the now-implemented encoder and commit it (this is deliberate golden-file bootstrap, not a placeholder). Run from `python/`:
 
@@ -1578,17 +1580,17 @@ Path('tests/fixtures/spec_all_variants.canonical.json').write_bytes(canonical_by
 
 Then eyeball the fixture (`cat tests/fixtures/spec_all_variants.canonical.json`) and confirm it contains each discriminator (`ReplaceFile`, `CreateFileNoClobber`, `DeletePath`, `MoveNoClobber`, `CreateDirectory`, `file`, `directory`, `symlink`, `absent`), the literal `café`, and sorted dependencies — i.e. that the *reviewed content*, not just self-generated bytes, is what gets locked.
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [x] **Step 5: Run tests to verify they pass**
 
 Run: `uv run pytest tests/test_canonical.py -v`
 Expected: PASS (all tests, including the golden and non-ASCII locks).
 
-- [ ] **Step 6: Full suite, lint, type-check**
+- [x] **Step 6: Full suite, lint, type-check**
 
 Run (from `python/`): `uv run pytest && uv run ruff check && uv run pyright`
 Expected: all tests pass, no lint/type errors.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add python/src/atoms/core/canonical.py python/tests/test_canonical.py \
@@ -1615,7 +1617,7 @@ The durable format (design §7.2 `spec_json`) is only half-specified by an encod
   - Round-trip guarantee: for any `build_spec`-produced spec, `from_canonical_bytes(canonical_bytes(spec)) == spec`.
   - Failure guarantee: on any malformed input, exactly `SpecValidationError` is raised.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `python/tests/test_canonical_decode.py`:
 
@@ -1767,12 +1769,12 @@ def test_malformed_utf8_is_rejected():
         from_canonical_bytes(b"\xff\xfe")
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `uv run pytest tests/test_canonical_decode.py -v`
 Expected: FAIL — `ImportError: cannot import name 'from_canonical_bytes'`.
 
-- [ ] **Step 3: Add the decoder to `canonical.py`**
+- [x] **Step 3: Add the decoder to `canonical.py`**
 
 First, add two imports at the **top** of `python/src/atoms/core/canonical.py` (alongside the existing imports, so ruff's E402 does not fire): `from atoms.core.errors import SpecValidationError` and extend the `atoms.core.spec` import to include `SCHEMA_VERSION` (i.e. `from atoms.core.spec import SCHEMA_VERSION, Dependency, SurfaceEntry, TransactionSpec`). The module already imports `json`. Then append the decoder below the existing encoder:
 
@@ -1937,12 +1939,12 @@ def from_canonical_bytes(data: bytes) -> TransactionSpec:
 
 Note: every JSON scalar, object, and array is type-checked with an exact type (`bool` refused where an integer is required), each state is checked for compatibility with the effect field that holds it (so `ReplaceFile(pre=AbsentState())` is refused, not silently reconstructed), and malformed JSON / non-UTF-8 input is converted to `SpecValidationError` — so `from_canonical_*` raises **only** `SpecValidationError`, never a leaked `KeyError`/`AttributeError`/`TypeError`/`UnicodeDecodeError`. This is durable-format validation, distinct from A2's semantic/path/timeline validation. Decoding rebuilds `TransactionSpec` directly (not via `build_spec`), preserving stored tuple order; round-trip identity holds because a `build_spec`-produced spec is already canonical and `==` on the frozen dataclasses is structural.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `uv run pytest tests/test_canonical_decode.py -v`
 Expected: PASS.
 
-- [ ] **Step 5: Full suite, lint, type-check, commit**
+- [x] **Step 5: Full suite, lint, type-check, commit**
 
 ```bash
 uv run pytest && uv run ruff check && uv run pyright

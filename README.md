@@ -20,13 +20,20 @@ half-write.
 
 ## Status
 
-Pre-implementation. The engine was originally designed inside science through roughly a
+Early implementation. The engine was originally designed inside science through roughly a
 dozen rounds of adversarial contract review; that review capital is carried into the
-standalone authority design below. No production code exists yet; the design's own
-roadmap (§14) gates implementation on owner approval.
+standalone authority design below. The design is approved and its roadmap (§14) decomposes
+Plan A into eight sub-plans, A1–A8.
+
+The pure core (`atoms.core`) exists under `python/`: the transaction model, the five effect
+variants, the semantic capability vocabulary, the reserved scratch grammar, and the durable
+canonical format with a strict round-trippable decoder. It has no filesystem, SQLite, or
+platform dependency yet — no path is mutated by any code in this repository today.
 
 - **Authority design:** [`docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md`](docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md)
   — standalone `atoms` engine, SQLite-in-WAL metadata store, `nodes`/science as deferred consumers.
+- **A1 — core model (implemented):** [`docs/plans/2026-07-23-plan-a1-core-model.md`](docs/plans/2026-07-23-plan-a1-core-model.md)
+- **A2 — compilation validation (planning):** filesystem-independent spec validation and repeated-path timelines.
 - Historical (superseded): the science-framed [`2026-07-20-*`](docs/plans/2026-07-20-recoverable-fs-effect-engine-design.md)
   design + roadmap, retained as the record of the review that hardened the effect/recovery contracts.
 

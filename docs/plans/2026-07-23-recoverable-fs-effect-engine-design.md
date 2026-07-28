@@ -1,7 +1,7 @@
 # Recoverable filesystem effect engine — design
 
 **Date:** 2026-07-23
-**Status:** Draft for owner review — authority design for `atoms`
+**Status:** Approved — authority design for `atoms`. Plan A implementation underway; A1 (§5.1–§5.3, §5.5-as-data, §7.2/§13.3 format) is implemented.
 **Repository:** `atoms` (`~/d/atoms`) — Python-first physical durability substrate below `nodes`
 **Supersedes:** the science-framed [`2026-07-20-recoverable-fs-effect-engine-design.md`](2026-07-20-recoverable-fs-effect-engine-design.md), retained as the historical, review-hardened record.
 
