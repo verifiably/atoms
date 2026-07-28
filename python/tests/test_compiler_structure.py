@@ -6,7 +6,7 @@ from atoms.core.compiler import CompiledSpec, compile_spec
 from atoms.core.effects import CreateFileNoClobber, DeletePath, ReplaceFile
 from atoms.core.errors import SpecValidationError
 from atoms.core.fingerprint import ABSENT, DirectoryState, FileState, SymlinkState
-from atoms.core.spec import Dependency, SurfaceEntry
+from atoms.core.spec import Dependency, SurfaceEntry, TransactionSpec
 from tests.support import EMPTY, F, valid_spec
 
 
@@ -29,6 +29,41 @@ def test_compiled_spec_is_frozen():
 def test_non_transaction_spec_is_rejected():
     with pytest.raises(SpecValidationError, match="TransactionSpec"):
         compile_spec({"schema_version": 1})  # type: ignore[arg-type]
+
+
+class _HostileType(type):
+    def __getattribute__(cls, name):
+        if name == "__name__":
+            raise RuntimeError("subclass-controlled")
+        return super().__getattribute__(name)
+
+
+class _HostileValue(metaclass=_HostileType):
+    pass
+
+
+def test_hostile_type_diagnostics_are_normalized():
+    with pytest.raises(SpecValidationError, match="TransactionSpec"):
+        compile_spec(_HostileValue())  # type: ignore[arg-type]
+
+
+def test_uninitialized_transaction_spec_is_rejected():
+    with pytest.raises(SpecValidationError):
+        compile_spec(object.__new__(TransactionSpec))
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        valid_spec(initial_surface=(object.__new__(SurfaceEntry),)),
+        valid_spec(effects=(object.__new__(CreateFileNoClobber),)),
+        valid_spec(final_surface=(SurfaceEntry(path="a.txt", state=object.__new__(FileState)),)),
+        valid_spec(dependencies=(object.__new__(Dependency),)),
+    ],
+)
+def test_uninitialized_nested_model_members_are_rejected(spec):
+    with pytest.raises(SpecValidationError):
+        compile_spec(spec)
 
 
 def test_unknown_schema_version_is_rejected():

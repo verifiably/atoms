@@ -90,18 +90,18 @@ def _require(condition: object, message: str) -> None:
 
 
 def _require_str(value: Any, what: str) -> str:
-    _require(type(value) is str, f"{what} must be a string, got {type(value).__name__}")
+    _require(type(value) is str, f"{what} must be a string")
     return value
 
 
 def _require_int(value: Any, what: str) -> int:
     # Exact type also refuses bool, which subclasses int and compares equal to 0 and 1.
-    _require(type(value) is int, f"{what} must be an integer, got {type(value).__name__}")
+    _require(type(value) is int, f"{what} must be an integer")
     return value
 
 
 def _require_tuple(value: Any, what: str) -> tuple[Any, ...]:
-    _require(type(value) is tuple, f"{what} must be a tuple, got {type(value).__name__}")
+    _require(type(value) is tuple, f"{what} must be a tuple")
     return value
 
 
@@ -109,7 +109,7 @@ def _require_state_structure(state: Any, what: str) -> None:
     # `type(...) in` is both the exact-type gate and the guard the two lookups need.
     _require(
         type(state) in _STATE_STR_FIELDS,
-        f"{what} must be one of the four path states, got {type(state).__name__}",
+        f"{what} must be one of the four path states",
     )
     for field in _STATE_STR_FIELDS[type(state)]:
         _require_str(getattr(state, field), f"{what}.{field}")
@@ -119,7 +119,7 @@ def _require_state_structure(state: Any, what: str) -> None:
 
 def _phase1_structure(spec: TransactionSpec) -> None:
     """Exhaustive structural typing. Every later phase reads fields with no defensive checks."""
-    _require(type(spec) is TransactionSpec, f"spec must be a TransactionSpec, got {type(spec).__name__}")
+    _require(type(spec) is TransactionSpec, "spec must be a TransactionSpec")
     _require_int(spec.schema_version, "schema_version")
     _require(
         spec.schema_version == SCHEMA_VERSION,
@@ -136,7 +136,7 @@ def _phase1_structure(spec: TransactionSpec) -> None:
             what = f"{label}[{index}]"
             _require(
                 type(entry) is SurfaceEntry,
-                f"{what} must be a SurfaceEntry, got {type(entry).__name__}",
+                f"{what} must be a SurfaceEntry",
             )
             _require_str(entry.path, f"{what}.path")
             _require_state_structure(entry.state, f"{what}.state")
@@ -147,7 +147,7 @@ def _phase1_structure(spec: TransactionSpec) -> None:
         what = f"effects[{index}]"
         _require(
             type(effect) in _EFFECT_FIELDS,
-            f"{what} must be one of the five effect variants, got {type(effect).__name__}",
+            f"{what} must be one of the five effect variants",
         )
         _require_str(effect.effect_id, f"{what}.effect_id")
         path_fields, state_fields = _EFFECT_FIELDS[type(effect)]
@@ -160,7 +160,7 @@ def _phase1_structure(spec: TransactionSpec) -> None:
         what = f"dependencies[{index}]"
         _require(
             type(dependency) is Dependency,
-            f"{what} must be a Dependency, got {type(dependency).__name__}",
+            f"{what} must be a Dependency",
         )
         _require_str(dependency.before, f"{what}.before")
         _require_str(dependency.after, f"{what}.after")
@@ -228,7 +228,12 @@ def compile_spec(spec: TransactionSpec) -> CompiledSpec:
     The phase order is part of the contract: it decides which violation surfaces first
     when a spec breaks several rules at once.
     """
-    _phase1_structure(spec)
-    _phase2_fingerprints(spec)
-    timelines = build_timelines(spec.effects)
-    return CompiledSpec(spec=_canonicalize(spec), timelines=timelines)
+    try:
+        _phase1_structure(spec)
+        _phase2_fingerprints(spec)
+        timelines = build_timelines(spec.effects)
+        return CompiledSpec(spec=_canonicalize(spec), timelines=timelines)
+    except SpecValidationError:
+        raise
+    except Exception as exc:
+        raise SpecValidationError("spec is structurally invalid") from exc
