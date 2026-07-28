@@ -2434,7 +2434,7 @@ both rules, asserting which refusal surfaces.
 
 ## Final-review correction wave
 
-**Status:** Written authority amendment complete; production steps are blocked on owner approval.
+**Status:** Implemented and verified (2026-07-28).
 
 Owner review of commit `7b2f71f` approved the staged-proof architecture with the corrections encoded
 below. This section preserves Tasks 1–6 as history while making the remaining work executable. It is

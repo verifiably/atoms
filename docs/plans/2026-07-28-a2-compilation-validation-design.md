@@ -677,6 +677,6 @@ it before their plans are written.
 
 ## 10. Open items
 
-The final-review production corrections specified in the implementation plan remain unimplemented until
-the owner approves this written amendment. The durability-allowlist configuration tuples and SQLite I/O
-layer still belong to A4 and A5 respectively and are untouched here.
+The final-review production corrections specified in the implementation plan are implemented and
+verified. The durability-allowlist configuration tuples and SQLite I/O layer still belong to A4 and A5
+respectively and are untouched here.
