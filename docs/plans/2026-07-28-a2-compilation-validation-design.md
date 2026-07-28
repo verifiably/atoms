@@ -43,10 +43,10 @@ library.
 
 - root and metadata-directory identity, compared by `st_dev`/`st_ino` rather than spelling (§5.4);
 - **filesystem-aware path aliasing** — whether two declared paths that A2's lexical key treats as
-  distinct nonetheless name one entry on this volume. A2 refuses the lexically detectable cases
-  (phase 4); A4 owes the volume-specific remainder via a per-mount folding probe, including for paths
-  declared `ABSENT`, where there is no inode to compare and the mutation-time no-clobber guard does not
-  contain the case. Now an explicit §5.4 obligation;
+  distinct nonetheless name one entry. A2 refuses the lexically detectable cases (phase 4); A4 owes the
+  remainder against each **parent directory's** actual lookup policy, not the mount's, including for
+  paths declared `ABSENT`, where there is no inode to compare and the mutation-time no-clobber guard does
+  not contain the case. Now an explicit §5.4 obligation;
 - ancestor symlink and mount traversal (`anchored_traversal`, §6);
 - platform capability availability and the per-mount probe (§5.5);
 - durability-allowlist membership;
@@ -253,10 +253,20 @@ Yet the declared final states — `x` absent, `y` present — are not jointly sa
 crash mid-sequence hands the per-path recovery classifier contradictory observations of that entry. The
 guard never fires, so nothing refuses.
 
-A4 therefore needs a **positive** equivalence determination for absent names — a same-volume folding
-probe, the same shape of per-mount probe §5.5 already specifies for capabilities — established at
-compilation, before any capture or mutation. A2's lexical rule shrinks the input to that check; it does
-not substitute for it.
+A4 therefore needs a **positive** equivalence determination for absent names, established at compilation,
+before any capture or mutation. §5.4 now carries it, and carries one constraint worth repeating here
+because it is easy to get wrong: the determination is **per parent directory, not per mount**. ext4
+enables case-insensitive lookup through the per-directory `+F` (`FS_CASEFOLD_FL`) attribute, so a single
+filesystem can hold case-sensitive and case-insensitive directories, and a result probed in the metadata
+root establishes nothing about a target parent. Since folding governs name lookup *within* a directory,
+the obligation decomposes: the leaf names declared beneath each parent must be distinct under that
+parent's policy, applied along the tree, with a transaction-created directory inheriting the policy of
+the deepest existing ancestor.
+
+A2's lexical rule shrinks the input to that check; it does not substitute for it. Note also that phase 4's
+whole-path key is deliberately **coarser** than the true per-directory question: it refuses `a/x` alongside
+`A/x` even where `a` and `A` are genuinely distinct directories. That is the same conservative direction
+the rule takes everywhere here, and it is what buys the portability property above.
 
 ### Phase 5 — Effect ID and exact variant shape
 
@@ -346,10 +356,19 @@ procedure originally covered only a *missing* ancestor — open the deepest exis
 first missing component is absent. That does not reach this case: `p` exists as a regular file, so
 guarded traversal toward `p/q`'s parent fails at `p` with `ENOTDIR`, and no component of `p/q` is missing
 where traversal stops. §6 now carries a second case in which the descendant's absence is **inferred from
-the ancestor's verified fingerprint** rather than probed — a descriptor-coherent observation that `p` is a
-regular file already proves nothing exists beneath it — with §9.5's published-directory descriptor handed
-down to the descendant exactly as in the missing-ancestor case. A2 must not admit a transition the
-capture contract cannot express, so the two land together.
+the ancestor's verified fingerprint** rather than probed, with §9.5's published-directory descriptor
+handed down to the descendant exactly as in the missing-ancestor case.
+
+The inference's strength differs by ancestor kind, and §6 states the two branches separately rather than
+under one justification. A regular-file ancestor is descriptor-coherent — opened `O_RDONLY | O_NOFOLLOW`,
+with type, mode, and content hash all taken from that one descriptor. A **symlink ancestor is not**:
+`symlink_fingerprint` is `lstat` plus `readlink`, which §5.5 defines as explicitly not
+descriptor-coherent, since `O_NOFOLLOW` fails by design on a symlink leaf. The absence inference itself
+holds for both, because neither kind can contain directory entries, but for the symlink branch the
+identity guarantee comes from validating the atomically transferred entry against the frozen fingerprint,
+never from a descriptor.
+
+A2 must not admit a transition the capture contract cannot express, so the two land together.
 
 The rule constrains only pairs where **both** paths are declared in that surface. An ancestor the
 specification never mentions carries no constraint here: whether it exists and is a directory is a live

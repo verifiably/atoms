@@ -278,18 +278,43 @@ Before any metadata or blob write, validation proves:
   root descriptor's `st_dev`/`st_ino`, so a case- or Unicode-normalization alias (an upper-case spelling
   on a case-insensitive volume — the macOS default — or an NFC/NFD variant) cannot slip an effect into
   the metadata store that a lexical prefix check would miss;
-- declared persistent paths name **pairwise distinct entries on the project-root volume**, checked
-  against that volume's actual name equivalence — probed per mount (§5.5) — and not by spelling alone.
-  Two declared paths the volume folds together compile as two independent timelines while addressing one
-  directory entry, so each timeline's occurrence-local preconditions and its recovery classification are
-  computed against state the other timeline is mutating. This check must cover paths declared **absent**,
-  where there is no inode to compare and identity-by-`st_dev`/`st_ino` therefore does not apply; a
-  same-volume folding probe supplies the equivalence instead. The mutation-time no-clobber guard does
-  **not** contain this case: a transaction may create, delete, and re-create through aliased names in
-  sequence — `create x`, `delete x`, `create y` — whereupon every `O_EXCL` and no-clobber transfer
-  succeeds, because the entry is absent each time one runs, while the declared final states (`x` absent,
-  `y` present) remain jointly unsatisfiable on a single entry. The equivalence must therefore be
-  established at compilation, before any capture or mutation;
+- declared persistent paths name **pairwise distinct entries**, checked against the actual name
+  equivalence of the **directory that performs each lookup** — not by spelling, and not per mount. Two
+  declared paths that fold together compile as two independent timelines while addressing one directory
+  entry, so each timeline's occurrence-local preconditions and its recovery classification are computed
+  against state the other timeline is mutating.
+
+  Name equivalence is **per parent directory, not per volume**. ext4 enables case-insensitive lookup with
+  the per-directory `+F` (`FS_CASEFOLD_FL`) attribute on a `casefold`-enabled filesystem, so one
+  filesystem can hold case-sensitive and case-insensitive directories at once
+  ([ext4 admin guide](https://cdn.kernel.org/doc/html/latest/admin-guide/ext4.html#case-insensitive-file-name-lookups)).
+  A result obtained in the metadata root or a probe directory therefore cannot establish the lookup policy
+  of any target parent.
+
+  The check decomposes accordingly. Folding governs the lookup of a name *within* a directory, so two
+  declared paths can alias only if their final components fold together in their **shared** parent;
+  paths under different parents alias only if those parents themselves alias, which is the same question
+  applied one level up. The obligation is therefore: for each declared parent directory, the leaf names
+  declared beneath it are pairwise distinct under **that directory's** policy, applied along the tree.
+
+  For a parent the transaction itself creates, the policy is inherited: where it is a directory attribute
+  it propagates from the parent at creation (ext4 inherits `+F`), so a created directory carries the
+  policy of the deepest existing ancestor, which is the directory whose policy must be determined. A
+  parent that neither exists nor is created by the transaction cannot be captured at all (§6) and is
+  refused before this question arises.
+
+  How a backend determines a given directory's policy is platform-specific and therefore informative,
+  not contractual — reading the directory attribute where the platform exposes one, or probing
+  empirically within the reserved scratch grammar (§5.1). What is contractual is that the determination
+  is made for the directories this transaction actually writes into.
+
+  This check must cover paths declared **absent**, where there is no inode to compare and
+  identity-by-`st_dev`/`st_ino` therefore does not apply. The mutation-time no-clobber guard does **not**
+  contain that case: a transaction may create, delete, and re-create through aliased names in sequence —
+  `create x`, `delete x`, `create y` — whereupon every `O_EXCL` and no-clobber transfer succeeds, because
+  the entry is absent each time one runs, while the declared final states (`x` absent, `y` present)
+  remain jointly unsatisfiable on a single entry. The equivalence must therefore be established at
+  compilation, before any capture or mutation;
 - every engine scratch name occupies the reserved scratch grammar (§5.1), and no persistent path
   matches that grammar, so scratch and persistent paths are provably disjoint independently of the
   runtime transaction ID;
@@ -427,14 +452,25 @@ traversal stops — guarded traversal fails at `p` itself with `ENOTDIR`, and th
 against which `q` could be looked up.
 
 The descendant's absence is therefore **inferred from the ancestor's verified state rather than probed**.
-Capture already opens the declared ancestor and validates its exact fingerprint — `O_RDONLY | O_NOFOLLOW`
-plus `fstat` and a content hash for a file, `symlink_fingerprint` for a symlink — and a verified regular
-file or symlink cannot contain entries, so nothing can exist beneath it. The inference is stronger than
-the lookup it replaces, not weaker: it rests on a descriptor-coherent observation of the ancestor rather
-than on a negative lookup. As everywhere in this section, capture-time verification is not
-compare-and-swap authority; if the ancestor is swapped for a directory before execution, the destructive
-transfer that deletes it validates the transferred object against the frozen fingerprint and refuses or
-halts rather than proceeding. Execution ordering then follows the missing-ancestor case exactly:
+Neither a regular file nor a symlink can contain directory entries, so an ancestor verified to be either
+one proves nothing exists beneath it. The strength of that verification differs by kind, and the two
+branches must not be conflated:
+
+- **A regular-file ancestor is descriptor-coherent.** Capture opens it with `O_RDONLY | O_NOFOLLOW`,
+  takes its type and mode from `fstat` on that same descriptor, and hashes its contents from it. The
+  inference is then stronger than the negative lookup it replaces, because it rests on a single
+  descriptor's coherent observation rather than on a name resolved twice.
+- **A symlink ancestor is not.** `symlink_fingerprint` is `lstat` plus `readlink` (§5.5), explicitly
+  *not* descriptor-coherent — `O_NOFOLLOW` fails by design on a symlink leaf, so no descriptor to the
+  link itself is available. The absence inference still holds, since a symlink is not a directory, but
+  its identity contract is the one this section states for every symlink precondition: the destructive
+  operation atomically transfers the live entry into the tombstone and validates that transferred object
+  against the frozen fingerprint. The guarantee comes from that validation, never from a descriptor.
+
+As everywhere in this section, capture-time verification is not compare-and-swap authority; if the
+ancestor is swapped for a directory before execution, the destructive transfer that deletes it validates
+the transferred object against the frozen fingerprint and refuses or halts rather than proceeding.
+Execution ordering then follows the missing-ancestor case exactly:
 timeline continuity forces the ancestor's deletion and re-creation to precede any descendant effect, and
 §9.5 hands the newly published directory's verified descriptor down as the descendant's parent
 descriptor, so the descendant never re-resolves the ancestor chain.
