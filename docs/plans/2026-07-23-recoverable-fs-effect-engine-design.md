@@ -1,7 +1,7 @@
 # Recoverable filesystem effect engine — design
 
 **Date:** 2026-07-23
-**Status:** Approved — authority design for `atoms`. Plan A implementation underway; A1 (§5.1–§5.3, §5.5-as-data, §7.2/§13.3 format) is implemented.
+**Status:** Approved — authority design for `atoms`. Plan A implementation underway; A1 (§5.1–§5.3, §5.5-as-data, §7.2/§13.3 format) is implemented. A2's initial implementation is under final-review correction to the staged proof boundary specified in §5.4.
 **Repository:** `atoms` (`~/d/atoms`) — Python-first physical durability substrate below `nodes`
 **Supersedes:** the science-framed [`2026-07-20-recoverable-fs-effect-engine-design.md`](2026-07-20-recoverable-fs-effect-engine-design.md), retained as the historical, review-hardened record.
 
@@ -62,14 +62,15 @@ the start. Shared primitives alone are not the transaction boundary.
 
 ### 3.1 Guarantees
 
-For a valid `TransactionSpec` that passes compilation validation (§5.4):
+For a `TransactionSpec` carried by a `ProjectApprovedSpec` after both stages of §5.4:
 
 1. **Declared persistent surface.** Every persistent path mutation is represented by an effect and
    agrees with the spec's declared initial/final transition surface.
-2. **Validated specification boundary.** The engine executes only a spec that passes compilation
-   validation. Producing and authenticating that spec (e.g. re-deriving a saved plan) is the
-   consumer's responsibility; the engine trusts the validated spec's provenance to the consumer and
-   owns everything after it.
+2. **Staged specification boundary.** The engine executes only a spec whose filesystem-independent
+   lexical/model rules were proved by A2 and whose concrete project/root rules were then proved by A4.
+   Producing and authenticating the raw spec (e.g. re-deriving a saved plan) is the consumer's
+   responsibility; neither A2 proof authenticates consumer intent nor A4 approval repairs an invalid
+   consumer plan.
 3. **Coherent rollback material.** A regular file's retained bytes and fingerprint come from one
    no-follow file descriptor.
 4. **Optimistic concurrency without destructive check/use gaps.** Capture verifies the frozen
@@ -131,9 +132,13 @@ For a valid `TransactionSpec` that passes compilation validation (§5.4):
 ## 4. Architecture boundary
 
 ```text
-consumer builds a validated TransactionSpec
+consumer builds a TransactionSpec
+    ↓ compile_spec (A2: pure lexical/model proof)
+CompiledSpec
     ↓
 engine coordinator acquires the project lock and resolves any active transaction
+    ↓ approve_for_project (A4: rooted filesystem/project proof)
+ProjectApprovedSpec
     ↓
 engine prepares the durable record → executes effects → commits or rolls back
     ↓
@@ -142,11 +147,14 @@ consumer receives a durable terminal outcome
 
 ### 4.1 The consumer boundary
 
-The engine's public input is a `TransactionSpec` (§5.1). A consumer owns every domain decision that
+The engine's public submission input is a `TransactionSpec` (§5.1). A consumer owns every domain decision that
 produces one — entity numbering, rendering, reference selection, destinations, cohort structure, and
 whatever saved plan or authentication the consumer maintains. Saved plans, wire formats, and
 re-derivation/authentication of frozen intent are **consumer concerns outside this design**; the
-engine begins at a validated spec and never reaches back into consumer plan formats.
+engine never reaches back into consumer plan formats. The engine first compiles the value to an A2
+`CompiledSpec`, then A4 approves that proof for one held project/root context and returns a
+`ProjectApprovedSpec` (§5.4). These proof values are engine-internal; a consumer does not construct or
+submit either one.
 
 Every fingerprint in the spec, including each path's expected initial state, comes from the consumer's
 frozen intent, not from a live filesystem read at spec-build time. That is what keeps a re-built spec
@@ -173,7 +181,9 @@ decision. It never receives mutable ownership state and never supplies commit ca
 
 ### 4.3 Public versus internal contracts
 
-The spec's declared initial/final transition surface is the engine's input contract. Effect ordering,
+The raw spec's declared initial/final transition surface is the consumer contract.
+`CompiledSpec` and `ProjectApprovedSpec` are staged internal evidence that this contract is usable;
+neither changes or merges the declared surface. Effect ordering,
 intermediate states, scratch paths, journal state, and recovery strategies are internal and are
 frozen in the durable record only when an application begins. This keeps engine mechanics out of any
 consumer's saved format and prevents observable internal ordering from becoming an accidental
@@ -196,7 +206,10 @@ The internal specification contains:
 
 The compiled specification is deterministic and contains no runtime transaction ID. Preparation binds
 it to a fresh transaction ID in the durable record; scratch paths derive from that ID plus the stable
-effect ID. No absolute path is serialized. Resolution happens against the locked project root.
+effect ID. Distinct effect IDs must also be distinct under the portability equivalence
+`NFC(casefold(NFC(id)))`: exact-string uniqueness alone is insufficient because `e1` and `E1` produce
+scratch leaves that alias in an insensitive parent. No absolute path is serialized. Resolution happens
+against the locked project root.
 
 Because the transaction ID is not known at build time, disjointness between scratch names and
 persistent paths cannot be established by comparing concrete names then. It is instead a **structural**
@@ -214,12 +227,19 @@ Compilation rejects any persistent effect path whose leaf begins with `.#~`, und
 Unicode-normalization semantics as the metadata-namespace identity check (§5.4), so declared persistent
 paths and scratch are disjoint regardless of which transaction ID is later bound.
 
-The grammar forecloses *declared* collisions, not concrete ones: a noncooperating writer, or debris
-predating this engine, can still create a concrete scratch leaf. Preparation therefore checks each
-instantiated scratch path for absence after binding the ID; on a collision it **regenerates the
-transaction ID** (yielding fresh scratch names), or, failing that, returns an external-state refusal —
-never an internal `ProtocolError`, because an occupied scratch name is external state under the
-noncooperating-writer model, not a contract violation. This absence check is advisory against a
+The grammar forecloses *declared persistent/scratch* collisions, not either kind of concrete scratch
+collision. A4 instantiates every effect/role scratch leaf in its actual parent and proves the complete
+set pairwise distinct under that parent's real lookup policy. A collision intrinsic to those generated
+names is a project-approval refusal; regenerating the transaction ID cannot fix equivalent effect IDs,
+because the colliding leaves receive the same new transaction-ID prefix. A2's portability-equivalent
+effect-ID uniqueness prevents the fixed NFC/casefold case, but A4's concrete proof remains mandatory
+for filesystem equivalences A2 cannot know.
+
+Separately, a noncooperating writer or debris predating this engine can occupy an otherwise distinct
+concrete scratch leaf. Preparation checks each instantiated scratch path for absence after binding the
+ID; only this **external occupancy** may cause transaction-ID regeneration, which actually changes the
+occupied names. If bounded regeneration cannot find an unoccupied set, preparation returns an
+external-state refusal — never an internal `ProtocolError`. The absence check is advisory against a
 post-check race: the authoritative guard is the `O_EXCL` creation or no-clobber transfer at the moment
 each scratch object is materialized, which fails closed if the name was taken between check and use.
 
@@ -258,74 +278,133 @@ retains the content needed to materialize every state in that timeline.
 The initial rollback surface is separate from occurrence-local preconditions. This removes any
 single-snapshot ambiguity that would force globally unique `rel_path` values.
 
-### 5.4 Compilation validation
+### 5.4 Staged specification validation
 
-Before any metadata or blob write, validation proves:
+Validation is two proof-producing stages. A boolean validator or a raw `TransactionSpec` is not
+interchangeable with either proof:
+
+```python
+compile_spec(spec: TransactionSpec) -> CompiledSpec
+approve_for_project(
+    compiled: CompiledSpec,
+    context: ProjectContext,
+) -> ProjectApprovedSpec
+```
+
+`compile_spec` is A2's sole public construction authority for `CompiledSpec`.
+`approve_for_project` is A4's sole public construction authority for `ProjectApprovedSpec`.
+`ProjectApprovedSpec` uses composition: it contains the exact `CompiledSpec` it approved plus A4's
+project/root binding and resolved-topology evidence; it is not a subclass of `CompiledSpec`. A4's
+reviewed plan owns the concrete fields of `ProjectContext` and that evidence, but `ProjectContext` must
+represent the held project-root and metadata-root identities and selected capability backend against
+which approval runs.
+
+Both proof types are frozen, factory-controlled dataclasses. Their ordinary public-field constructors
+refuse, and `dataclasses.replace(proof, ...)` refuses because it re-enters the same guarded constructor
+without the module-private construction authority. This is a conventional Python API boundary, not a
+claim of cryptographic unforgeability: hostile code can use private module state, `object.__new__`, or
+`object.__setattr__` to manufacture objects. The engine relies on module privacy, type checking, and
+architecture tests to prevent ordinary in-repository bypass; it does not present either proof as safe
+against arbitrary code executing in the process.
+
+The stages are deliberately non-substitutable:
+
+- A3's filesystem-independent reference model may consume `CompiledSpec`.
+- A4 consumes `CompiledSpec` and returns `ProjectApprovedSpec` only after every rooted check below.
+- A5–A8 accept `ProjectApprovedSpec`, never raw `TransactionSpec` or raw `CompiledSpec`, for preparation,
+  capture, execution, recovery, or the synthetic exerciser.
+- There is no union-typed entry point, compatibility adapter, implicit revalidation, or fallback path
+  accepting both proof stages.
+
+#### A2: lexical/model proof
+
+A2 is pure and proves only rules decidable from the value:
 
 - the specification declares at least one effect — a zero-effect transaction is refused rather than
-  committed as a no-op, so the project lock, the durable record, and the recovery machinery are never
-  spent on a transaction that cannot mutate anything;
-- effect IDs are unique and ordering is complete;
+  committed as a no-op;
+- effect IDs are valid, exact-string unique, and pairwise distinct under
+  `NFC(casefold(NFC(effect_id)))`, the portability equivalence used by generated scratch leaves;
+- dependency endpoints and ordering are complete;
 - each effect's shapes are legal for its variant;
-- payload hashes and modes match the declared postconditions;
+- every `FileState.byte_len` fits SQLite's signed `INTEGER` domain:
+  `0 <= byte_len <= 2**63 - 1`;
+- fingerprint hashes and permission modes are well formed; payload bytes remain A6's stream-verification
+  responsibility;
 - repeated-path timelines are continuous;
 - each path's first and last states match the spec's declared initial/final states;
-- the effect surface equals the declared transition surface exactly;
-- no persistent path is omitted or undeclared;
-- ancestor-resolved, leaf-retaining paths stay inside the project root;
+- the effect surface equals the declared transition surface exactly, with no omitted or undeclared path;
+- persistent paths obey the project-relative lexical grammar and cannot occupy the reserved scratch
+  grammar;
+- distinct persistent path spellings are refused when their **whole-path** portability keys
+  `NFC(casefold(NFC(path)))` match;
+- the lexical initial/final trees are surface-consistent, and every lexically recognized
+  transaction-created directory precedes effects beneath it.
+
+A2's whole-path alias refusal is intentionally stronger than an actual-policy check. For example, it
+refuses `a/x` together with `A/x` even on a case-sensitive volume where `a` and `A` are distinct
+directories. That conservative loss of expressiveness buys a portable subset: anything A2 compiles is
+free of the NFC/casefold aliases it knows about on both sensitive and insensitive volumes. It is still
+only a filter. A4 may not treat successful A2 compilation as evidence of actual per-directory
+distinctness or topology.
+
+A2's surface-tree and created-directory-order checks must be linear in the total number of characters
+and components across their declared inputs. They build a component trie, or use an equivalent
+single-pass component traversal, and never materialize every prefix string for every path. Traversal is
+iterative so Python's recursion limit does not become an arbitrary lexical path-depth limit. A2 imposes
+no `NAME_MAX`, `PATH_MAX`, component-count, or total-path-length limit; real filesystem limits belong to
+A4.
+
+#### A4: rooted project approval
+
+A4 proves the remaining rules against one held project/root context before any transaction-record or
+blob write:
+
+- ancestor-resolved, leaf-retaining paths stay inside the held project root;
 - no persistent effect path resolves at or below the metadata root — checked by **filesystem identity,
   not spelling**: each effect path's resolved leaf and ancestors are compared against the held metadata
-  root descriptor's `st_dev`/`st_ino`, so a case- or Unicode-normalization alias (an upper-case spelling
-  on a case-insensitive volume — the macOS default — or an NFC/NFD variant) cannot slip an effect into
-  the metadata store that a lexical prefix check would miss;
-- declared persistent paths name **pairwise distinct entries**, checked against the actual name
-  equivalence of the **directory that performs each lookup** — not by spelling, and not per mount. Two
-  declared paths that fold together compile as two independent timelines while addressing one directory
-  entry, so each timeline's occurrence-local preconditions and its recovery classification are computed
-  against state the other timeline is mutating.
+  root descriptor's `st_dev`/`st_ino`;
+- every path and component fits the actual filesystem's `NAME_MAX` / `PATH_MAX` constraints;
+- each required semantic capability (§5.5), plus the always-required `anchored_traversal`,
+  `durable_publish`, and `advisory_project_lock`, is supplied by the selected backend for the
+  project-root volume and the resolved configuration tuple is on the durability allowlist;
+- all instantiated effect/role scratch leaves are pairwise distinct under the actual lookup policy of
+  their concrete parents (§5.1), before the separate external-occupancy check;
+- declared persistent paths name pairwise distinct entries under the actual name equivalence of the
+  **directory that performs each lookup**; and
+- the initial/final surface-tree and transaction-created-directory ordering rules are re-run over the
+  **resolved equivalence topology**, not A2's lexical spellings.
 
-  Name equivalence is **per parent directory, not per volume**. ext4 enables case-insensitive lookup with
-  the per-directory `+F` (`FS_CASEFOLD_FL`) attribute on a `casefold`-enabled filesystem, so one
-  filesystem can hold case-sensitive and case-insensitive directories at once
-  ([ext4 admin guide](https://cdn.kernel.org/doc/html/latest/admin-guide/ext4.html#case-insensitive-file-name-lookups)).
-  A result obtained in the metadata root or a probe directory therefore cannot establish the lookup policy
-  of any target parent.
+The resolved topology requirement is stronger than endpoint distinctness. On an insensitive parent,
+declared path `A` and declared descendant `a/x` do not name the same endpoint, so a pairwise endpoint
+check passes; nevertheless `A` is the actual ancestor of `a/x`. A4 must represent both through the same
+resolved parent node, then re-check that a non-directory `A` constrains `a/x` to `ABSENT` and that a
+`CreateDirectory("A")` precedes an effect on `a/x`. It may not reuse A2's lexical tree verdict.
 
-  The check decomposes accordingly. Folding governs the lookup of a name *within* a directory, so two
-  declared paths can alias only if their final components fold together in their **shared** parent;
-  paths under different parents alias only if those parents themselves alias, which is the same question
-  applied one level up. The obligation is therefore: for each declared parent directory, the leaf names
-  declared beneath it are pairwise distinct under **that directory's** policy, applied along the tree.
+Name equivalence is **per parent directory, not per volume**. ext4 enables case-insensitive lookup with
+the per-directory `+F` (`FS_CASEFOLD_FL`) attribute on a `casefold`-enabled filesystem, so one
+filesystem can hold case-sensitive and case-insensitive directories at once
+([ext4 admin guide](https://cdn.kernel.org/doc/html/latest/admin-guide/ext4.html#case-insensitive-file-name-lookups)).
+A result obtained in the metadata root or a probe directory therefore cannot establish the lookup
+policy of any target parent.
 
-  For a parent the transaction itself creates, the policy is inherited: where it is a directory attribute
-  it propagates from the parent at creation (ext4 inherits `+F`), so a created directory carries the
-  policy of the deepest existing ancestor, which is the directory whose policy must be determined. A
-  parent that neither exists nor is created by the transaction cannot be captured at all (§6) and is
-  refused before this question arises.
+Folding governs lookup of one component within its parent. A4 consequently walks the declared tree
+component by component, applying each held or inherited parent policy. For a directory the transaction
+creates, the policy is inherited from the deepest existing ancestor where the platform defines it that
+way (ext4 inherits `+F`). A parent that neither exists nor is created by the transaction cannot be
+captured and is refused before approval.
 
-  How a backend determines a given directory's policy is platform-specific and therefore informative,
-  not contractual — reading the directory attribute where the platform exposes one, or probing
-  empirically within the reserved scratch grammar (§5.1). What is contractual is that the determination
-  is made for the directories this transaction actually writes into.
+How a backend determines a directory's policy is platform-specific and therefore informative, not
+contractual — reading a directory attribute where exposed, or probing empirically within the reserved
+scratch grammar (§5.1). What is contractual is that approval determines the policy for every directory
+this transaction looks up or writes into.
 
-  This check must cover paths declared **absent**, where there is no inode to compare and
-  identity-by-`st_dev`/`st_ino` therefore does not apply. The mutation-time no-clobber guard does **not**
-  contain that case: a transaction may create, delete, and re-create through aliased names in sequence —
-  `create x`, `delete x`, `create y` — whereupon every `O_EXCL` and no-clobber transfer succeeds, because
-  the entry is absent each time one runs, while the declared final states (`x` absent, `y` present)
-  remain jointly unsatisfiable on a single entry. The equivalence must therefore be established at
-  compilation, before any capture or mutation;
-- every engine scratch name occupies the reserved scratch grammar (§5.1), and no persistent path
-  matches that grammar, so scratch and persistent paths are provably disjoint independently of the
-  runtime transaction ID;
-- every semantic capability (§5.5) named by the spec's effects, plus the always-required
-  `anchored_traversal`, `durable_publish`, and `advisory_project_lock`, is supplied by the active
-  backend for the project-root volume; a missing capability refuses before any transaction-record write
-  (spec, journal, or blob) or project mutation. The engine-owned bootstrap the probe itself requires —
-  creating/opening `metadata_root`, the lock, and `probe/` — is exempt and necessarily precedes this
-  approval (§5.5).
+The check covers paths declared **absent**, where identity-by-`st_dev`/`st_ino` does not apply.
+Mutation-time no-clobber is not a substitute: `create x`, `delete x`, `create y` can make every
+no-clobber operation succeed while aliasing `x` and `y` leave the declared final states unsatisfiable.
+Actual equivalence and the resolved topology are therefore established before capture or mutation.
 
-After this boundary, internal execution code trusts the specification.
+Only a factory-issued `ProjectApprovedSpec` crosses into A5–A8. After that boundary, those stages may
+trust both the A2 value proof and the A4 project/root proof without re-deriving either.
 
 ### 5.5 Filesystem capability vocabulary
 
@@ -637,7 +716,8 @@ the atomicity SQLite provides natively.
 
 ### 7.3 Preparation order and the cross-substrate durability rule
 
-Because blob and staging bytes live on the filesystem while the record lives in the database, the one
+Preparation accepts only a factory-issued `ProjectApprovedSpec` (§5.4). Because blob and staging bytes
+live on the filesystem while the record lives in the database, the one
 ordering the engine must enforce by hand is: **anything the database references must be durable on the
 filesystem before the COMMIT that references it.** Preparation is:
 
@@ -1058,8 +1138,9 @@ fallback or automatic discharge of a halt.
 
 ## 12. Consumers
 
-The engine's only public boundary is a validated `TransactionSpec` and the recovery-resolve lease. It
-ships with no consumer-specific compilation baked in. Two vehicles exercise and adopt it.
+The engine's consumer submission boundary is a `TransactionSpec`; its mutation boundary is a
+`ProjectApprovedSpec` plus the recovery-resolve lease (§5.4). It ships with no consumer-specific
+compilation baked in. Two vehicles exercise and adopt it.
 
 ### 12.1 Synthetic exerciser (the vertical slice)
 
@@ -1162,10 +1243,35 @@ tuple the engine has not crash-certified is refused at preparation, not trusted.
 
 ### 13.3 Spec and compiler conformance
 
-Build a spec, validate it twice, and require identical canonical output. Reject missing effects, extra
-effects, invalid ordering, malformed timelines, payload/mode mismatches, path escapes, and initial/final
-surface divergence. Apply the same case- and Unicode (NFC/NFD) alias tests to **all three**
-name-equivalence surfaces on case- and normalization-insensitive volumes:
+Build a spec, compile it twice, and require equal `CompiledSpec` values and identical canonical output.
+The A2 suite additionally proves:
+
+- `compile_spec` is the ordinary construction authority: direct `CompiledSpec(...)` and
+  `dataclasses.replace(compiled, ...)` raise `TypeError`, while field assignment raises the exact
+  `dataclasses.FrozenInstanceError`;
+- `FileState.byte_len` accepts `2**63 - 1`, rejects `2**63`, and rejects an integer with thousands of
+  digits without interpolating that integer into a diagnostic, under both Python's default
+  `int_max_str_digits` limit and the disabled (`0`) setting; the accepted maximum survives canonical
+  encode/decode;
+- distinct effect IDs that share `NFC(casefold(NFC(id)))` are refused, even though their exact strings
+  differ;
+- surface-tree and created-directory-order validation use iterative component tries (or an equivalent
+  traversal), visit each input component a constant number of times, and accept a lexically valid path
+  deeper than Python's recursion limit; and
+- tests pin only the load-bearing refusal precedence declared by A2: structural typing before any field
+  interpretation, duplicate effect IDs before dependency resolution, duplicate surfaces before map
+  construction, and exact coverage before endpoint lookup. The thirteen phase numbers do not promise
+  error precedence between independent rules, so no change-detector tests freeze those adjacencies.
+
+Reject missing effects, extra effects, invalid ordering, malformed timelines, fingerprint/mode
+mismatches, path escapes, and initial/final surface divergence. A4's conformance suite constructs a
+`ProjectApprovedSpec` only through `approve_for_project`; direct construction and
+`dataclasses.replace` refuse just as for the A2 proof. A5–A8 type/architecture tests reject raw
+`TransactionSpec` and raw `CompiledSpec` at their preparation and execution boundaries.
+
+Apply case- and Unicode (NFC/NFD) alias tests to all name-equivalence surfaces. A2 runs the fixed
+portability-key cases without a filesystem; A4 runs actual-policy cases on case- and
+normalization-insensitive directories:
 
 1. **The metadata namespace** — a persistent path spelled as an upper-case or NFC/NFD variant of
    `metadata_root`, which the identity-based check of §5.4 must reject where a lexical prefix check would
@@ -1173,8 +1279,9 @@ name-equivalence surfaces on case- and normalization-insensitive volumes:
 2. **The reserved scratch grammar** — a persistent path aliasing the scratch sigil through a case or
    normalization variant, which the equivalence-aware grammar match of §5.1 must reject. A letter-free
    sigil and equivalence-aware matching must both pass these tests.
-3. **Persistent-path distinctness** — two declared persistent paths that the *lookup directory* folds
-   together, which the pairwise-distinctness check of §5.4 must reject. Because that rule is scoped per
+3. **Persistent-path distinctness and topology** — two declared persistent paths that the *lookup
+   directory* folds together, which A4 approval must reject, plus spellings that resolve to one
+   ancestor/descendant topology without naming the same endpoint. Because that rule is scoped per
    parent directory rather than per volume, its conformance suite must cover:
    - **Mixed policies on one filesystem.** A `casefold`-enabled ext4 volume carrying both a plain parent
      and a `+F` (`FS_CASEFOLD_FL`) parent, proving a policy determined in one directory is never applied
@@ -1185,9 +1292,16 @@ name-equivalence surfaces on case- and normalization-insensitive volumes:
    - **Absent-path alias refusal.** Two aliasing paths both declared `ABSENT`, refused **before capture**
      — the case where no inode exists to compare and identity alone cannot decide.
    - **The create/delete/re-create counterexample.** The `create x`, `delete x`, `create y` sequence of
-     §5.4, asserting that compilation refuses it. Every `O_EXCL` and no-clobber transfer in that sequence
-     succeeds, so a suite that only exercises mutation-time guards would pass while the declared final
-     states remain jointly unsatisfiable.
+     §5.4, asserting that A2 refuses fixed-key aliases and A4 refuses any remaining actual-policy alias.
+     Every `O_EXCL` and no-clobber transfer in that sequence succeeds, so a suite that only exercises
+     mutation-time guards would pass while the declared final states remain jointly unsatisfiable.
+   - **Resolved ancestor topology.** On an insensitive parent, `A` and `a/x`, proving A4 re-runs both
+     surface-tree consistency and created-directory-before-descendant ordering over resolved
+     equivalence nodes rather than accepting A2's lexical-tree verdict.
+4. **Concrete scratch distinctness** — all instantiated effect/role scratch leaves in each actual
+   parent are pairwise distinct under that parent's policy. An intrinsic collision refuses approval and
+   is unchanged by transaction-ID regeneration; separate external occupancy may trigger the bounded
+   regeneration policy of §5.1.
 
 ### 13.4 End-to-end recovery
 
@@ -1255,7 +1369,9 @@ transaction model.
 
 ### Plan A — engine core and synthetic exerciser
 
-1. Pure transaction/effect model and validators (§5).
+1. Pure transaction/effect model, A2's factory-controlled `CompiledSpec`, and the executable recovery
+   reference model (§5, §8.4, §13.1). `CompiledSpec` carries only filesystem-independent lexical/model
+   proof.
 2. A platform capability backend layer resolving the §5.5 vocabulary behind one interface: a Linux
    backend (`openat2` anchored traversal, `renameat2`, `fsync`) and a macOS backend
    (`openat`+`O_NOFOLLOW_ANY`, `renamex_np`/`renameatx_np`, `fcntl(F_FULLFSYNC)`), plus a per-volume
@@ -1266,7 +1382,9 @@ transaction model.
    wrappers are **vendored/adapted**
    (not depended on) for `renameat2`
    / `openat2` on Linux and `renamex_np` / `F_FULLFSYNC` on macOS; the solved single-file case uses
-   stdlib `os.replace`.
+   stdlib `os.replace`. This layer owns A4's factory-controlled `ProjectApprovedSpec`, concrete
+   scratch-name distinctness, and resolved per-directory equivalence topology; A5–A8 accept that proof
+   rather than raw `CompiledSpec`.
 3. The SQLite-WAL metadata store (§7): schema, the project lock and universal recovery-resolve lease,
    blobs, and the preparation/per-effect commit ordering — including the idempotent bootstrap phase
    (§5.5) that precedes capability approval, and the **metadata-store I/O-layer decision** (§7): stdlib
@@ -1309,6 +1427,8 @@ explicit recursive content model (§5.2); they are not implied by the initial cl
 
 The architecture is complete when:
 
+- ordinary construction and `dataclasses.replace` cannot manufacture either staged proof, and every
+  A5–A8 transaction entry point requires `ProjectApprovedSpec`;
 - the synthetic exerciser drives every effect variant through the engine and mutates only through the
   executor;
 - every mutating entry point runs inside the recovery-resolve lease, holding the project lock across its

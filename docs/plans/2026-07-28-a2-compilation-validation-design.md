@@ -1,7 +1,7 @@
 # A2 — Filesystem-independent compilation validation and repeated-path timelines
 
 **Date:** 2026-07-28
-**Status:** Implemented (2026-07-28)
+**Status:** Reopened by final review (2026-07-28). This amendment is written; production corrections await owner approval.
 **Refines:** [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md) §5.3, §5.4, §13.3
 **Depends on:** [`2026-07-23-plan-a1-core-model.md`](2026-07-23-plan-a1-core-model.md) (implemented)
 
@@ -9,15 +9,17 @@ Where this document and the authority design disagree, the authority design wins
 
 ## 1. Decision
 
-A2 adds the engine's **compilation trust boundary** as a pure function:
+A2 adds the first stage of the engine's specification trust boundary as a pure function:
 
 ```python
 compile_spec(spec: TransactionSpec) -> CompiledSpec
 ```
 
-`CompiledSpec` is a frozen value that A3–A8 accept wherever they require trusted input. Everything
-downstream of this call may assume the specification is well-formed; nothing downstream re-derives these
-invariants.
+`CompiledSpec` is a factory-controlled, frozen proof of A2's filesystem-independent lexical/model
+rules. A3 may consume it for the pure recovery reference model. A4 consumes it and, after actual
+project/root checks, constructs the distinct `ProjectApprovedSpec` proof defined by authority §5.4.
+A5–A8 accept that A4 proof, not raw `TransactionSpec` and not raw `CompiledSpec`. No compatibility
+adapter, union-typed entry point, or implicit downstream recompilation bridges the two proof stages.
 
 A2 implements exactly the subset of design §5.4 that is decidable without touching a filesystem. It has
 no filesystem, SQLite, or platform dependency, and — like A1 — depends on nothing outside the standard
@@ -28,18 +30,24 @@ library.
 **A2 establishes the trust boundary for:**
 
 - effect-ID uniqueness and dependency validity;
+- effect-ID distinctness under the scratch portability equivalence
+  `NFC(casefold(NFC(effect_id)))`;
 - exact per-variant shape validation;
 - safe identifiers and the project-relative path grammar;
 - reserved `.#~` scratch-name rejection, under case- and NFC/NFD-equivalence semantics;
 - lexical distinctness of declared paths under Unicode caseless matching, so two spellings of one entry
   cannot compile as two timelines;
 - UTF-8 encodability of every string that reaches the durable canonical form;
-- fingerprint well-formedness (hash spelling, byte lengths, permission-only modes);
+- fingerprint well-formedness (hash spelling, signed-64-bit byte lengths, permission-only modes);
 - continuous repeated-path timelines (§5.3);
 - initial/final surface agreement and exact effect-surface coverage;
 - structural consistency between a declared path and its declared ancestors.
 
-**Deferred to A4, unchanged:**
+Phases 12–13 establish their lexical topology rules in time linear in the total characters/components
+they consume. They use iterative component tries or an equivalent single-pass traversal, not repeated
+materialization of every prefix string, and impose no lexical path-depth or path-length limit.
+
+**Deferred to A4:**
 
 - root and metadata-directory identity, compared by `st_dev`/`st_ino` rather than spelling (§5.4);
 - **filesystem-aware path aliasing** — whether two declared paths that A2's lexical key treats as
@@ -47,6 +55,12 @@ library.
   remainder against each **parent directory's** actual lookup policy, not the mount's, including for
   paths declared `ABSENT`, where there is no inode to compare and the mutation-time no-clobber guard does
   not contain the case. Now an explicit §5.4 obligation;
+- the resolved per-directory equivalence topology. A4 must re-run surface-tree consistency and
+  created-directory-before-descendant ordering over that topology; pairwise endpoint distinctness alone
+  does not discharge this;
+- pairwise distinctness of every instantiated effect/role scratch leaf in its concrete parent under
+  that parent's actual lookup policy. Intrinsic name collisions refuse approval; transaction-ID
+  regeneration is reserved for external occupancy and cannot repair equivalent effect IDs;
 - ancestor symlink and mount traversal (`anchored_traversal`, §6);
 - platform capability availability and the per-mount probe (§5.5);
 - durability-allowlist membership;
@@ -73,7 +87,44 @@ TimelineOccurrence
   post:         PathState
 ```
 
-All three are frozen dataclasses, consistent with A1's model.
+All three are frozen dataclasses, consistent with A1's model. `PathTimeline` and
+`TimelineOccurrence` are ordinary data values. `CompiledSpec` is different because its type is proof:
+its dataclass uses a guarded, non-generated constructor, and `compile_spec` is its sole public
+construction authority.
+
+Ordinary `CompiledSpec(spec=..., timelines=...)` construction raises `TypeError`, even when the supplied
+fields came from a valid compiled value. `dataclasses.replace(compiled, ...)` also raises `TypeError`,
+because `replace` calls that guarded constructor and does not possess the module-private construction
+authority. Assignment to a field raises exactly `dataclasses.FrozenInstanceError`.
+
+This is not cryptographic or hostile-process unforgeability. Python permits deliberate bypass with
+private module state, `object.__new__`, and `object.__setattr__`. The contract prevents ordinary
+construction and accidental in-repository laundering; module privacy, static typing, and architecture
+tests enforce that convention. It must not be described as proof against arbitrary Python code already
+executing in the engine process.
+
+The next proof is composition, not inheritance:
+
+```
+ProjectApprovedSpec
+  compiled:        CompiledSpec
+  project_binding: A4-owned rooted approval evidence
+  topology:        A4-owned resolved per-directory equivalence topology
+```
+
+A4's construction authority is:
+
+```python
+approve_for_project(
+    compiled: CompiledSpec,
+    context: ProjectContext,
+) -> ProjectApprovedSpec
+```
+
+It is the sole public construction authority for that frozen, factory-controlled type. Its ordinary
+constructor and `dataclasses.replace` obey the same refusal contract. The A4 plan owns the concrete
+`ProjectContext`, binding, and topology field types; it may refine their internal shape but may not
+collapse `ProjectApprovedSpec` into `CompiledSpec`.
 
 `CompiledSpec` deliberately holds nothing else. The required-capability set stays derivable through the
 existing `TransactionSpec.required_capabilities()`, which A4 calls; freezing a denormalized copy into the
@@ -103,21 +154,26 @@ more than one unit's worth of responsibility:
 
 ## 5. Validation phases
 
-Compilation proceeds in fail-early phases. **The phase order is part of the contract**: it determines
-which violation surfaces first when a specification breaks several rules at once, which is what makes
-error assertions in the test suite stable.
+Compilation is described as thirteen fail-early phases because that is the clearest responsibility map.
+The numbers do **not** make every adjacent pair a public first-error contract. Independent rules may be
+reordered without a compatibility promise, and tests must not freeze such changes merely to detect them.
 
-Three ordering constraints are forced rather than chosen. Every field must be type-checked (phase 1)
-before any later phase interprets one, or a wrong-typed field would raise the exceptions §6 forbids.
-Duplicate effect IDs (phase 6) must be rejected before dependency endpoints are resolved (phase 7), or an
-ID would not identify one effect. Exact coverage (phase 10) must be proven before timeline endpoints are
-compared against the surfaces (phase 11), or the endpoint comparison could look up a path that no surface
-declares.
+Only four precedence constraints are load-bearing:
 
-Each forced constraint carries a test obligation: a specification that violates **both** rules, asserting
-that the earlier phase's refusal is the one that surfaces. Per-rule tests do not discharge it — a suite
-whose duplicate-ID cases declare no dependencies and whose dependency cases use unique IDs stays green
-under a swap, leaving a contractual order unverified.
+1. Phase 1 exact structural typing precedes every field interpretation, so a malformed direct dataclass
+   cannot leak `AttributeError`, `TypeError`, or subclass-controlled behavior.
+2. Phase 6 duplicate effect-ID refusal precedes phase 7 endpoint resolution, because an ID must name
+   exactly one effect before `{effect_id: index}` is meaningful.
+3. Phase 8 duplicate-surface refusal precedes construction of the surface maps consumed by phases
+   10–12, because dict construction would silently collapse a duplicate.
+4. Phase 10 exact coverage precedes phase 11 endpoint lookup, because endpoint comparison indexes both
+   surface maps by timeline path.
+
+Each stable edge carries a multi-violation test asserting the earlier refusal: malformed structure plus
+a later-rule violation, duplicate IDs plus an invalid dependency, duplicate surface entries plus an
+endpoint/tree violation, and a missing surface path that also makes endpoint lookup impossible.
+Per-rule tests establish all other rules independently. There is deliberately no twelve-test
+adjacent-phase change detector.
 
 ### Phase 1 — Exhaustive structural typing
 
@@ -180,7 +236,12 @@ phase 5 asks "is this variant's choice of state legal".
 Applied to every `PathState` reachable from the surfaces and from the effects.
 
 - `FileState.content_hash` matches `^sha256:[0-9a-f]{64}$` — lowercase hex only.
-- `FileState.byte_len` is an integer `>= 0`.
+- `FileState.byte_len` is in SQLite's signed `INTEGER` domain:
+  `0 <= byte_len <= 2**63 - 1`. The bound check runs before the empty-file cross-check and its refusal
+  message contains the fixed bounds, not `repr(byte_len)` or any interpolation of the rejected value.
+  This makes refusal total for an integer with thousands of digits under both the default and disabled
+  `int_max_str_digits` setting and avoids allocating a diagnostic proportional to attacker-controlled
+  integer size.
 - Every `mode` (`FileState`, `DirectoryState`, `SymlinkState`) is an integer in `0 .. 0o7777`.
   Permission bits only, never type bits. The range admits setuid, setgid, and sticky, because a setgid
   directory is a legitimate declared postcondition.
@@ -246,15 +307,17 @@ guarantee is derived per-timeline, so this corrupts the model itself, not merely
 A2 cannot decide it. Refusing the whole equivalence class is the conservative direction: it costs only
 specifications that declare two case- or normalization-variant spellings of one path in a single
 transaction, which has no legitimate use even on a case-sensitive volume, and it buys a portability
-property worth having — **a specification that compiles is safe to execute on either kind of volume.**
-Resolving instead of refusing would mean silently merging two declared timelines, which is precisely the
-silent fallback this codebase forbids.
+property worth having — **a specification that compiles contains none of this fixed NFC/casefold alias
+class on either kind of volume.** It still requires A4's actual-policy proof before execution. Resolving
+instead of refusing would mean silently merging two declared timelines, which is precisely the silent
+fallback this codebase forbids.
 
-**What remains A4's.** The key above is a fixed approximation of one volume's folding. A filesystem may
+**What remains A4's.** This stronger whole-path portability refusal remains intentional; it is not an
+attempt to model the target filesystem. The key above is a fixed approximation of name folding. A filesystem may
 alias two paths this key treats as distinct — a locale-sensitive fold, or HFS+'s particular
 normalization — so phase 4 is a conservative first filter, never a proof of distinctness. A4 owes the
-real check against the volume's actual name equivalence, and §5.4 now carries it as an explicit
-compilation obligation.
+real per-directory check and resolved topology against actual name equivalence. Successful phase 4 is
+never sufficient evidence for A4 approval.
 
 That check cannot be identity-by-`st_dev`/`st_ino` alone, because a path declared `ABSENT` has no inode
 to compare. **Nor is the mutation-time no-clobber guard a sufficient backstop** — an earlier draft of
@@ -273,7 +336,7 @@ Yet the declared final states — `x` absent, `y` present — are not jointly sa
 crash mid-sequence hands the per-path recovery classifier contradictory observations of that entry. The
 guard never fires, so nothing refuses.
 
-A4 therefore needs a **positive** equivalence determination for absent names, established at compilation,
+A4 therefore needs a **positive** equivalence determination for absent names during project approval,
 before any capture or mutation. §5.4 now carries it, and carries one constraint worth repeating here
 because it is easy to get wrong: the determination is **per parent directory, not per mount**. ext4
 enables case-insensitive lookup through the per-directory `+F` (`FS_CASEFOLD_FL`) attribute, so a single
@@ -287,6 +350,12 @@ A2's lexical rule shrinks the input to that check; it does not substitute for it
 whole-path key is deliberately **coarser** than the true per-directory question: it refuses `a/x` alongside
 `A/x` even where `a` and `A` are genuinely distinct directories. That is the same conservative direction
 the rule takes everywhere here, and it is what buys the portability property above.
+
+Actual topology is a separate problem from endpoint aliasing. On an insensitive parent, declared `A`
+and declared `a/x` are different endpoints, but the first is the actual ancestor of the second. A4 must
+map both component spellings through one resolved parent node, then re-run phase 12's surface rule and
+phase 13's creation-order rule over that topology. Pairwise endpoint distinctness and successful A2
+lexical checks do not imply either result.
 
 ### Phase 5 — Effect ID and exact variant shape
 
@@ -304,9 +373,16 @@ builder, which would otherwise have to invent an order between two occurrences i
 A `ReplaceFile` whose `pre` equals its `post` is well-formed and permitted; it keeps the timeline
 continuous and A2 adds no rule the design does not call for.
 
-### Phase 6 — Duplicate effect IDs
+### Phase 6 — Effect-ID uniqueness
 
-No effect ID appears twice.
+No effect ID appears twice by exact string, and no two distinct IDs share
+`NFC(casefold(NFC(effect_id)))`. The second rule is the portability equivalence applied to the
+effect-ID field embedded in `.#~<txid>.<effect-id>.<role>`. With exact-only uniqueness, `e1` and `E1`
+would compile yet generate same-parent scratch leaves that alias on an insensitive filesystem.
+
+Transaction-ID regeneration does not repair that intrinsic collision: both leaves receive the same new
+transaction-ID prefix and remain aliases. A4 still proves the fully instantiated scratch-leaf set under
+each actual parent policy, because a target filesystem can have equivalences beyond A2's fixed key.
 
 ### Phase 7 — Dependencies
 
@@ -354,6 +430,13 @@ This is a property of the two declared surfaces alone and makes no reference to 
 contradictory specifications that the per-effect rules accept — for instance `CreateDirectory("a/b")`
 together with `DeletePath("a/b/c", pre=FileState(...))`, where `a/b` is declared absent initially and so
 `a/b/c` cannot be a file.
+
+The compiler constructs one component trie per surface. Each declared path is split once and its
+terminal node stores the original full spelling plus state. An iterative stack walk carries the nearest
+declared non-directory ancestor, refusing a present terminal beneath it. Trie insertion and traversal
+touch each input component a constant number of times and never join prefixes, so this phase is linear
+in the total surface characters/components. The walk is iterative: recursive descent would turn
+Python's recursion limit into an undeclared path-depth limit.
 
 **A non-directory ancestor constrains its descendants; it does not forbid them.** An earlier draft of
 this rule refused any declared descendant beneath a declared file or symlink outright, which wrongly
@@ -404,11 +487,21 @@ engine itself created and verified.
 This stays separate from phase 12: phase 12 constrains the declared *states*, phase 13 constrains the
 effect *sequence*, and neither implies the other.
 
+The compiler inserts each `CreateDirectory` path into a component trie whose terminal stores the
+creator's path and effect index. It then walks each occurrence's proper-ancestor components once,
+checking creator indices encountered along that route. It does not call `ancestors(path)` or materialize
+joined prefixes. The phase is linear in the components across created-directory paths and effect
+occurrences, with no component-count or lexical path-length ceiling.
+
 ## 6. Error contract
 
 Every malformed specification raises `SpecValidationError` — A1's existing exception, unchanged. No
 `TypeError`, `KeyError`, `AttributeError`, or assertion escapes `compile_spec` on any input, including a
 `TransactionSpec` constructed directly with ill-typed fields rather than through `build_spec`.
+
+That totality promise is scoped to `compile_spec`. Misusing the proof type's guarded constructor or
+`dataclasses.replace` raises `TypeError` by design; mutating a compiled proof raises
+`dataclasses.FrozenInstanceError`. Those are API-misuse refusals, not malformed-specification results.
 
 Totality is load-bearing in two directions, and phases 1 and 3 are what secure it:
 
@@ -422,7 +515,7 @@ Totality is load-bearing in two directions, and phases 1 and 3 are what secure i
 The exception carries a formatted message naming the violated rule and, where applicable, the offending
 effect ID and path. It gains **no** structured attributes. A1's decoder already establishes
 message-only refusal, its tests already assert with `pytest.raises(..., match=...)`, and a wider error
-surface would be a contract every one of A3–A8 then has to honor.
+surface would become an unnecessary contract for compilation callers and the A3/A4 seam.
 
 ## 7. Decisions recorded
 
@@ -461,11 +554,39 @@ specification twice yields equal `CompiledSpec` values and byte-identical `canon
 satisfying §13.3's "validate a spec twice, require identical canonical output". Compilation is also
 idempotent: `compile_spec(compile_spec(s).spec) == compile_spec(s)`.
 
+**Compilation proof is staged, not universal.** `CompiledSpec` means only that A2's pure rules passed.
+It deliberately carries no project root, metadata-root identity, lookup policy, resolved topology,
+capability result, or live precondition. A4's composed `ProjectApprovedSpec` is the proof accepted by
+A5–A8. Keeping two concrete types prevents a caller from treating a portability filter as actual
+filesystem approval.
+
+**`byte_len` adopts the durable-store domain early.** Although A2 imports no SQLite module, the value is
+destined for §7's SQLite `INTEGER` column. Refusing values outside signed 64-bit range at the pure
+boundary prevents a spec from compiling successfully and failing only when metadata is prepared.
+
 ## 8. Testing
 
 Every phase gets independent tests for both acceptance and refusal, asserting on the message so the
-documented phase order is actually pinned. Beyond per-rule coverage:
+rule is identified. Only the four load-bearing precedence edges in §5 get multi-violation tests; tests
+do not pin error order between independent phases. Beyond per-rule coverage:
 
+- **Proof construction and freezing.** `compile_spec` returns `CompiledSpec`; ordinary direct
+  construction and `dataclasses.replace` raise `TypeError`; field assignment raises the exact
+  `dataclasses.FrozenInstanceError`.
+- **Signed-64-bit byte length.** `2**63 - 1` compiles and survives
+  `from_canonical_bytes(canonical_bytes(...))`; `2**63` refuses. A thousands-of-digits value refuses
+  under `sys.int_info.default_max_str_digits` and `0`, proving the diagnostic never formats the rejected
+  value.
+- **Effect-ID portability equivalence.** Distinct safe IDs `e1` and `E1` on otherwise independent effects
+  refuse even though exact-string uniqueness passes. Exact duplicates still surface before dependency
+  resolution.
+- **Linear tree validation.** A path deeper than `sys.getrecursionlimit()` compiles when otherwise
+  valid; a source inspection/assertion confirms phases 12–13 use the iterative component-trie helpers
+  and no longer call the prefix-materializing `ancestors`. The algorithmic proof is the one-split,
+  one-insert, one-walk accounting in §5, not a wall-clock threshold.
+- **Stable precedence only.** Multi-violation cases lock phase 1 before interpretation, phase 6 before
+  phase 7, phase 8 before surface-map consumers, and phase 10 before phase 11. No test is added solely
+  for the other adjacent pairs.
 - **Repeated-path timelines.** The `absent → file → absent → file` case from §5.3, proving a path may
   appear in several ordered effects with a continuous timeline, plus a broken variant for each way
   continuity can fail.
@@ -503,11 +624,14 @@ documented phase order is actually pinned. Beyond per-rule coverage:
 
 Compilation admits shapes it does not itself execute, and each admission obliges a later sub-plan.
 Those are registered in [`docs/deferred-obligation-ledger.md`](../deferred-obligation-ledger.md) —
-entries 1 through 6 and 8 originate here. The register exists because every finding across three review
-rounds of this document sat at that seam: a shape A2 permitted whose downstream contract was unwritten.
-A3 and A4 are reviewed against it before their plans are written.
+entries 1 through 6, 8, and the final-review additions 9 through 11 originate here or at its A4 seam.
+The additions lock the staged A4 proof, resolved equivalence topology, and concrete scratch-name
+distinctness. The register exists because every finding across review rounds of this document sat at
+that seam: a shape A2 permitted whose downstream contract was unwritten. A3 and A4 are reviewed against
+it before their plans are written.
 
 ## 10. Open items
 
-None. The two decisions design §14 defers — the durability-allowlist configuration tuples and the SQLite
-I/O layer — belong to A4 and A5 respectively and are untouched here.
+The final-review production corrections specified in the implementation plan remain unimplemented until
+the owner approves this written amendment. The durability-allowlist configuration tuples and SQLite I/O
+layer still belong to A4 and A5 respectively and are untouched here.

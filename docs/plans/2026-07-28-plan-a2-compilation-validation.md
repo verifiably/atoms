@@ -10,6 +10,12 @@
 
 **Design authority:** [`2026-07-28-a2-compilation-validation-design.md`](2026-07-28-a2-compilation-validation-design.md), which refines [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md) §5.3, §5.4, §13.3. Where they disagree, the authority design wins.
 
+> **Final-review amendment (2026-07-28):** Tasks 1–6 below are the historical implementation record.
+> They remain intact for provenance, including code blocks that describe the pre-review implementation.
+> The section **Final-review correction wave** at the end of this document is the sole executable plan
+> for remaining A2 work and supersedes every conflicting historical statement or snippet. Production
+> work must not begin until the owner approves the amended authority and A2 design.
+
 ## Global Constraints
 
 - **Python floor:** `requires-python = ">=3.11"`. Already set; do not change.
@@ -2422,3 +2428,559 @@ both rules, asserting which refusal surfaces.
 - Phase 10 before phase 11: phase 11 indexes the surface maps directly, so an undeclared path would
   raise `KeyError` rather than a refusal (Task 5 states this). Locked by the phase 10 "omits" tests,
   which produce exactly that specification.
+
+---
+
+## Final-review correction wave
+
+**Status:** Written authority amendment complete; production steps are blocked on owner approval.
+
+This section preserves Tasks 1–6 as history while making the remaining work executable. It supersedes
+four historical claims above:
+
+| Historical claim | Corrected contract |
+| --- | --- |
+| `CompiledSpec` is an ordinarily constructible frozen dataclass trusted by A3–A8 | `compile_spec` is its guarded construction authority; A3 may consume it, A4 approves it, and A5–A8 require A4's composed `ProjectApprovedSpec` |
+| `FileState.byte_len >= 0` | `0 <= byte_len <= 2**63 - 1`, refused before any rejected integer is formatted |
+| Phases 12–13 repeatedly call `ancestors(path)` | Both use iterative component tries and are linear in the characters/components they consume |
+| All thirteen phases have stable first-error order | Only the four load-bearing precedence edges in the amended design §5 are stable |
+
+The A2 correction touches only the existing A2 modules and tests. It does not implement A4, add a
+compatibility layer, introduce a `Unified` type, impose a lexical path-length limit, or modify A1 model
+files.
+
+### Stage 1 gate: written authority
+
+**Files:**
+- Modify: `docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md`
+- Modify: `docs/plans/2026-07-28-a2-compilation-validation-design.md`
+- Modify: `docs/plans/2026-07-28-plan-a2-compilation-validation.md`
+- Modify: `docs/deferred-obligation-ledger.md`
+
+- [ ] Amend the four documents, run their self-review, and commit with a `docs(a2): ...` subject.
+- [ ] Stop and obtain owner approval. Do not edit `python/src/` or `python/tests/` in this stage.
+
+### Task 7: Factory-control the A2 proof
+
+**Files:**
+- Modify: `python/src/atoms/core/compiler.py`
+- Test: `python/tests/test_compiler_structure.py`
+
+**Interfaces:**
+- `compile_spec(spec: TransactionSpec) -> CompiledSpec` remains the public A2 factory.
+- `CompiledSpec.spec` and `.timelines` remain read-only fields.
+- Ordinary construction and `dataclasses.replace` raise `TypeError`; mutation raises
+  `dataclasses.FrozenInstanceError`.
+
+- [ ] **Step 1: Write focused failing tests**
+
+Change the dataclass import and replace the broad freezing assertion:
+
+```python
+from dataclasses import FrozenInstanceError, dataclass, replace
+
+
+def test_compiled_spec_is_frozen():
+    compiled = compile_spec(valid_spec())
+    with pytest.raises(FrozenInstanceError):
+        compiled.spec = None  # type: ignore[misc]
+
+
+def test_compiled_spec_refuses_ordinary_direct_construction():
+    compiled = compile_spec(valid_spec())
+    with pytest.raises(TypeError, match="compile_spec"):
+        CompiledSpec(spec=compiled.spec, timelines=compiled.timelines)
+
+
+def test_compiled_spec_refuses_dataclasses_replace():
+    compiled = compile_spec(valid_spec())
+    with pytest.raises(TypeError, match="compile_spec"):
+        replace(compiled)
+    with pytest.raises(TypeError, match="compile_spec"):
+        replace(compiled, spec=compiled.spec)
+```
+
+- [ ] **Step 2: Run the focused tests and observe red**
+
+Run: `uv run pytest tests/test_compiler_structure.py -k "frozen or ordinary_direct or dataclasses_replace" -v`
+
+Expected before implementation: direct construction and both `replace` calls return values instead of
+raising; the exact freezing assertion already passes.
+
+- [ ] **Step 3: Guard construction without claiming unforgeability**
+
+Replace the generated `CompiledSpec` initializer and route the successful compiler return through one
+private helper:
+
+```python
+_COMPILED_SPEC_CONSTRUCTION_TOKEN = object()
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class CompiledSpec:
+    """A2's factory-issued proof of filesystem-independent specification rules."""
+
+    spec: TransactionSpec
+    timelines: tuple[PathTimeline, ...]
+
+    def __init__(
+        self,
+        *,
+        spec: TransactionSpec,
+        timelines: tuple[PathTimeline, ...],
+        _construction_token: object | None = None,
+    ) -> None:
+        if _construction_token is not _COMPILED_SPEC_CONSTRUCTION_TOKEN:
+            raise TypeError("CompiledSpec values are created only by compile_spec")
+        object.__setattr__(self, "spec", spec)
+        object.__setattr__(self, "timelines", timelines)
+
+
+def _new_compiled_spec(
+    *,
+    spec: TransactionSpec,
+    timelines: tuple[PathTimeline, ...],
+) -> CompiledSpec:
+    return CompiledSpec(
+        spec=spec,
+        timelines=timelines,
+        _construction_token=_COMPILED_SPEC_CONSTRUCTION_TOKEN,
+    )
+```
+
+The final line of `compile_spec` becomes:
+
+```python
+return _new_compiled_spec(spec=_canonicalize(spec), timelines=timelines)
+```
+
+The token is a conventional module-private gate. Do not describe it as a secret or security boundary;
+`object.__new__`, `object.__setattr__`, or importing private state can bypass it deliberately.
+
+- [ ] **Step 4: Re-run the focused tests and observe green**
+
+Run: `uv run pytest tests/test_compiler_structure.py -k "frozen or ordinary_direct or dataclasses_replace" -v`
+
+Expected: all selected tests pass.
+
+### Task 8: Bound byte lengths and make effect IDs scratch-distinct
+
+**Files:**
+- Modify: `python/src/atoms/core/compiler.py`
+- Test: `python/tests/test_compiler_structure.py`
+- Test: `python/tests/test_compiler_paths.py`
+
+#### 8A — signed-64-bit `byte_len`
+
+- [ ] **Step 1: Write failing boundary and diagnostic tests**
+
+Add imports of `sys`, `canonical_bytes`, and `from_canonical_bytes`, then add:
+
+```python
+MAX_SQLITE_INTEGER = 2**63 - 1
+
+
+def _spec_with_byte_len(byte_len: int):
+    state = FileState(content_hash=F.content_hash, mode=F.mode, byte_len=byte_len)
+    return valid_spec(
+        final_surface=(SurfaceEntry(path="a.txt", state=state),),
+        effects=(CreateFileNoClobber(effect_id="e1", path="a.txt", post=state),),
+    )
+
+
+def test_maximum_sqlite_byte_len_compiles_and_round_trips():
+    compiled = compile_spec(_spec_with_byte_len(MAX_SQLITE_INTEGER))
+    assert from_canonical_bytes(canonical_bytes(compiled.spec)) == compiled.spec
+
+
+def test_byte_len_above_sqlite_integer_domain_is_rejected():
+    with pytest.raises(SpecValidationError, match=r"0\.\.2\*\*63 - 1"):
+        compile_spec(_spec_with_byte_len(MAX_SQLITE_INTEGER + 1))
+
+
+@pytest.mark.parametrize("digit_limit", [sys.int_info.default_max_str_digits, 0])
+def test_huge_byte_len_refuses_without_formatting_it(digit_limit):
+    previous = sys.get_int_max_str_digits()
+    try:
+        sys.set_int_max_str_digits(digit_limit)
+        huge = 10 ** (sys.int_info.default_max_str_digits + 1000)
+        with pytest.raises(SpecValidationError, match=r"0\.\.2\*\*63 - 1"):
+            compile_spec(_spec_with_byte_len(huge))
+    finally:
+        sys.set_int_max_str_digits(previous)
+```
+
+- [ ] **Step 2: Run red**
+
+Run: `uv run pytest tests/test_compiler_structure.py -k "sqlite_byte_len or huge_byte_len" -v`
+
+Expected: the maximum compiles, while the out-of-range cases fail because the current compiler accepts
+them (or leaks while formatting the huge integer under the default digit limit).
+
+- [ ] **Step 3: Add the bound before every value-formatting branch**
+
+Add beside `MAX_MODE`:
+
+```python
+MAX_SQLITE_INTEGER = 2**63 - 1
+```
+
+At the start of the `FileState` branch in `_phase2_fingerprints`, after the hash spelling check and
+before the empty-file cross-check:
+
+```python
+_require(
+    0 <= state.byte_len <= MAX_SQLITE_INTEGER,
+    f"{what}.byte_len must be in 0..2**63 - 1",
+)
+```
+
+Remove the old non-negative check whose message interpolates `state.byte_len`. No refusal path may
+format the rejected integer.
+
+- [ ] **Step 4: Run green**
+
+Run: `uv run pytest tests/test_compiler_structure.py -k "byte_len" -v`
+
+Expected: all byte-length tests pass.
+
+#### 8B — portability-equivalent effect IDs
+
+- [ ] **Step 5: Write the failing intrinsic-collision test**
+
+Add to `test_compiler_paths.py`:
+
+```python
+def test_portability_equivalent_effect_ids_are_rejected():
+    with pytest.raises(SpecValidationError, match="portability-equivalent effect_id"):
+        compile_spec(
+            _spec(
+                {"a": ABSENT, "b": ABSENT},
+                {"a": F, "b": F},
+                (
+                    CreateFileNoClobber(effect_id="e1", path="a", post=F),
+                    CreateFileNoClobber(effect_id="E1", path="b", post=F),
+                ),
+            )
+        )
+```
+
+- [ ] **Step 6: Run red**
+
+Run: `uv run pytest tests/test_compiler_paths.py -k "portability_equivalent_effect_ids" -v`
+
+Expected: FAIL because exact-string uniqueness currently accepts `e1` and `E1`.
+
+- [ ] **Step 7: Extend phase 6 without weakening exact-duplicate precedence**
+
+Replace `_phase6_unique_effect_ids` with:
+
+```python
+def _phase6_unique_effect_ids(spec: TransactionSpec) -> None:
+    exact_seen: set[str] = set()
+    first_by_portability_key: dict[str, str] = {}
+    for effect in spec.effects:
+        _require(
+            effect.effect_id not in exact_seen,
+            f"duplicate effect_id: {effect.effect_id!r}",
+        )
+        exact_seen.add(effect.effect_id)
+
+        key = path_equivalence_key(effect.effect_id)
+        previous = first_by_portability_key.setdefault(key, effect.effect_id)
+        _require(
+            previous == effect.effect_id,
+            f"portability-equivalent effect_id values {previous!r} and "
+            f"{effect.effect_id!r} would generate aliasing scratch leaves",
+        )
+```
+
+Exact duplicates are checked first so the existing phase 6 → phase 7 precedence test retains its
+documented message.
+
+- [ ] **Step 8: Run green**
+
+Run: `uv run pytest tests/test_compiler_paths.py -k "effect_id" -v`
+
+Expected: all effect-ID tests pass.
+
+### Task 9: Make phases 12–13 linear
+
+**Files:**
+- Modify: `python/src/atoms/core/compiler.py`
+- Test: `python/tests/test_compiler_timelines.py`
+
+**Complexity contract:** Let `C_surface` be the sum of component counts/characters in one surface and
+`C_effect` the sum across created-directory paths and effect occurrences. Phase 12 is `O(C_surface)`;
+phase 13 is `O(C_effect)` with average-constant dict lookup. Neither recursion nor repeated joined
+prefix strings is allowed.
+
+- [ ] **Step 1: Add a deep-path failing test**
+
+Add `import sys`, `import atoms.core.compiler as compiler_module`, and:
+
+```python
+def test_tree_validation_does_not_materialize_prefix_paths(monkeypatch):
+    def reject_prefix_materialization(path):
+        raise AssertionError(f"materialized prefixes for {path!r}")
+
+    monkeypatch.setattr(
+        compiler_module,
+        "ancestors",
+        reject_prefix_materialization,
+        raising=False,
+    )
+    compile_spec(
+        _spec(
+            {"a": ABSENT, "a/b": ABSENT, "a/b/f": ABSENT},
+            {"a": D, "a/b": D, "a/b/f": F},
+            (
+                CreateDirectory(effect_id="e1", path="a", post=D),
+                CreateDirectory(effect_id="e2", path="a/b", post=D),
+                CreateFileNoClobber(effect_id="e3", path="a/b/f", post=F),
+            ),
+        )
+    )
+
+
+def test_tree_validation_has_no_python_recursion_depth_limit():
+    depth = sys.getrecursionlimit() + 100
+    path = "/".join(f"d{i}" for i in range(depth))
+    compile_spec(
+        _spec(
+            {path: ABSENT},
+            {path: F},
+            (CreateFileNoClobber(effect_id="e1", path=path, post=F),),
+        )
+    )
+```
+
+The first test is red against the current compiler because both phases call `ancestors`; after the
+refactor the injected name is unused. The second protects the iterative requirement. The linearity
+proof comes from the component accounting and implementation inspection below, not a flaky wall-clock
+threshold.
+
+- [ ] **Step 2: Add trie helpers and remove prefix materialization**
+
+Change the import to `from dataclasses import dataclass, field`, remove `ancestors` from the
+`atoms.core.paths` import, and add:
+
+```python
+@dataclass(slots=True)
+class _PathTrieNode:
+    children: dict[str, "_PathTrieNode"] = field(default_factory=dict)
+    surface: tuple[str, PathState] | None = None
+    creator: tuple[str, int] | None = None
+
+
+def _insert_path(root: _PathTrieNode, path: str) -> _PathTrieNode:
+    node = root
+    for component in path.split("/"):
+        child = node.children.get(component)
+        if child is None:
+            child = _PathTrieNode()
+            node.children[component] = child
+        node = child
+    return node
+```
+
+Replace phase 12 with the iterative surface walk:
+
+```python
+def _phase12_surface_tree(surface: dict[str, PathState], label: str) -> None:
+    root = _PathTrieNode()
+    for path, state in surface.items():
+        _insert_path(root, path).surface = (path, state)
+
+    constraint: tuple[str, PathState] | None
+    stack: list[tuple[_PathTrieNode, tuple[str, PathState] | None]] = [(root, None)]
+    while stack:
+        node, constraint = stack.pop()
+        next_constraint = constraint
+        if node.surface is not None:
+            path, state = node.surface
+            if constraint is not None:
+                ancestor_path, ancestor_state = constraint
+                _require(
+                    isinstance(state, AbsentState),
+                    f"{label} declares {path!r} beneath {ancestor_path!r}, which is "
+                    f"{type(ancestor_state).__name__} and so cannot contain entries; "
+                    f"{path!r} must be declared absent",
+                )
+            next_constraint = None if isinstance(state, DirectoryState) else (path, state)
+        for child in node.children.values():
+            stack.append((child, next_constraint))
+```
+
+Replace phase 13 with a creator trie and one component walk per occurrence:
+
+```python
+def _phase13_ancestor_ordering(spec: TransactionSpec) -> None:
+    root = _PathTrieNode()
+    has_creator = False
+    for index, effect in enumerate(spec.effects):
+        if isinstance(effect, CreateDirectory):
+            _insert_path(root, effect.path).creator = (effect.path, index)
+            has_creator = True
+    if not has_creator:
+        return
+
+    for index, effect in enumerate(spec.effects):
+        for occurrence in occurrences(effect):
+            node = root
+            for component in occurrence.path.split("/")[:-1]:
+                child = node.children.get(component)
+                if child is None:
+                    break
+                node = child
+                if node.creator is None:
+                    continue
+                creator_path, creator_index = node.creator
+                _require(
+                    creator_index < index,
+                    f"effect {effect.effect_id!r} touches {occurrence.path!r} beneath "
+                    f"{creator_path!r}, which this transaction creates later; outer "
+                    f"directory creation must come before every affected descendant",
+                )
+```
+
+- [ ] **Step 3: Run the focused tree suite**
+
+Run: `uv run pytest tests/test_compiler_timelines.py -k "tree or ancestor or directory_creation or nested_creation or ordering" -v`
+
+Expected: all selected tests pass, including the path deeper than the recursion limit.
+
+- [ ] **Step 4: Inspect the complexity construction**
+
+Run:
+
+```bash
+rg -n "ancestors|join\\(" src/atoms/core/compiler.py
+```
+
+Expected: no matches. Inspect `_insert_path`, `_phase12_surface_tree`, and
+`_phase13_ancestor_ordering`: each loop advances by one input component and no loop rebuilds a prefix.
+Do not replace this inspection with a timing assertion, and do not add a lexical length limit.
+
+### Task 10: Lock only load-bearing precedence and refresh boundary wording
+
+**Files:**
+- Modify: `python/src/atoms/core/compiler.py`
+- Test: `python/tests/test_compiler_paths.py`
+- Test: `python/tests/test_compiler_timelines.py`
+- Modify after green: `README.md`
+- Modify after green: `AGENTS.md`
+- Modify after green: `docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md`
+- Modify after green: `docs/plans/2026-07-28-a2-compilation-validation-design.md`
+
+- [ ] **Step 1: Add the missing phase 8 precedence test**
+
+```python
+def test_duplicate_surface_refuses_before_surface_maps_collapse_it():
+    with pytest.raises(SpecValidationError, match="duplicate path"):
+        compile_spec(
+            valid_spec(
+                initial_surface=(
+                    SurfaceEntry(path="a.txt", state=ABSENT),
+                    SurfaceEntry(path="a.txt", state=F),
+                ),
+                final_surface=(SurfaceEntry(path="a.txt", state=F),),
+            )
+        )
+```
+
+This one spec violates duplicate-surface shape and, after a last-value-wins dict collapse, the initial
+endpoint rule. The duplicate must surface.
+
+- [ ] **Step 2: Make the phase 10 precedence case explicit**
+
+Retain the existing missing-initial-surface test and tighten its match to the coverage diagnostic:
+
+```python
+with pytest.raises(SpecValidationError, match="initial_surface omits"):
+```
+
+That input also makes phase 11's indexed lookup impossible, so it locks phase 10 → phase 11.
+The phase 1 and phase 6 precedence cases already exist. Do not add tests for the other adjacent pairs.
+
+- [ ] **Step 3: Run the precedence tests**
+
+Run:
+
+```bash
+uv run pytest tests/test_compiler_structure.py tests/test_compiler_paths.py \
+  tests/test_compiler_timelines.py -k "non_effect_in_effects_is_rejected or duplicate_ids_are_refused_before or duplicate_surface_refuses_before or missing_from_the_initial_surface" -v
+```
+
+Expected: all selected tests pass.
+
+- [ ] **Step 4: Correct source and status wording after all production tests are green**
+
+In `compiler.py`, state that `CompiledSpec` proves A2 rules, A4 produces `ProjectApprovedSpec`, and only
+the four named precedence edges are stable. Remove every claim that A3–A8 may trust raw
+`CompiledSpec`.
+
+Update status text as follows:
+
+- A2 design: `**Status:** Implemented, including final-review corrections (2026-07-28)`.
+- Authority header: remove the pending-correction sentence and state that A1 and A2 are implemented.
+- `AGENTS.md`: describe `compile_spec` as the pure first-stage proof; state that A4 must produce
+  `ProjectApprovedSpec` before A5–A8.
+- `README.md`: retain A2 as implemented and describe it as filesystem-independent compilation, not the
+  complete project/root approval boundary.
+
+Do not discharge ledger entries 2, 4–7, or 9–11; their owners have not landed.
+
+### Task 11: Full verification and production commit
+
+- [ ] **Step 1: Run the focused corrected suite**
+
+Run from `python/`:
+
+```bash
+uv run pytest tests/test_compiler_structure.py tests/test_compiler_paths.py \
+  tests/test_compiler_timelines.py tests/test_compiler_properties.py -v
+```
+
+Expected: all selected tests pass.
+
+- [ ] **Step 2: Run the complete project verification**
+
+```bash
+uv run pytest
+uv run ruff check
+uv run pyright
+```
+
+Expected: zero test failures, zero lint errors, and zero type errors. Read each complete output before
+claiming completion.
+
+- [ ] **Step 3: Review scope and diff**
+
+```bash
+git status --short
+git diff --check
+git diff --stat
+git diff -- python/src/atoms/core/compiler.py python/tests \
+  README.md AGENTS.md docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md \
+  docs/plans/2026-07-28-a2-compilation-validation-design.md
+```
+
+Expected: only the A2 compiler/tests and named status documents change; no A1 model file, A4
+implementation, compatibility layer, or unrelated refactor appears.
+
+- [ ] **Step 4: Commit the production correction separately**
+
+```bash
+git add python/src/atoms/core/compiler.py \
+  python/tests/test_compiler_structure.py \
+  python/tests/test_compiler_paths.py \
+  python/tests/test_compiler_timelines.py \
+  README.md AGENTS.md \
+  docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md \
+  docs/plans/2026-07-28-a2-compilation-validation-design.md
+git commit -m "fix(core): close A2 compilation proof gaps"
+```
+
+No trailer is added. The controller then produces one scoped diff and dispatches exactly one scoped
+re-review.
