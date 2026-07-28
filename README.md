@@ -36,6 +36,9 @@ platform dependency yet — no path is mutated by any code in this repository to
 - **A2 — compilation validation (implemented):** [`docs/plans/2026-07-28-plan-a2-compilation-validation.md`](docs/plans/2026-07-28-plan-a2-compilation-validation.md)
   — pure filesystem-independent `CompiledSpec` proof; A4 still owns project/root approval and must
   produce `ProjectApprovedSpec` before A5–A8.
+- **A3 — executable recovery reference model (design under owner review):**
+  [`docs/plans/2026-07-28-a3-recovery-reference-model-design.md`](docs/plans/2026-07-28-a3-recovery-reference-model-design.md)
+  — production classification authority with a pure semantic reducer; no A3 code has landed.
 - Historical (superseded): the science-framed [`2026-07-20-*`](docs/plans/2026-07-20-recoverable-fs-effect-engine-design.md)
   design + roadmap, retained as the record of the review that hardened the effect/recovery contracts.
 

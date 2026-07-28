@@ -309,7 +309,9 @@ against arbitrary code executing in the process.
 
 The stages are deliberately non-substitutable:
 
-- A3's filesystem-independent reference model may consume `CompiledSpec`.
+- A3's filesystem-independent reference model builds pure recovery snapshots around the exact
+  `CompiledSpec`. Synthetic model tests may supply a structurally validated logical topology; the
+  production snapshot also contains A4's factory-issued resolved topology from `ProjectApprovedSpec`.
 - A4 consumes `CompiledSpec` and returns `ProjectApprovedSpec` only after every rooted check below.
 - A5–A8 accept `ProjectApprovedSpec`, never raw `TransactionSpec` or raw `CompiledSpec`, for preparation,
   capture, execution, recovery, or the synthetic exerciser.
@@ -398,6 +400,9 @@ declared path `A` and declared descendant `a/x` do not name the same endpoint, s
 check passes; nevertheless `A` is the actual ancestor of `a/x`. A4 must represent both through the same
 resolved parent node, then re-check that a non-directory `A` constrains `a/x` to `ABSENT` and that a
 `CreateDirectory("A")` precedes an effect on `a/x`. It may not reuse A2's lexical tree verdict.
+The retained evidence includes a pure logical node/parent topology over every declared persistent path
+and effect scratch role. A3 consumes that topology when reconstructing directory occupancy and abstract
+rollback convergence; it may not substitute A2's exact-spelling tree in production.
 
 Name equivalence is **per parent directory, not per volume**. ext4 enables case-insensitive lookup with
 the per-directory `+F` (`FS_CASEFOLD_FL`) attribute on a `casefold`-enabled filesystem, so one
@@ -846,8 +851,12 @@ idempotently accepted; an unattributable path halts.
 
 Recovery is a two-level operation. First it reconstructs, **per path**, where that path's timeline
 stands; then it classifies the single in-flight effect **jointly over all of its paths**. Its inputs
-are the `transaction.state`, the per-effect `journal_state` rows, and the observed live path tuples;
-because SQLite gives a single crash-consistent metadata state on open, there is no partial journal to
+are the exact A2 `CompiledSpec`, A4's resolved logical topology in production, the active binding, the
+`transaction.state`, the per-effect `journal_state` rows, and coherent logical observations of every
+persistent path and effect scratch role. Present observations carry opaque snapshot-local entry
+identities; file staging observations also carry their exact/prefix/diverged relation to the planned
+postimage, and directory observations identify children outside the resolved topology. Because SQLite
+gives a single crash-consistent metadata state on open, there is no partial journal to
 reconcile before classification begins. Comparing each occurrence independently against the single live
 entry would misread a repeated-path timeline (§5.3), and classifying a multi-path effect (e.g.
 `MoveNoClobber` over source, destination, and anchor, §9.4) per path could yield contradictory
@@ -881,7 +890,10 @@ paths, using the variant's tuple rule, and the one decision applies to every pat
 
 - exact pre-state (forward) or restored pre-state (reverse), no engine scratch survivor → it did not
   land / was fully undone;
-- exact post-state → it landed (subject to the fingerprint-equivalent-recreation non-guarantee);
+- the variant's complete post tuple → it landed (subject to the
+  fingerprint-equivalent-recreation non-guarantee). A persistent post fingerprint alone is
+  insufficient when the variant requires a retained displaced entry, tombstone, anchor, or work-name
+  relation; `CreateFileNoClobber` is the explicit no-staging exception in §9.2;
 - a variant-declared intermediate, including an unvalidated displaced entry → apply that variant's
   settlement rule;
 - a no-clobber blocker whose variant-specific joint tuple proves it did not land → preserve it and
@@ -1125,6 +1137,12 @@ At entry, restoration classifies a surviving staging or tombstone object:
 - undo quarantine for an absent preimage → validate, delete, and fsync it before `UNDONE`;
 - foreign object or changed live target → halt and preserve evidence.
 
+The recovery observation that feeds A3 is coherent. State and identity for one entry come from the same
+opened object; a file prefix relation is computed by comparing that object with the planned blob; and a
+directory's occupancy evidence comes from one descriptor-relative enumeration reconciled against A4's
+resolved persistent-and-scratch topology. A3 receives those primitive facts and owns the verdict. A6/A7
+may not pre-classify them into a recovery outcome.
+
 The authority check precedes every staging-object mutation, including prefix removal. Atomic live
 publication means a crash during restoration leaves the target at the effect state or restored state,
 never at an in-place partial state.
@@ -1190,22 +1208,39 @@ transaction-dialect choice.
 
 ### 13.1 Executable reference model
 
-Recovery is specified as a **top-level transaction classifier** with a subordinate variant classifier:
+Recovery is specified as a production **top-level transaction classifier** with subordinate variant
+classifiers, fresh step authorization, and a pure abstract reducer:
 
 ```text
-transaction: (TransactionSpec, transaction state, per-effect journal states, observed path tuples)
-                 → per-effect recovery decisions
-variant:     (variant, effect journal state, effect's joint persistent-and-scratch tuple)
-                 → effect decision
+transaction: (CompiledSpec, resolved logical topology, active binding,
+              transaction state, rollback result, per-effect journal states, logical observations)
+                 → frozen ordered RecoveryPlan
+variant:     (variant, effect journal state, effect's joint persistent-and-scratch observation)
+                 → effect settlement decision
+authorize:   (RecoveryPlan, step index, fresh coherent observation)
+                 → AuthorizedStep | HaltPlan
+reduce:      (recovery snapshot, RecoveryPlan)
+                 → next recovery snapshot
 ```
 
 The transaction state (§8.1) is a required input: `APPLIED` and `COMMITTED` can present identical `DONE`
 effects and the same final surface yet demand opposite decisions — rollback versus committed cleanup —
 so the classifier cannot be a pure function of effect states and observed tuples alone. The transaction
 classifier reconstructs each path's frontier (forward or reverse per that state) and invokes the
-variant classifier once per in-flight effect over its joint tuple (§8.4). Table and property tests cover
-every variant, forward/reverse state, named intermediate, and unattributable state. Generated valid
-effect sequences prove:
+variant classifier once per in-flight effect over its joint tuple (§8.4). It validates every path and
+scratch observation before emitting any mutating step. A7 consumes this plan as the production recovery
+authority and does not implement a second classifier. Before each filesystem mutation, A7 obtains a
+fresh coherent observation; exact agreement authorizes the bound step, while any mismatch produces a
+halt plan rather than silent reclassification.
+
+The reducer applies the same semantic steps to the logical snapshot. It models identity-preserving
+transfers, removals, preserved external blockers, resolved directory occupancy, journal transitions,
+and active detachment, but no syscall or durability barrier. Applying classification and reduction
+twice reaches a fixed point: a detached terminal snapshot is `NO_RECOVERY`, and an already halted
+snapshot is a stable halt.
+
+Table and property tests cover every variant, forward/reverse state, named intermediate, and
+unattributable state. Generated valid effect sequences prove:
 
 - path timelines are continuous;
 - recovery reconstructs each path's timeline frontier, forward and reverse, and never misreads a
@@ -1214,6 +1249,7 @@ effect sequences prove:
 - uncommitted recovery removes every attributable mutation and preserves proved external blockers;
 - committed recovery retains the final surface;
 - recovery never mutates an unattributable state;
+- a stale plan step is never authorized; and
 - a second recovery pass is idempotent.
 
 This model is the normative recovery specification.

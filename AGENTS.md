@@ -16,7 +16,10 @@ Plan B is written only after Plan A's interfaces settle.
   Stdlib only, no filesystem or SQLite dependency.
 - **A2 — compilation validation: implemented.** `compile_spec` in `atoms/core/compiler.py` produces
   the pure, filesystem-independent first-stage `CompiledSpec` proof; `paths.py` and `timeline.py`
-  support it. A4 must produce the distinct `ProjectApprovedSpec` before A5–A8. A3–A8: not started.
+  support it. A4 must produce the distinct `ProjectApprovedSpec` before A5–A8.
+- **A3 — executable recovery reference model: design under owner review.** The draft defines the pure
+  production classifier, semantic plan, fresh-step authorization, and abstract reducer. No A3
+  production code has landed. A4–A8: not started.
 
 Work lives under `python/` (`uv run pytest`, `uv run ruff check`, `uv run pyright`, all from
 `python/`). No code in this repository mutates a filesystem path yet; that begins at A4.
