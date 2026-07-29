@@ -1,8 +1,8 @@
 from typing import cast
 
 from atoms.core.compiler import compile_spec
-from atoms.core.effects import ReplaceFile
-from atoms.core.fingerprint import FileState
+from atoms.core.effects import CreateFileNoClobber, ReplaceFile
+from atoms.core.fingerprint import ABSENT, FileState, SymlinkState
 from atoms.core.recovery import (
     OBSERVED_ABSENT,
     CommitDecision,
@@ -17,6 +17,7 @@ from atoms.core.recovery import (
     JournalState,
     ObservedEntry,
     ObservedFile,
+    ObservedSymlink,
     OperatorAction,
     PersistentNode,
     PersistentObservation,
@@ -36,10 +37,21 @@ from atoms.core.recovery import (
     TransitionTransactionState,
     build_recovery_snapshot,
 )
+from atoms.core.recovery.journal import reconstruct_frontiers
 from atoms.core.spec import build_spec
 from tests.support import DIGEST, F, G, valid_spec
 
 _DEFAULT = object()
+_EXTERNAL = FileState(
+    content_hash="sha256:" + "9" * 64,
+    mode=0o600,
+    byte_len=19,
+)
+_PREFIX = FileState(
+    content_hash="sha256:" + "8" * 64,
+    mode=0o644,
+    byte_len=2,
+)
 
 
 def compiled_create():
@@ -343,6 +355,229 @@ def make_replace_transform_case():
             result_after=result_after,
             identity_relations=(),
         ),
+    )
+
+
+def _file_effect_topology(effect_id: str):
+    project = ProjectRoot()
+    return RecoveryTopology(
+        parents=(
+            TopologyParent(node=PersistentNode("a.txt"), parent=project),
+            TopologyParent(
+                node=ScratchNode(effect_id, ScratchRole.STAGING),
+                parent=project,
+            ),
+        )
+    )
+
+
+def _file_entry(name: str, *, pre: FileState, post: FileState):
+    if name == "foreign":
+        return ObservedSymlink(SymlinkState("elsewhere", 0o777))
+    states = {
+        "pre": pre,
+        "post": post,
+        "same": pre,
+        "prefix": _PREFIX,
+        "external": _EXTERNAL,
+        "diverged": _EXTERNAL,
+    }
+    if name == "absent":
+        return OBSERVED_ABSENT
+    try:
+        return ObservedFile(states[name], EntryIdentity())
+    except KeyError as exc:
+        raise AssertionError(f"unknown file observation name: {name}") from exc
+
+
+def _file_relation(
+    *,
+    effect,
+    live_name: str,
+    staging_name: str,
+    journal: JournalState,
+):
+    if journal is not JournalState.STARTED or staging_name == "absent":
+        return None
+    if staging_name == "foreign":
+        return None
+    if type(effect) is ReplaceFile and live_name not in {"pre", "same"}:
+        return None
+    if staging_name == "prefix":
+        return FileBuildRelation.STRICT_PREFIX
+    if staging_name == "diverged":
+        return FileBuildRelation.DIVERGED
+    if staging_name in {"pre", "post", "same"}:
+        return FileBuildRelation.EXACT
+    return FileBuildRelation.DIVERGED
+
+
+def _transaction_fields(journal: JournalState, *, committed: bool):
+    if committed:
+        return (
+            TransactionState.COMMITTED,
+            CommitDecision.COMMITTED,
+            None,
+        )
+    if journal in {JournalState.DONE, JournalState.UNDO_STARTED}:
+        return (
+            TransactionState.ROLLING_BACK,
+            CommitDecision.UNCOMMITTED,
+            None,
+        )
+    if journal is JournalState.UNDONE:
+        return (
+            TransactionState.ROLLED_BACK,
+            CommitDecision.UNCOMMITTED,
+            RollbackResult.RESTORED,
+        )
+    if journal is JournalState.PENDING:
+        return (
+            TransactionState.PREPARED,
+            CommitDecision.UNCOMMITTED,
+            None,
+        )
+    return (
+        TransactionState.APPLYING,
+        CommitDecision.UNCOMMITTED,
+        None,
+    )
+
+
+def _make_file_effect_case(
+    effect,
+    live_name: str,
+    staging_name: str,
+    journal: JournalState,
+    *,
+    committed: bool,
+):
+    pre = effect.pre if type(effect) is ReplaceFile else F
+    state, decision, rollback_result = _transaction_fields(
+        journal,
+        committed=committed,
+    )
+    compiled = compile_spec(
+        build_spec(
+            consumer_tag="cnsmr",
+            intent_digest=DIGEST,
+            initial_surface=(
+                {"a.txt": effect.pre}
+                if type(effect) is ReplaceFile
+                else {"a.txt": ABSENT}
+            ),
+            final_surface={"a.txt": effect.post},
+            effects=(effect,),
+        )
+    )
+    snapshot = build_recovery_snapshot(
+        compiled=compiled,
+        topology=_file_effect_topology(effect.effect_id),
+        transaction_state=state,
+        commit_decision=decision,
+        rollback_result=rollback_result,
+        halt_diagnostic=None,
+        active=True,
+        journals=(EffectJournalState(effect.effect_id, journal),),
+        persistent_observations=(
+            PersistentObservation(
+                "a.txt",
+                _file_entry(live_name, pre=pre, post=effect.post),
+            ),
+        ),
+        scratch_observations=(
+            ScratchObservation(
+                effect.effect_id,
+                ScratchRole.STAGING,
+                _file_entry(staging_name, pre=pre, post=effect.post),
+                _file_relation(
+                    effect=effect,
+                    live_name=live_name,
+                    staging_name=staging_name,
+                    journal=journal,
+                ),
+            ),
+        ),
+    )
+    return snapshot, reconstruct_frontiers(snapshot)
+
+
+def make_replace_case(
+    live_name: str,
+    staging_name: str,
+    journal: JournalState,
+    *,
+    committed: bool = False,
+):
+    return _make_file_effect_case(
+        ReplaceFile("e1", "a.txt", F, G),
+        live_name,
+        staging_name,
+        journal,
+        committed=committed,
+    )
+
+
+def make_noop_replace_case(
+    staging_name: str,
+    journal: JournalState,
+    *,
+    committed: bool = False,
+):
+    return _make_file_effect_case(
+        ReplaceFile("e1", "a.txt", F, F),
+        "same",
+        staging_name,
+        journal,
+        committed=committed,
+    )
+
+
+def make_create_file_case(
+    live_name: str,
+    staging_name: str,
+    journal: JournalState,
+    *,
+    committed: bool = False,
+):
+    return _make_file_effect_case(
+        CreateFileNoClobber("e1", "a.txt", G),
+        live_name,
+        staging_name,
+        journal,
+        committed=committed,
+    )
+
+
+def make_pending_drift_case():
+    return make_create_file_case(
+        "external",
+        "absent",
+        JournalState.PENDING,
+    )
+
+
+def make_pending_clean_case():
+    return make_create_file_case(
+        "absent",
+        "absent",
+        JournalState.PENDING,
+    )
+
+
+def make_pending_scratch_case():
+    return make_create_file_case(
+        "absent",
+        "post",
+        JournalState.PENDING,
+    )
+
+
+def make_undone_drift_case():
+    return make_create_file_case(
+        "external",
+        "absent",
+        JournalState.UNDONE,
     )
 
 
