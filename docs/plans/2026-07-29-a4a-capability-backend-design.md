@@ -630,6 +630,13 @@ Every probe cleans up after itself; §7.3 reclamation runs again afterwards rega
 reclamation is **exception-safe**: it runs whether the probe block succeeded, refused, or raised, because a
 SQLite refusal or a subprocess timeout would otherwise strand debris in engine-owned space.
 
+Exception-safe means two things beyond "there is a `finally`". **Acquisition is staged inside the cleanup
+scope**, so a probe that creates two operands or opens two descriptors and fails on the second still
+releases the first — the two-directory `noclobber_transfer` and `identity_anchor` probes are where this
+bites, since each opens a second child directory after the first is already open. And **every release is
+attempted**: a failing close does not un-open the descriptors after it, so a loop that lets the first
+failure escape leaks every later one for the process lifetime, and reclamation must still be reached.
+
 ### 8.3 SQLite-WAL hostability
 
 Opening a database and selecting WAL mode does not prove the required shared-memory path, because WAL can
@@ -664,8 +671,11 @@ choreography would resolve only by one side timing out. The first child performs
 parent commits; the second child performs step 7. Nothing is weakened by the split — step 4 still reads
 concurrently with a held writer, and step 5 still contends against it — and the result is deterministic
 rather than dependent on two timeouts racing. Each child runs under a bounded subprocess timeout, so a
-volume with broken locking fails the probe instead of hanging it. Afterwards the database, `-wal`, and
-`-shm` names are removed through anchored probe cleanup.
+volume with broken locking fails the probe instead of hanging it. A child that exceeds that bound is a
+**refusal, not an escaping error**: the expiry converts to `CapabilityUnavailable` naming which phase —
+contention or write — did not finish, because a `TimeoutExpired` reaching the caller would put a failed
+certification outside the §10 contract, where every other certification failure already lands. Afterwards
+the database, `-wal`, and `-shm` names are removed through anchored probe cleanup.
 
 The second reader must be a subprocess, not a second connection in this process. A same-process
 connection exercises WAL but not SQLite's cross-process POSIX locking contract, and the shared-memory
@@ -874,7 +884,9 @@ substituting the path mid-lease requires the optional hardened VFS the authority
 `CapabilityUnavailable` is raised for: an unsupported platform or architecture; a filesystem type outside
 the barrier-option table; an unresolvable mount identity; a mount-identity or `st_dev` mismatch between
 the roots; a configuration and profile pair absent from the supplied allowlist; unavailable
-`anchored_traversal` or `advisory_project_lock`; and a volume that cannot host SQLite-WAL.
+`anchored_traversal` or `advisory_project_lock`; and a volume that cannot host SQLite-WAL — including a
+certification child that exceeds its bounded timeout, which is a volume that failed to demonstrate
+cross-process WAL coordination rather than an error escaping the contract.
 
 `ProtocolError` is raised for internal contract violations — using a spent binding or a released lock, a
 `verified_child_path` component or identity check that fails, `lock` or a layout name occupied by
@@ -942,6 +954,13 @@ capability absent binds successfully with that capability reported missing. The 
 each non-unsupported errno to confirm it propagates as `OSError` rather than becoming
 `CapabilityUnavailable`.
 
+Injection is **scoped to the call whose outcome the probe reads as evidence**. A fake that raises on every
+call of an operation fails the earlier availability call instead, so the test passes without the refusal
+step ever executing — and keeps passing if that step is mutated to accept any `OSError`, which is exactly
+the defect the test exists to catch. The fake therefore selects its target by name: the availability open
+succeeds and only the named refusal open fails. One injection case is not an errno set at all — the second
+of two child-directory opens fails — and its assertion is that the probe leaks no descriptor.
+
 ### 11.3 Tier 3 — real filesystem
 
 Tier 3 must not assume this machine's layout. A conftest fixture resolves the test root as follows, and
@@ -985,6 +1004,11 @@ separate filesystem, which is true here but not portable.
 
 Reclamation with planted debris: a file, a nested directory, and a symlink pointing *outside* `probe/`,
 asserting the debris is removed and the symlink's target survives.
+
+Release failure is exercised, since it is the one cleanup path no ordinary run reaches: a forced `close`
+failure while releasing the project lock must still attempt the second descriptor, and a forced failure
+releasing a layout descriptor must still reach reclamation. A certification child that exceeds its timeout
+is forced too, asserting `CapabilityUnavailable` naming the phase rather than a `TimeoutExpired`.
 
 Two ordering locks, both encoding decisions that would otherwise regress silently:
 
@@ -1061,10 +1085,14 @@ production-allowlist call-site assertion, owned by A5.
     both the created and `EEXIST` paths; a symlink or non-directory at `probe/` is refused by reclamation
     rather than unlinked; the sync-ignore marker is set best-effort on creation and its failure does not
     fail bootstrap.
-11. Reclamation of a pre-existing `probe/` precedes allowlist refusal, and refusal writes nothing new.
+11. Reclamation of a pre-existing `probe/` precedes allowlist refusal, and refusal writes nothing new. The
+    second reclamation runs in a `finally` and is reached even when releasing a layout descriptor fails;
+    every probe stages its acquisitions inside its own cleanup scope, so failing on the second of two
+    leaves nothing open and nothing behind; and every multi-descriptor release attempts each close.
 12. Absent `anchored_traversal` or `advisory_project_lock` refuses; absent optional capabilities are
     reported; absent SQLite-WAL hostability refuses, certified across **two processes** through the §8.3
-    choreography. `transfer_noclobber` and `link_anchor` are probed across distinct parent directories.
+    choreography, with a child that exceeds its bounded timeout refusing as `CapabilityUnavailable` naming
+    the phase. `transfer_noclobber` and `link_anchor` are probed across distinct parent directories.
 13. `VolumeEvidence` and `HeldProjectLock` are factory-guarded, as is `ProjectBinding`. All three expose
     the §7.1/§9.3 surfaces: no public descriptor attributes, borrowed descriptors, `O_CLOEXEC`, idempotent
     exit, and `ProtocolError` from every accessor once spent or once the lock is released — **except**
@@ -1077,7 +1105,9 @@ production-allowlist call-site assertion, owned by A5.
 15. `OSError` propagates except for the documented per-operation unsupported errno values, each licensed
     by the §10 probe precondition and proved by a mutation test. Every probe step that treats a *refusal*
     as evidence requires the exact expected errno — `ELOOP`, `EXDEV`, `EEXIST`, `SQLITE_BUSY` — and the
-    two bootstrap prerequisites convert from the same shared errno table rather than a second copy.
+    two bootstrap prerequisites convert from the same shared errno table rather than a second copy. Each
+    such step's mutation test injects at the named refusal target, so the assertion fails if the step is
+    weakened to accept any `OSError`.
 16. Tier 3 resolves its volume portably and skips with a precise reason rather than assuming this
     machine's ext4-and-tmpfs layout.
 17. All four verification tiers pass; Ruff and Pyright are clean; the ledger and `AGENTS.md` are updated
