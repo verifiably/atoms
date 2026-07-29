@@ -299,44 +299,68 @@ Failure to resolve a mount ID, or a mismatch between the roots, refuses with `Ca
 @dataclass(frozen=True, slots=True)
 class VolumeConfiguration:
     backend_id: str                        # "linux"
-    kernel_line: str                       # major.minor of os.uname().release, e.g. "7.1"
+    backend_revision: str                  # Atoms backend contract revision, e.g. "linux-1"
+    kernel_identifier: str                 # exact os.uname().release, e.g. "7.1.5-arch1-1"
     filesystem_type: str                   # from mountinfo
     barrier_options: tuple[str, ...]       # normalized and sorted; see the tables below
     durability_features: tuple[str, ...]   # canonical, sorted; empty until a resolver exists
 ```
 
-**Implementation discriminator.** `backend_id` and `filesystem_type` alone would let one crash-tested
-Linux/ext4 build certify every Linux/ext4 implementation ever compiled, which is precisely the
-over-broad claim the tuple design exists to prevent. `kernel_line` narrows it. It is the major.minor of
-`os.uname().release` — not the full release string, which would de-certify a volume on every patch
-bump. The full release is retained in `VolumeEvidence` for diagnostics but is **not** matched; if A8
-finds a patch-level distinction that bears on durability, it narrows this field alongside the entry that
-needs it.
+**Implementation discriminators.** `backend_id` and `filesystem_type` alone would let one crash-tested
+Linux/ext4 build certify every Linux/ext4 implementation ever compiled, which is precisely the over-broad
+claim the tuple design exists to prevent. Two fields close that, and both are matched exactly.
+
+`kernel_identifier` is the **complete** `os.uname().release`, not a truncation. Truncating to a major.minor
+line would silently certify every future kernel in that line from a single crash test — the same
+over-broad claim in a smaller form. A certified entry names the kernel that was actually tested.
+
+`backend_revision` versions the Atoms backend implementation itself, which `backend_id="linux"` does not.
+A crash test certifies a *pair*: a volume configuration and the backend code that issued the syscalls
+against it. Changing the backend's syscall selection, flag set, or durability ordering invalidates that
+evidence, so the revision is a deliberately bumped constant, and bumping it de-certifies every entry
+naming the old one — which is the intended effect, not a hazard.
+
+The consequence is that certification is narrow by default: an entry certifies one kernel and one backend
+revision. **Widening to a family must be explicit** — A8 either enumerates additional entries or
+introduces an explicit family field carrying its own certification record. Widening is never obtained by
+truncating a string.
 
 **`barrier_options` is not the raw mount option list.** Recording every option would make the tuple
 over-specific — an unrelated `noatime` difference would break a match that should hold. A4a records only
 the options that bear on barrier and `fsync` behavior, each **normalized to an explicit value even when
 absent**, so a tuple never depends on whether an option happened to be spelled out:
 
-| Filesystem | Option | Source | Normalized when absent |
-| --- | --- | --- | --- |
-| `ext4` | `barrier` | mount | `barrier=1` |
-| `ext4` | `data` | mount | `data=ordered` |
-| `ext4` | `journal_async_commit` | mount | absent (off) |
-| `ext4` | `commit` | mount | `commit=5` |
-| `ext4` | `sync` | mount | `async` |
-| `ext4` | `dirsync` | mount | absent (off) |
-| `xfs` | `barrier` | mount | `barrier=1` — the option was removed in Linux 4.19 and barriers are unconditional since, which normalizes to the same value |
-| `xfs` | `wsync` | mount | absent (off) |
-| `xfs` | `sync` | mount | `async` |
-| `btrfs` | `barrier` | mount | `barrier=1` |
-| `btrfs` | `flushoncommit` | mount | `noflushoncommit` |
-| `btrfs` | `commit` | mount | `commit=30` |
-| `btrfs` | `notreelog` | mount | absent (tree-log on) |
+`mountinfo` carries **two distinct option fields**, and conflating them is a correctness bug, not a
+formatting detail. Field 6 holds the per-mount options (the VFS flags: `ro`/`rw`, `sync`, `dirsync`,
+`noatime`), while field 11 — after the `-` separator, filesystem type, and source — holds the
+**superblock** options, which is where every filesystem-specific durability value lives. Reading only
+field 6 would find no `data=` at all and normalize an explicitly mounted `data=writeback` to its safe
+`data=ordered` default, certifying a volume as durable on evidence it never supplied.
 
-Each option name, its source, and its absent-default are fixed by this table. The plan verifies every
-default against `mount(8)` and the per-filesystem kernel documentation before implementing the
-normalizer; a correction there is a plan-level fix to a stated default, not a licence to invent policy.
+| Filesystem | Option | `mountinfo` field | Normalized when absent |
+| --- | --- | --- | --- |
+| `ext4` | `barrier` | 11 (super) | `barrier=1` |
+| `ext4` | `data` | 11 (super) | `data=ordered` |
+| `ext4` | `journal_async_commit` | 11 (super) | absent (off) |
+| `ext4` | `commit` | 11 (super) | `commit=5` |
+| `ext4` | `sync` | 6 (per-mount) | `async` |
+| `ext4` | `dirsync` | 6 (per-mount) | absent (off) |
+| `xfs` | `barrier` | 11 (super) | `barrier=1` — the option was removed in Linux 4.19 and barriers are unconditional since, which normalizes to the same value |
+| `xfs` | `wsync` | 11 (super) | absent (off) |
+| `xfs` | `sync` | 6 (per-mount) | `async` |
+| `btrfs` | `barrier` | 11 (super) | `barrier=1` |
+| `btrfs` | `flushoncommit` | 11 (super) | `noflushoncommit` |
+| `btrfs` | `commit` | 11 (super) | `commit=30` |
+| `btrfs` | `notreelog` | 11 (super) | absent (tree-log on) |
+
+Each option name, the exact field it is read from, and its absent-default are fixed by this table. The
+normalizer reads each option **only** from its stated field; a value found in the other field is not a
+substitute. Tier 1 fixtures include, for each filesystem, a mount whose non-default durability value
+appears **only** in the super-options field — the case a field-6-only parser silently normalizes away.
+
+The plan verifies every default against `mount(8)` and the per-filesystem kernel documentation before
+implementing the normalizer; a correction there is a plan-level fix to a stated default, not a licence to
+invent policy.
 
 **Any other filesystem type refuses with `CapabilityUnavailable`**, because the engine has no basis for
 deciding which of its options bear on durability. This is what makes §5.5's explicit refusals — tmpfs,
@@ -405,7 +429,10 @@ second proof type:
 
 - `DurabilityAllowlist` is immutable.
 - The `allowlist` parameter of `bind_project_volume` is **required and keyword-only, with no default**.
-- Production composition passes exactly `CERTIFIED_ALLOWLIST`, enforced by an architecture test.
+- Production composition passes exactly `CERTIFIED_ALLOWLIST`. A4a cannot assert this — it has no
+  production composition root — so the call-site assertion is ledger entry #18, owned by A5. A4a proves
+  only that the parameter is required and keyword-only, that the constant is empty, and that no production
+  caller exists yet (§11.4).
 - Tests may inject a singleton allowlist containing the resolved test tuple and an explicit test profile.
 - `VolumeEvidence` retains the resolved configuration and the matched entry for diagnostics.
 - A4b trusts the factory-issued binding and performs **no second durability check**.
@@ -430,27 +457,56 @@ with acquire_project_lock(backend, metadata_root) as lock:
 ```
 
 `acquire_project_lock` establishes `metadata_root` per §5.4, opens `lock`, and takes an exclusive advisory
-lock through the backend. The returned `HeldProjectLock` **retains the metadata-root descriptor and the
-exact backend**, which is why `bind_project_volume` takes no separate `metadata_root` argument: a lock
-acquired for one root cannot be paired with a different root.
+lock through the backend. The returned `HeldProjectLock` **retains the metadata-root descriptor, its
+verified pathname, and the exact backend**, which is why `bind_project_volume` takes no separate
+`metadata_root` argument: a lock acquired for one root cannot be paired with a different root.
 
 ```python
 class HeldProjectLock:
     @property
-    def backend(self) -> Backend: ...          # requires held
+    def backend(self) -> Backend: ...              # requires held
     @property
-    def metadata_root_fd(self) -> int: ...     # borrowed; requires held
+    def metadata_root_fd(self) -> int: ...         # borrowed; requires held
     @property
-    def held(self) -> bool: ...                # always readable
+    def metadata_root_path(self) -> str: ...       # verified, normalized; requires held
+    @property
+    def held(self) -> bool: ...                    # always readable
     def __enter__(self) -> HeldProjectLock: ...
-    def __exit__(self, *exc) -> None: ...      # releases; idempotent
+    def __exit__(self, *exc) -> None: ...          # releases; idempotent
 ```
+
+`HeldProjectLock` is **factory-controlled** with the same construction token as `VolumeEvidence`.
+`acquire_project_lock` is its sole construction authority. This matters because every downstream signature
+that takes a `HeldProjectLock` — `reclaim_probe_survivors`, `probe_backend`, `bind_project_volume` —
+treats the *type* as proof that a real lock is held. An ordinarily constructible class would let that
+proof be fabricated with a bare object.
 
 Descriptors are exposed only through properties that check `held` and raise `ProtocolError` otherwise —
 never as public integer attributes, which would stay readable after release and quietly contradict the
 guard. `__exit__` releases the advisory lock and closes the `lock` and metadata-root descriptors, in that
 order, and is idempotent: a second exit is a no-op, not an error. An exceptional exit still releases and
 closes, then propagates.
+
+**Opening `lock`.** The lock file is opened **relative to the held metadata-root descriptor** with
+`O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC`, never by path, then `fstat`-verified to be a regular file. A
+symlink at that name fails the open; anything else that is not a regular file refuses with
+`ProtocolError`. Taking an advisory lock on a symlink target or a device node outside `metadata_root`
+would serialize nothing.
+
+**The verified pathname.** §5.4's walk resolves the caller-supplied path with `RESOLVE_NO_SYMLINKS`, so no
+component is a symlink. That is what makes the path safe to *normalize lexically*: with no symlink in it,
+collapsing `.` and `..` and making it absolute against the current directory cannot change which entry it
+names. The result is retained as `metadata_root_path`. It is not the caller's string — §9.4 explains why
+that distinction is load-bearing for A5.
+
+**The sync-ignore marker.** When — and only when — A4a *creates* `metadata_root`, it best-effort requests
+that cross-machine sync clients ignore the directory, setting the extended attribute
+`user.com.dropbox.ignored=1` on the held descriptor. The authority requires this at creation because the
+metadata store is single-host by construction and a synced copy is neither required nor trusted. It is
+**best-effort**: any failure, including a filesystem without extended attributes, is swallowed and
+weakens no single-host guarantee. A test asserts both that the attribute is set on a fresh
+`metadata_root` where the filesystem supports it, and that a `setxattr` failure does not fail the
+bootstrap.
 
 The lock is caller-owned and outlives the binding. That is what lets A5's recovery-resolve lease span
 resolution plus an entire write phase across more than one binding.
@@ -469,7 +525,20 @@ If `advisory_project_lock` is unavailable on the volume, `acquire_project_lock` 
 ### 7.2 Metadata layout
 
 Under the held metadata-root descriptor, A4a ensures `probe/`, `staging/`, `work/`, and `blobs/sha256/`
-exist, using `mkdirat` relative to retained descriptors. It creates no database and defines no schema.
+exist. Each component, at every level, follows one rule:
+
+1. `mkdirat` the single component relative to the retained parent descriptor. `EEXIST` is **expected and
+   tolerated** — the bootstrap is idempotent by design and normally runs against an existing store.
+2. **Always reopen** the component through `open_child_directory` from that same parent descriptor, and
+   retain the resulting descriptor.
+3. Refuse if the reopen fails or the result is not a directory.
+
+Step 2 runs on both paths, created and pre-existing, and that is the point. Tolerating `EEXIST` without
+reopening would accept whatever already occupies the name — a symlink pointing out of the store, or a
+regular file — as though A4a had created it. Because `open_child_directory` refuses symlinks and mount
+crossings, an occupied name can only pass by being a real directory beneath the metadata root.
+
+A4a creates no database and defines no schema.
 
 ### 7.3 Probe-survivor reclamation
 
@@ -505,7 +574,11 @@ crash claim is carried solely by the matched allowlist entry, never by a probe r
 
 ### 8.2 Per-capability probes
 
-Each probe runs entirely inside `probe/`, relative to retained descriptors. The one exception is
+Each probe runs entirely inside `probe/`, relative to retained descriptors. `transfer_noclobber` and
+`link_anchor` accept **distinct** source and destination parent descriptors, so their probes must use two
+separate directories under `probe/` — that is the form A5's blob promotion and A7's staging publication
+actually depend on, and a same-directory probe would leave it unproven. The one exception to running
+inside `probe/` is
 `advisory_project_lock`, which must contend against the *existing* `lock` file in `metadata_root`; it
 creates nothing and leaves no survivor.
 
@@ -514,8 +587,8 @@ creates nothing and leaves no survivor.
 | `anchored_traversal` | Open `probe/` with `RESOLVE_BENEATH \| RESOLVE_NO_SYMLINKS \| RESOLVE_NO_XDEV`. Plant a symlink pointing at `..` and require the open to refuse; require a `..` component to refuse. Both the success and the refusals must hold. |
 | `advisory_project_lock` | Open a second, independent descriptor to `lock` and require `try_lock_exclusive` to return `False` against the already-held lock. Because `flock` is per-open-file-description, this contends correctly within one process. |
 | `atomic_exchange` | Create two files with distinct content, exchange them, verify both names now resolve to the swapped content. |
-| `noclobber_transfer` | Create a source and an existing destination; require the transfer to fail with `EEXIST`; remove the destination; require the transfer to succeed. |
-| `identity_anchor` | Create a file, link it to a second name, and require equal `st_dev`/`st_ino` and `st_nlink == 2`. |
+| `noclobber_transfer` | **Across two distinct directories** under `probe/`: create a source in one and an existing destination in the other; require the transfer to fail with `EEXIST`; remove the destination; require the transfer to succeed. |
+| `identity_anchor` | **Across two distinct directories** under `probe/`: create a file in one, link it into the other, and require equal `st_dev`/`st_ino` and `st_nlink == 2`. |
 | `durable_publish` | Flush a file descriptor and its parent directory descriptor. Availability only. |
 | `nofollow_coherent_read` | Open a regular file `O_RDONLY \| O_NOFOLLOW`, `fstat` and read from that one descriptor; then require the same open against a symlink leaf to fail with `ELOOP`. |
 | `symlink_fingerprint` | Create a symlink, then require `lstat` to report a symlink and `readlink` to return the exact target. |
@@ -528,12 +601,24 @@ Opening a database and selecting WAL mode does not prove the required shared-mem
 operate without shared memory when SQLite runs in exclusive locking mode. The probe therefore keeps
 **normal** locking mode and:
 
-- requires `PRAGMA journal_mode=WAL` to return `wal`;
-- performs and commits a write — `PRAGMA user_version=1` — avoiding any schema;
-- keeps the first connection open;
-- has a **separate process** open the same database, read back `user_version`, and exercise
-  reader/writer locking;
-- removes the database, `-wal`, and `-shm` names through anchored probe cleanup.
+The choreography is fixed here rather than described loosely, because "exercise reader/writer locking"
+admits materially different tests with materially different evidence. Every step is required:
+
+| # | Actor | Action | Required outcome |
+| --- | --- | --- | --- |
+| 1 | parent | open the database, `PRAGMA journal_mode=WAL` | returns `wal` |
+| 2 | parent | `PRAGMA synchronous=FULL`, then commit `PRAGMA user_version=1` | committed |
+| 3 | parent | `BEGIN IMMEDIATE`, holding the write lock; keep the connection open | acquired |
+| 4 | child | open the same database, read `PRAGMA user_version` | returns `1` — a cross-process read **concurrent with a held writer**, the property the shared-memory WAL index exists to provide |
+| 5 | child | `BEGIN IMMEDIATE` with `busy_timeout=0` | fails `SQLITE_BUSY` — cross-process write exclusion |
+| 6 | parent | `COMMIT` | released |
+| 7 | child | `BEGIN IMMEDIATE` with an explicit bounded `busy_timeout`, write `PRAGMA user_version=2`, commit, exit `0` | succeeds |
+| 8 | parent | read `PRAGMA user_version` in a fresh read transaction | returns `2` |
+
+Step 4 is the one that distinguishes this from a same-process test, and step 5 is the one that proves
+locking rather than merely concurrency. The child runs under a bounded subprocess timeout in addition to
+its `busy_timeout`, so a volume with broken locking fails the probe instead of hanging it. Afterwards the
+database, `-wal`, and `-shm` names are removed through anchored probe cleanup.
 
 The second reader must be a subprocess, not a second connection in this process. A same-process
 connection exercises WAL but not SQLite's cross-process POSIX locking contract, and the shared-memory
@@ -618,8 +703,10 @@ class VolumeEvidence:
     metadata_root_device: int
     metadata_root_inode: int
     mount_id: int
-    kernel_release: str          # full os.uname().release; diagnostic only, never matched
 ```
+
+The kernel release is **not** repeated here; it is matched, so it lives on `configuration` as
+`kernel_identifier`.
 
 Frozen and factory-token-guarded exactly like `CompiledSpec`: direct construction and
 `dataclasses.replace` both refuse. `bind_project_volume` is its sole construction authority.
@@ -652,6 +739,7 @@ class ProjectBinding:
     def evidence(self) -> VolumeEvidence: ...    # readable after close
     @property
     def active(self) -> bool: ...                # always readable
+    def verified_metadata_path(self, name: str) -> str: ...   # see §9.4; requires active
     def __enter__(self) -> ProjectBinding: ...
     def __exit__(self, *exc) -> None: ...        # closes what it opened; idempotent
 ```
@@ -675,6 +763,38 @@ The rules that make this a real guard rather than a convention:
   somewhere far away.
 
 It does not own the lock. `HeldProjectLock` is caller-supplied and outlives it.
+
+### 9.4 Verified pathnames for the SQLite surface
+
+Everything else in the engine is issued as a single-component operation relative to a held descriptor.
+SQLite is the authority's stated exception: stdlib `sqlite3.connect()` opens by pathname and performs all
+database and sidecar I/O through its own VFS, so no descriptor can participate. The authority's
+replacement is *anchoring by verified identity* — resolve `metadata_root` once through guarded traversal,
+record its `st_dev`/`st_ino`, confirm it is a real directory on the allowlisted volume, and open the
+database by that verified path.
+
+A4a already performs every part of that resolution. If it exposed only descriptors, A5 would have to
+reconstruct the pathname from the original unbound caller string — discarding the guarantee and
+re-introducing the ancestor-swap the guarded walk exists to catch. So the binding exposes it:
+
+```python
+def verified_metadata_path(self, name: str) -> str:
+    """Return `<verified metadata_root>/<name>`, re-confirming the root's identity first."""
+```
+
+The operation requires an active binding, rejects any `name` that is not a single path component, and
+before returning **re-confirms** that the retained metadata-root descriptor still reports the
+`st_dev`/`st_ino` recorded in `VolumeEvidence`, raising `ProtocolError` on a mismatch. That is the
+verify-then-open the authority requires, performed at the moment of use rather than trusted from
+bootstrap.
+
+Both consumers go through it: the §8.3 SQLite probe uses it for the database it hands its child, and A5
+uses it for `atoms.db`. Neither builds a path any other way.
+
+This does not close the authority's cooperating-process gap, and does not claim to. Mutating or replacing
+`metadata_root` or an ancestor while a lease is active still voids the recovery guarantee; the project
+lock serializes the cooperating processes for which this never arises, and defending against an adversary
+substituting the path mid-lease requires the optional hardened VFS the authority describes.
 
 ## 10. Error contract
 
@@ -744,10 +864,21 @@ Tier 3 must not assume this machine's layout. A conftest fixture resolves the te
 
 The default location is added to `.gitignore` in the same commit as the fixture.
 
-Real `flock` contention through a subprocess, in both directions. Real exchange, no-clobber transfer, and
-link probes. Real cross-process SQLite-WAL certification. Root establishment through a **symlinked
-ancestor**, asserting refusal — the §5.4 guarantee that no runtime probe covers. Establishment of a
-missing `metadata_root` leaf, and refusal when its parent is missing.
+Real `flock` contention through a subprocess, in both directions. Real exchange, and real no-clobber
+transfer and link probes **across distinct parent directories**. Real cross-process SQLite-WAL
+certification through the §8.3 choreography, including the `SQLITE_BUSY` step. Root establishment through
+a **symlinked ancestor**, asserting refusal — the §5.4 guarantee that no runtime probe covers.
+Establishment of a missing `metadata_root` leaf, and refusal when its parent is missing.
+
+The bootstrap trust boundary gets direct coverage, since each case is a name an attacker or an accident
+could already occupy: a symlink planted at `lock` refuses; a non-regular file at `lock` refuses; a symlink
+planted at `probe/`, `staging/`, `work/`, or `blobs/` refuses on the `EEXIST` path rather than being
+adopted; a real pre-existing directory at each of those names is reopened and accepted. The sync-ignore
+marker is asserted present on a freshly created `metadata_root` where the filesystem supports extended
+attributes, and a forced `setxattr` failure is asserted not to fail bootstrap.
+
+`verified_metadata_path` is exercised for its component check, its active-only guard, and its
+`st_dev`/`st_ino` re-confirmation.
 
 Cross-volume refusal likewise resolves dynamically: the fixture scans `mountinfo` for a writable mount
 with a mount ID distinct from the test volume's, and skips if none exists. It does not assume `/tmp` is a
@@ -808,24 +939,35 @@ production-allowlist call-site assertion, owned by A5.
    a missing `metadata_root` leaf is created relative to a guarded parent descriptor and reverified, and
    a missing parent refuses.
 6. Mount identity is proved from held descriptors' mount IDs plus `st_dev`, and the roots must agree.
-7. An unlisted filesystem type refuses; `ext4`, `xfs`, and `btrfs` barrier options normalize per the §6.2
-   table, including absent-default normalization. `VolumeConfiguration` carries `kernel_line` and
-   `durability_features`; no certified entry references a feature without a resolver.
+7. An unlisted filesystem type refuses. `ext4`, `xfs`, and `btrfs` options normalize per the §6.2 table,
+   each read from its stated `mountinfo` field, with fixtures where a non-default value appears only in
+   super-options. `VolumeConfiguration` carries `backend_revision`, the exact `kernel_identifier`, and
+   `durability_features`; no certified entry references a feature without a resolver, and no widening is
+   obtained by truncation.
 8. `StorageProfile` is declaration-only, required, keyword-only, exact-match, and surfaced as
    `declared_storage_profile`.
 9. The `allowlist` parameter is required and keyword-only; `CERTIFIED_ALLOWLIST` is empty; there is no
    override and no uncertified binding state. A4a asserts no production call site (ledger #18).
 10. Bootstrap creates only engine-owned state under `metadata_root`, and reclamation is unconditional,
-    symlink-safe, and takes `HeldProjectLock`.
+    symlink-safe, and takes `HeldProjectLock`. `lock` is opened descriptor-relative with `O_NOFOLLOW` and
+    verified to be a regular file; every layout directory is reopened through `open_child_directory` on
+    both the created and `EEXIST` paths; the sync-ignore marker is set best-effort on creation and its
+    failure does not fail bootstrap.
 11. Reclamation of a pre-existing `probe/` precedes allowlist refusal, and refusal writes nothing new.
 12. Absent `anchored_traversal` or `advisory_project_lock` refuses; absent optional capabilities are
-    reported; absent SQLite-WAL hostability refuses, certified across **two processes**.
-13. `VolumeEvidence` is frozen and factory-guarded. `HeldProjectLock` and `ProjectBinding` expose the
-    §7.1/§9.3 surfaces: no public descriptor attributes, borrowed descriptors, `O_CLOEXEC`, idempotent
-    exit, and `ProtocolError` from every accessor once spent or once the lock is released.
-14. `OSError` propagates except for the documented per-operation unsupported errno values, each licensed
+    reported; absent SQLite-WAL hostability refuses, certified across **two processes** through the §8.3
+    choreography. `transfer_noclobber` and `link_anchor` are probed across distinct parent directories.
+13. `VolumeEvidence` and `HeldProjectLock` are factory-guarded, as is `ProjectBinding`. All three expose
+    the §7.1/§9.3 surfaces: no public descriptor attributes, borrowed descriptors, `O_CLOEXEC`, idempotent
+    exit, and `ProtocolError` from every accessor once spent or once the lock is released — **except**
+    `evidence` and `active` on the binding and `held` on the lock, which are deliberately readable
+    afterwards so a diagnostic can inspect a released resource.
+14. `verified_metadata_path` returns a single-component child of the verified, normalized metadata-root
+    pathname, re-confirming `st_dev`/`st_ino` at each call; the §8.3 probe and A5 use no other means of
+    constructing a database path.
+15. `OSError` propagates except for the documented per-operation unsupported errno values, each licensed
     by the §10 probe precondition and proved by a mutation test.
-15. Tier 3 resolves its volume portably and skips with a precise reason rather than assuming this
+16. Tier 3 resolves its volume portably and skips with a precise reason rather than assuming this
     machine's ext4-and-tmpfs layout.
-16. All four verification tiers pass; Ruff and Pyright are clean; the ledger and `AGENTS.md` are updated
+17. All four verification tiers pass; Ruff and Pyright are clean; the ledger and `AGENTS.md` are updated
     in the same commit.
