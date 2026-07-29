@@ -3,7 +3,7 @@ from dataclasses import replace
 import pytest
 
 from atoms.core.compiler import compile_spec
-from atoms.core.effects import CreateFileNoClobber
+from atoms.core.effects import CreateDirectory, CreateFileNoClobber
 from atoms.core.errors import ProtocolError
 from atoms.core.fingerprint import ABSENT
 from atoms.core.recovery import (
@@ -13,10 +13,13 @@ from atoms.core.recovery import (
     EffectJournalState,
     EffectVariant,
     EntryIdentity,
+    HaltDiagnostic,
+    HaltReason,
     JointObservation,
     JournalState,
     ObservedDirectory,
     ObservedFile,
+    OperatorAction,
     ParentOccupancy,
     PersistentNode,
     PersistentObservation,
@@ -33,6 +36,7 @@ from atoms.core.recovery import (
     TransformEffectTuple,
     TransitionEffectState,
     TransitionTransactionState,
+    WorkRoot,
     apply_recovery_plan,
     build_recovery_snapshot,
     reduce_recovery_plan_prefix,
@@ -384,46 +388,138 @@ def test_transform_preserves_directory_unmodeled_child_evidence():
         _apply_steps(source, (step,))
 
 
-def occupancy_transform(result_children, *, has_unmodeled_child=False):
-    source = create_snapshot(journal=JournalState.UNDO_STARTED)
-    expected = JointObservation(
-        persistent=source.persistent_observations,
-        scratch=source.scratch_observations,
-        parent_occupancy=(
-            ParentOccupancy(
-                parent=ProjectRoot(),
-                present_children=(ScratchNode("e1", ScratchRole.STAGING),),
-                has_unmodeled_child=False,
+def directory_removal_step(
+    *,
+    modeled_child=False,
+    source_unmodeled=False,
+    expected_unmodeled=None,
+    omit_occupancy=False,
+    add_unrelated_occupancy=False,
+    live_kind="directory",
+):
+    compiled = compile_spec(
+        build_spec(
+            consumer_tag="cnsmr",
+            intent_digest=DIGEST,
+            initial_surface={"dir": ABSENT, "dir/child.txt": ABSENT},
+            final_surface={"dir": D, "dir/child.txt": F},
+            effects=(
+                CreateDirectory("e1", "dir", D),
+                CreateFileNoClobber("e2", "dir/child.txt", F),
             ),
-        ),
+            dependencies=(("e1", "e2"),),
+        )
     )
-    result = JointObservation(
-        persistent=(
-            PersistentObservation(
-                "a.txt",
-                source.scratch_observations[0].entry,
-            ),
+    project = ProjectRoot()
+    work = WorkRoot()
+    live_node = PersistentNode("dir")
+    child_node = PersistentNode("dir/child.txt")
+    work_node = ScratchNode("e1", ScratchRole.WORK)
+    child_scratch = ScratchNode("e2", ScratchRole.STAGING)
+    topology = RecoveryTopology(
+        parents=(
+            TopologyParent(work, project),
+            TopologyParent(live_node, project),
+            TopologyParent(work_node, work),
+            TopologyParent(child_node, live_node),
+            TopologyParent(child_scratch, live_node),
+        )
+    )
+    directory = ObservedDirectory(D, EntryIdentity(), source_unmodeled)
+    live_entry = {
+        "directory": directory,
+        "absent": OBSERVED_ABSENT,
+        "file": ObservedFile(F, EntryIdentity()),
+    }[live_kind]
+    child_entry = (
+        ObservedFile(F, EntryIdentity()) if modeled_child else OBSERVED_ABSENT
+    )
+    source = build_recovery_snapshot(
+        compiled=compiled,
+        topology=topology,
+        transaction_state=TransactionState.ROLLING_BACK,
+        commit_decision=CommitDecision.UNCOMMITTED,
+        rollback_result=None,
+        halt_diagnostic=None,
+        active=True,
+        journals=(
+            EffectJournalState("e1", JournalState.UNDO_STARTED),
+            EffectJournalState("e2", JournalState.UNDONE),
         ),
-        scratch=(
+        persistent_observations=(
+            PersistentObservation("dir", live_entry),
+            PersistentObservation("dir/child.txt", child_entry),
+        ),
+        scratch_observations=(
+            ScratchObservation("e1", ScratchRole.WORK, OBSERVED_ABSENT, None),
             ScratchObservation(
-                "e1",
+                "e2",
                 ScratchRole.STAGING,
                 OBSERVED_ABSENT,
                 None,
             ),
         ),
-        parent_occupancy=(
+    )
+    unmodeled = (
+        source_unmodeled if expected_unmodeled is None else expected_unmodeled
+    )
+    required_before = ParentOccupancy(
+        parent=live_node,
+        present_children=(child_node,) if modeled_child else (),
+        has_unmodeled_child=unmodeled,
+    )
+    required_after = ParentOccupancy(
+        parent=live_node,
+        present_children=(child_node,) if modeled_child else (),
+        has_unmodeled_child=unmodeled,
+    )
+    before_occupancy = () if omit_occupancy else (required_before,)
+    after_occupancy = () if omit_occupancy else (required_after,)
+    if add_unrelated_occupancy:
+        before_occupancy = (
+            *before_occupancy,
             ParentOccupancy(
-                parent=ProjectRoot(),
-                present_children=result_children,
-                has_unmodeled_child=has_unmodeled_child,
+                parent=project,
+                present_children=(work, live_node),
+                has_unmodeled_child=False,
+            ),
+        )
+        after_occupancy = (
+            *after_occupancy,
+            ParentOccupancy(
+                parent=project,
+                present_children=(work,),
+                has_unmodeled_child=False,
+            ),
+        )
+    expected = JointObservation(
+        persistent=(PersistentObservation("dir", live_entry),),
+        scratch=(
+            ScratchObservation(
+                "e1",
+                ScratchRole.WORK,
+                OBSERVED_ABSENT,
+                None,
             ),
         ),
+        parent_occupancy=before_occupancy,
+    )
+    result = JointObservation(
+        persistent=(PersistentObservation("dir", OBSERVED_ABSENT),),
+        scratch=(
+            ScratchObservation(
+                "e1",
+                ScratchRole.WORK,
+                OBSERVED_ABSENT,
+                None,
+            ),
+        ),
+        parent_occupancy=after_occupancy,
     )
     step = TransformEffectTuple(
         effect_id="e1",
-        variant=EffectVariant.CREATE_FILE_NO_CLOBBER,
-        settlement=SettlementKind.REPAIR_INTERMEDIATE,
+        variant=EffectVariant.CREATE_DIRECTORY,
+        settlement=SettlementKind.REMOVE_ATTRIBUTABLE_CREATION,
         expected_before=expected,
         result_after=result,
         identity_relations=(),
@@ -431,27 +527,46 @@ def occupancy_transform(result_children, *, has_unmodeled_child=False):
     return source, step
 
 
-def test_transform_recomputes_modeled_occupancy_but_preserves_unmodeled_fact():
-    source, step = occupancy_transform(
-        (PersistentNode("a.txt"),),
-        has_unmodeled_child=True,
-    )
-    with pytest.raises(ProtocolError, match="unmodeled"):
+def test_directory_removal_requires_exact_occupancy_coverage():
+    source, step = directory_removal_step(omit_occupancy=True)
+    with pytest.raises(ProtocolError, match="occupancy coverage"):
         _apply_steps(source, (step,))
 
 
-def test_transform_accepts_recomputed_modeled_occupancy():
-    source, step = occupancy_transform((PersistentNode("a.txt"),))
-    reduced = _apply_steps(source, (step,))
-    assert reduced.persistent_observations[0].entry is source.scratch_observations[0].entry
-    assert reduced.scratch_observations[0].entry is OBSERVED_ABSENT
+def test_directory_removal_refuses_unrelated_occupancy():
+    source, step = directory_removal_step(add_unrelated_occupancy=True)
+    with pytest.raises(ProtocolError, match="occupancy coverage"):
+        _apply_steps(source, (step,))
 
 
-def test_transform_refuses_stale_modeled_occupancy():
-    source, step = occupancy_transform(
-        (ScratchNode("e1", ScratchRole.STAGING),),
+def test_directory_removal_refuses_modeled_children():
+    source, step = directory_removal_step(modeled_child=True)
+    with pytest.raises(ProtocolError, match="directory is not empty"):
+        _apply_steps(source, (step,))
+
+
+def test_directory_removal_refuses_unmodeled_children():
+    source, step = directory_removal_step(source_unmodeled=True)
+    with pytest.raises(ProtocolError, match="directory is not empty"):
+        _apply_steps(source, (step,))
+
+
+def test_expected_occupancy_unmodeled_fact_comes_from_current_directory():
+    source, step = directory_removal_step(
+        source_unmodeled=True,
+        expected_unmodeled=False,
     )
-    with pytest.raises(ProtocolError, match="stale parent occupancy"):
+    with pytest.raises(ProtocolError, match="expected_before"):
+        _apply_steps(source, (step,))
+
+
+@pytest.mark.parametrize("live_kind", ["absent", "file"])
+def test_expected_occupancy_requires_current_directory_evidence(live_kind):
+    source, step = directory_removal_step(
+        live_kind=live_kind,
+        omit_occupancy=True,
+    )
+    with pytest.raises(ProtocolError, match="exact directory"):
         _apply_steps(source, (step,))
 
 
@@ -479,6 +594,32 @@ def test_transaction_transition_refuses_an_illegal_recovery_edge():
         halt_diagnostic=None,
     )
     with pytest.raises(ProtocolError, match="edge"):
+        _apply_steps(snapshot, (step,))
+
+
+def test_halt_transition_diagnostic_is_bound_to_its_source_state():
+    snapshot = create_snapshot()
+    diagnostic = HaltDiagnostic(
+        pre_halt_state=TransactionState.PREPARED,
+        commit_decision=snapshot.commit_decision,
+        journals=snapshot.journals,
+        projected_transaction_state=snapshot.transaction_state,
+        projected_journals=snapshot.journals,
+        effect_id=None,
+        paths=(),
+        expected=(),
+        observed=(),
+        identity_relations=(),
+        reason=HaltReason.ACTIVE_BINDING_MISSING,
+        operator_action=OperatorAction.REPAIR_DURABLE_METADATA,
+    )
+    step = TransitionTransactionState(
+        from_state=TransactionState.APPLYING,
+        to_state=TransactionState.HALTED,
+        rollback_result=None,
+        halt_diagnostic=diagnostic,
+    )
+    with pytest.raises(ProtocolError, match="pre-halt"):
         _apply_steps(snapshot, (step,))
 
 

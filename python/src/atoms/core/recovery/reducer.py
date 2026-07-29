@@ -23,6 +23,7 @@ from atoms.core.recovery.model import (
     IdentityRelation,
     JournalState,
     ObservedAbsent,
+    ObservedDirectory,
     ObservedEntry,
     ObservedFile,
     PersistentObservation,
@@ -238,6 +239,14 @@ def _transition_transaction(
         valid_payload = not has_result and not has_diagnostic
     if not valid_payload:
         raise ProtocolError("transaction transition has invalid terminal payloads")
+    if (
+        step.to_state is TransactionState.HALTED
+        and step.halt_diagnostic is not None
+        and step.halt_diagnostic.pre_halt_state is not step.from_state
+    ):
+        raise ProtocolError(
+            "halt diagnostic pre-halt state does not match its transition source"
+        )
 
     return _rebuild(
         snapshot,
@@ -297,13 +306,18 @@ def _transform_effect_tuple(
         raise ProtocolError("transform settlement must be an exact SettlementKind")
     _validate_identity_relations(step.identity_relations)
 
+    _validate_joint_coverage(step.expected_before, step.result_after)
+    _validate_effect_joint_coverage(snapshot, effect, step.expected_before)
     current = _current_joint_observation(snapshot, step.expected_before)
     if current != step.expected_before:
         raise ProtocolError("transform expected_before does not match current observation")
-    _validate_joint_coverage(step.expected_before, step.result_after)
-    _validate_effect_joint_coverage(effect, step.expected_before)
     _require_exact_entry_transfers(step.expected_before, step.result_after)
     _require_parent_unmodeled_conservation(
+        step.expected_before,
+        step.result_after,
+    )
+    _require_removed_directories_empty(
+        effect,
         step.expected_before,
         step.result_after,
     )
@@ -331,13 +345,18 @@ def _remove_scratch(
     if type(step.role) is not ScratchRole:
         raise ProtocolError("remove scratch role must be an exact ScratchRole")
 
+    _validate_joint_coverage(step.expected_before, step.result_after)
+    _validate_effect_joint_coverage(snapshot, effect, step.expected_before)
     current = _current_joint_observation(snapshot, step.expected_before)
     if current != step.expected_before:
         raise ProtocolError("remove scratch expected_before does not match current observation")
-    _validate_joint_coverage(step.expected_before, step.result_after)
-    _validate_effect_joint_coverage(effect, step.expected_before)
     _require_exact_entry_transfers(step.expected_before, step.result_after)
     _require_parent_unmodeled_conservation(
+        step.expected_before,
+        step.result_after,
+    )
+    _require_removed_directories_empty(
+        effect,
         step.expected_before,
         step.result_after,
     )
@@ -441,6 +460,7 @@ def _validate_identity_relations(
 
 
 def _validate_effect_joint_coverage(
+    snapshot: RecoverySnapshot,
     effect: Effect,
     observation: JointObservation,
 ) -> None:
@@ -456,6 +476,51 @@ def _validate_effect_joint_coverage(
         raise ProtocolError(
             "effect tuple omits or adds scratch nodes instead of exact effect coverage"
         )
+    occupancy_keys = {item.parent for item in observation.parent_occupancy}
+    required_occupancy = _required_effect_occupancy_parents(
+        snapshot,
+        effect,
+        observation,
+    )
+    if occupancy_keys != required_occupancy:
+        raise ProtocolError(
+            "effect tuple does not have exact affected occupancy coverage"
+        )
+
+
+def _required_effect_occupancy_parents(
+    snapshot: RecoverySnapshot,
+    effect: Effect,
+    observation: JointObservation,
+) -> set[TopologyNode]:
+    topology_parents = {edge.parent for edge in snapshot.topology.parents}
+    return {
+        node
+        for node, entry in _effect_observed_nodes(effect, observation)
+        if type(entry) is ObservedDirectory and node in topology_parents
+    }
+
+
+def _effect_observed_nodes(
+    effect: Effect,
+    observation: JointObservation,
+) -> tuple[tuple[TopologyNode, ObservedEntry], ...]:
+    persistent_by_path = {
+        item.path: item.entry for item in observation.persistent
+    }
+    scratch_by_key = {
+        (item.effect_id, item.role): item.entry for item in observation.scratch
+    }
+    persistent = tuple(
+        (PersistentNode(item.path), persistent_by_path[item.path])
+        for item in occurrences(effect)
+    )
+    scratch_role = required_scratch_role(effect)
+    scratch = ScratchNode(effect.effect_id, scratch_role)
+    return (
+        *persistent,
+        ((scratch, scratch_by_key[(effect.effect_id, scratch_role)])),
+    )
 
 
 def _validate_joint_coverage(
@@ -563,6 +628,7 @@ def _current_joint_observation(
         template.parent_occupancy,
         snapshot.persistent_observations,
         snapshot.scratch_observations,
+        validate_current_directory=True,
     )
     return JointObservation(
         persistent=persistent,
@@ -626,6 +692,53 @@ def _require_exact_entry_transfers(
         available[entry] -= 1
 
 
+def _require_removed_directories_empty(
+    effect: Effect,
+    expected: JointObservation,
+    result: JointObservation,
+) -> None:
+    if type(effect) is not CreateDirectory:
+        return
+    expected_nodes = dict(_effect_observed_nodes(effect, expected))
+    result_nodes = dict(_effect_observed_nodes(effect, result))
+    removed_directory = False
+    for node, entry in expected_nodes.items():
+        result_entry = result_nodes[node]
+        if type(result_entry) is not ObservedAbsent or result_entry == entry:
+            continue
+        if type(entry) is not ObservedDirectory:
+            raise ProtocolError(
+                "CreateDirectory removal requires an exact directory before-entry"
+            )
+        removed_directory = True
+    if all(type(entry) is ObservedAbsent for entry in result_nodes.values()) and (
+        not removed_directory
+    ):
+        raise ProtocolError(
+            "CreateDirectory removal requires an exact directory before-entry"
+        )
+
+    surviving_entries = {
+        entry
+        for entry in (
+            *(item.entry for item in result.persistent),
+            *(item.entry for item in result.scratch),
+        )
+        if type(entry) is not ObservedAbsent
+    }
+    occupancy_by_parent = {
+        item.parent: item for item in expected.parent_occupancy
+    }
+    for node, entry in _effect_observed_nodes(effect, expected):
+        if type(entry) is not ObservedDirectory or entry in surviving_entries:
+            continue
+        occupancy = occupancy_by_parent.get(node)
+        if entry.has_unmodeled_child or (
+            occupancy is not None and occupancy.present_children
+        ):
+            raise ProtocolError("directory is not empty and may not be removed")
+
+
 def _require_parent_unmodeled_conservation(
     expected: JointObservation,
     result: JointObservation,
@@ -653,6 +766,8 @@ def _recompute_occupancy(
     occupancy: tuple[ParentOccupancy, ...],
     persistent: tuple[PersistentObservation, ...],
     scratch: tuple[ScratchObservation, ...],
+    *,
+    validate_current_directory: bool = False,
 ) -> tuple[ParentOccupancy, ...]:
     persistent_by_path = {item.path: item.entry for item in persistent}
     scratch_by_key = {
@@ -661,6 +776,13 @@ def _recompute_occupancy(
     _validate_occupancy_topology(snapshot, occupancy)
     result: list[ParentOccupancy] = []
     for item in occupancy:
+        has_unmodeled_child = item.has_unmodeled_child
+        if validate_current_directory:
+            has_unmodeled_child = _current_directory_unmodeled_fact(
+                item.parent,
+                persistent_by_path,
+                scratch_by_key,
+            )
         present_children: list[TopologyNode] = []
         for edge in snapshot.topology.parents:
             if edge.parent != item.parent:
@@ -679,10 +801,30 @@ def _recompute_occupancy(
             ParentOccupancy(
                 parent=item.parent,
                 present_children=tuple(present_children),
-                has_unmodeled_child=item.has_unmodeled_child,
+                has_unmodeled_child=has_unmodeled_child,
             )
         )
     return tuple(result)
+
+
+def _current_directory_unmodeled_fact(
+    parent: TopologyNode,
+    persistent_by_path: Mapping[str, ObservedEntry],
+    scratch_by_key: Mapping[tuple[str, ScratchRole], ObservedEntry],
+) -> bool:
+    if type(parent) is PersistentNode:
+        entry = persistent_by_path[parent.path]
+    elif type(parent) is ScratchNode:
+        entry = scratch_by_key[(parent.effect_id, parent.role)]
+    else:
+        raise ProtocolError(
+            "current occupancy parent has no exact directory observation"
+        )
+    if type(entry) is not ObservedDirectory:
+        raise ProtocolError(
+            "current occupancy parent is absent or not an exact directory"
+        )
+    return entry.has_unmodeled_child
 
 
 def _validate_occupancy_topology(
