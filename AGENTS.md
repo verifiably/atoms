@@ -16,15 +16,23 @@ Plan B is written only after Plan A's interfaces settle.
   Stdlib only, no filesystem or SQLite dependency.
 - **A2 — compilation validation: implemented.** `compile_spec` in `atoms/core/compiler.py` produces
   the pure, filesystem-independent first-stage `CompiledSpec` proof; `paths.py` and `timeline.py`
-  support it. A4 must produce the distinct `ProjectApprovedSpec` before A5–A8.
+  support it. A4b must produce the distinct `ProjectApprovedSpec` before A5–A8.
 - **A3 — executable recovery reference model: implemented.** The pure production authority exposes
   `build_recovery_snapshot`, `classify_recovery`, `authorize_recovery_step`,
   `reduce_recovery_plan_prefix`, and `apply_recovery_plan` with the closed recovery model, fresh-step
   authorization, and abstract reducer. A4–A8 remain unimplemented, and no filesystem mutation code
   has landed.
+- **A4 is split into A4a and A4b.** §14 item 2 bundles the platform capability backend with rooted
+  project approval, but the second is defined in terms of the first, so each gets its own design and
+  plan. **A4a — capability backend and project volume binding: designed, not implemented**
+  ([design](docs/plans/2026-07-29-a4a-capability-backend-design.md)) delivers the impure `atoms/fs/`
+  package, the `Backend` protocol and its Linux implementation, durability-configuration resolution,
+  the §5.5 bootstrap, and the capability probe. **A4b — rooted project approval** then owns
+  `approve_for_project`, `ProjectApprovedSpec`, and ledger entries #2, #3 (its part), #4, #5, #6, #9,
+  #10, and #11.
 
 Work lives under `python/` (`uv run pytest`, `uv run ruff check`, `uv run pyright`, all from
-`python/`). No code in this repository mutates a filesystem path yet; that begins at A4.
+`python/`). No code in this repository mutates a filesystem path yet; that begins at A4a.
 
 ## Authority order
 
