@@ -22,6 +22,18 @@ from atoms.core.recovery.model import (
     ScratchRole,
     TransactionState,
 )
+from atoms.core.recovery.snapshot import (
+    PersistentNode,
+    ProjectRoot,
+    RecoverySnapshot,
+    RecoveryTopology,
+    ScratchNode,
+    TopologyDirectory,
+    TopologyNode,
+    TopologyParent,
+    WorkRoot,
+    build_recovery_snapshot,
+)
 
 __all__ = (
     "OBSERVED_ABSENT",
@@ -41,9 +53,19 @@ __all__ = (
     "ObservedFile",
     "ObservedSymlink",
     "OperatorAction",
+    "PersistentNode",
     "PersistentObservation",
+    "ProjectRoot",
+    "RecoverySnapshot",
+    "RecoveryTopology",
     "RollbackResult",
+    "ScratchNode",
     "ScratchObservation",
     "ScratchRole",
+    "TopologyDirectory",
+    "TopologyNode",
+    "TopologyParent",
     "TransactionState",
+    "WorkRoot",
+    "build_recovery_snapshot",
 )
