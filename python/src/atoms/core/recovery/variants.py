@@ -29,8 +29,10 @@ from atoms.core.recovery.journal import (
 from atoms.core.recovery.model import (
     OBSERVED_ABSENT,
     CommitDecision,
+    DiagnosticIdentityRelation,
     FileBuildRelation,
     HaltReason,
+    IdentityRelation,
     JournalState,
     ObservedAbsent,
     ObservedDirectory,
@@ -43,6 +45,7 @@ from atoms.core.recovery.model import (
 from atoms.core.recovery.plan import (
     EffectVariant,
     JointObservation,
+    ParentOccupancy,
     PreserveExternal,
     RecoveryStep,
     RemoveScratch,
@@ -52,6 +55,7 @@ from atoms.core.recovery.plan import (
 from atoms.core.recovery.snapshot import (
     PersistentNode,
     RecoverySnapshot,
+    ScratchNode,
     TopologyNode,
     persistent_map,
     required_scratch_role,
@@ -128,12 +132,14 @@ def _decision(
 def _halt(
     expected: JointObservation,
     observed: JointObservation,
+    *,
+    reason: HaltReason = HaltReason.EFFECT_TUPLE_UNATTRIBUTABLE,
 ) -> EffectDecision:
     return EffectDecision(
         kind=EffectDecisionKind.HALT,
         steps=(),
         refused=False,
-        halt_reason=HaltReason.EFFECT_TUPLE_UNATTRIBUTABLE,
+        halt_reason=reason,
         expected=expected,
         observed=observed,
     )
@@ -200,10 +206,58 @@ def _joint(snapshot: RecoverySnapshot, effect: Effect) -> JointObservation:
         scratch_observation = scratch[(effect.effect_id, role)]
     except KeyError as exc:
         raise ProtocolError("snapshot is missing effect observation coverage") from exc
+    effect_nodes = (
+        *(
+            (PersistentNode(item.path), item.entry)
+            for item in persistent_observations
+        ),
+        (
+            ScratchNode(effect.effect_id, role),
+            scratch_observation.entry,
+        ),
+    )
+    topology_parents = {edge.parent for edge in snapshot.topology.parents}
+    parent_occupancy = tuple(
+        _parent_occupancy(snapshot, node, entry)
+        for node, entry in effect_nodes
+        if type(entry) is ObservedDirectory and node in topology_parents
+    )
     return JointObservation(
         persistent=persistent_observations,
         scratch=(scratch_observation,),
-        parent_occupancy=(),
+        parent_occupancy=parent_occupancy,
+    )
+
+
+def _parent_occupancy(
+    snapshot: RecoverySnapshot,
+    parent: TopologyNode,
+    entry: ObservedEntry,
+) -> ParentOccupancy:
+    if type(entry) is not ObservedDirectory:
+        raise ProtocolError("occupancy parent is not an exact observed directory")
+    persistent = persistent_map(snapshot)
+    scratch = scratch_map(snapshot)
+    present_children: list[TopologyNode] = []
+    for edge in snapshot.topology.parents:
+        if edge.parent != parent:
+            continue
+        child = edge.node
+        if type(child) is PersistentNode:
+            present = type(persistent[child.path]) is not ObservedAbsent
+        elif type(child) is ScratchNode:
+            present = (
+                type(scratch[(child.effect_id, child.role)].entry)
+                is not ObservedAbsent
+            )
+        else:
+            present = True
+        if present:
+            present_children.append(child)
+    return ParentOccupancy(
+        parent=parent,
+        present_children=tuple(present_children),
+        has_unmodeled_child=entry.has_unmodeled_child,
     )
 
 
@@ -243,6 +297,7 @@ def _transform(
     persistent: tuple[ObservedEntry, ...],
     scratch: ObservedEntry,
     settlement: SettlementKind,
+    identity_relations: tuple[DiagnosticIdentityRelation, ...] = (),
 ) -> TransformEffectTuple:
     try:
         variant = _EFFECT_VARIANT[type(effect)]
@@ -259,7 +314,7 @@ def _transform(
         settlement=settlement,
         expected_before=observed,
         result_after=result_after,
-        identity_relations=(),
+        identity_relations=identity_relations,
     )
 
 
@@ -659,8 +714,96 @@ def _classify_delete(
     frontiers: tuple[PathFrontier, ...],
 ) -> EffectDecision:
     del frontiers
-    observed = _joint(snapshot, effect)
+    if type(effect) is not DeletePath:
+        raise ProtocolError("delete classifier received the wrong effect variant")
+    delete = cast(DeletePath, effect)
+    observed = _joint(snapshot, delete)
+    live = observed.persistent[0].entry
+    tombstone = observed.scratch[0].entry
+    live_class = _classify_entry(
+        live,
+        pre=delete.pre,
+        post=ABSENT,
+        build_relation=None,
+    )
+    tombstone_class = _classify_entry(
+        tombstone,
+        pre=delete.pre,
+        post=ABSENT,
+        build_relation=None,
+    )
+    journal = _journal(snapshot, delete.effect_id)
+
+    if snapshot.commit_decision is CommitDecision.COMMITTED:
+        if (
+            journal is JournalState.DONE
+            and live_class is EntryClass.ABSENT
+            and tombstone_class is EntryClass.PRE
+        ):
+            return _decision(
+                EffectDecisionKind.REMOVE_SCRATCH,
+                observed,
+                steps=(_remove_scratch(delete, observed),),
+            )
+        if (
+            journal is JournalState.DONE
+            and live_class is EntryClass.ABSENT
+            and tombstone_class is EntryClass.ABSENT
+        ):
+            return _decision(EffectDecisionKind.NO_ACTION, observed)
+        return _halt(observed, observed)
+
+    if journal is JournalState.STARTED:
+        if (
+            live_class is EntryClass.PRE
+            and tombstone_class is EntryClass.ABSENT
+        ):
+            return _decision(
+                EffectDecisionKind.UNDO_WITHOUT_MUTATION,
+                observed,
+            )
+        if (
+            live_class is EntryClass.ABSENT
+            and tombstone_class is EntryClass.PRE
+        ):
+            return _restore_tombstone(delete, observed)
+    elif journal is JournalState.DONE:
+        if (
+            live_class is EntryClass.ABSENT
+            and tombstone_class is EntryClass.PRE
+        ):
+            return _restore_tombstone(delete, observed)
+    elif journal is JournalState.UNDO_STARTED:
+        if (
+            live_class is EntryClass.ABSENT
+            and tombstone_class is EntryClass.PRE
+        ):
+            return _restore_tombstone(delete, observed)
+        if (
+            live_class is EntryClass.PRE
+            and tombstone_class is EntryClass.ABSENT
+        ):
+            return _decision(EffectDecisionKind.ALREADY_UNDONE, observed)
     return _halt(observed, observed)
+
+
+def _restore_tombstone(
+    effect: DeletePath,
+    observed: JointObservation,
+) -> EffectDecision:
+    tombstone = observed.scratch[0].entry
+    transform = _transform(
+        effect,
+        observed,
+        persistent=(tombstone,),
+        scratch=OBSERVED_ABSENT,
+        settlement=SettlementKind.RESTORE_PRE,
+    )
+    return _decision(
+        EffectDecisionKind.RESTORE_TOMBSTONE,
+        observed,
+        steps=(transform,),
+    )
 
 
 def _classify_move(
@@ -669,8 +812,238 @@ def _classify_move(
     frontiers: tuple[PathFrontier, ...],
 ) -> EffectDecision:
     del frontiers
-    observed = _joint(snapshot, effect)
+    if type(effect) is not MoveNoClobber:
+        raise ProtocolError("move classifier received the wrong effect variant")
+    move = cast(MoveNoClobber, effect)
+    observed = _joint(snapshot, move)
+    source = observed.persistent[0].entry
+    destination = observed.persistent[1].entry
+    anchor = observed.scratch[0].entry
+    source_class = _move_entry_class(source, move)
+    destination_class = _move_entry_class(destination, move)
+    anchor_class = _move_entry_class(anchor, move)
+    source_anchor_same = _same_identity(source, anchor)
+    destination_anchor_same = _same_identity(destination, anchor)
+    journal = _journal(snapshot, move.effect_id)
+
+    if snapshot.commit_decision is CommitDecision.COMMITTED:
+        if (
+            journal is JournalState.DONE
+            and source_class is EntryClass.ABSENT
+            and destination_class is EntryClass.PRE
+            and anchor_class is EntryClass.PRE
+            and destination_anchor_same
+        ):
+            return _decision(
+                EffectDecisionKind.REMOVE_ANCHOR,
+                observed,
+                steps=(_remove_scratch(move, observed),),
+            )
+        if (
+            journal is JournalState.DONE
+            and source_class is EntryClass.ABSENT
+            and destination_class is EntryClass.PRE
+            and anchor_class is EntryClass.ABSENT
+        ):
+            return _decision(EffectDecisionKind.NO_ACTION, observed)
+        return _halt(observed, observed)
+
+    if journal is JournalState.DONE:
+        if (
+            source_class is EntryClass.ABSENT
+            and destination_class is EntryClass.PRE
+            and anchor_class is EntryClass.PRE
+            and destination_anchor_same
+        ):
+            return _move_restore_source(move, observed)
+        return _halt(observed, observed)
+
+    if journal not in {JournalState.STARTED, JournalState.UNDO_STARTED}:
+        return _halt(observed, observed)
+
+    if (
+        source_class is EntryClass.PRE
+        and destination_class is EntryClass.ABSENT
+        and anchor_class is EntryClass.ABSENT
+    ):
+        return _decision(
+            (
+                EffectDecisionKind.ALREADY_UNDONE
+                if journal is JournalState.UNDO_STARTED
+                else EffectDecisionKind.UNDO_WITHOUT_MUTATION
+            ),
+            observed,
+        )
+    if (
+        source_class is EntryClass.PRE
+        and destination_class is EntryClass.ABSENT
+        and anchor_class is EntryClass.PRE
+        and source_anchor_same
+    ):
+        return _decision(
+            EffectDecisionKind.REMOVE_ANCHOR,
+            observed,
+            steps=(_remove_scratch(move, observed),),
+        )
+    if (
+        source_class is EntryClass.ABSENT
+        and destination_class is EntryClass.PRE
+        and anchor_class is EntryClass.PRE
+        and destination_anchor_same
+    ):
+        return _move_restore_source(move, observed)
+    if (
+        source_class is EntryClass.PRE
+        and destination_class is EntryClass.PRE
+        and anchor_class is EntryClass.PRE
+        and source_anchor_same
+        and destination_anchor_same
+    ):
+        return _move_remove_destination(move, observed)
+    if (
+        source_class is EntryClass.ABSENT
+        and destination_class is EntryClass.ABSENT
+        and anchor_class is EntryClass.PRE
+    ):
+        return _move_restore_from_anchor(move, observed)
+    if (
+        source_class is EntryClass.PRE
+        and destination_class is EntryClass.EXTERNAL
+        and anchor_class is EntryClass.PRE
+        and source_anchor_same
+    ):
+        return _decision(
+            EffectDecisionKind.REFUSED_PRESERVE_DESTINATION,
+            observed,
+            steps=(
+                _preserve(PersistentNode(move.destination)),
+                _remove_scratch(move, observed),
+            ),
+            refused=True,
+        )
     return _halt(observed, observed)
+
+
+def _move_entry_class(
+    entry: ObservedEntry,
+    effect: MoveNoClobber,
+) -> EntryClass:
+    return _classify_entry(
+        entry,
+        pre=effect.source_pre,
+        post=effect.source_pre,
+        build_relation=None,
+    )
+
+
+def _entry_identity(entry: ObservedEntry):
+    if type(entry) is ObservedFile:
+        return cast(ObservedFile, entry).identity
+    if type(entry) is ObservedDirectory:
+        return cast(ObservedDirectory, entry).identity
+    return None
+
+
+def _same_identity(left: ObservedEntry, right: ObservedEntry) -> bool:
+    left_identity = _entry_identity(left)
+    right_identity = _entry_identity(right)
+    return left_identity is not None and left_identity == right_identity
+
+
+def _identity_relation(
+    left_slot: str,
+    right_slot: str,
+    relation: IdentityRelation,
+) -> DiagnosticIdentityRelation:
+    return DiagnosticIdentityRelation(left_slot, right_slot, relation)
+
+
+def _move_restore_source(
+    effect: MoveNoClobber,
+    observed: JointObservation,
+) -> EffectDecision:
+    destination = observed.persistent[1].entry
+    anchor = observed.scratch[0].entry
+    transform = _transform(
+        effect,
+        observed,
+        persistent=(destination, OBSERVED_ABSENT),
+        scratch=anchor,
+        settlement=SettlementKind.RESTORE_PRE,
+        identity_relations=(
+            _identity_relation(
+                "destination",
+                "anchor",
+                IdentityRelation.SAME,
+            ),
+        ),
+    )
+    remove = _remove_after_transform(effect, transform)
+    return _decision(
+        EffectDecisionKind.RESTORE_SOURCE,
+        observed,
+        steps=(transform, remove),
+    )
+
+
+def _move_remove_destination(
+    effect: MoveNoClobber,
+    observed: JointObservation,
+) -> EffectDecision:
+    source = observed.persistent[0].entry
+    anchor = observed.scratch[0].entry
+    transform = _transform(
+        effect,
+        observed,
+        persistent=(source, OBSERVED_ABSENT),
+        scratch=anchor,
+        settlement=SettlementKind.REPAIR_INTERMEDIATE,
+        identity_relations=(
+            _identity_relation(
+                "destination",
+                "anchor",
+                IdentityRelation.SAME,
+            ),
+            _identity_relation(
+                "source",
+                "anchor",
+                IdentityRelation.SAME,
+            ),
+        ),
+    )
+    remove = _remove_after_transform(effect, transform)
+    return _decision(
+        EffectDecisionKind.REMOVE_DESTINATION,
+        observed,
+        steps=(transform, remove),
+    )
+
+
+def _move_restore_from_anchor(
+    effect: MoveNoClobber,
+    observed: JointObservation,
+) -> EffectDecision:
+    anchor = observed.scratch[0].entry
+    transform = _transform(
+        effect,
+        observed,
+        persistent=(anchor, OBSERVED_ABSENT),
+        scratch=anchor,
+        settlement=SettlementKind.REPAIR_INTERMEDIATE,
+        identity_relations=(
+            _identity_relation(
+                "source",
+                "anchor",
+                IdentityRelation.SAME,
+            ),
+        ),
+    )
+    remove = _remove_after_transform(effect, transform)
+    return _decision(
+        EffectDecisionKind.RESTORE_FROM_ANCHOR,
+        observed,
+        steps=(transform, remove),
+    )
 
 
 def _classify_directory(
@@ -679,8 +1052,204 @@ def _classify_directory(
     frontiers: tuple[PathFrontier, ...],
 ) -> EffectDecision:
     del frontiers
-    observed = _joint(snapshot, effect)
+    if type(effect) is not CreateDirectory:
+        raise ProtocolError("directory classifier received the wrong effect variant")
+    directory = cast(CreateDirectory, effect)
+    observed = _joint(snapshot, directory)
+    live = observed.persistent[0].entry
+    work = observed.scratch[0].entry
+    live_class = _classify_entry(
+        live,
+        pre=ABSENT,
+        post=directory.post,
+        build_relation=None,
+    )
+    work_class = _classify_entry(
+        work,
+        pre=ABSENT,
+        post=directory.post,
+        build_relation=None,
+    )
+    same_identity = _same_identity(live, work)
+    journal = _journal(snapshot, directory.effect_id)
+
+    if snapshot.commit_decision is CommitDecision.COMMITTED:
+        if (
+            journal is JournalState.DONE
+            and live_class is EntryClass.POST
+            and work_class is EntryClass.ABSENT
+        ):
+            return _decision(EffectDecisionKind.NO_ACTION, observed)
+        return _halt(observed, observed)
+
+    if journal is JournalState.DONE:
+        if (
+            live_class is EntryClass.POST
+            and work_class is EntryClass.ABSENT
+        ):
+            if not _directory_is_empty(
+                observed,
+                PersistentNode(directory.path),
+                live,
+            ):
+                return _halt(
+                    observed,
+                    observed,
+                    reason=HaltReason.DIRECTORY_NOT_EMPTY,
+                )
+            return _remove_live_directory(directory, observed)
+        return _halt(observed, observed)
+
+    if journal not in {JournalState.STARTED, JournalState.UNDO_STARTED}:
+        return _halt(observed, observed)
+
+    if (
+        live_class is EntryClass.ABSENT
+        and work_class is EntryClass.ABSENT
+    ):
+        return _decision(
+            (
+                EffectDecisionKind.ALREADY_UNDONE
+                if journal is JournalState.UNDO_STARTED
+                else EffectDecisionKind.UNDO_WITHOUT_MUTATION
+            ),
+            observed,
+        )
+    if (
+        live_class is EntryClass.ABSENT
+        and work_class is EntryClass.POST
+    ):
+        if not _directory_is_empty(
+            observed,
+            ScratchNode(directory.effect_id, required_scratch_role(directory)),
+            work,
+        ):
+            return _halt(
+                observed,
+                observed,
+                reason=HaltReason.DIRECTORY_NOT_EMPTY,
+            )
+        return _decision(
+            EffectDecisionKind.REMOVE_WORK,
+            observed,
+            steps=(_remove_scratch(directory, observed),),
+        )
+    if live_class is EntryClass.POST and work_class is EntryClass.ABSENT:
+        if not _directory_is_empty(
+            observed,
+            PersistentNode(directory.path),
+            live,
+        ):
+            return _halt(
+                observed,
+                observed,
+                reason=HaltReason.DIRECTORY_NOT_EMPTY,
+            )
+        return _remove_live_directory(directory, observed)
+    if (
+        live_class is EntryClass.POST
+        and work_class is EntryClass.POST
+        and same_identity
+    ):
+        if not (
+            _directory_is_empty(
+                observed,
+                PersistentNode(directory.path),
+                live,
+            )
+            and _directory_is_empty(
+                observed,
+                ScratchNode(
+                    directory.effect_id,
+                    required_scratch_role(directory),
+                ),
+                work,
+            )
+        ):
+            return _halt(
+                observed,
+                observed,
+                reason=HaltReason.DIRECTORY_NOT_EMPTY,
+            )
+        remove_stale = _remove_scratch(directory, observed)
+        landed = _remove_live_directory(
+            directory,
+            remove_stale.result_after,
+            identity_relations=(
+                _identity_relation(
+                    "live",
+                    "work",
+                    IdentityRelation.SAME,
+                ),
+            ),
+        )
+        return _decision(
+            EffectDecisionKind.REMOVE_DUAL_NAME_DIRECTORY,
+            observed,
+            steps=(remove_stale, *landed.steps),
+        )
+    if (
+        live_class in {EntryClass.POST, EntryClass.EXTERNAL}
+        and work_class is EntryClass.POST
+        and not same_identity
+    ):
+        if not _directory_is_empty(
+            observed,
+            ScratchNode(directory.effect_id, required_scratch_role(directory)),
+            work,
+        ):
+            return _halt(
+                observed,
+                observed,
+                reason=HaltReason.DIRECTORY_NOT_EMPTY,
+            )
+        return _decision(
+            EffectDecisionKind.REFUSED_PRESERVE_LIVE,
+            observed,
+            steps=(
+                _preserve(PersistentNode(directory.path)),
+                _remove_scratch(directory, observed),
+            ),
+            refused=True,
+        )
     return _halt(observed, observed)
+
+
+def _directory_is_empty(
+    observed: JointObservation,
+    node: TopologyNode,
+    entry: ObservedEntry,
+) -> bool:
+    if type(entry) is not ObservedDirectory:
+        return False
+    directory = cast(ObservedDirectory, entry)
+    if directory.has_unmodeled_child:
+        return False
+    for occupancy in observed.parent_occupancy:
+        if occupancy.parent == node:
+            return not occupancy.present_children
+    return True
+
+
+def _remove_live_directory(
+    effect: CreateDirectory,
+    observed: JointObservation,
+    *,
+    identity_relations: tuple[DiagnosticIdentityRelation, ...] = (),
+) -> EffectDecision:
+    transform = _transform(
+        effect,
+        observed,
+        persistent=(OBSERVED_ABSENT,),
+        scratch=OBSERVED_ABSENT,
+        settlement=SettlementKind.REMOVE_ATTRIBUTABLE_CREATION,
+        identity_relations=identity_relations,
+    )
+    return _decision(
+        EffectDecisionKind.REMOVE_LIVE_DIRECTORY,
+        observed,
+        steps=(transform,),
+    )
 
 
 _CLASSIFIERS = {

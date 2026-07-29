@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import Counter
 from collections.abc import Callable, Mapping
 from typing import cast
 
@@ -670,26 +669,25 @@ def _require_exact_entry_transfers(
     expected: JointObservation,
     result: JointObservation,
 ) -> None:
-    available = Counter(
+    available = {
         entry
         for entry in (
             *(item.entry for item in expected.persistent),
             *(item.entry for item in expected.scratch),
         )
         if type(entry) is not ObservedAbsent
-    )
+    }
     for entry in (
         *(item.entry for item in result.persistent),
         *(item.entry for item in result.scratch),
     ):
         if type(entry) is ObservedAbsent:
             continue
-        if available[entry] == 0:
+        if entry not in available:
             raise ProtocolError(
                 "step result fabricates or alters an entry, including identity or "
                 "unmodeled evidence, instead of transferring it exactly"
             )
-        available[entry] -= 1
 
 
 def _require_removed_directories_empty(

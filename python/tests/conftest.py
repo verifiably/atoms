@@ -4,7 +4,10 @@ import pytest
 
 from tests.recovery_support import (
     make_create_file_case,
+    make_delete_case,
+    make_directory_case,
     make_halted_authority_snapshot,
+    make_move_case,
     make_noop_replace_case,
     make_pending_clean_case,
     make_pending_drift_case,
@@ -62,6 +65,21 @@ def noop_replace_case():
 @pytest.fixture
 def create_file_case():
     return make_create_file_case
+
+
+@pytest.fixture
+def delete_case():
+    return make_delete_case
+
+
+@pytest.fixture
+def move_case():
+    return make_move_case
+
+
+@pytest.fixture
+def directory_case():
+    return make_directory_case
 
 
 @pytest.fixture

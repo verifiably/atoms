@@ -10,11 +10,13 @@ from atoms.core.recovery import (
     OBSERVED_ABSENT,
     CommitDecision,
     DetachActive,
+    DiagnosticIdentityRelation,
     EffectJournalState,
     EffectVariant,
     EntryIdentity,
     HaltDiagnostic,
     HaltReason,
+    IdentityRelation,
     JointObservation,
     JournalState,
     ObservedDirectory,
@@ -44,7 +46,7 @@ from atoms.core.recovery import (
 from atoms.core.recovery.plan import _new_action_plan
 from atoms.core.recovery.reducer import _apply_steps, _normalize_joint_observation
 from atoms.core.spec import build_spec
-from tests.recovery_support import create_snapshot
+from tests.recovery_support import create_snapshot, make_move_case
 from tests.support import DIGEST, D, F, G
 
 
@@ -218,6 +220,47 @@ def test_transform_refuses_a_fabricated_identity(reducer_step_cases):
     )
     with pytest.raises(ProtocolError, match="fabricates"):
         _apply_steps(source, (invalid,))
+
+
+def test_transform_may_copy_an_existing_exact_entry_identity():
+    source, _ = make_move_case(
+        "absent",
+        "absent",
+        "pre",
+        None,
+        JournalState.UNDO_STARTED,
+    )
+    anchor = source.scratch_observations[0].entry
+    expected = JointObservation(
+        persistent=source.persistent_observations,
+        scratch=source.scratch_observations,
+        parent_occupancy=(),
+    )
+    result = JointObservation(
+        persistent=(
+            PersistentObservation("source.txt", anchor),
+            source.persistent_observations[1],
+        ),
+        scratch=source.scratch_observations,
+        parent_occupancy=(),
+    )
+    step = TransformEffectTuple(
+        effect_id="e1",
+        variant=EffectVariant.MOVE_NO_CLOBBER,
+        settlement=SettlementKind.REPAIR_INTERMEDIATE,
+        expected_before=expected,
+        result_after=result,
+        identity_relations=(
+            DiagnosticIdentityRelation(
+                "source",
+                "anchor",
+                IdentityRelation.SAME,
+            ),
+        ),
+    )
+    reduced = _apply_steps(source, (step,))
+    assert reduced.persistent_observations[0].entry is anchor
+    assert reduced.scratch_observations[0].entry is anchor
 
 
 def test_transform_refuses_a_changed_entry_under_an_existing_identity(

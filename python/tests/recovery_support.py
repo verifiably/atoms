@@ -1,8 +1,14 @@
 from typing import cast
 
 from atoms.core.compiler import compile_spec
-from atoms.core.effects import CreateFileNoClobber, ReplaceFile
-from atoms.core.fingerprint import ABSENT, FileState, SymlinkState
+from atoms.core.effects import (
+    CreateDirectory,
+    CreateFileNoClobber,
+    DeletePath,
+    MoveNoClobber,
+    ReplaceFile,
+)
+from atoms.core.fingerprint import ABSENT, DirectoryState, FileState, SymlinkState
 from atoms.core.recovery import (
     OBSERVED_ABSENT,
     CommitDecision,
@@ -15,6 +21,7 @@ from atoms.core.recovery import (
     HaltReason,
     JointObservation,
     JournalState,
+    ObservedDirectory,
     ObservedEntry,
     ObservedFile,
     ObservedSymlink,
@@ -35,11 +42,12 @@ from atoms.core.recovery import (
     TransformEffectTuple,
     TransitionEffectState,
     TransitionTransactionState,
+    WorkRoot,
     build_recovery_snapshot,
 )
 from atoms.core.recovery.journal import reconstruct_frontiers
 from atoms.core.spec import build_spec
-from tests.support import DIGEST, F, G, valid_spec
+from tests.support import DIGEST, D, F, G, L, valid_spec
 
 _DEFAULT = object()
 _EXTERNAL = FileState(
@@ -52,6 +60,8 @@ _PREFIX = FileState(
     mode=0o644,
     byte_len=2,
 )
+_EXTERNAL_DIRECTORY = DirectoryState(mode=0o700)
+_EXTERNAL_SYMLINK = SymlinkState(target="../external", mode=0o777)
 
 
 def compiled_create():
@@ -547,6 +557,346 @@ def make_create_file_case(
         journal,
         committed=committed,
     )
+
+
+def _single_effect_snapshot(
+    *,
+    effect,
+    initial_surface,
+    final_surface,
+    topology: RecoveryTopology,
+    journal: JournalState,
+    persistent_observations: tuple[PersistentObservation, ...],
+    scratch_observation: ScratchObservation,
+    committed: bool,
+):
+    state, decision, rollback_result = _transaction_fields(
+        journal,
+        committed=committed,
+    )
+    snapshot = build_recovery_snapshot(
+        compiled=compile_spec(
+            build_spec(
+                consumer_tag="cnsmr",
+                intent_digest=DIGEST,
+                initial_surface=initial_surface,
+                final_surface=final_surface,
+                effects=(effect,),
+            )
+        ),
+        topology=topology,
+        transaction_state=state,
+        commit_decision=decision,
+        rollback_result=rollback_result,
+        halt_diagnostic=None,
+        active=True,
+        journals=(EffectJournalState(effect.effect_id, journal),),
+        persistent_observations=persistent_observations,
+        scratch_observations=(scratch_observation,),
+    )
+    return snapshot, reconstruct_frontiers(snapshot)
+
+
+def make_delete_case(
+    live_name: str,
+    tombstone_name: str,
+    journal: JournalState,
+    *,
+    committed: bool = False,
+    symlink: bool = False,
+):
+    pre = L if symlink else F
+    effect = DeletePath("e1", "a.txt", pre)
+    project = ProjectRoot()
+
+    def entry(name: str):
+        if name == "absent":
+            return OBSERVED_ABSENT
+        if name == "pre":
+            return (
+                ObservedSymlink(L)
+                if symlink
+                else ObservedFile(F, EntryIdentity())
+            )
+        if name == "external":
+            return (
+                ObservedSymlink(_EXTERNAL_SYMLINK)
+                if symlink
+                else ObservedFile(_EXTERNAL, EntryIdentity())
+            )
+        raise AssertionError(f"unknown delete observation name: {name}")
+
+    topology = RecoveryTopology(
+        parents=(
+            TopologyParent(PersistentNode("a.txt"), project),
+            TopologyParent(
+                ScratchNode("e1", ScratchRole.TOMBSTONE),
+                project,
+            ),
+        )
+    )
+    return _single_effect_snapshot(
+        effect=effect,
+        initial_surface={"a.txt": pre},
+        final_surface={"a.txt": ABSENT},
+        topology=topology,
+        journal=journal,
+        persistent_observations=(
+            PersistentObservation("a.txt", entry(live_name)),
+        ),
+        scratch_observation=ScratchObservation(
+            "e1",
+            ScratchRole.TOMBSTONE,
+            entry(tombstone_name),
+            None,
+        ),
+        committed=committed,
+    )
+
+
+def _move_identities(relation: str | None):
+    source = EntryIdentity()
+    destination = EntryIdentity()
+    anchor = EntryIdentity()
+    if relation == "source_anchor_same":
+        anchor = source
+    elif relation == "destination_anchor_same":
+        anchor = destination
+    elif relation == "source_destination_same":
+        destination = source
+    elif relation == "all_same":
+        destination = source
+        anchor = source
+    elif relation not in {None, "different"}:
+        raise AssertionError(f"unknown move identity relation: {relation}")
+    return source, destination, anchor
+
+
+def make_move_case(
+    source_name: str,
+    destination_name: str,
+    anchor_name: str,
+    relation: str | None,
+    journal: JournalState | None = None,
+    *,
+    committed: bool = False,
+):
+    actual_journal = (
+        JournalState.DONE
+        if journal is None and committed
+        else JournalState.STARTED
+        if journal is None
+        else journal
+    )
+    effect = MoveNoClobber("e1", "source.txt", "destination.txt", F)
+    source_id, destination_id, anchor_id = _move_identities(relation)
+
+    def entry(name: str, identity: EntryIdentity):
+        if name == "absent":
+            return OBSERVED_ABSENT
+        if name == "pre":
+            return ObservedFile(F, identity)
+        if name == "external":
+            return ObservedFile(_EXTERNAL, identity)
+        if name == "foreign":
+            return ObservedSymlink(_EXTERNAL_SYMLINK)
+        raise AssertionError(f"unknown move observation name: {name}")
+
+    project = ProjectRoot()
+    topology = RecoveryTopology(
+        parents=(
+            TopologyParent(PersistentNode("source.txt"), project),
+            TopologyParent(PersistentNode("destination.txt"), project),
+            TopologyParent(ScratchNode("e1", ScratchRole.ANCHOR), project),
+        )
+    )
+    return _single_effect_snapshot(
+        effect=effect,
+        initial_surface={
+            "source.txt": F,
+            "destination.txt": ABSENT,
+        },
+        final_surface={
+            "source.txt": ABSENT,
+            "destination.txt": F,
+        },
+        topology=topology,
+        journal=actual_journal,
+        persistent_observations=(
+            PersistentObservation(
+                "source.txt",
+                entry(source_name, source_id),
+            ),
+            PersistentObservation(
+                "destination.txt",
+                entry(destination_name, destination_id),
+            ),
+        ),
+        scratch_observation=ScratchObservation(
+            "e1",
+            ScratchRole.ANCHOR,
+            entry(anchor_name, anchor_id),
+            None,
+        ),
+        committed=committed,
+    )
+
+
+def _directory_identities(relation: str | None):
+    live = EntryIdentity()
+    work = EntryIdentity()
+    if relation == "same":
+        work = live
+    elif relation not in {None, "different"}:
+        raise AssertionError(f"unknown directory identity relation: {relation}")
+    return live, work
+
+
+def make_directory_case(
+    live_name: str,
+    work_name: str,
+    relation: str | None,
+    unmodeled: bool,
+    journal: JournalState | None = None,
+    *,
+    committed: bool = False,
+):
+    actual_journal = (
+        JournalState.DONE
+        if journal is None and committed
+        else JournalState.STARTED
+        if journal is None
+        else journal
+    )
+    effect = CreateDirectory("e1", "dir", D)
+    live_id, work_id = _directory_identities(relation)
+
+    def entry(name: str, identity: EntryIdentity):
+        if name == "absent":
+            return OBSERVED_ABSENT
+        if name == "post":
+            return ObservedDirectory(D, identity, unmodeled)
+        if name == "external":
+            return ObservedDirectory(
+                _EXTERNAL_DIRECTORY,
+                identity,
+                unmodeled,
+            )
+        raise AssertionError(f"unknown directory observation name: {name}")
+
+    project = ProjectRoot()
+    work_root = WorkRoot()
+    topology = RecoveryTopology(
+        parents=(
+            TopologyParent(work_root, project),
+            TopologyParent(PersistentNode("dir"), project),
+            TopologyParent(
+                ScratchNode("e1", ScratchRole.WORK),
+                work_root,
+            ),
+        )
+    )
+    return _single_effect_snapshot(
+        effect=effect,
+        initial_surface={"dir": ABSENT},
+        final_surface={"dir": D},
+        topology=topology,
+        journal=actual_journal,
+        persistent_observations=(
+            PersistentObservation("dir", entry(live_name, live_id)),
+        ),
+        scratch_observation=ScratchObservation(
+            "e1",
+            ScratchRole.WORK,
+            entry(work_name, work_id),
+            None,
+        ),
+        committed=committed,
+    )
+
+
+def make_directory_descendant_case(*, descendant_present: bool):
+    effects = (
+        CreateDirectory("e1", "dir", D),
+        CreateFileNoClobber("e2", "dir/child.txt", F),
+    )
+    compiled = compile_spec(
+        build_spec(
+            consumer_tag="cnsmr",
+            intent_digest=DIGEST,
+            initial_surface={
+                "dir": ABSENT,
+                "dir/child.txt": ABSENT,
+            },
+            final_surface={
+                "dir": D,
+                "dir/child.txt": F,
+            },
+            effects=effects,
+            dependencies=(("e1", "e2"),),
+        )
+    )
+    project = ProjectRoot()
+    work_root = WorkRoot()
+    live = PersistentNode("dir")
+    topology = RecoveryTopology(
+        parents=(
+            TopologyParent(work_root, project),
+            TopologyParent(live, project),
+            TopologyParent(ScratchNode("e1", ScratchRole.WORK), work_root),
+            TopologyParent(PersistentNode("dir/child.txt"), live),
+            TopologyParent(ScratchNode("e2", ScratchRole.STAGING), live),
+        )
+    )
+    snapshot = build_recovery_snapshot(
+        compiled=compiled,
+        topology=topology,
+        transaction_state=TransactionState.ROLLING_BACK,
+        commit_decision=CommitDecision.UNCOMMITTED,
+        rollback_result=None,
+        halt_diagnostic=None,
+        active=True,
+        journals=(
+            EffectJournalState("e1", JournalState.DONE),
+            EffectJournalState(
+                "e2",
+                (
+                    JournalState.UNDO_STARTED
+                    if descendant_present
+                    else JournalState.UNDONE
+                ),
+            ),
+        ),
+        persistent_observations=(
+            PersistentObservation(
+                "dir",
+                ObservedDirectory(D, EntryIdentity(), False),
+            ),
+            PersistentObservation(
+                "dir/child.txt",
+                (
+                    ObservedFile(F, EntryIdentity())
+                    if descendant_present
+                    else OBSERVED_ABSENT
+                ),
+            ),
+        ),
+        scratch_observations=(
+            ScratchObservation(
+                "e1",
+                ScratchRole.WORK,
+                OBSERVED_ABSENT,
+                None,
+            ),
+            ScratchObservation(
+                "e2",
+                ScratchRole.STAGING,
+                OBSERVED_ABSENT,
+                None,
+            ),
+        ),
+    )
+    return snapshot, reconstruct_frontiers(snapshot)
 
 
 def make_pending_drift_case():
