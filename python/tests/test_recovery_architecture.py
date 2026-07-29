@@ -295,17 +295,39 @@ def test_authorization_does_not_import_the_classifier():
         "from .classifier import classify_recovery as classify",
         "from . import classifier as recovery_classifier",
         "from atoms.core.recovery import classifier as recovery_classifier",
+        "import atoms.core.recovery.classifier",
+        "from atoms.core.recovery.classifier import classify_recovery",
     ],
     ids=[
         "relative-symbol",
         "relative-module",
         "absolute-package-member",
+        "absolute-module",
+        "absolute-symbol",
     ],
 )
 def test_classifier_import_scanner_rejects_equivalent_static_imports(
     source: str,
 ):
     assert _imports_classifier(source, package="atoms.core.recovery")
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from . import classifier_helpers",
+        "from atoms.core.recovery import classifier_helpers",
+    ],
+    ids=[
+        "relative-sibling",
+        "absolute-package-sibling",
+    ],
+)
+def test_classifier_import_scanner_allows_sibling_modules(source: str):
+    assert not _imports_classifier(
+        source,
+        package="atoms.core.recovery",
+    )
 
 
 def test_recovery_import_does_not_require_a_filesystem_backend():
