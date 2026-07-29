@@ -41,6 +41,10 @@ from atoms.core.recovery.plan import (
     TransitionEffectState,
     TransitionTransactionState,
 )
+from atoms.core.recovery.reducer import (
+    apply_recovery_plan,
+    reduce_recovery_plan_prefix,
+)
 from atoms.core.recovery.snapshot import (
     PersistentNode,
     ProjectRoot,
@@ -103,5 +107,7 @@ __all__ = (
     "TransitionEffectState",
     "TransitionTransactionState",
     "WorkRoot",
+    "apply_recovery_plan",
     "build_recovery_snapshot",
+    "reduce_recovery_plan_prefix",
 )
