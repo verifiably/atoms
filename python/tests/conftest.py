@@ -3,21 +3,31 @@
 import pytest
 
 from tests.recovery_support import (
+    make_committed_halt_source,
+    make_committed_repeated_replace_snapshot,
+    make_committed_snapshot,
+    make_committed_superseded_cleanup_case,
     make_create_file_case,
     make_delete_case,
     make_directory_case,
     make_halted_authority_snapshot,
+    make_halted_snapshot,
     make_move_case,
     make_noop_replace_case,
     make_pending_clean_case,
     make_pending_drift_case,
     make_pending_scratch_case,
+    make_prepared_drift_snapshot,
+    make_recovery_case,
     make_reducer_step_cases,
+    make_repeated_path_mid_plan_halt,
     make_replace_case,
     make_replace_started_case,
     make_replace_transform_case,
+    make_snapshot_pair_differing_only_dependencies,
     make_terminal_snapshot,
     make_three_effect_snapshot,
+    make_two_effect_snapshot,
     make_undone_drift_case,
 )
 
@@ -100,3 +110,53 @@ def pending_scratch_case():
 @pytest.fixture
 def undone_drift_case():
     return make_undone_drift_case
+
+
+@pytest.fixture
+def two_effect_snapshot():
+    return make_two_effect_snapshot
+
+
+@pytest.fixture
+def committed_snapshot():
+    return make_committed_snapshot()
+
+
+@pytest.fixture
+def committed_repeated_replace_snapshot():
+    return make_committed_repeated_replace_snapshot()
+
+
+@pytest.fixture
+def committed_superseded_cleanup_case():
+    return make_committed_superseded_cleanup_case
+
+
+@pytest.fixture
+def prepared_drift_snapshot():
+    return make_prepared_drift_snapshot()
+
+
+@pytest.fixture
+def halted_snapshot():
+    return make_halted_snapshot()
+
+
+@pytest.fixture
+def recovery_case():
+    return make_recovery_case
+
+
+@pytest.fixture
+def committed_halt_source():
+    return make_committed_halt_source()
+
+
+@pytest.fixture
+def repeated_path_mid_plan_halt():
+    return make_repeated_path_mid_plan_halt()
+
+
+@pytest.fixture
+def snapshot_pair_differing_only_dependencies():
+    return make_snapshot_pair_differing_only_dependencies()

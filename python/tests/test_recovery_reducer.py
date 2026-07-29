@@ -1,4 +1,4 @@
-from dataclasses import replace
+from dataclasses import fields, replace
 
 import pytest
 
@@ -28,7 +28,9 @@ from atoms.core.recovery import (
     PlanDisposition,
     PreserveExternal,
     ProjectRoot,
+    RecoverySnapshot,
     RecoveryTopology,
+    RemoveScratch,
     ScratchNode,
     ScratchObservation,
     ScratchRole,
@@ -48,6 +50,57 @@ from atoms.core.recovery.reducer import _apply_steps, _normalize_joint_observati
 from atoms.core.spec import build_spec
 from tests.recovery_support import create_snapshot, make_move_case
 from tests.support import DIGEST, D, F, G
+
+
+def scratch_only_remove_step(
+    source,
+    *,
+    step_role=ScratchRole.STAGING,
+    observation_role=ScratchRole.STAGING,
+):
+    scratch = source.scratch_observations[0]
+    expected = JointObservation(
+        persistent=(),
+        scratch=(
+            ScratchObservation(
+                scratch.effect_id,
+                observation_role,
+                scratch.entry,
+                None,
+            ),
+        ),
+        parent_occupancy=(),
+    )
+    result = JointObservation(
+        persistent=(),
+        scratch=(
+            ScratchObservation(
+                scratch.effect_id,
+                observation_role,
+                OBSERVED_ABSENT,
+                None,
+            ),
+        ),
+        parent_occupancy=(),
+    )
+    return RemoveScratch(
+        effect_id=scratch.effect_id,
+        role=step_role,
+        expected_before=expected,
+        result_after=result,
+    )
+
+
+def snapshot_with_unchecked_journal(source, state):
+    forged = object.__new__(RecoverySnapshot)
+    for field in fields(source):
+        object.__setattr__(forged, field.name, getattr(source, field.name))
+    object.__setattr__(
+        forged,
+        "journals",
+        (EffectJournalState(source.journals[0].effect_id, state),),
+    )
+    return forged
 
 
 def transition_plan(snapshot):
@@ -310,8 +363,75 @@ def test_remove_scratch_requires_the_complete_effect_tuple(reducer_step_cases):
         expected_before=replace(step.expected_before, persistent=()),
         result_after=replace(step.result_after, persistent=()),
     )
-    with pytest.raises(ProtocolError, match="omits"):
+    with pytest.raises(ProtocolError, match="COMMITTED"):
         _apply_steps(source, (incomplete,))
+
+
+def test_committed_remove_scratch_accepts_exact_scratch_only_coverage(
+    committed_snapshot,
+):
+    step = scratch_only_remove_step(committed_snapshot)
+
+    reduced = _apply_steps(committed_snapshot, (step,))
+
+    assert reduced.persistent_observations == (
+        committed_snapshot.persistent_observations
+    )
+    assert reduced.scratch_observations[0].entry is OBSERVED_ABSENT
+
+
+def test_committed_remove_scratch_requires_done_effect_journal(
+    committed_snapshot,
+):
+    source = snapshot_with_unchecked_journal(
+        committed_snapshot,
+        JournalState.STARTED,
+    )
+    with pytest.raises(ProtocolError, match="DONE"):
+        _apply_steps(source, (scratch_only_remove_step(source),))
+
+
+def test_committed_remove_scratch_requires_exact_role_and_scratch_key(
+    committed_snapshot,
+):
+    wrong_step_role = scratch_only_remove_step(
+        committed_snapshot,
+        step_role=ScratchRole.TOMBSTONE,
+    )
+    with pytest.raises(ProtocolError, match="role"):
+        _apply_steps(committed_snapshot, (wrong_step_role,))
+
+    wrong_observation_key = scratch_only_remove_step(
+        committed_snapshot,
+        observation_role=ScratchRole.TOMBSTONE,
+    )
+    with pytest.raises(ProtocolError, match="scratch key"):
+        _apply_steps(committed_snapshot, (wrong_observation_key,))
+
+
+def test_committed_scratch_only_remove_rejects_create_variants(
+    committed_halt_source,
+    directory_case,
+):
+    committed_directory, _ = directory_case(
+        "post",
+        "post",
+        "same",
+        False,
+        committed=True,
+    )
+    sources_and_roles = (
+        (committed_halt_source, ScratchRole.STAGING),
+        (committed_directory, ScratchRole.WORK),
+    )
+    for source, role in sources_and_roles:
+        step = scratch_only_remove_step(
+            source,
+            step_role=role,
+            observation_role=role,
+        )
+        with pytest.raises(ProtocolError, match="retained-scratch"):
+            _apply_steps(source, (step,))
 
 
 def test_transform_refuses_nodes_owned_by_another_effect():

@@ -87,7 +87,7 @@ A3 remains stdlib-only at runtime and performs no filesystem I/O.
 ## 3. Seam review and authority corrections
 
 At the time of the pre-plan seam review, no ledger row named A3 as its first owner. Deriving the
-executable contract then exposed four authority seams that this design corrected:
+executable contract then exposed five authority seams that this design corrected:
 
 1. §13.1 named raw `TransactionSpec` as the classifier input. A3 instead operates on the exact
    factory-issued `CompiledSpec`, plus logical recovery evidence; the authority now says so. A3 never
@@ -99,6 +99,9 @@ executable contract then exposed four authority seams that this design corrected
    evidence.
 4. A2's exact-spelling tree is insufficient for abstract directory convergence after A4 resolves
    actual per-directory equivalence. A3 needs A4's resolved logical topology in production.
+5. Occurrence-local committed tuples are unsound for repeated paths: only the last occurrence's
+   post-state is live. Committed cleanup therefore proves the transaction final surface once, then
+   classifies scratch independently of occurrence-local persistent evidence.
 
 The authority and deferred-obligation ledger change in the same commit as this design. No A3 API may
 silently delegate these questions to a later plan.
@@ -298,8 +301,9 @@ The relation is required only where the forward classifier can consume construct
 
 It is absent everywhere else. In particular, a displaced preimage retained by a completed
 `ReplaceFile`, a quarantined postimage during reverse settlement, and committed-cleanup scratch are
-classified by their exact fingerprints and atomic tuple, so A6/A7 does not stream-compare those files
-against the planned blob.
+not stream-compared against the planned blob. Uncommitted settlement uses the complete atomic tuple;
+after the transaction-wide final-surface proof, committed cleanup uses only the exact retained scratch
+state.
 
 ### 5.5 Recovery snapshot
 
@@ -346,6 +350,13 @@ the affected parent-directory occupancy evidence named by the step. It contains 
 transaction state: A5 supplies those durable facts, while A7 supplies the descriptor-coherent
 filesystem evidence.
 
+Ordinary rollback steps name the effect's complete persistent-and-scratch coverage. The deliberate
+exception is a committed cleanup `RemoveScratch`: after the transaction classifier has proved the
+complete final surface once, its `JointObservation` contains exactly one retained scratch slot and no
+persistent or occupancy entries. The reducer accepts that shape only for an exact `COMMITTED`
+transaction, the named effect at exact `DONE`, and the effect's exact required retained-scratch
+key/role. Every noncommitted `RemoveScratch` still requires complete effect coverage.
+
 `authorize_recovery_step` validates the joint observation's exact node coverage and closed runtime
 types. Missing, extra, duplicated, or incoherent evidence is `ProtocolError`; well-shaped evidence
 that differs from the plan precondition yields `PLAN_PRECONDITION_CHANGED`. Agreement means exact
@@ -355,13 +366,31 @@ token universes.
 
 ## 6. Transaction classifier
 
-`classify_recovery` runs a fixed semantic pipeline:
+`classify_recovery` first validates transaction authority, then selects one of two fixed semantic
+pipelines.
+
+For an uncommitted transaction the pipeline:
 
 1. validate the transaction/journal topology;
 2. reconstruct every declared path's forward or reverse frontier;
 3. validate all persistent and scratch evidence for every effect;
 4. classify the at-most-one in-flight effect jointly across its persistent paths and scratch role; and
 5. emit the complete ordered plan only after every observation has been classified.
+
+For `COMMITTED` with all effects `DONE`, it bypasses frontier reconstruction and the ordinary
+`classify_effect` path:
+
+1. compare the one current observation for every compiled path with the complete compiled final
+   surface;
+2. only after that succeeds, classify the complete scratch vector through the proof-gated committed
+   cleanup helper;
+3. accept exact retained replace/delete/move scratch for removal or absence as already cleaned;
+4. require create-file staging and create-directory `WORK` to be absent; and
+5. after every scratch slot passes, emit scratch-only removals in compiled order and detach.
+
+Any retained scratch state/kind mismatch or create staging/`WORK` survivor halts without cleanup
+steps. The complete final-surface proof is the sole persistent predicate for this branch, so repeated
+paths are not compared against every occurrence-local post-state.
 
 No step is emitted incrementally while later evidence remains unchecked. Recovery therefore cannot
 destroy early evidence before discovering a later conflict.
@@ -374,7 +403,7 @@ destroy early evidence before discovering a later conflict.
 | `APPLYING` | `DONE* STARTED? PENDING*` | Settle the in-flight effect, undo attributable effects in reverse order |
 | `APPLIED` | all `DONE` | No commit exists; undo every effect in reverse order |
 | `ROLLING_BACK` | `DONE* STARTED? PENDING*` **or** `DONE* UNDO_STARTED? UNDONE* PENDING*` | Resume from the one forward-or-reverse frontier |
-| `COMMITTED` | all `DONE` | Rollback forbidden; verify final surface, clean retained scratch, detach |
+| `COMMITTED` | all `DONE` | Rollback forbidden; prove the complete final surface once, validate scratch transaction-wide, clean exact retained scratch, detach |
 | `ROLLED_BACK` | `UNDONE* PENDING*` | Detach metadata only; never mutate project or scratch |
 | `HALTED` | not re-derived; the current vector must equal the diagnostic's frozen full journal vector | Stable halt; no further state change |
 
@@ -425,8 +454,8 @@ treat the baseline as the whole admissible set.
 
 An all-`PENDING` forward timeline is `INITIAL` at its first declared pre-state. Production
 `classify_recovery` changes every uncommitted active transaction to `ROLLING_BACK` before it
-reconstructs effect frontiers, so its forward reconstruction is used by committed cleanup; direct
-variant tests still exercise the forward in-flight vocabulary.
+reconstructs effect frontiers. Committed cleanup does not reconstruct frontiers; direct variant tests
+still exercise the forward in-flight vocabulary.
 
 All persistent paths owned by one effect are classified together. A move can never be "landed" for
 its destination while independently "not landed" for its source.
@@ -494,6 +523,12 @@ even though the classification evidence that selected the settlement retains the
 Plan construction binds or rebases semantic steps against this post-transition pure cursor; it never
 weakens reducer or authorization equality.
 
+`RemoveScratch` normally carries the same complete effect coverage. For committed cleanup only, after
+the transaction-wide final-surface proof, it carries exactly the one retained scratch slot and empty
+persistent/occupancy tuples. This is not a general partial-observation fallback: the reducer permits it
+only while the snapshot is exact `COMMITTED`, the named journal is exact `DONE`, and the key and role
+are exactly the compiled retained-scratch slot.
+
 Settlement kinds express intent — restore pre-state, remove an attributable creation, repair an
 intermediate to pre-state, or finish an already-landed undo. They do not name `renameat2`, `unlink`,
 `rmdir`, `fsync`, or another backend primitive.
@@ -512,6 +547,11 @@ Before each filesystem-mutating step, A7 obtains one fresh coherent joint observ
 identity partition returns a factory-controlled `AuthorizedStep`; raw tokens are never compared across
 the plan and fresh-observation universes. Any mismatch returns a halt plan with stable reason
 `PLAN_PRECONDITION_CHANGED`. A7 may not silently retry, reclassify, or reinterpret the stale step.
+
+For committed cleanup, the complete final surface is authorized once before any cleanup step is
+planned. Each later `RemoveScratch` fresh-authorizes only its exact retained scratch slot. Unrelated
+post-commit live drift therefore cannot strand engine scratch after the transaction-level proof; it
+also cannot license deleting a scratch slot whose own state or shape changed.
 
 `step_index` must select a filesystem-mutating `TransformEffectTuple` or `RemoveScratch`. Naming
 `TransitionTransactionState`, `TransitionEffectState`, `PreserveExternal`, or `DetachActive` is
@@ -618,7 +658,8 @@ Notation below:
 - `X` — another present state;
 - `==` between present entries — equal opaque identity.
 
-An entry is **attributable** only when it occupies the effect's A4-approved logical scratch slot and
+For uncommitted recovery, an entry is **attributable** only when it occupies the effect's A4-approved
+logical scratch slot and
 the complete joint observation gives that slot one of the shapes permitted by the variant and current
 journal state. Constructive evidence is an exact expected fingerprint, a proved prefix of the planned
 blob, or an expected identity relation. Transfer evidence is a variant-specific atomic tuple, such as
@@ -626,7 +667,26 @@ blob, or an expected identity relation. Transfer evidence is a variant-specific 
 `STAGING`. Occupying a reserved-looking slot by itself is never attribution; a shape outside these
 rules is foreign or unattributable and is preserved.
 
-Every tuple not listed is unattributable and halts.
+Every uncommitted tuple not listed is unattributable and halts.
+
+Committed cleanup has a separate transaction-level table. `classify_recovery` first proves the
+complete compiled final surface from the transaction's one current observation per persistent path.
+Only after that proof does its internal committed-cleanup helper inspect each scratch slot; it never
+compares the final live entry with an earlier occurrence's post-state:
+
+| `DONE` effect scratch | Committed decision |
+| --- | --- |
+| `ReplaceFile.STAGING` exact declared `pre` | remove staging |
+| `DeletePath.TOMBSTONE` exact declared `pre` | remove tombstone |
+| `MoveNoClobber.ANCHOR` exact declared `source_pre` | remove anchor; no current destination/anchor identity predicate |
+| retained replace/delete/move scratch absent | already cleaned |
+| `CreateFileNoClobber.STAGING` absent | valid; no cleanup step |
+| `CreateDirectory.WORK` absent | valid; no cleanup step |
+| any wrong retained entry state/kind, or any create staging/`WORK` survivor | halt and preserve evidence |
+
+All retained removals use a scratch-only `JointObservation`. This table is available only behind the
+successful final-surface proof; ordinary `classify_effect` retains the complete occurrence-local tuple
+rules below for uncommitted settlement and conservative direct classification.
 
 ### 9.1 `ReplaceFile`: `(live, staging)`
 
@@ -640,7 +700,6 @@ general rows below:
 | `(same, same)` while `UNDO_STARTED` or uncommitted `DONE` | remove staging and leave live unchanged |
 | `(same, A)` while `UNDO_STARTED` | reverse settlement is already complete |
 | `(same, A)` while uncommitted `DONE` | halt; forward `DONE` requires the retained displaced entry even when its fingerprint equals `post` |
-| `(same, same)` or `(same, A)` during committed cleanup | remove staging if present; retain live |
 | `(same, X)` | halt and preserve both; with no state change, the tuple does not prove that exchange displaced `X` |
 
 This precedence restores the declared state for both sides of the otherwise indistinguishable
@@ -668,8 +727,8 @@ Reverse `UNDO_STARTED` accepts both atomic sides:
 uses the ordinary landed rollback above. `(post, A)` is a contradiction before a commit decision
 because terminal scratch cleanup was not yet licensed.
 
-Committed cleanup accepts `(post, pre)` or `(post, A)`, where absent scratch means cleanup already
-landed. `live=post` without the displaced entry is not attributed during uncommitted recovery.
+Committed cleanup follows the transaction-level scratch table above. `live=post` without the displaced
+entry is not attributed during uncommitted recovery.
 
 ### 9.2 `CreateFileNoClobber`: `(live, staging)`
 
@@ -692,7 +751,7 @@ Reverse `UNDO_STARTED`:
 
 A changed live target during undo or foreign staging evidence halts. `DONE` under uncommitted rollback
 accepts only `(post, A)`, transitions to `UNDO_STARTED`, and performs the ordinary landed rollback.
-Committed cleanup also requires `(post, A)`.
+Committed cleanup uses the transaction-level absent-staging rule above.
 
 ### 9.3 `DeletePath`: `(live, tombstone)`
 
@@ -711,7 +770,8 @@ unattributable.
 `DONE` under uncommitted rollback accepts only `(A, pre)`, transitions to `UNDO_STARTED`, and restores
 the retained tombstone. `(A, A)` is not accepted before commit.
 
-Committed cleanup accepts `(A, pre)` or `(A, A)`.
+Committed cleanup uses the transaction-level tombstone rule above; the current live path may reflect a
+later occurrence.
 
 ### 9.4 `MoveNoClobber`: `(source, destination, anchor)`
 
@@ -736,8 +796,9 @@ converges to `(pre, A, pre)` with source `==` anchor and then removes the anchor
 transitions to `UNDO_STARTED`, and performs the ordinary landed rollback. A missing anchor is a
 contradiction before commit.
 
-Committed cleanup requires `(A, pre, pre)` with destination `==` anchor, or `(A, pre, A)` after
-anchor cleanup. Source reappearance or destination divergence never licenses rollback.
+Committed cleanup uses the transaction-level anchor rule above and does not require the current
+destination to retain an earlier occurrence's anchor identity. Source reappearance or destination
+divergence never licenses uncommitted rollback.
 
 ### 9.5 `CreateDirectory`: `(live, work)`
 
@@ -759,9 +820,9 @@ eventual removal halts before recovery mutation.
 converging to `(A, A)`.
 
 `DONE` under uncommitted rollback accepts only `(post, A)`, transitions to `UNDO_STARTED`, and performs
-the ordinary landed rollback after declared descendants have been reversed. Committed cleanup also
-requires `(post, A)`. Work removal is durable before `DONE`; a work survivor beside `DONE` is a
-contradiction, not committed cleanup.
+the ordinary landed rollback after declared descendants have been reversed. During committed cleanup,
+the transaction-wide final-surface proof owns the persistent predicate and `WORK` must be absent. Work
+removal is durable before `DONE`; a work survivor beside `DONE` is a contradiction, not cleanup.
 
 ### 9.6 Intentional differences across variants
 
@@ -772,10 +833,12 @@ Scratch absence does not have one global meaning:
 - Replace and delete need the displaced entry or tombstone to prove their uncommitted joint tuple.
 - Move needs the anchor for uncommitted identity attribution.
 - Create-directory work must already be absent at `DONE`.
-- Retained replace staging, delete tombstones, and move anchors may be absent during committed cleanup
-  because cleanup itself can have landed before a crash.
+- Only behind a durable commit decision and successful complete final-surface proof, retained replace
+  staging, delete tombstones, and move anchors may be absent because cleanup itself can have landed
+  before a crash.
 
-A shared "scratch missing means landed" fallback is forbidden.
+A shared "scratch missing means landed" fallback is forbidden outside that proof-gated committed
+table.
 
 ## 10. Error and totality contract
 
@@ -838,6 +901,12 @@ Properties lock:
 - explicit `DONE`-under-rollback acceptance without reusing `UNDO_STARTED` tuples;
 - rollback restoration or explicit preserved drift;
 - committed recovery never emits rollback;
+- committed repeated-path cleanup proves the complete final surface before scratch decisions and never
+  compares that final live state with every occurrence-local postimage;
+- committed retained scratch accepts only exact expected state or absence, while create-file staging
+  and create-directory `WORK` survivors halt;
+- committed cleanup bypasses the ordinary per-effect classifier and produces scratch-only
+  `RemoveScratch` authorization;
 - a committed halt retains its commit decision and frozen first-halt diagnostic;
 - halt diagnostics round-trip without identity tokens and remain equal across a regenerated token
   universe;
@@ -869,6 +938,9 @@ Mutation checks must demonstrate that the tests fail when:
 - a symlink is given decisive opaque identity;
 - a no-op replace is dispatched through the overlapping general rows;
 - a completed replace requires a planned-blob relation for its displaced preimage;
+- committed cleanup compares an earlier repeated-path effect with the final live entry;
+- committed cleanup invokes the ordinary occurrence-local effect classifier;
+- the reducer accepts scratch-only `RemoveScratch` outside exact `COMMITTED`/`DONE` retained cleanup;
 - a step builder allocates a new identity token;
 - resolved topology is replaced by lexical topology;
 - scratch absence is treated uniformly across variants; or

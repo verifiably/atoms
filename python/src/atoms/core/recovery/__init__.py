@@ -1,3 +1,4 @@
+from atoms.core.recovery.classifier import classify_recovery
 from atoms.core.recovery.model import (
     OBSERVED_ABSENT,
     CommitDecision,
@@ -109,5 +110,6 @@ __all__ = (
     "WorkRoot",
     "apply_recovery_plan",
     "build_recovery_snapshot",
+    "classify_recovery",
     "reduce_recovery_plan_prefix",
 )

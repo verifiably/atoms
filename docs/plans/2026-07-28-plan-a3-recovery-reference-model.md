@@ -121,6 +121,8 @@ directly by non-pytest checks. No test may name a fixture absent from this regis
 | `directory_case` | Task 7 | callable building directory states/occupancy, optionally committed |
 | `two_effect_snapshot` | Task 8 | callable selecting a named decision case for each of two effects |
 | `committed_snapshot` | Task 8 | committed all-DONE snapshot with removable terminal scratch |
+| `committed_repeated_replace_snapshot` | Task 8 | committed repeated-path `F→G→H` replace chain with retained `F`/`G` staging |
+| `committed_superseded_cleanup_case` | Task 8 | callable committed Delete→Create and Move→Replace cases with superseded persistent evidence |
 | `prepared_drift_snapshot` | Task 8 | prepared all-PENDING snapshot with external live drift |
 | `halted_snapshot` | Task 8 | validated HALTED snapshot carrying its frozen first-halt diagnostic |
 | `recovery_case` | Task 8 | callable returning named restored/refused/committed/halt fixed-point sources |
@@ -2008,8 +2010,9 @@ def test_all_pending_forward_frontier_is_initial():
 ```
 
 Within production `classify_recovery`, every uncommitted active state transitions to
-`ROLLING_BACK` before frontier reconstruction, so forward reconstruction there serves committed
-cleanup. Direct Task 5/6 classifier tests still exercise forward in-flight frontiers.
+`ROLLING_BACK` before frontier reconstruction. Committed cleanup bypasses frontier reconstruction and
+uses Task 8's proof-gated scratch-only helper. Direct Task 5/6 classifier tests still exercise forward
+in-flight frontiers.
 
 - [ ] **Step 5: Mutation-lock the load-bearing grammar**
 
@@ -2168,7 +2171,7 @@ def test_create_file_joint_table(create_file_case, live_name, staging_name, jour
 For every parameterized test, also assert a foreign or diverged staging observation halts without a
 mutation step.
 
-Exercise the committed-cleanup rows directly in Task 6:
+Exercise conservative occurrence-local `COMMITTED` rows directly in Task 6:
 
 ```python
 @pytest.mark.parametrize(
@@ -2227,6 +2230,11 @@ def test_create_file_committed_cleanup_rows(
     )
     assert classify_effect(snapshot, 0, frontiers).kind.value == expected
 ```
+
+These `classify_effect` rows require the effect-local live tuple because no transaction-level
+final-surface proof has been supplied. They remain conservative direct-classifier coverage; Task 8's
+production committed path uses a distinct internal helper only after proving the complete final
+surface, which is required for repeated paths.
 
 - [ ] **Step 3: Write failing non-in-flight evidence tests**
 
@@ -2420,7 +2428,7 @@ Encode these replace outcomes exactly:
 | `UNDO_STARTED` | `(pre,post)` | `remove_scratch` |
 | `UNDO_STARTED` | `(pre,A)` | `already_undone` |
 | uncommitted `DONE` | `(post,pre)` only | transition-ready `exchange_back` |
-| committed `DONE` | `(post,pre)` / `(post,A)` | `REMOVE_SCRATCH` / `NO_ACTION` |
+| direct classifier, committed `DONE` | `(post,pre)` / `(post,A)` | conservative `REMOVE_SCRATCH` / `NO_ACTION` |
 
 For `pre == post`, encode the dedicated design §9.1 matrix before the general classifier. `(same,X)`
 always halts; uncommitted `DONE (same,A)` halts. Committed `(same,same)` removes staging and
@@ -2437,7 +2445,7 @@ Encode these create-file outcomes exactly:
 | `UNDO_STARTED` | `(post,A)` | quarantine/remove live post |
 | `UNDO_STARTED` | `(A,post)` | remove quarantined post |
 | `UNDO_STARTED` | `(A,A)` | already undone |
-| uncommitted/committed `DONE` | `(post,A)` only | remove live for rollback / committed `NO_ACTION` |
+| uncommitted `DONE`; direct committed row | `(post,A)` only | remove live for rollback / conservative committed `NO_ACTION` |
 
 Every tuple not listed returns `_halt(expected, observed)` and no semantic mutation. Non-halt
 decisions carry the same two complete joint observations with `halt_reason=None`, so later plan or
@@ -2587,7 +2595,7 @@ def test_create_directory_joint_table(
 Add a resolved-topology case where declared descendants are present before reverse ordering and absent
 after their simulated reversal. The parent directory may be removed only in the latter prefix.
 
-Exercise every committed-cleanup row directly in Task 7:
+Exercise conservative occurrence-local `COMMITTED` rows directly in Task 7:
 
 ```python
 @pytest.mark.parametrize(
@@ -2637,6 +2645,10 @@ def test_directory_committed_cleanup_rows(directory_case, work, relation, expect
     assert classify_effect(snapshot, 0, frontiers).kind.value == expected
 ```
 
+As in Task 6, these ordinary `classify_effect` rows do not carry the transaction-level final-surface
+proof. Task 8 keeps them unchanged and adds direct tests for the separate proof-gated committed
+scratch helper, including superseded persistent evidence.
+
 - [ ] **Step 4: Run tests to verify Task 6 stubs fail**
 
 Run: `uv run pytest tests/test_recovery_variants_paths.py -v`
@@ -2653,7 +2665,7 @@ Replace the stubs with the exact tables:
 | Delete `STARTED` | `(A,pre)` | restore tombstone no-clobber |
 | Delete `UNDO_STARTED` | `(A,pre)` / `(pre,A)` | retry restore / already restored |
 | Delete uncommitted `DONE` | `(A,pre)` only | restore |
-| Delete committed | `(A,pre)` / `(A,A)` | `REMOVE_SCRATCH` / `NO_ACTION` |
+| Delete direct committed row | `(A,pre)` / `(A,A)` | conservative `REMOVE_SCRATCH` / `NO_ACTION` |
 | Move any forward/reverse frontier | `(pre,A,A)` | nothing landed |
 | Move | `(pre,A,pre)`, source `==` anchor | remove anchor |
 | Move | `(A,pre,pre)`, destination `==` anchor | restore source |
@@ -2661,7 +2673,7 @@ Replace the stubs with the exact tables:
 | Move | `(A,A,pre)` | restore source from anchor |
 | Move | source `==` anchor plus foreign destination | preserve destination, remove anchor, refuse |
 | Move uncommitted `DONE` | `(A,pre,pre)`, destination `==` anchor only | ordinary rollback |
-| Move committed | `(A,pre,pre)` same / `(A,pre,A)` | `REMOVE_ANCHOR` / `NO_ACTION` |
+| Move direct committed row | `(A,pre,pre)` same / `(A,pre,A)` | conservative `REMOVE_ANCHOR` / `NO_ACTION` |
 
 Move result steps must converge through `(pre,A,pre)` with source `==` anchor, then remove the anchor.
 Record only `DiagnosticIdentityRelation("source", "anchor", SAME)` or its destination equivalent in
@@ -2680,8 +2692,9 @@ Encode:
 | live blocker + different attributable work | preserve blocker, remove work, refuse |
 
 Any unmodeled child needed for removal returns `DIRECTORY_NOT_EMPTY`. Under uncommitted `DONE`, accept
-only `(post,A)` and only after declared descendants have reversed. Under committed cleanup, accept only
-`(post,A)` as `NO_ACTION`. A `DONE` work survivor is a contradiction.
+only `(post,A)` and only after declared descendants have reversed. The ordinary direct committed row
+accepts `(post,A)` as `NO_ACTION`; Task 8's production committed helper instead consumes only absent
+`WORK` after the complete final-surface proof. A `DONE` work survivor is a contradiction.
 
 Use `RecoveryTopology` parent edges, not lexical string prefixes, to enumerate modeled direct
 descendants.
@@ -2721,8 +2734,17 @@ token-free diagnostics for every halt.
 - Create: `python/src/atoms/core/recovery/classifier.py`
 - Create: `python/tests/test_recovery_classifier.py`
 - Modify: `python/src/atoms/core/recovery/__init__.py`
+- Modify: `python/src/atoms/core/recovery/variants.py`
+- Modify: `python/src/atoms/core/recovery/reducer.py`
 - Modify: `python/tests/recovery_support.py`
 - Modify: `python/tests/conftest.py`
+- Modify: `python/tests/test_recovery_reducer.py`
+- Modify: `python/tests/test_recovery_variants_files.py`
+- Modify: `python/tests/test_recovery_variants_paths.py`
+- Modify: `docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md`
+- Modify: `docs/plans/2026-07-28-a3-recovery-reference-model-design.md`
+- Modify: `docs/plans/2026-07-28-plan-a3-recovery-reference-model.md`
+- Modify: `docs/deferred-obligation-ledger.md`
 
 **Interfaces:**
 - Consumes: Tasks 2–7, including Task 4's normative `_apply_steps` reducer kernel.
@@ -2734,7 +2756,8 @@ Create `python/tests/test_recovery_classifier.py`:
 
 Task 8 adds `two_effect_snapshot`, `committed_snapshot`, `prepared_drift_snapshot`,
 `halted_snapshot`, `recovery_case`, `committed_halt_source`,
-`repeated_path_mid_plan_halt`, and `snapshot_pair_differing_only_dependencies` adapters to
+`repeated_path_mid_plan_halt`, `committed_repeated_replace_snapshot`,
+`committed_superseded_cleanup_case`, and `snapshot_pair_differing_only_dependencies` adapters to
 `conftest.py` in the same commit as their `make_*` factories.
 
 ```python
@@ -2821,6 +2844,30 @@ def test_prepared_external_drift_is_refused_without_project_mutation(prepared_dr
     assert plan.rollback_result is RollbackResult.EXTERNAL_DRIFT_PRESERVED
     assert not any(type(step).__name__ in {"TransformEffectTuple", "RemoveScratch"} for step in plan.steps)
 ```
+
+The committed branch has a proof-gated contract distinct from ordinary occurrence-local
+`classify_effect`. Add a factory-issued repeated-path replace chain `F→G→H`, with both journals
+`DONE`, final live `H`, and retained staging preimages `F` and `G`. Before the correction this must
+produce a failing regression because the first replace is incorrectly compared with live `H`.
+
+Add internal `variants.classify_committed_cleanup(snapshot, effect_index)`. Its caller precondition is
+an exact `COMMITTED`/all-`DONE` snapshot whose complete compiled final surface has already been proved.
+The helper observes only the named scratch slot:
+
+- exact retained replace staging, delete tombstone, or move anchor produces scratch removal;
+- absence for those roles is already cleaned;
+- create-file staging and create-directory `WORK` must be absent; and
+- every retained state/kind mismatch or create survivor halts.
+
+Ordinary `classify_effect` remains unchanged and conservative without that transaction-level proof.
+Direct helper tests use globally final-surface-matching snapshots and include superseded Replace,
+Delete, and Move persistent evidence.
+
+Committed `RemoveScratch` uses literal scratch-only joint observations: both persistent tuples and
+both parent-occupancy tuples are empty. Narrowly extend Task 4's reducer so that shape is accepted only
+for `RemoveScratch` on exact `COMMITTED`, with the named effect at exact `DONE` and exactly its compiled
+retained scratch key/role. Noncommitted removal still requires complete effect coverage. Add positive
+and negative locks for the state, journal, key, and role boundaries.
 
 - [ ] **Step 2: Write the all-evidence-first regression**
 
@@ -3097,10 +3144,14 @@ def test_post_transition_step_precondition_is_rebased():
     assert terminal.transaction_state is TransactionState.ROLLED_BACK
 ```
 
-`_committed_plan` first verifies every live path against the compiled final surface, then walks effects
-in compiled order, classifies each against a reducer-backed cursor, and appends only committed scratch
-cleanup steps plus `DetachActive`. A mismatch halts with `COMMITTED_SURFACE_MISMATCH`; rollback steps
-are forbidden.
+`_committed_plan` first verifies the complete compiled final surface from the transaction's one current
+observation per persistent path. It then validates the complete scratch vector through
+`classify_committed_cleanup`, without `reconstruct_frontiers` or ordinary `classify_effect`. Exact
+retained replace/delete/move scratch yields scratch-only `RemoveScratch`; absence is already cleaned.
+Create-file staging and directory `WORK` must be absent. A final-surface mismatch halts with
+`COMMITTED_SURFACE_MISMATCH`; any scratch mismatch halts with
+`EFFECT_TUPLE_UNATTRIBUTABLE` and no cleanup steps. Only after all evidence passes are removal steps
+built in compiled order and followed by `DetachActive`. Rollback steps are forbidden.
 
 `_terminal_detach_plan` produces `DETACH_TERMINAL` and only `DetachActive`. A `PREPARED` plan contains
 no filesystem step; it preserves any drift and transitions directly through `ROLLING_BACK` to
@@ -3155,6 +3206,8 @@ dependency irrelevance rather than accidentally testing two token universes.
 Run:
 
 ```bash
+uv run pytest tests/test_recovery_reducer.py -v
+uv run pytest tests/test_recovery_variants_files.py tests/test_recovery_variants_paths.py -v
 uv run pytest tests/test_recovery_classifier.py -v
 uv run pytest
 uv run ruff check .
@@ -3167,8 +3220,15 @@ Expected: all pass.
 
 ```bash
 git add src/atoms/core/recovery/classifier.py src/atoms/core/recovery/diagnostics.py \
-  src/atoms/core/recovery/__init__.py \
-  tests/conftest.py tests/test_recovery_classifier.py tests/recovery_support.py
+  src/atoms/core/recovery/__init__.py src/atoms/core/recovery/reducer.py \
+  src/atoms/core/recovery/variants.py tests/conftest.py \
+  tests/test_recovery_classifier.py tests/test_recovery_reducer.py \
+  tests/test_recovery_variants_files.py tests/test_recovery_variants_paths.py \
+  tests/recovery_support.py \
+  ../docs/deferred-obligation-ledger.md \
+  ../docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md \
+  ../docs/plans/2026-07-28-a3-recovery-reference-model-design.md \
+  ../docs/plans/2026-07-28-plan-a3-recovery-reference-model.md
 git commit -m "feat(recovery): classify complete recovery plans"
 ```
 
@@ -3191,6 +3251,11 @@ fresh conflict substituted.
 - Consumes: `RecoveryPlan`, reducer prefix/normalization operations, shared diagnostic projections.
 - Produces:
   - `authorize_recovery_step(plan, step_index, observed) -> AuthorizedStep | HaltPlan`.
+
+For a committed cleanup `RemoveScratch`, the expected and fresh `JointObservation` contain exactly the
+one retained scratch slot, with empty persistent and parent-occupancy tuples. Add a focused
+authorization test proving that scratch-only evidence succeeds and that unrelated persistent evidence
+is neither required nor admitted. Ordinary rollback steps retain complete effect joint coverage.
 
 - [ ] **Step 1: Write failing authorization tests**
 

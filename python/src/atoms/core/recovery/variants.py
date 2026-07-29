@@ -41,6 +41,7 @@ from atoms.core.recovery.model import (
     ObservedSymlink,
     PersistentObservation,
     ScratchObservation,
+    TransactionState,
 )
 from atoms.core.recovery.plan import (
     EffectVariant,
@@ -1268,6 +1269,84 @@ def _journal(snapshot: RecoverySnapshot, effect_id: str) -> JournalState:
                 raise ProtocolError("journal state has the wrong exact runtime type")
             return row.state
     raise ProtocolError("snapshot is missing effect journal coverage")
+
+
+def _committed_scratch_joint(
+    snapshot: RecoverySnapshot,
+    effect: Effect,
+) -> JointObservation:
+    role = required_scratch_role(effect)
+    scratch = scratch_map(snapshot)
+    return JointObservation(
+        persistent=(),
+        scratch=(scratch[(effect.effect_id, role)],),
+        parent_occupancy=(),
+    )
+
+
+def _expected_retained_scratch_state(effect: Effect) -> PathState:
+    if type(effect) is ReplaceFile:
+        return cast(ReplaceFile, effect).pre
+    if type(effect) is DeletePath:
+        return cast(DeletePath, effect).pre
+    if type(effect) is MoveNoClobber:
+        return cast(MoveNoClobber, effect).source_pre
+    raise ProtocolError("effect does not retain committed scratch")
+
+
+def classify_committed_cleanup(
+    snapshot: RecoverySnapshot,
+    effect_index: int,
+) -> EffectDecision:
+    """Classify one scratch slot after the caller proves the final surface.
+
+    The caller must first establish transaction-level COMMITTED/all-DONE
+    authority and compare the complete current persistent surface with the
+    compiled final surface. This helper deliberately does not inspect
+    occurrence-local persistent entries.
+    """
+    if type(snapshot) is not RecoverySnapshot:
+        raise ProtocolError("snapshot must be a factory-issued RecoverySnapshot")
+    if type(effect_index) is not int:
+        raise ProtocolError("effect_index has the wrong exact runtime type")
+    if effect_index < 0 or effect_index >= len(snapshot.compiled.spec.effects):
+        raise ProtocolError("effect_index is outside compiled effect coverage")
+    if (
+        snapshot.transaction_state is not TransactionState.COMMITTED
+        or snapshot.commit_decision is not CommitDecision.COMMITTED
+        or any(
+            journal.state is not JournalState.DONE
+            for journal in snapshot.journals
+        )
+    ):
+        raise ProtocolError(
+            "committed cleanup requires COMMITTED authority with all effects DONE"
+        )
+
+    effect = snapshot.compiled.spec.effects[effect_index]
+    observed = _committed_scratch_joint(snapshot, effect)
+    scratch = observed.scratch[0].entry
+    if type(scratch) is ObservedAbsent:
+        return _decision(EffectDecisionKind.NO_ACTION, observed)
+
+    effect_type = type(effect)
+    if effect_type in {CreateFileNoClobber, CreateDirectory}:
+        return _halt(observed, observed)
+    if effect_type not in {ReplaceFile, DeletePath, MoveNoClobber}:
+        raise ProtocolError("effect variant is outside A3's closed set")
+    if _entry_state(scratch) != _expected_retained_scratch_state(effect):
+        return _halt(observed, observed)
+
+    kind = (
+        EffectDecisionKind.REMOVE_ANCHOR
+        if effect_type is MoveNoClobber
+        else EffectDecisionKind.REMOVE_SCRATCH
+    )
+    return _decision(
+        kind,
+        observed,
+        steps=(_remove_scratch(effect, observed),),
+    )
 
 
 def _frontier_map(

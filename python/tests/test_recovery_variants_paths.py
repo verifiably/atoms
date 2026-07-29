@@ -9,7 +9,11 @@ from atoms.core.recovery import (
     RemoveScratch,
     TransformEffectTuple,
 )
-from atoms.core.recovery.variants import EffectDecisionKind, classify_effect
+from atoms.core.recovery.variants import (
+    EffectDecisionKind,
+    classify_committed_cleanup,
+    classify_effect,
+)
 from tests.recovery_support import make_directory_descendant_case
 
 
@@ -292,7 +296,11 @@ def test_directory_refusal_preserves_blocker_before_removing_work(directory_case
 
 @pytest.mark.parametrize(
     ("tombstone_name", "expected"),
-    [("pre", "remove_scratch"), ("absent", "no_action")],
+    [
+        ("pre", "remove_scratch"),
+        ("absent", "no_action"),
+        ("external", "halt"),
+    ],
 )
 def test_delete_committed_cleanup_rows(delete_case, tombstone_name, expected):
     snapshot, frontiers = delete_case(
@@ -302,6 +310,7 @@ def test_delete_committed_cleanup_rows(delete_case, tombstone_name, expected):
         committed=True,
     )
     assert classify_effect(snapshot, 0, frontiers).kind.value == expected
+    assert classify_committed_cleanup(snapshot, 0).kind.value == expected
 
 
 @pytest.mark.parametrize(
@@ -309,6 +318,7 @@ def test_delete_committed_cleanup_rows(delete_case, tombstone_name, expected):
     [
         ("pre", "destination_anchor_same", "remove_anchor"),
         ("absent", None, "no_action"),
+        ("external", None, "halt"),
     ],
 )
 def test_move_committed_cleanup_rows(move_case, anchor, relation, expected):
@@ -320,6 +330,7 @@ def test_move_committed_cleanup_rows(move_case, anchor, relation, expected):
         committed=True,
     )
     assert classify_effect(snapshot, 0, frontiers).kind.value == expected
+    assert classify_committed_cleanup(snapshot, 0).kind.value == expected
 
 
 @pytest.mark.parametrize(
@@ -341,5 +352,33 @@ def test_directory_committed_cleanup_rows(
     )
     decision = classify_effect(snapshot, 0, frontiers)
     assert decision.kind.value == expected
+    assert classify_committed_cleanup(snapshot, 0).kind.value == expected
     if expected == "halt":
         assert decision.steps == ()
+
+
+@pytest.mark.parametrize(
+    ("case", "effect_index", "expected_kind"),
+    [
+        ("delete_then_create", 0, EffectDecisionKind.REMOVE_SCRATCH),
+        ("move_then_replace", 0, EffectDecisionKind.REMOVE_ANCHOR),
+    ],
+)
+def test_committed_cleanup_path_effects_use_superseded_live_surface(
+    committed_superseded_cleanup_case,
+    case,
+    effect_index,
+    expected_kind,
+):
+    source, _ = committed_superseded_cleanup_case(case)
+
+    decision = classify_committed_cleanup(source, effect_index)
+
+    assert decision.kind is expected_kind
+    assert len(decision.steps) == 1
+    step = decision.steps[0]
+    assert type(step) is RemoveScratch
+    assert step.expected_before.persistent == ()
+    assert step.result_after.persistent == ()
+    assert step.expected_before.parent_occupancy == ()
+    assert step.result_after.parent_occupancy == ()

@@ -9,7 +9,11 @@ from atoms.core.recovery import (
     RemoveScratch,
     TransformEffectTuple,
 )
-from atoms.core.recovery.variants import EffectDecisionKind, classify_effect
+from atoms.core.recovery.variants import (
+    EffectDecisionKind,
+    classify_committed_cleanup,
+    classify_effect,
+)
 
 
 @pytest.mark.parametrize(
@@ -139,6 +143,7 @@ def test_create_file_foreign_or_diverged_staging_halts_without_mutation(
     [
         ("post", "pre", "remove_scratch"),
         ("post", "absent", "no_action"),
+        ("post", "external", "halt"),
     ],
 )
 def test_replace_committed_cleanup_rows(
@@ -154,6 +159,7 @@ def test_replace_committed_cleanup_rows(
         committed=True,
     )
     assert classify_effect(snapshot, 0, frontiers).kind.value == expected
+    assert classify_committed_cleanup(snapshot, 0).kind.value == expected
 
 
 @pytest.mark.parametrize(
@@ -171,6 +177,7 @@ def test_noop_replace_committed_cleanup_rows(
         committed=True,
     )
     assert classify_effect(snapshot, 0, frontiers).kind.value == expected
+    assert classify_committed_cleanup(snapshot, 0).kind.value == expected
 
 
 @pytest.mark.parametrize(
@@ -190,8 +197,32 @@ def test_create_file_committed_cleanup_rows(
     )
     decision = classify_effect(snapshot, 0, frontiers)
     assert decision.kind.value == expected
+    assert classify_committed_cleanup(snapshot, 0).kind.value == expected
     if expected == "halt":
         assert decision.steps == ()
+
+
+def test_committed_cleanup_replace_uses_superseded_live_surface(
+    committed_repeated_replace_snapshot,
+):
+    source = committed_repeated_replace_snapshot
+    decisions = tuple(
+        classify_committed_cleanup(source, index)
+        for index in range(len(source.compiled.spec.effects))
+    )
+
+    assert tuple(decision.kind for decision in decisions) == (
+        EffectDecisionKind.REMOVE_SCRATCH,
+        EffectDecisionKind.REMOVE_SCRATCH,
+    )
+    for decision in decisions:
+        assert len(decision.steps) == 1
+        step = decision.steps[0]
+        assert type(step) is RemoveScratch
+        assert step.expected_before.persistent == ()
+        assert step.result_after.persistent == ()
+        assert step.expected_before.parent_occupancy == ()
+        assert step.result_after.parent_occupancy == ()
 
 
 def test_pending_live_drift_is_preserved_and_refused(pending_drift_case):

@@ -1001,3 +1001,373 @@ def make_reducer_step_cases(case):
     else:
         raise AssertionError(f"unknown reducer step case: {case}")
     return source, step, expected
+
+
+def make_two_effect_snapshot(*, first: str, second: str):
+    outcomes = {"halt", "repairable"}
+    if first not in outcomes or second not in outcomes:
+        raise AssertionError("two-effect outcomes must be 'halt' or 'repairable'")
+
+    h = FileState(
+        content_hash="sha256:" + "3" * 64,
+        mode=0o644,
+        byte_len=7,
+    )
+    effects = (
+        ReplaceFile("e1", "a.txt", F, G),
+        ReplaceFile("e2", "a.txt", G, h),
+    )
+    compiled = compile_spec(
+        build_spec(
+            consumer_tag="cnsmr",
+            intent_digest=DIGEST,
+            initial_surface={"a.txt": F},
+            final_surface={"a.txt": h},
+            effects=effects,
+        )
+    )
+    project = ProjectRoot()
+    topology = RecoveryTopology(
+        parents=(
+            TopologyParent(PersistentNode("a.txt"), project),
+            TopologyParent(
+                ScratchNode("e1", ScratchRole.STAGING),
+                project,
+            ),
+            TopologyParent(
+                ScratchNode("e2", ScratchRole.STAGING),
+                project,
+            ),
+        )
+    )
+    live = ObservedFile(h, EntryIdentity())
+    first_preimage = ObservedFile(F, EntryIdentity())
+    second_preimage = ObservedFile(G, EntryIdentity())
+    return build_recovery_snapshot(
+        compiled=compiled,
+        topology=topology,
+        transaction_state=TransactionState.APPLIED,
+        commit_decision=CommitDecision.UNCOMMITTED,
+        rollback_result=None,
+        halt_diagnostic=None,
+        active=True,
+        journals=(
+            EffectJournalState("e1", JournalState.DONE),
+            EffectJournalState("e2", JournalState.DONE),
+        ),
+        persistent_observations=(PersistentObservation("a.txt", live),),
+        scratch_observations=(
+            ScratchObservation(
+                "e1",
+                ScratchRole.STAGING,
+                (
+                    first_preimage
+                    if first == "repairable"
+                    else OBSERVED_ABSENT
+                ),
+                None,
+            ),
+            ScratchObservation(
+                "e2",
+                ScratchRole.STAGING,
+                (
+                    second_preimage
+                    if second == "repairable"
+                    else OBSERVED_ABSENT
+                ),
+                None,
+            ),
+        ),
+    )
+
+
+def make_committed_repeated_replace_snapshot():
+    source = make_two_effect_snapshot(
+        first="repairable",
+        second="repairable",
+    )
+    return build_recovery_snapshot(
+        compiled=source.compiled,
+        topology=source.topology,
+        transaction_state=TransactionState.COMMITTED,
+        commit_decision=CommitDecision.COMMITTED,
+        rollback_result=None,
+        halt_diagnostic=None,
+        active=True,
+        journals=source.journals,
+        persistent_observations=source.persistent_observations,
+        scratch_observations=source.scratch_observations,
+    )
+
+
+def make_committed_superseded_cleanup_case(case: str):
+    project = ProjectRoot()
+    if case == "delete_then_create":
+        effects = (
+            DeletePath("e1", "a.txt", F),
+            CreateFileNoClobber("e2", "a.txt", G),
+        )
+        initial_surface = {"a.txt": F}
+        final_surface = {"a.txt": G}
+        topology = RecoveryTopology(
+            parents=(
+                TopologyParent(PersistentNode("a.txt"), project),
+                TopologyParent(
+                    ScratchNode("e1", ScratchRole.TOMBSTONE),
+                    project,
+                ),
+                TopologyParent(
+                    ScratchNode("e2", ScratchRole.STAGING),
+                    project,
+                ),
+            )
+        )
+        persistent = (
+            PersistentObservation(
+                "a.txt",
+                ObservedFile(G, EntryIdentity()),
+            ),
+        )
+        scratch = (
+            ScratchObservation(
+                "e1",
+                ScratchRole.TOMBSTONE,
+                ObservedFile(F, EntryIdentity()),
+                None,
+            ),
+            ScratchObservation(
+                "e2",
+                ScratchRole.STAGING,
+                OBSERVED_ABSENT,
+                None,
+            ),
+        )
+        expected_removals = ("e1",)
+    elif case == "move_then_replace":
+        effects = (
+            MoveNoClobber("e1", "source.txt", "destination.txt", F),
+            ReplaceFile("e2", "destination.txt", F, G),
+        )
+        initial_surface = {
+            "source.txt": F,
+            "destination.txt": ABSENT,
+        }
+        final_surface = {
+            "source.txt": ABSENT,
+            "destination.txt": G,
+        }
+        topology = RecoveryTopology(
+            parents=(
+                TopologyParent(PersistentNode("source.txt"), project),
+                TopologyParent(PersistentNode("destination.txt"), project),
+                TopologyParent(
+                    ScratchNode("e1", ScratchRole.ANCHOR),
+                    project,
+                ),
+                TopologyParent(
+                    ScratchNode("e2", ScratchRole.STAGING),
+                    project,
+                ),
+            )
+        )
+        persistent = (
+            PersistentObservation("source.txt", OBSERVED_ABSENT),
+            PersistentObservation(
+                "destination.txt",
+                ObservedFile(G, EntryIdentity()),
+            ),
+        )
+        scratch = (
+            ScratchObservation(
+                "e1",
+                ScratchRole.ANCHOR,
+                ObservedFile(F, EntryIdentity()),
+                None,
+            ),
+            ScratchObservation(
+                "e2",
+                ScratchRole.STAGING,
+                ObservedFile(F, EntryIdentity()),
+                None,
+            ),
+        )
+        expected_removals = ("e1", "e2")
+    else:
+        raise AssertionError(f"unknown committed cleanup case: {case}")
+
+    snapshot = build_recovery_snapshot(
+        compiled=compile_spec(
+            build_spec(
+                consumer_tag="cnsmr",
+                intent_digest=DIGEST,
+                initial_surface=initial_surface,
+                final_surface=final_surface,
+                effects=effects,
+            )
+        ),
+        topology=topology,
+        transaction_state=TransactionState.COMMITTED,
+        commit_decision=CommitDecision.COMMITTED,
+        rollback_result=None,
+        halt_diagnostic=None,
+        active=True,
+        journals=tuple(
+            EffectJournalState(effect.effect_id, JournalState.DONE)
+            for effect in effects
+        ),
+        persistent_observations=persistent,
+        scratch_observations=scratch,
+    )
+    return snapshot, expected_removals
+
+
+def make_committed_snapshot():
+    snapshot, _ = make_replace_case(
+        "post",
+        "pre",
+        JournalState.DONE,
+        committed=True,
+    )
+    return snapshot
+
+
+def make_prepared_drift_snapshot():
+    snapshot, _ = make_pending_drift_case()
+    return snapshot
+
+
+def make_halted_snapshot():
+    source = create_snapshot()
+    diagnostic = HaltDiagnostic(
+        pre_halt_state=source.transaction_state,
+        commit_decision=source.commit_decision,
+        journals=source.journals,
+        projected_transaction_state=source.transaction_state,
+        projected_journals=source.journals,
+        effect_id="e1",
+        paths=("a.txt",),
+        expected=(),
+        observed=(),
+        identity_relations=(),
+        reason=HaltReason.EFFECT_TUPLE_UNATTRIBUTABLE,
+        operator_action=OperatorAction.INSPECT_PRESERVED_EVIDENCE,
+    )
+    return build_recovery_snapshot(
+        compiled=source.compiled,
+        topology=source.topology,
+        transaction_state=TransactionState.HALTED,
+        commit_decision=source.commit_decision,
+        rollback_result=None,
+        halt_diagnostic=diagnostic,
+        active=source.active,
+        journals=source.journals,
+        persistent_observations=source.persistent_observations,
+        scratch_observations=source.scratch_observations,
+    )
+
+
+def make_committed_halt_source():
+    snapshot, _ = make_create_file_case(
+        "post",
+        "post",
+        JournalState.DONE,
+        committed=True,
+    )
+    return snapshot
+
+
+def make_recovery_case(case: str):
+    if case == "restored":
+        return create_snapshot()
+    if case == "refused":
+        return make_prepared_drift_snapshot()
+    if case == "committed":
+        return make_committed_snapshot()
+    if case == "halt":
+        return make_committed_halt_source()
+    raise AssertionError(f"unknown recovery case: {case}")
+
+
+def make_repeated_path_mid_plan_halt():
+    return make_two_effect_snapshot(first="halt", second="repairable")
+
+
+def make_snapshot_pair_differing_only_dependencies():
+    effects = (
+        CreateFileNoClobber("e1", "a.txt", F),
+        CreateFileNoClobber("e2", "b.txt", G),
+    )
+
+    def compiled(dependencies):
+        return compile_spec(
+            build_spec(
+                consumer_tag="cnsmr",
+                intent_digest=DIGEST,
+                initial_surface={
+                    "a.txt": ABSENT,
+                    "b.txt": ABSENT,
+                },
+                final_surface={
+                    "a.txt": F,
+                    "b.txt": G,
+                },
+                effects=effects,
+                dependencies=dependencies,
+            )
+        )
+
+    left_compiled = compiled(())
+    right_compiled = compiled((("e1", "e2"),))
+    project = ProjectRoot()
+    topology = RecoveryTopology(
+        parents=(
+            TopologyParent(PersistentNode("a.txt"), project),
+            TopologyParent(PersistentNode("b.txt"), project),
+            TopologyParent(
+                ScratchNode("e1", ScratchRole.STAGING),
+                project,
+            ),
+            TopologyParent(
+                ScratchNode("e2", ScratchRole.STAGING),
+                project,
+            ),
+        )
+    )
+    journals = (
+        EffectJournalState("e1", JournalState.DONE),
+        EffectJournalState("e2", JournalState.DONE),
+    )
+    persistent_observations = (
+        PersistentObservation("a.txt", ObservedFile(F, EntryIdentity())),
+        PersistentObservation("b.txt", ObservedFile(G, EntryIdentity())),
+    )
+    scratch_observations = (
+        ScratchObservation(
+            "e1",
+            ScratchRole.STAGING,
+            OBSERVED_ABSENT,
+            None,
+        ),
+        ScratchObservation(
+            "e2",
+            ScratchRole.STAGING,
+            OBSERVED_ABSENT,
+            None,
+        ),
+    )
+
+    def snapshot(compiled_spec):
+        return build_recovery_snapshot(
+            compiled=compiled_spec,
+            topology=topology,
+            transaction_state=TransactionState.APPLIED,
+            commit_decision=CommitDecision.UNCOMMITTED,
+            rollback_result=None,
+            halt_diagnostic=None,
+            active=True,
+            journals=journals,
+            persistent_observations=persistent_observations,
+            scratch_observations=scratch_observations,
+        )
+
+    return snapshot(left_compiled), snapshot(right_compiled)

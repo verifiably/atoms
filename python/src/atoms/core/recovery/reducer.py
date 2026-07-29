@@ -15,6 +15,7 @@ from atoms.core.effects import (
 )
 from atoms.core.errors import ProtocolError
 from atoms.core.recovery.model import (
+    CommitDecision,
     DiagnosticIdentityRelation,
     EffectJournalState,
     FileBuildRelation,
@@ -345,7 +346,7 @@ def _remove_scratch(
         raise ProtocolError("remove scratch role must be an exact ScratchRole")
 
     _validate_joint_coverage(step.expected_before, step.result_after)
-    _validate_effect_joint_coverage(snapshot, effect, step.expected_before)
+    _validate_remove_scratch_joint_coverage(snapshot, effect, step)
     current = _current_joint_observation(snapshot, step.expected_before)
     if current != step.expected_before:
         raise ProtocolError("remove scratch expected_before does not match current observation")
@@ -484,6 +485,59 @@ def _validate_effect_joint_coverage(
     if occupancy_keys != required_occupancy:
         raise ProtocolError(
             "effect tuple does not have exact affected occupancy coverage"
+        )
+
+
+def _validate_remove_scratch_joint_coverage(
+    snapshot: RecoverySnapshot,
+    effect: Effect,
+    step: RemoveScratch,
+) -> None:
+    observation = step.expected_before
+    scratch_only = (
+        observation.persistent == ()
+        and observation.parent_occupancy == ()
+    )
+    if not scratch_only:
+        _validate_effect_joint_coverage(snapshot, effect, observation)
+        return
+
+    if (
+        snapshot.transaction_state is not TransactionState.COMMITTED
+        or snapshot.commit_decision is not CommitDecision.COMMITTED
+    ):
+        raise ProtocolError(
+            "scratch-only RemoveScratch requires an exact COMMITTED transaction"
+        )
+    if type(effect) not in {ReplaceFile, DeletePath, MoveNoClobber}:
+        raise ProtocolError(
+            "scratch-only RemoveScratch requires a retained-scratch effect"
+        )
+    matching_journals = tuple(
+        journal
+        for journal in snapshot.journals
+        if journal.effect_id == effect.effect_id
+    )
+    if (
+        len(matching_journals) != 1
+        or type(matching_journals[0].state) is not JournalState
+        or matching_journals[0].state is not JournalState.DONE
+    ):
+        raise ProtocolError(
+            "scratch-only RemoveScratch requires the exact DONE effect journal"
+        )
+
+    required_role = required_scratch_role(effect)
+    scratch_keys = {
+        (item.effect_id, item.role) for item in observation.scratch
+    }
+    if scratch_keys != {(effect.effect_id, required_role)}:
+        raise ProtocolError(
+            "scratch-only RemoveScratch requires the exact effect scratch key"
+        )
+    if step.role is not required_role:
+        raise ProtocolError(
+            "scratch-only RemoveScratch requires the effect's exact scratch role"
         )
 
 
