@@ -817,9 +817,11 @@ finds any noncommitted active transaction. `HALTED` preserves the record, scratc
 durable commit decision (if any), and diagnostic classification. A halt after `COMMITTED` never
 licenses rollback; it preserves the final state and reports incomplete cleanup. The halt transition
 does not clear the separate `committed` value. Its diagnostic freezes the pre-halt transaction state
-and commit decision, the full per-effect journal vector, token-free expected/observed state, and the
-named-slot identity relations used by classification — never the snapshot-local tokens themselves.
-Later recovery returns that stored diagnostic rather than recomputing an origin state of `HALTED`.
+and commit decision, the full durable per-effect journal vector, any separately labeled pure-planning
+cursor state that produced the conflict, token-free expected/observed state, and the named-slot
+identity relations used by classification — never the snapshot-local tokens themselves. A projected
+cursor is diagnostic evidence, not a claim that its semantic steps became durable. Later recovery
+returns that stored diagnostic rather than recomputing an origin state of `HALTED`.
 
 ### 8.2 Forward effect states
 
@@ -1200,10 +1202,11 @@ Caught process-local failures, including cancellation, `KeyboardInterrupt`, and 
 rollback before being re-raised. `SIGKILL`, power loss, and machine failure do not unwind Python and
 are exercised only through fresh-process recovery tests.
 
-Recovery and rollback diagnostics identify the transaction, effect, paths, full journal vector,
-token-free expected and observed states, named-slot identity relations, A3's closed halt reason, and
-the non-mutating operator action required next. They never serialize snapshot-local identity tokens.
-There is no silent fallback or automatic discharge of a halt.
+Recovery and rollback diagnostics identify the transaction, effect, paths, durable journal vector,
+any separately labeled projected conflict vector, token-free expected and observed states, named-slot
+identity relations, A3's closed halt reason, and the non-mutating operator action required next. They
+never serialize snapshot-local identity tokens. There is no silent fallback or automatic discharge of
+a halt.
 
 ## 12. Consumers
 
@@ -1267,8 +1270,9 @@ classifier reconstructs each path's frontier (forward or reverse per that state)
 variant classifier once per in-flight effect over its joint tuple (§8.4). It validates every path and
 scratch observation before emitting any mutating step. A7 consumes this plan as the production recovery
 authority and does not implement a second classifier. Before each filesystem mutation, A7 obtains a
-fresh coherent observation; exact agreement authorizes the bound step, while any mismatch produces a
-halt plan rather than silent reclassification.
+fresh coherent observation. Exact non-identity agreement plus the same named-slot identity partition
+authorizes the bound step; tokens are freshly allocated per observation and are never compared across
+token universes. Any mismatch produces a halt plan rather than silent reclassification.
 
 The reducer applies the same semantic steps to the logical snapshot. It models identity-preserving
 transfers, removals, preserved external blockers, resolved directory occupancy, journal transitions,

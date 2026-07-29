@@ -1,6 +1,8 @@
 # Plan A3 — Executable recovery reference model
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use
+> superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement
+> this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build A3's pure production recovery authority: validated logical snapshots, exhaustive
 journal and variant classification, frozen semantic plans, fresh-step authorization, and a reducer
@@ -14,7 +16,8 @@ A7 must consume these decisions later and may not duplicate them.
 **Tech Stack:** Python ≥3.11, stdlib only (`dataclasses`, `enum`, `collections`), managed with `uv`;
 `ruff` + `pyright` + `pytest`. All commands run from `python/`.
 
-**Design authority:** [`2026-07-28-a3-recovery-reference-model-design.md`](2026-07-28-a3-recovery-reference-model-design.md),
+**Design authority:**
+[`2026-07-28-a3-recovery-reference-model-design.md`](2026-07-28-a3-recovery-reference-model-design.md),
 which refines [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md)
 §§5.4, 7.2, 8.1–8.4, 9, 10, and 13.1. Where they disagree, the authority design wins.
 
@@ -28,6 +31,8 @@ which refines [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-r
 - **Pure boundary:** no filesystem calls, SQLite, absolute paths, descriptors, concrete scratch leaves,
   platform probes, clocks, randomness, or durability barriers.
 - **Closed model:** exact runtime types define every union. Subclasses are not members.
+- **Enums:** use plain `Enum` with string `.value` members. Do not use `str, Enum`; enum members must
+  not compare equal to caller-supplied strings.
 - **Factory control:** `RecoverySnapshot`, `RecoveryPlan` variants, and `AuthorizedStep` refuse ordinary
   construction and `dataclasses.replace`.
 - **Input proof:** production-facing recovery accepts exact factory-issued `CompiledSpec`; never raw
@@ -36,6 +41,9 @@ which refines [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-r
   `HaltPlan`; unexpected implementation exceptions propagate unchanged.
 - **Diagnostics:** `HaltDiagnostic` is token-free and persistable. It stores named-slot identity
   relations, never `EntryIdentity` tokens or arbitrary token `repr`.
+- **Identity universes:** one coherent observation reuses one token for every slot naming the same
+  entry and uses distinct tokens for distinct entries. Every fresh observation regenerates all tokens;
+  cross-observation comparison uses non-identity fields plus named-slot identity partitions.
 - **Ordering:** compiled effect order is authoritative. `dependencies` never schedule recovery.
 - **Mutation discipline:** use TDD for every task. Run the named failing test before production edits.
 - **Commits:** no AI-attribution trailers. Documentation paths use `~/d/atoms/...`, never host-specific
@@ -55,6 +63,7 @@ which refines [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-r
 | `python/src/atoms/core/recovery/reducer.py` | Prefix and full abstract plan reduction |
 | `python/src/atoms/core/recovery/authorization.py` | Fresh observation comparison and authorized-step factory |
 | `python/tests/recovery_support.py` | Valid compiled specs, topologies, snapshots, identity partitions |
+| `python/tests/conftest.py` | Explicit pytest fixture registry over `recovery_support` factories |
 | `python/tests/test_recovery_model.py` | Closed/frozen/token-free value tests |
 | `python/tests/test_recovery_snapshot.py` | Snapshot/topology factory validation |
 | `python/tests/test_recovery_plan.py` | Guarded plan/step construction |
@@ -81,6 +90,61 @@ which refines [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-r
 | Complete transaction classification, reducer-backed planning, and halt reasons | 8 |
 | Fresh observation authorization | 9 |
 | Exhaustive generators, architecture checks, status sync | 10 |
+
+## Fixture registry
+
+`python/tests/conftest.py` is created in Task 2 and extended by the task that first needs each
+fixture. It contains only thin `@pytest.fixture` adapters over explicit factories in
+`tests.recovery_support`; the factory is where construction logic lives and can also be called
+directly by non-pytest checks. No test may name a fixture absent from this registry.
+
+| Fixture | Added | Exact contract |
+| --- | --- | --- |
+| `terminal_snapshot` | Task 4 | active, validated `ROLLED_BACK` snapshot accepted by `DetachActive` |
+| `reducer_step_cases` | Task 4 | callable mapping six step-case names to `(source, step, expected)` |
+| `replace_started_case` | Task 4 | callable returning a STARTED replace snapshot and its `UNDO_STARTED` transition |
+| `replace_transform_case` | Task 4 | callable returning a STARTED replace whose tuple moves live off `pre` |
+| `three_effect_snapshot` | Task 5 | callable returning a three-effect snapshot for a state/journal vector |
+| `replace_case` | Task 6 | callable constructing the named live/staging/journal tuple and reconstructed frontiers |
+| `noop_replace_case` | Task 6 | same as `replace_case`, with exact `pre == post` |
+| `create_file_case` | Task 6 | callable constructing the named live/staging/journal tuple and frontiers |
+| `pending_drift_case` | Task 6 | callable returning a pending create with external live drift |
+| `pending_scratch_case` | Task 6 | callable returning a pending create with surviving staging |
+| `undone_drift_case` | Task 6 | callable returning an undone create with non-initial live evidence |
+| `delete_case` | Task 7 | callable constructing the named live/tombstone/journal tuple and frontiers |
+| `move_case` | Task 7 | callable constructing source/destination/anchor states and the requested identity partition |
+| `directory_case` | Task 7 | callable constructing live/work states, identity relation, occupancy, and frontiers |
+| `two_effect_snapshot` | Task 8 | callable selecting a named decision case for each of two effects |
+| `committed_snapshot` | Task 8 | committed all-DONE snapshot with removable terminal scratch |
+| `prepared_drift_snapshot` | Task 8 | prepared all-PENDING snapshot with external live drift |
+| `halted_snapshot` | Task 8 | validated HALTED snapshot carrying its frozen first-halt diagnostic |
+| `recovery_case` | Task 8 | callable returning named restored/refused/committed/halt fixed-point sources |
+| `committed_halt_source` | Task 8 | committed source whose cleanup tuple requires a halt |
+| `repeated_path_mid_plan_halt` | Task 8 | earlier effect halts after a later repair projection |
+| `snapshot_pair_differing_only_dependencies` | Task 8 | equal snapshots except for compiled dependency edges |
+| `classifier_plan` | Task 9 | action plan containing at least one filesystem-mutating step |
+| `generated_snapshots` | Task 10 | finite generator exposing the three methods Task 10 names |
+| `identity_case` | Task 10 | pair of snapshots differing only by a consistent identity-token alpha-renaming |
+| `halt_restart_case` | Task 10 | pair of halted snapshots with equal diagnostics and regenerated observation tokens |
+
+Each task's fixture step must add both the support factory and this exact adapter shape:
+
+```python
+@pytest.fixture
+def fixture_name():
+    return make_fixture_name()
+```
+
+For a callable fixture, omit the parentheses in the return:
+
+```python
+@pytest.fixture
+def fixture_name():
+    return make_fixture_name
+```
+
+The Task 10 architecture test enumerates test function signatures and fails if any non-builtin pytest
+argument is absent from `conftest.py`; this keeps the registry complete as tests evolve.
 
 ---
 
@@ -127,7 +191,7 @@ from atoms.core.recovery import (
 from tests.support import F
 
 
-def test_state_and_reason_values_are_closed_string_enums():
+def test_state_and_reason_values_are_closed_enums_with_string_values():
     assert [state.value for state in TransactionState] == [
         "prepared",
         "applying",
@@ -139,6 +203,7 @@ def test_state_and_reason_values_are_closed_string_enums():
     ]
     assert HaltReason.ACTIVE_BINDING_MISSING.value == "active_binding_missing"
     assert HaltReason.COMMIT_DECISION_CONFLICT.value == "commit_decision_conflict"
+    assert TransactionState.PREPARED != "prepared"
 
 
 def test_entry_identity_is_opaque_snapshot_local_and_repr_safe():
@@ -161,6 +226,7 @@ def test_halt_diagnostic_has_no_identity_token_field():
     field_types = {field.name: str(field.type) for field in fields(HaltDiagnostic)}
     assert all("EntryIdentity" not in field_type for field_type in field_types.values())
     assert "identity_relations" in field_types
+    assert "projected_journals" in field_types
     assert IdentityRelation.SAME.value == "same"
     assert JournalState.STARTED.value == "started"
 ```
@@ -185,7 +251,7 @@ from atoms.core.effects import RelPath
 from atoms.core.fingerprint import DirectoryState, FileState, PathState, SymlinkState
 
 
-class TransactionState(str, Enum):
+class TransactionState(Enum):
     PREPARED = "prepared"
     APPLYING = "applying"
     APPLIED = "applied"
@@ -195,12 +261,12 @@ class TransactionState(str, Enum):
     HALTED = "halted"
 
 
-class CommitDecision(str, Enum):
+class CommitDecision(Enum):
     UNCOMMITTED = "uncommitted"
     COMMITTED = "committed"
 
 
-class JournalState(str, Enum):
+class JournalState(Enum):
     PENDING = "pending"
     STARTED = "started"
     DONE = "done"
@@ -208,12 +274,12 @@ class JournalState(str, Enum):
     UNDONE = "undone"
 
 
-class RollbackResult(str, Enum):
+class RollbackResult(Enum):
     RESTORED = "restored"
     EXTERNAL_DRIFT_PRESERVED = "external_drift_preserved"
 
 
-class HaltReason(str, Enum):
+class HaltReason(Enum):
     JOURNAL_TOPOLOGY_INVALID = "journal_topology_invalid"
     COMMIT_DECISION_CONFLICT = "commit_decision_conflict"
     ACTIVE_BINDING_MISSING = "active_binding_missing"
@@ -223,25 +289,25 @@ class HaltReason(str, Enum):
     PLAN_PRECONDITION_CHANGED = "plan_precondition_changed"
 
 
-class ScratchRole(str, Enum):
+class ScratchRole(Enum):
     STAGING = "staging"
     TOMBSTONE = "tombstone"
     ANCHOR = "anchor"
     WORK = "work"
 
 
-class FileBuildRelation(str, Enum):
+class FileBuildRelation(Enum):
     EXACT = "exact"
     STRICT_PREFIX = "strict_prefix"
     DIVERGED = "diverged"
 
 
-class IdentityRelation(str, Enum):
+class IdentityRelation(Enum):
     SAME = "same"
     DIFFERENT = "different"
 
 
-class OperatorAction(str, Enum):
+class OperatorAction(Enum):
     INSPECT_PRESERVED_EVIDENCE = "inspect_preserved_evidence"
     REPAIR_DURABLE_METADATA = "repair_durable_metadata"
 
@@ -324,6 +390,8 @@ class HaltDiagnostic:
     pre_halt_state: TransactionState
     commit_decision: CommitDecision
     journals: tuple[EffectJournalState, ...]
+    projected_transaction_state: TransactionState
+    projected_journals: tuple[EffectJournalState, ...]
     effect_id: str | None
     paths: tuple[RelPath, ...]
     expected: tuple[DiagnosticEntry, ...]
@@ -334,7 +402,8 @@ class HaltDiagnostic:
 ```
 
 Create `python/src/atoms/core/recovery/__init__.py` and explicitly re-export these names. Do not use
-star imports or introduce aliases outside the closed enums.
+star imports or introduce aliases outside the closed enums. Define an explicit `__all__` tuple at the
+same time; every later task extends it in the commit that adds a public symbol.
 
 - [ ] **Step 4: Run focused tests and static checks**
 
@@ -366,6 +435,7 @@ coherence before classification sees a value.
 **Files:**
 - Create: `python/src/atoms/core/recovery/snapshot.py`
 - Create: `python/tests/recovery_support.py`
+- Create: `python/tests/conftest.py`
 - Create: `python/tests/test_recovery_snapshot.py`
 - Modify: `python/src/atoms/core/recovery/__init__.py`
 
@@ -385,8 +455,6 @@ Create `python/tests/recovery_support.py` with reusable exact fixtures:
 
 ```python
 from atoms.core.compiler import compile_spec
-from atoms.core.effects import CreateFileNoClobber
-from atoms.core.fingerprint import ABSENT
 from atoms.core.recovery import (
     CommitDecision,
     EffectJournalState,
@@ -404,22 +472,13 @@ from atoms.core.recovery import (
     TransactionState,
     build_recovery_snapshot,
 )
-from atoms.core.spec import build_spec
-from tests.support import DIGEST, F
+from tests.support import F, valid_spec
 
 _DEFAULT = object()
 
 
 def compiled_create():
-    return compile_spec(
-        build_spec(
-            consumer_tag="cnsmr",
-            intent_digest=DIGEST,
-            initial_surface={"a.txt": ABSENT},
-            final_surface={"a.txt": F},
-            effects=(CreateFileNoClobber(effect_id="e1", path="a.txt", post=F),),
-        )
-    )
+    return compile_spec(valid_spec())
 
 
 def create_topology():
@@ -699,9 +758,16 @@ class RecoverySnapshot:
     ) -> None:
         if _construction_token is not _SNAPSHOT_TOKEN:
             raise TypeError("RecoverySnapshot values are created only by build_recovery_snapshot")
-        for name, value in locals().copy().items():
-            if name not in {"self", "_construction_token"}:
-                object.__setattr__(self, name, value)
+        object.__setattr__(self, "compiled", compiled)
+        object.__setattr__(self, "topology", topology)
+        object.__setattr__(self, "transaction_state", transaction_state)
+        object.__setattr__(self, "commit_decision", commit_decision)
+        object.__setattr__(self, "rollback_result", rollback_result)
+        object.__setattr__(self, "halt_diagnostic", halt_diagnostic)
+        object.__setattr__(self, "active", active)
+        object.__setattr__(self, "journals", journals)
+        object.__setattr__(self, "persistent_observations", persistent_observations)
+        object.__setattr__(self, "scratch_observations", scratch_observations)
 ```
 
 Add these exact helpers:
@@ -792,10 +858,10 @@ The validation helpers must enforce these exact rules:
 | `_validate_journal_coverage` | exact effect IDs once, in compiled order; exact `EffectJournalState` |
 | `_validate_persistent_coverage` | exact union of compiled timeline paths once |
 | `_validate_scratch_coverage` | exact effect/role pair once for every compiled effect |
-| `_validate_topology` | exact endpoint/scratch coverage, unique nonnegative `TopologyDirectory.node_id`, one parent per non-root, roots parentless, acyclic |
+| `_validate_topology` | iterative exact coverage, unique IDs, one parent, root and cycle rules |
 | `_validate_observations` | exact observation variants and scalar types; no symlink identity |
-| `_validate_halt_diagnostic` | exact nested tuple/member types, sorted named slots/relations, no identity token field or arbitrary free-form reason |
-| construction relation | present for started create staging; present for started replace staging only while live is exact `pre`; absent otherwise |
+| `_validate_halt_diagnostic` | exact nested types, durable/projected vectors, sorted slots/relations, no tokens |
+| construction relation | only the two started construction cases; absent otherwise |
 | terminal payload | rollback result exactly for `ROLLED_BACK`; diagnostic exactly for `HALTED` |
 | halted coherence | current commit decision and full journal vector equal the diagnostic |
 
@@ -805,7 +871,13 @@ Export every public name through `recovery/__init__.py`.
 `TopologyDirectory` represents a resolved intermediate parent that is not itself a declared
 persistent endpoint. It is a pure opaque node label, not a path, descriptor, device, or inode. Add a
 nested-path test proving two endpoints share their actual parent node and that endpoints under
-different parents do not collapse onto `ProjectRoot`.
+different parents do not collapse onto `ProjectRoot`. `_validate_topology` must use an explicit
+indegree/worklist traversal; recursion is forbidden so a 1,100-component topology remains valid.
+
+Create `python/tests/conftest.py` with only the module docstring
+`"""Explicit recovery-model fixture registry."""`; importing unused `pytest` here would fail Ruff.
+Task 4 adds the first adapter and the `pytest` import. Tasks 5–10 add each later adapter in the same
+commit as its `make_*` support factory. The architecture test in Task 10 checks this registry.
 
 - [ ] **Step 4: Add adversarial factory tests**
 
@@ -862,7 +934,7 @@ Expected: all pass.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/atoms/core/recovery tests/recovery_support.py tests/test_recovery_snapshot.py
+git add src/atoms/core/recovery tests/conftest.py tests/recovery_support.py tests/test_recovery_snapshot.py
 git commit -m "feat(recovery): validate logical recovery snapshots"
 ```
 
@@ -880,7 +952,7 @@ only internal factories construct plan variants and authorized steps.
 **Interfaces:**
 - Consumes: Task 1 model values and Task 2 `RecoverySnapshot`/topology nodes.
 - Produces:
-  - `PlanDisposition`, `SettlementKind`;
+  - `PlanDisposition`, `SettlementKind`, `EffectVariant`;
   - `JointObservation`;
   - step union `TransitionTransactionState | TransitionEffectState | TransformEffectTuple |
     RemoveScratch | PreserveExternal | DetachActive`;
@@ -915,7 +987,6 @@ def test_action_plan_is_source_bound_frozen_and_factory_controlled():
         bound_snapshot=snapshot,
         disposition=PlanDisposition.ROLL_BACK,
         steps=(),
-        rollback_result=RollbackResult.RESTORED,
     )
     assert plan.bound_snapshot == snapshot
     with pytest.raises(FrozenInstanceError):
@@ -961,7 +1032,7 @@ Create `python/src/atoms/core/recovery/plan.py`:
 ```python
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 from atoms.core.errors import ProtocolError
@@ -978,7 +1049,7 @@ from atoms.core.recovery.model import (
 from atoms.core.recovery.snapshot import RecoverySnapshot, TopologyNode
 
 
-class PlanDisposition(str, Enum):
+class PlanDisposition(Enum):
     ROLL_BACK = "roll_back"
     ROLL_BACK_REFUSED = "roll_back_refused"
     COMMITTED_CLEANUP = "committed_cleanup"
@@ -987,12 +1058,20 @@ class PlanDisposition(str, Enum):
     NO_RECOVERY = "no_recovery"
 
 
-class SettlementKind(str, Enum):
+class SettlementKind(Enum):
     RESTORE_PRE = "restore_pre"
     REMOVE_ATTRIBUTABLE_CREATION = "remove_attributable_creation"
     REPAIR_INTERMEDIATE = "repair_intermediate"
     FINISH_LANDED_UNDO = "finish_landed_undo"
     REMOVE_COMMITTED_SCRATCH = "remove_committed_scratch"
+
+
+class EffectVariant(Enum):
+    REPLACE_FILE = "replace_file"
+    CREATE_FILE_NO_CLOBBER = "create_file_no_clobber"
+    DELETE_PATH = "delete_path"
+    MOVE_NO_CLOBBER = "move_no_clobber"
+    CREATE_DIRECTORY = "create_directory"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1027,7 +1106,7 @@ class TransitionEffectState:
 @dataclass(frozen=True, slots=True)
 class TransformEffectTuple:
     effect_id: str
-    variant: str
+    variant: EffectVariant
     settlement: SettlementKind
     expected_before: JointObservation
     result_after: JointObservation
@@ -1091,9 +1170,9 @@ class ActionPlan:
 @dataclass(frozen=True, slots=True, init=False)
 class HaltPlan:
     bound_snapshot: RecoverySnapshot
-    disposition: PlanDisposition
+    disposition: PlanDisposition = field(init=False)
     diagnostic: HaltDiagnostic
-    steps: tuple[TransitionTransactionState, ...]
+    steps: tuple[TransitionTransactionState, ...] = field(init=False)
 
     def __init__(
         self,
@@ -1114,8 +1193,8 @@ class HaltPlan:
 @dataclass(frozen=True, slots=True, init=False)
 class NoRecoveryPlan:
     bound_snapshot: RecoverySnapshot
-    disposition: PlanDisposition
-    steps: tuple[()]
+    disposition: PlanDisposition = field(init=False)
+    steps: tuple[()] = field(init=False)
 
     def __init__(
         self,
@@ -1159,7 +1238,8 @@ class AuthorizedStep:
 Add the four internal factories. Each validates the disposition/payload combination before passing its
 module token. `_new_action_plan` permits only the four action dispositions. `ROLL_BACK` requires
 `RESTORED`; `ROLL_BACK_REFUSED` requires `EXTERNAL_DRIFT_PRESERVED`; `COMMITTED_CLEANUP` and
-`DETACH_TERMINAL` require `None`. `_new_halt_plan` accepts exactly one
+`DETACH_TERMINAL` derive `None`; callers do not supply a redundant result. `_new_halt_plan` accepts
+exactly one
 `TransitionTransactionState` from the bound snapshot's current state to `HALTED` for a first halt, or
 no steps when the bound snapshot is already `HALTED` and supplies the same frozen diagnostic.
 `_new_no_recovery_plan` has no steps; `_new_authorized_step` accepts only `TransformEffectTuple` or
@@ -1182,6 +1262,8 @@ def _validate_steps(steps: tuple[RecoveryStep, ...]) -> None:
     if type(steps) is not tuple or any(type(step) not in _STEP_TYPES for step in steps):
         raise ProtocolError("plan steps must be an exact tuple of closed step variants")
     for step in steps:
+        if type(step) is TransformEffectTuple and type(step.variant) is not EffectVariant:
+            raise ProtocolError("transform variant must be an exact EffectVariant")
         if type(step) is not TransitionTransactionState:
             continue
         has_result = step.rollback_result is not None
@@ -1201,7 +1283,6 @@ def _new_action_plan(
     bound_snapshot: RecoverySnapshot,
     disposition: PlanDisposition,
     steps: tuple[RecoveryStep, ...],
-    rollback_result: RollbackResult | None,
 ) -> ActionPlan:
     _validate_steps(steps)
     expected_result = {
@@ -1212,8 +1293,7 @@ def _new_action_plan(
     }
     if disposition not in expected_result:
         raise ProtocolError("action plan has a non-action disposition")
-    if rollback_result is not expected_result[disposition]:
-        raise ProtocolError("action plan has an invalid rollback result")
+    rollback_result = expected_result[disposition]
     return ActionPlan(
         bound_snapshot=bound_snapshot,
         disposition=disposition,
@@ -1277,26 +1357,28 @@ Add parameterized tests proving:
 
 ```python
 @pytest.mark.parametrize(
-    ("disposition", "result"),
+    "disposition",
     [
-        (PlanDisposition.ROLL_BACK, RollbackResult.RESTORED),
-        (PlanDisposition.ROLL_BACK_REFUSED, RollbackResult.EXTERNAL_DRIFT_PRESERVED),
-        (PlanDisposition.COMMITTED_CLEANUP, None),
-        (PlanDisposition.DETACH_TERMINAL, None),
+        PlanDisposition.ROLL_BACK,
+        PlanDisposition.ROLL_BACK_REFUSED,
+        PlanDisposition.COMMITTED_CLEANUP,
+        PlanDisposition.DETACH_TERMINAL,
     ],
 )
-def test_action_plan_factory_accepts_only_action_dispositions(disposition, result):
+def test_action_plan_factory_derives_result_from_disposition(disposition):
     plan = _new_action_plan(
         bound_snapshot=create_snapshot(),
         disposition=disposition,
         steps=(),
-        rollback_result=result,
     )
     assert plan.disposition is disposition
 ```
 
 Also assert direct construction and both `replace(plan)` forms fail for all three variants and
-`AuthorizedStep`.
+`AuthorizedStep`, always with `match="classify_recovery"` (or
+`match="authorize_recovery_step"` for `AuthorizedStep`). `HaltPlan` and `NoRecoveryPlan` mark their
+derived `disposition`/`steps` fields `init=False`, so `replace` reaches the factory guard rather than
+failing on an unexpected keyword argument.
 
 - [ ] **Step 5: Run focused and full checks**
 
@@ -1329,6 +1411,7 @@ authorization a precise logical source and models crash points between durable s
 - Create: `python/src/atoms/core/recovery/reducer.py`
 - Create: `python/tests/test_recovery_reducer.py`
 - Modify: `python/tests/recovery_support.py`
+- Modify: `python/tests/conftest.py`
 - Modify: `python/src/atoms/core/recovery/__init__.py`
 
 **Interfaces:**
@@ -1350,9 +1433,9 @@ from atoms.core.errors import ProtocolError
 from atoms.core.recovery import (
     DetachActive,
     PlanDisposition,
-    RollbackResult,
     TransactionState,
     TransitionTransactionState,
+    apply_recovery_plan,
     reduce_recovery_plan_prefix,
 )
 from atoms.core.recovery.plan import _new_action_plan
@@ -1371,7 +1454,6 @@ def transition_plan(snapshot):
         bound_snapshot=snapshot,
         disposition=PlanDisposition.ROLL_BACK,
         steps=(step,),
-        rollback_result=RollbackResult.RESTORED,
     )
 
 
@@ -1483,10 +1565,11 @@ TransitionTransactionState:
     replace transaction state and terminal payloads.
 TransitionEffectState:
     require exact effect ID/current state;
-    replace only that journal row.
+    replace that journal row, then normalize construction-only build relations against the new state.
 TransformEffectTuple:
     require current joint observation == expected_before;
-    merge result_after persistent/scratch/occupancy evidence.
+    merge result_after persistent/scratch/occupancy evidence, then normalize construction-only build
+    relations against the effect's unchanged journal state and new live/staging tuple.
 RemoveScratch:
     require expected_before;
     merge result_after, whose named scratch entry is absent.
@@ -1496,9 +1579,17 @@ DetachActive:
     require active; set active false.
 ```
 
-After each step, call `build_recovery_snapshot` with the merged exact values so every intermediate
-remains validated. A mismatch is `ProtocolError`, not a semantic halt: a factory plan applied in order
-to its bound logical source cannot legitimately disagree with itself.
+Before calling `build_recovery_snapshot` after each step, run
+`_normalize_file_build_relations(compiled, journals, persistent, scratch)`. It preserves a relation
+only for a present create staging at `STARTED`, or a present replace staging at `STARTED` while live is
+exact `pre`; otherwise it replaces the relation with `None`. A tuple step entering a required case
+must carry the new relation in `result_after`; normalization must not invent `EXACT`, `STRICT_PREFIX`,
+or `DIVERGED`. This makes `STARTED -> UNDO_STARTED` valid even when the staging entry remains present,
+and makes a replace tuple moving live away from exact `pre` drop now-irrelevant evidence.
+
+Then call `build_recovery_snapshot` with the normalized exact values so every intermediate remains
+validated. A mismatch is `ProtocolError`, not a semantic halt: a factory plan applied in order to its
+bound logical source cannot legitimately disagree with itself.
 
 For directory observations, recompute modeled occupancy from `RecoveryTopology` after each
 `TransformEffectTuple`; preserve `has_unmodeled_child`.
@@ -1525,6 +1616,27 @@ def test_each_step_has_one_exact_logical_reduction(reducer_step_cases, case):
     assert _apply_steps(snapshot, (step,)) == expected
 ```
 
+Add two relation-transition locks:
+
+```python
+def test_effect_transition_drops_construction_relation(replace_started_case):
+    source, transition = replace_started_case()
+    reduced = _apply_steps(source, (transition,))
+    staging = reduced.scratch_observations[0]
+    assert staging.entry == source.scratch_observations[0].entry
+    assert staging.file_build_relation is None
+
+
+def test_replace_tuple_leaving_pre_drops_construction_relation(replace_transform_case):
+    source, transform = replace_transform_case()
+    reduced = _apply_steps(source, (transform,))
+    assert reduced.scratch_observations[0].file_build_relation is None
+```
+
+Task 4 adds `terminal_snapshot`, `reducer_step_cases`, `replace_started_case`, and
+`replace_transform_case` adapters to `conftest.py`; their `make_*` factories live in
+`recovery_support.py`.
+
 - [ ] **Step 7: Run focused and full checks**
 
 Run:
@@ -1541,7 +1653,8 @@ Expected: all pass.
 - [ ] **Step 8: Commit**
 
 ```bash
-git add src/atoms/core/recovery/reducer.py src/atoms/core/recovery/__init__.py tests/test_recovery_reducer.py tests/recovery_support.py
+git add src/atoms/core/recovery/reducer.py src/atoms/core/recovery/__init__.py \
+  tests/conftest.py tests/test_recovery_reducer.py tests/recovery_support.py
 git commit -m "feat(recovery): reduce semantic recovery plans"
 ```
 
@@ -1556,6 +1669,7 @@ frontier per compiled path from every occurrence's journal state; never read `de
 - Create: `python/src/atoms/core/recovery/journal.py`
 - Create: `python/tests/test_recovery_journal.py`
 - Modify: `python/tests/recovery_support.py`
+- Modify: `python/tests/conftest.py`
 
 **Interfaces:**
 - Consumes: `RecoverySnapshot`, compiled `PathTimeline`, Task 1 states/reasons.
@@ -1563,7 +1677,8 @@ frontier per compiled path from every occurrence's journal state; never read `de
   - `AuthorityDecision(kind: AuthorityKind, halt_reason: HaltReason | None)`;
   - `AuthorityKind {CLASSIFY, DETACH, NO_RECOVERY, STABLE_HALT, HALT}`;
   - `FrontierDirection {FORWARD, REVERSE, INITIAL}`;
-  - `PathFrontier(path, direction, effect_index, effect_id, journal_state, expected_state)`;
+  - `PathFrontier(path, direction, effect_index, effect_id, journal_state, expected_state,
+    admissible_states)`;
   - `classify_transaction_authority(snapshot) -> AuthorityDecision`;
   - `reconstruct_frontiers(snapshot) -> tuple[PathFrontier, ...]`.
 
@@ -1602,12 +1717,12 @@ def test_single_effect_legal_languages(state, journals, expected):
 
 
 def test_commit_decision_conflict_has_closed_reason():
-    snapshot = create_snapshot(state=TransactionState.APPLIED, journal=JournalState.DONE)
-    forged = object.__new__(type(snapshot))
-    for field in snapshot.__dataclass_fields__:
-        object.__setattr__(forged, field, getattr(snapshot, field))
-    object.__setattr__(forged, "commit_decision", CommitDecision.COMMITTED)
-    decision = classify_transaction_authority(forged)
+    snapshot = create_snapshot(
+        state=TransactionState.APPLIED,
+        journal=JournalState.DONE,
+        commit_decision=CommitDecision.COMMITTED,
+    )
+    decision = classify_transaction_authority(snapshot)
     assert decision.kind is AuthorityKind.HALT
     assert decision.halt_reason is HaltReason.COMMIT_DECISION_CONFLICT
 
@@ -1641,6 +1756,20 @@ def test_rolling_back_rejects_started_followed_by_undone(three_effect_snapshot):
     )
     decision = classify_transaction_authority(snapshot)
     assert decision.halt_reason is HaltReason.JOURNAL_TOPOLOGY_INVALID
+
+
+@pytest.mark.parametrize(
+    "states",
+    [
+        (JournalState.PENDING, JournalState.UNDONE, JournalState.PENDING),
+        (JournalState.UNDONE, JournalState.PENDING, JournalState.UNDONE),
+    ],
+)
+def test_rolling_back_rejects_undone_after_pending(three_effect_snapshot, states):
+    snapshot = three_effect_snapshot(TransactionState.ROLLING_BACK, states)
+    decision = classify_transaction_authority(snapshot)
+    assert decision.kind is AuthorityKind.HALT
+    assert decision.halt_reason is HaltReason.JOURNAL_TOPOLOGY_INVALID
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -1662,7 +1791,7 @@ from atoms.core.fingerprint import PathState
 from atoms.core.recovery.model import HaltReason, JournalState
 
 
-class AuthorityKind(str, Enum):
+class AuthorityKind(Enum):
     CLASSIFY = "classify"
     DETACH = "detach"
     NO_RECOVERY = "no_recovery"
@@ -1676,7 +1805,7 @@ class AuthorityDecision:
     halt_reason: HaltReason | None
 
 
-class FrontierDirection(str, Enum):
+class FrontierDirection(Enum):
     FORWARD = "forward"
     REVERSE = "reverse"
     INITIAL = "initial"
@@ -1690,6 +1819,7 @@ class PathFrontier:
     effect_id: str | None
     journal_state: JournalState | None
     expected_state: PathState
+    admissible_states: tuple[PathState, ...]
 
 
 def _all(states, wanted):
@@ -1719,7 +1849,7 @@ def _reverse_language(states):
         if phase == 0 and state is JournalState.UNDO_STARTED:
             phase = 1
             continue
-        if state is JournalState.UNDONE:
+        if state is JournalState.UNDONE and phase in {0, 1, 2}:
             phase = 2
             continue
         if state is JournalState.PENDING and phase in {0, 2, 3}:
@@ -1728,6 +1858,12 @@ def _reverse_language(states):
         return False
     return True
 ```
+
+`expected_state` is the continuity baseline: the path state before the selected occurrence for a
+forward frontier and after it for a reverse frontier. `admissible_states` is the closed set for the
+selected journal state. A `STARTED` frontier therefore retains one baseline while explicitly carrying
+its pre/intermediate/post admissible states; consumers never mistake the baseline for the whole set.
+Task 5 adds the `three_effect_snapshot` adapter to `conftest.py`.
 
 `classify_transaction_authority` applies this exact precedence:
 
@@ -1804,7 +1940,7 @@ Expected: all pass.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/atoms/core/recovery/journal.py tests/test_recovery_journal.py tests/recovery_support.py
+git add src/atoms/core/recovery/journal.py tests/conftest.py tests/test_recovery_journal.py tests/recovery_support.py
 git commit -m "feat(recovery): classify journals and path frontiers"
 ```
 
@@ -1820,6 +1956,7 @@ not fall through the overlapping general rows.
 - Create: `python/src/atoms/core/recovery/variants.py`
 - Create: `python/tests/test_recovery_variants_files.py`
 - Modify: `python/tests/recovery_support.py`
+- Modify: `python/tests/conftest.py`
 
 **Interfaces:**
 - Consumes: Task 2 snapshot maps, Task 3 semantic steps, Task 5 frontiers.
@@ -1828,11 +1965,29 @@ not fall through the overlapping general rows.
   - `classify_effect(snapshot, effect_index, frontiers) -> EffectDecision`;
   - exact file-state and relation normalization helpers.
 
+Every `TransformEffectTuple.variant` comes from an exact-type table:
+
+```python
+_EFFECT_VARIANT = {
+    ReplaceFile: EffectVariant.REPLACE_FILE,
+    CreateFileNoClobber: EffectVariant.CREATE_FILE_NO_CLOBBER,
+    DeletePath: EffectVariant.DELETE_PATH,
+    MoveNoClobber: EffectVariant.MOVE_NO_CLOBBER,
+    CreateDirectory: EffectVariant.CREATE_DIRECTORY,
+}
+```
+
+Index this table by `type(effect)`; never derive a free-form variant string from a class name.
+
 - [ ] **Step 1: Write failing replace table tests**
 
 Create `python/tests/test_recovery_variants_files.py` with a fixture that builds a one-effect compiled
 replace snapshot for arbitrary live/staging observations and journal state. Parameterize the general
 table:
+
+Task 6 adds `replace_case`, `noop_replace_case`, `create_file_case`, `pending_drift_case`,
+`pending_scratch_case`, and `undone_drift_case` adapters to `conftest.py` in the same commit as their
+`make_*` factories.
 
 ```python
 import pytest
@@ -1976,7 +2131,7 @@ from atoms.core.recovery.plan import (
 from atoms.core.recovery.snapshot import RecoverySnapshot
 
 
-class EntryClass(str, Enum):
+class EntryClass(Enum):
     ABSENT = "absent"
     PRE = "pre"
     POST = "post"
@@ -1984,7 +2139,7 @@ class EntryClass(str, Enum):
     EXTERNAL = "external"
 
 
-class EffectDecisionKind(str, Enum):
+class EffectDecisionKind(Enum):
     UNDO_WITHOUT_MUTATION = "undo_without_mutation"
     REMOVE_SCRATCH = "remove_scratch"
     EXCHANGE_BACK = "exchange_back"
@@ -2143,7 +2298,8 @@ Expected: all pass.
 - [ ] **Step 9: Commit**
 
 ```bash
-git add src/atoms/core/recovery/variants.py tests/test_recovery_variants_files.py tests/recovery_support.py
+git add src/atoms/core/recovery/variants.py tests/conftest.py \
+  tests/test_recovery_variants_files.py tests/recovery_support.py
 git commit -m "feat(recovery): classify file effect recovery"
 ```
 
@@ -2159,6 +2315,7 @@ between snapshot-local identities; diagnostics and semantic plan metadata retain
 - Modify: `python/src/atoms/core/recovery/variants.py`
 - Create: `python/tests/test_recovery_variants_paths.py`
 - Modify: `python/tests/recovery_support.py`
+- Modify: `python/tests/conftest.py`
 
 **Interfaces:**
 - Consumes: Task 6 `EffectDecision`, tuple normalization, and step builders.
@@ -2168,6 +2325,9 @@ between snapshot-local identities; diagnostics and semantic plan metadata retain
 - [ ] **Step 1: Write failing delete tests**
 
 Create `python/tests/test_recovery_variants_paths.py`:
+
+Task 7 adds `delete_case`, `move_case`, and `directory_case` adapters to `conftest.py` in the same
+commit as their `make_*` factories.
 
 ```python
 import pytest
@@ -2323,7 +2483,8 @@ Expected: all pass.
 - [ ] **Step 8: Commit**
 
 ```bash
-git add src/atoms/core/recovery/variants.py tests/test_recovery_variants_paths.py tests/recovery_support.py
+git add src/atoms/core/recovery/variants.py tests/conftest.py \
+  tests/test_recovery_variants_paths.py tests/recovery_support.py
 git commit -m "feat(recovery): classify path and directory recovery"
 ```
 
@@ -2340,6 +2501,7 @@ token-free diagnostics for every halt.
 - Create: `python/tests/test_recovery_classifier.py`
 - Modify: `python/src/atoms/core/recovery/__init__.py`
 - Modify: `python/tests/recovery_support.py`
+- Modify: `python/tests/conftest.py`
 
 **Interfaces:**
 - Consumes: Tasks 2–7, including Task 4's normative `_apply_steps` reducer kernel.
@@ -2348,6 +2510,11 @@ token-free diagnostics for every halt.
 - [ ] **Step 1: Write failing disposition and ordering tests**
 
 Create `python/tests/test_recovery_classifier.py`:
+
+Task 8 adds `two_effect_snapshot`, `committed_snapshot`, `prepared_drift_snapshot`,
+`halted_snapshot`, `recovery_case`, `committed_halt_source`, and
+`repeated_path_mid_plan_halt`, and `snapshot_pair_differing_only_dependencies` adapters to
+`conftest.py` in the same commit as their `make_*` factories.
 
 ```python
 import pytest
@@ -2456,6 +2623,24 @@ def test_classifier_checks_every_effect_before_building_action_steps(
     assert not any(type(step).__name__ in {"TransformEffectTuple", "RemoveScratch"} for step in plan.steps)
 ```
 
+Add a cursor-provenance lock with a repeated-path source whose later effect is repairable and whose
+earlier effect halts only after that repair is projected:
+
+```python
+def test_mid_plan_halt_labels_projected_journals_without_rewriting_durable_source(
+    repeated_path_mid_plan_halt,
+):
+    source = repeated_path_mid_plan_halt
+    plan = classify_recovery(source)
+    diagnostic = plan.diagnostic
+    assert diagnostic.journals == source.journals
+    assert diagnostic.projected_journals != diagnostic.journals
+    assert diagnostic.projected_transaction_state is TransactionState.ROLLING_BACK
+```
+
+Task 8 also registers `repeated_path_mid_plan_halt` and its explicit support factory in
+`conftest.py`.
+
 Add a repeated-path case with two completed replaces on one path. The second replace's rollback must
 be projected first; the first replace step's `expected_before` must name the intermediate state
 restored by that projection, not the source snapshot's final live state.
@@ -2472,17 +2657,21 @@ Create `python/src/atoms/core/recovery/classifier.py`. Add:
 
 ```python
 def _diagnostic(
-    snapshot: RecoverySnapshot,
+    source: RecoverySnapshot,
     *,
     reason: HaltReason,
+    projected: RecoverySnapshot | None = None,
     effect_id: str | None = None,
     expected: JointObservation | None = None,
     observed: JointObservation | None = None,
 ) -> HaltDiagnostic:
+    evidence_snapshot = source if projected is None else projected
     return HaltDiagnostic(
-        pre_halt_state=snapshot.transaction_state,
-        commit_decision=snapshot.commit_decision,
-        journals=snapshot.journals,
+        pre_halt_state=source.transaction_state,
+        commit_decision=source.commit_decision,
+        journals=source.journals,
+        projected_transaction_state=evidence_snapshot.transaction_state,
+        projected_journals=evidence_snapshot.journals,
         effect_id=effect_id,
         paths=_diagnostic_paths(expected, observed),
         expected=_project_entries(expected),
@@ -2504,6 +2693,13 @@ def _diagnostic(
     )
 ```
 
+The durable fields always come from the snapshot to which the halt transition will be applied.
+`projected_*` fields identify the pure cursor whose tuple produced `expected` and `observed`. For an
+immediate authority halt they equal the durable fields. For a contradiction found after reversing
+later effects in `_rollback_plan`, `_halt_plan` receives `source` for durable facts and `cursor` as
+`projected`; no semantic step has executed, so it must not report cursor journals as durable. An
+authorization mismatch is bound to its already-durable prefix snapshot, so both sets again agree.
+
 `_project_entries` converts every observed entry to `DiagnosticEntry`; it copies state,
 `has_unmodeled_child`, and build relation but never identity. `_project_identity_relations` compares
 identities only within the one tuple passed to it and emits sorted, namespace-qualified named-slot
@@ -2511,8 +2707,10 @@ identities only within the one tuple passed to it and emits sorted, namespace-qu
 fresh authorization observation may use a different token universe. Its result must remain unchanged
 when every token inside either tuple is consistently renamed.
 
-`_halt_plan` creates one `TransitionTransactionState(current, HALTED, None, diagnostic)` for a first
-halt. For an already halted snapshot it returns the stored diagnostic and no steps.
+`_halt_plan(source, reason, effect_id=None, expected=None, observed=None, *,
+projected=None)` creates one `TransitionTransactionState(current, HALTED, None, diagnostic)` for a
+first halt. It passes both `source` and `projected` to `_diagnostic`. For an already halted snapshot it
+returns the stored diagnostic and no steps.
 
 - [ ] **Step 5: Implement classification pipeline and plan ordering**
 
@@ -2567,6 +2765,7 @@ def _rollback_plan(source: RecoverySnapshot) -> RecoveryPlan:
                 effect.effect_id,
                 decision.expected,
                 decision.observed,
+                projected=cursor,
             )
         refused = refused or decision.refused
         local_steps = _reverse_effect_steps(cursor, index, decision)
@@ -2588,7 +2787,9 @@ def _rollback_plan(source: RecoverySnapshot) -> RecoveryPlan:
         DetachActive(),
     )
     steps.extend(terminal)
-    _apply_steps(cursor, terminal)
+    cursor = _apply_steps(cursor, terminal)
+    if cursor.transaction_state is not TransactionState.ROLLED_BACK or cursor.active:
+        raise ProtocolError("terminal rollback projection did not settle")
     return _new_action_plan(
         bound_snapshot=source,
         disposition=(
@@ -2597,7 +2798,6 @@ def _rollback_plan(source: RecoverySnapshot) -> RecoveryPlan:
             else PlanDisposition.ROLL_BACK
         ),
         steps=tuple(steps),
-        rollback_result=result,
     )
 ```
 
@@ -2676,7 +2876,8 @@ Expected: all pass.
 - [ ] **Step 8: Commit**
 
 ```bash
-git add src/atoms/core/recovery/classifier.py src/atoms/core/recovery/__init__.py tests/test_recovery_classifier.py tests/recovery_support.py
+git add src/atoms/core/recovery/classifier.py src/atoms/core/recovery/__init__.py \
+  tests/conftest.py tests/test_recovery_classifier.py tests/recovery_support.py
 git commit -m "feat(recovery): classify complete recovery plans"
 ```
 
@@ -2692,6 +2893,8 @@ fresh conflict substituted.
 - Create: `python/src/atoms/core/recovery/authorization.py`
 - Create: `python/tests/test_recovery_authorization.py`
 - Modify: `python/src/atoms/core/recovery/__init__.py`
+- Modify: `python/tests/recovery_support.py`
+- Modify: `python/tests/conftest.py`
 
 **Interfaces:**
 - Consumes: `RecoveryPlan`, reducer prefix operation, classifier diagnostic projection.
@@ -2701,6 +2904,9 @@ fresh conflict substituted.
 - [ ] **Step 1: Write failing authorization tests**
 
 Create `python/tests/test_recovery_authorization.py`:
+
+Task 9 adds the `classifier_plan` adapter to `conftest.py` in the same commit as
+`make_classifier_plan`.
 
 ```python
 import pytest
@@ -2717,7 +2923,7 @@ from atoms.core.recovery import (
     authorize_recovery_step,
     classify_recovery,
 )
-from tests.recovery_support import create_snapshot
+from tests.recovery_support import create_snapshot, reallocate_joint_identities
 from tests.support import G
 
 
@@ -2728,10 +2934,12 @@ def first_mutating_step(plan):
     raise AssertionError("fixture must produce a mutating step")
 
 
-def test_exact_fresh_observation_authorizes_bound_step():
+def test_fresh_alpha_renamed_observation_authorizes_bound_step():
     plan = classify_recovery(create_snapshot())
     index, step = first_mutating_step(plan)
-    result = authorize_recovery_step(plan, index, step.expected_before)
+    fresh = reallocate_joint_identities(step.expected_before)
+    assert fresh != step.expected_before
+    result = authorize_recovery_step(plan, index, fresh)
     assert type(result) is AuthorizedStep
     assert result.plan is plan
     assert result.step_index == index
@@ -2799,13 +3007,77 @@ def authorize_recovery_step(
     )
     expected = step.expected_before
     _validate_joint_coverage(expected, observed)
-    if observed == expected:
+    if _authorization_projection(observed) == _authorization_projection(expected):
         return _new_authorized_step(plan, step_index, step)
     return _precondition_changed_halt(prefix, expected, observed)
 ```
 
 `_validate_joint_coverage` requires the exact same persistent path keys, scratch effect/role keys, and
 parent nodes as `expected`. Missing/extra/duplicate/wrong exact types raise `ProtocolError`.
+
+`_authorization_projection` returns:
+
+1. every persistent, scratch, and parent-occupancy field with `EntryIdentity` removed;
+2. the sorted named-slot identity relations produced by
+   `_project_identity_relations("authorization", observation)`.
+
+It compares exact entry variants, fingerprints, build relations, occupancy, and identity partitions.
+It never compares a token from `expected` with a token from `observed`. The
+`reallocate_joint_identities` helper walks every named slot, allocates one new `EntryIdentity` per old
+token, and reuses that new token for every occurrence of the old one; the test above therefore fails
+if authorization regresses to dataclass equality or loses an identity relation.
+
+```python
+def _authorization_projection(observation: JointObservation):
+    return (
+        _project_entries(observation),
+        observation.parent_occupancy,
+        _project_identity_relations("authorization", observation),
+    )
+```
+
+Add this exact helper to `recovery_support.py`, extending its recovery imports with
+`JointObservation` and `ObservedDirectory`:
+
+```python
+def reallocate_joint_identities(observation: JointObservation) -> JointObservation:
+    replacements: dict[EntryIdentity, EntryIdentity] = {}
+
+    def fresh_identity(identity: EntryIdentity) -> EntryIdentity:
+        replacement = replacements.get(identity)
+        if replacement is None:
+            replacement = EntryIdentity()
+            replacements[identity] = replacement
+        return replacement
+
+    def fresh_entry(entry):
+        if type(entry) is ObservedFile:
+            return ObservedFile(entry.state, fresh_identity(entry.identity))
+        if type(entry) is ObservedDirectory:
+            return ObservedDirectory(
+                entry.state,
+                fresh_identity(entry.identity),
+                entry.has_unmodeled_child,
+            )
+        return entry
+
+    return JointObservation(
+        persistent=tuple(
+            PersistentObservation(item.path, fresh_entry(item.entry))
+            for item in observation.persistent
+        ),
+        scratch=tuple(
+            ScratchObservation(
+                item.effect_id,
+                item.role,
+                fresh_entry(item.entry),
+                item.file_build_relation,
+            )
+            for item in observation.scratch
+        ),
+        parent_occupancy=observation.parent_occupancy,
+    )
+```
 
 `_precondition_changed_halt`:
 
@@ -2857,7 +3129,8 @@ Expected: all pass.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/atoms/core/recovery/authorization.py src/atoms/core/recovery/__init__.py tests/test_recovery_authorization.py
+git add src/atoms/core/recovery/authorization.py src/atoms/core/recovery/__init__.py \
+  tests/conftest.py tests/test_recovery_authorization.py tests/recovery_support.py
 git commit -m "feat(recovery): authorize fresh recovery steps"
 ```
 
@@ -2872,6 +3145,7 @@ status documents only after every A3 test and full repository check passes.
 - Create: `python/tests/test_recovery_properties.py`
 - Create: `python/tests/test_recovery_architecture.py`
 - Modify: `python/tests/recovery_support.py`
+- Modify: `python/tests/conftest.py`
 - Modify: `README.md`
 - Modify: `AGENTS.md`
 - Modify: `docs/plans/2026-07-28-a3-recovery-reference-model-design.md`
@@ -2883,6 +3157,9 @@ status documents only after every A3 test and full repository check passes.
 - [ ] **Step 1: Add bounded exhaustive journal/state properties**
 
 Create `python/tests/test_recovery_properties.py`. Enumerate products, not random samples:
+
+Task 10 adds `generated_snapshots`, `identity_case`, and `halt_restart_case` adapters to
+`conftest.py` in the same commit as their `make_*` factories.
 
 ```python
 from itertools import product
@@ -3033,7 +3310,17 @@ def test_public_surface_has_exactly_five_operations():
 
 def test_recovery_package_has_no_io_or_sqlite_imports():
     root = Path(__file__).parents[1] / "src" / "atoms" / "core" / "recovery"
-    forbidden = {"os", "pathlib", "sqlite3", "subprocess", "ctypes"}
+    forbidden = {
+        "ctypes",
+        "datetime",
+        "os",
+        "pathlib",
+        "random",
+        "secrets",
+        "sqlite3",
+        "subprocess",
+        "time",
+    }
     for source_path in root.glob("*.py"):
         tree = ast.parse(source_path.read_text())
         imports = set()
@@ -3052,7 +3339,10 @@ def test_a3_does_not_accept_raw_transaction_spec():
 ```
 
 Add an AST test that `classifier.py`, `journal.py`, and `variants.py` never access `.dependencies`, and
-an import test proving `atoms.core.recovery` imports without a filesystem/backend module.
+an import test proving `atoms.core.recovery` imports without a filesystem/backend module. Also inspect
+the collected fixture names and fail if any test argument other than a parameterized name or pytest
+builtin lacks a definition in `conftest.py`; this is the standing lock for the fixture registry rather
+than a one-time plan review.
 
 - [ ] **Step 5: Run the complete A3 mutation checklist**
 
@@ -3063,15 +3353,18 @@ Apply one mutation at a time, run the named focused tests, and revert each mutat
 | classify move paths independently | joint move table/property |
 | share APPLIED and COMMITTED decision | committed-never-rolls-back |
 | accept STARTED followed by UNDONE | journal-language regression |
+| accept UNDONE after the PENDING tail begins | reverse-language tail regression |
 | recompute halted diagnostic | restart diagnostic equality |
 | store raw identity token in diagnostic | token-free field/round-trip test |
 | require prefix relation for completed replace | conditional relation test |
 | dispatch no-op replace through general rows | no-op precedence matrix |
+| compare fresh authorization by raw dataclass equality | fresh alpha-renamed authorization |
 | authorize stale observation | authorization mismatch |
 | authorize non-mutating step | protocol-error test |
 | use lexical topology | resolved descendant test |
 | treat every absent scratch as landed | variant absence matrices |
 | omit reverse intermediate | reducer prefix/fixed-point test |
+| retain construction relation after leaving STARTED/pre | reducer relation-transition tests |
 | catch unexpected exception | internal-fault propagation |
 
 - [ ] **Step 6: Run final repository verification**
@@ -3115,15 +3408,18 @@ Before implementation begins, verify:
 - [ ] Every row in all five variant tables is exercised in Tasks 6–7 and the finite generators.
 - [ ] `DONE` rollback has explicit per-variant coverage separate from `UNDO_STARTED`.
 - [ ] No-op replace has its own precedence and mutation test.
-- [ ] Diagnostics contain full journals and named-slot relations, never identity tokens.
+- [ ] Diagnostics distinguish durable source journals from projected conflict journals and retain
+  named-slot relations, never identity tokens.
 - [ ] Conditional `file_build_relation` evidence is tested in both required and forbidden positions.
 - [ ] Prefix reduction precedes fresh authorization, and non-mutating steps cannot be authorized.
+- [ ] Fresh authorization compares exact non-identity fields plus identity partitions, not tokens.
 - [ ] Repeated-path planning advances a pure cursor through Task 4's reducer before classifying each
   earlier effect; no second projection algorithm exists.
 - [ ] Reducer fixed points cover restored, refused, committed, first-halt, repeated-halt, and detached
   terminal outcomes.
 - [ ] A3 remains pure and stdlib-only.
 - [ ] No task contains placeholder language or an undefined public interface.
+- [ ] Every pytest argument is parameterized, built in, or registered explicitly in `conftest.py`.
 
 ## Execution handoff
 

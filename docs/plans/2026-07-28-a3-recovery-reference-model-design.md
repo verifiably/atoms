@@ -194,10 +194,10 @@ terminal detachment and a second recovery pass. `RollbackResult` is absent until
 detachment cannot erase whether the engine owes a clean rollback outcome or `PreconditionRefused`.
 
 `HaltDiagnostic` is absent before the first halt and present exactly when `transaction_state` is
-`HALTED`. It freezes the pre-halt transaction state, the unchanged `CommitDecision`, the journal
-state vector in compiled effect order, token-free expected and observed evidence, one closed
-`HaltReason`, and the operator action. A second pass returns that stored diagnostic rather than
-recomputing it with `HALTED` as the origin state.
+`HALTED`. It freezes the pre-halt transaction state, the unchanged `CommitDecision`, the durable
+journal state vector in compiled effect order, any separately labeled projected cursor state,
+token-free expected and observed evidence, one closed `HaltReason`, and the operator action. A second
+pass returns that stored diagnostic rather than recomputing it with `HALTED` as the origin state.
 
 ### 5.2 Logical scratch roles
 
@@ -252,6 +252,11 @@ ObservedDirectory(
 `EntryIdentity` is an opaque, snapshot-local equality token carried only by regular files and
 directories. A3 may only compare two identities for equality. Tokens are not serialized, logged
 through arbitrary `repr`, or interpreted as `st_dev` / `st_ino`.
+
+Within one coherent observation, A6/A7 allocate exactly one token for each observed underlying entry
+and reuse it in every named slot that denotes that entry. Distinct entries receive distinct tokens.
+Every separately captured observation creates a fresh token universe: identity meaning is the
+equality partition among named slots, never equality with a token from an earlier observation.
 
 A symlink carries no A3 identity. Its observation is the weaker `lstat` + `readlink`
 `symlink_fingerprint` contract from authority §§5.5 and 6; it is not descriptor-coherent and A3 never
@@ -340,7 +345,10 @@ filesystem evidence.
 
 `authorize_recovery_step` validates the joint observation's exact node coverage and closed runtime
 types. Missing, extra, duplicated, or incoherent evidence is `ProtocolError`; well-shaped evidence
-that differs from the plan precondition yields `PLAN_PRECONDITION_CHANGED`.
+that differs from the plan precondition yields `PLAN_PRECONDITION_CHANGED`. Agreement means exact
+equality of every non-identity field plus equality of the named-slot identity partition. It never
+compares an expected token with a freshly observed token, because those values belong to different
+token universes.
 
 ## 6. Transaction classifier
 
@@ -373,6 +381,9 @@ must be settled before any reverse effect, so `STARTED` followed by `UNDONE` is 
 reversed. A well-typed but illegal combination produces a halt plan and preserves evidence; it is
 never normalized into a plausible history.
 
+Once the reverse language reaches its `PENDING*` tail, no later `UNDONE` is legal. Thus
+`PENDING UNDONE` and `UNDONE PENDING UNDONE` are contradictions, not alternative reverse frontiers.
+
 The state, commit decision, and active binding are validated jointly:
 
 - `PREPARED`, `APPLYING`, `APPLIED`, `ROLLING_BACK`, and `ROLLED_BACK` require `UNCOMMITTED`;
@@ -401,6 +412,11 @@ Forward and reverse path frontiers follow authority §8.4. A `PENDING` frontier 
 from the preceding post-state is external drift. It is preserved and produces a refused rollback
 outcome. A completed frontier whose live or retained scratch evidence is inconsistent is
 unattributable and halts.
+
+Each reconstructed `PathFrontier` carries both a continuity baseline and the closed set of states
+admissible at the selected occurrence. For an in-flight `STARTED` occurrence the baseline is still one
+state, while the admissible set contains pre/intermediate/post as the variant defines. Consumers never
+treat the baseline as the whole admissible set.
 
 All persistent paths owned by one effect are classified together. A move can never be "landed" for
 its destination while independently "not landed" for its source.
@@ -475,9 +491,10 @@ object identity. Applying it to a value-unequal snapshot is `ProtocolError`; pla
 capabilities.
 
 Before each filesystem-mutating step, A7 obtains one fresh coherent joint observation and calls
-`authorize_recovery_step`. Exact agreement returns a factory-controlled `AuthorizedStep`. Any mismatch
-returns a halt plan with stable reason `PLAN_PRECONDITION_CHANGED`. A7 may not silently retry,
-reclassify, or reinterpret the stale step.
+`authorize_recovery_step`. Exact state/occupancy/build-relation agreement plus the same named-slot
+identity partition returns a factory-controlled `AuthorizedStep`; raw tokens are never compared across
+the plan and fresh-observation universes. Any mismatch returns a halt plan with stable reason
+`PLAN_PRECONDITION_CHANGED`. A7 may not silently retry, reclassify, or reinterpret the stale step.
 
 `step_index` must select a filesystem-mutating `TransformEffectTuple` or `RemoveScratch`. Naming
 `TransitionTransactionState`, `TransitionEffectState`, `PreserveExternal`, or `DetachActive` is
@@ -504,11 +521,14 @@ A halt plan contains no project or scratch mutation. A first halt may persist on
 - the transition to transaction state `HALTED`; and
 - its structured diagnostic.
 
-The diagnostic contains the pre-halt transaction state, preserved commit decision, full journal state
-vector in compiled effect order, effect and logical paths when applicable, token-free expected and
-observed tuple projections, one `HaltReason`, and a non-mutating operator action. Tuple projections
-retain exact path states, entry kinds, prefix/occupancy facts, and the identity relations the
-classifier used between named slots:
+The diagnostic contains the durable source's pre-halt transaction state, preserved commit decision,
+and full journal state vector in compiled effect order. When classification discovers a contradiction
+after advancing its pure planning cursor, the diagnostic also names the cursor's completed semantic
+prefix and labels its expected and observed tuples as projected conflict evidence; it never presents
+that cursor as durable state. The diagnostic additionally carries the effect and logical paths when
+applicable, one `HaltReason`, and a non-mutating operator action. Tuple projections retain exact path
+states, entry kinds, prefix/occupancy facts, and the identity relations the classifier used between
+named slots:
 
 ```text
 DiagnosticIdentityRelation(left_slot, right_slot, relation: SAME | DIFFERENT)
@@ -533,6 +553,12 @@ with the current snapshot's identity tokens.
 - the terminal rollback transition records its exact `RollbackResult`;
 - the first halt preserves `CommitDecision` and stores its exact `HaltDiagnostic`; and
 - terminal detachment clears the abstract active binding.
+
+After every step, the reducer reconstructs conditional `file_build_relation` evidence from the
+resulting journal state and live/staging tuple before invoking the snapshot factory. A transition out
+of `STARTED` drops construction-only evidence; a transition or tuple transformation into one of
+§5.4's two construction cases installs the relation carried by that step's result. No intermediate
+snapshot retains evidence that its new state makes irrelevant.
 
 It produces these fixed points:
 
@@ -796,9 +822,12 @@ Properties lock:
 - a committed halt retains its commit decision and frozen first-halt diagnostic;
 - halt diagnostics round-trip without identity tokens and remain equal across a regenerated token
   universe;
+- a mid-plan contradiction keeps durable source journals separate from labeled projected cursor
+  journals;
 - halt preserves filesystem evidence;
 - `dependencies` never affect ordering;
 - plan/source binding and exact step authorization;
+- fresh authorization succeeds across consistently regenerated identity tokens;
 - construction evidence is required only in §5.4's two forward cases;
 - identity-token renaming invariance;
 - reducer convergence and second-pass idempotence;
@@ -812,6 +841,7 @@ Mutation checks must demonstrate that the tests fail when:
 - a `ROLLING_BACK` history accepts `STARTED` followed by `UNDONE`;
 - an already halted snapshot recomputes its diagnostic from state `HALTED`;
 - a stale step is authorized;
+- fresh but alpha-renamed identity evidence is rejected;
 - a non-mutating step receives filesystem authorization;
 - a symlink is given decisive opaque identity;
 - a no-op replace is dispatched through the overlapping general rows;
@@ -828,7 +858,8 @@ equivalence. It also creates downstream obligations:
 - A4 constructs and retains the resolved logical topology A3 consumes in production.
 - A5 persists A3's transaction/effect transitions, separate commit decision, rollback result, and
   token-free frozen first-halt diagnostic in plan order.
-- A6/A7 produce coherent identity, prefix, and directory-occupancy evidence.
+- A6/A7 produce coherent identity, prefix, and directory-occupancy evidence, allocating one token per
+  observed entry within each observation and a fresh token universe for every new observation.
 - A7 executes only A3-authorized steps and does not rederive recovery decisions.
 - A8 tests the real executor against A3's decisions and fixed points.
 
