@@ -213,12 +213,19 @@ _STEP_TYPES = {
 }
 
 
+def _validate_transform_payload(step: TransformEffectTuple) -> None:
+    if type(step.variant) is not EffectVariant:
+        raise ProtocolError("transform variant must be an exact EffectVariant")
+    if type(step.settlement) is not SettlementKind:
+        raise ProtocolError("transform settlement must be an exact SettlementKind")
+
+
 def _validate_steps(steps: tuple[RecoveryStep, ...]) -> None:
     if type(steps) is not tuple or any(type(step) not in _STEP_TYPES for step in steps):
         raise ProtocolError("plan steps must be an exact tuple of closed step variants")
     for step in steps:
-        if type(step) is TransformEffectTuple and type(step.variant) is not EffectVariant:
-            raise ProtocolError("transform variant must be an exact EffectVariant")
+        if type(step) is TransformEffectTuple:
+            _validate_transform_payload(step)
         if type(step) is not TransitionTransactionState:
             continue
         has_result = step.rollback_result is not None
@@ -239,6 +246,8 @@ def _new_action_plan(
     disposition: PlanDisposition,
     steps: tuple[RecoveryStep, ...],
 ) -> ActionPlan:
+    if type(disposition) is not PlanDisposition:
+        raise ProtocolError("action plan disposition must be an exact PlanDisposition")
     _validate_steps(steps)
     expected_result = {
         PlanDisposition.ROLL_BACK: RollbackResult.RESTORED,
@@ -264,6 +273,8 @@ def _new_halt_plan(
     diagnostic: HaltDiagnostic,
     steps: tuple[TransitionTransactionState, ...],
 ) -> HaltPlan:
+    if type(steps) is not tuple or any(type(step) is not TransitionTransactionState for step in steps):
+        raise ProtocolError("halt plan steps must be an exact tuple of TransitionTransactionState")
     if bound_snapshot.transaction_state is TransactionState.HALTED:
         valid = not steps and bound_snapshot.halt_diagnostic == diagnostic
     else:
@@ -298,6 +309,8 @@ def _new_authorized_step(
 ) -> AuthorizedStep:
     if type(step) not in {TransformEffectTuple, RemoveScratch}:
         raise ProtocolError("authorized step must be filesystem-mutating")
+    if type(step) is TransformEffectTuple:
+        _validate_transform_payload(step)
     return AuthorizedStep(
         plan=plan,
         step_index=step_index,

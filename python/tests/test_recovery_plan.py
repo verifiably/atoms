@@ -8,6 +8,7 @@ from atoms.core.recovery import (
     AuthorizedStep,
     CommitDecision,
     EffectJournalState,
+    EffectVariant,
     HaltDiagnostic,
     HaltPlan,
     HaltReason,
@@ -17,6 +18,7 @@ from atoms.core.recovery import (
     OperatorAction,
     PlanDisposition,
     RollbackResult,
+    SettlementKind,
     TransactionState,
 )
 from atoms.core.recovery.plan import (
@@ -205,7 +207,51 @@ def test_halt_plan_factory_accepts_only_bound_halt_transition():
         )
 
 
-def test_transform_step_is_an_authorized_mutation_variant():
+@pytest.mark.parametrize(
+    "steps",
+    [
+        lambda transition: [transition],
+        lambda transition: (object(),),
+    ],
+)
+def test_halt_plan_factory_refuses_non_exact_step_containers_and_types(steps):
+    snapshot = create_snapshot()
+    diagnostic = _halt_diagnostic()
+    transition = TransitionTransactionState(
+        from_state=snapshot.transaction_state,
+        to_state=TransactionState.HALTED,
+        rollback_result=None,
+        halt_diagnostic=diagnostic,
+    )
+    with pytest.raises(ProtocolError):
+        _new_halt_plan(
+            bound_snapshot=snapshot,
+            diagnostic=diagnostic,
+            steps=steps(transition),  # type: ignore[arg-type]
+        )
+
+
+def test_action_factory_refuses_non_exact_disposition():
+    with pytest.raises(ProtocolError, match="disposition"):
+        _new_action_plan(
+            bound_snapshot=create_snapshot(),
+            disposition=[],  # type: ignore[arg-type]
+            steps=(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("variant", "settlement", "message"),
+    [
+        (None, SettlementKind.RESTORE_PRE, "variant"),
+        (EffectVariant.CREATE_FILE_NO_CLOBBER, None, "settlement"),
+    ],
+)
+def test_transform_steps_require_exact_enum_payloads_at_factory_boundaries(
+    variant,
+    settlement,
+    message,
+):
     snapshot = create_snapshot()
     plan = _new_action_plan(
         bound_snapshot=snapshot,
@@ -215,10 +261,17 @@ def test_transform_step_is_an_authorized_mutation_variant():
     observation = JointObservation((), (), ())
     step = TransformEffectTuple(
         effect_id="e1",
-        variant=None,  # type: ignore[arg-type]
-        settlement=None,  # type: ignore[arg-type]
+        variant=variant,  # type: ignore[arg-type]
+        settlement=settlement,  # type: ignore[arg-type]
         expected_before=observation,
         result_after=observation,
         identity_relations=(),
     )
-    assert _new_authorized_step(plan, 0, step).step is step
+    with pytest.raises(ProtocolError, match=message):
+        _new_action_plan(
+            bound_snapshot=snapshot,
+            disposition=PlanDisposition.ROLL_BACK,
+            steps=(step,),
+        )
+    with pytest.raises(ProtocolError, match=message):
+        _new_authorized_step(plan, 0, step)
