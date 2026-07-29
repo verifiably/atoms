@@ -111,10 +111,16 @@ non-builtin pytest argument missing from `conftest.py`.
 | `metadata_root` | Task 4 | fresh, non-existent `Path` under `test_volume` for one test |
 | `project_root` | Task 4 | fresh, existing `Path` under `test_volume` for one test |
 | `held_lock` | Task 4 | callable `(metadata_root) -> HeldProjectLock` context manager |
-| `fake_backend` | Task 5 | callable `(supplied: set[Capability], **errno_overrides) -> Backend` |
+| `fake_backend` | Task 4 | callable `(supplied: set[Capability], lock_excludes=True, **errno_overrides) -> Backend` |
 | `test_allowlist` | Task 6 | callable `(configuration, storage) -> DurabilityAllowlist` singleton |
 | `bound_volume` | Task 6 | callable yielding an active `ProjectBinding` on `test_volume` |
 | `distinct_volume` | Task 6 | `Path` on a writable mount with a different mount ID; skips if none |
+
+Not every shared helper is a fixture. `tests.fs_support` also exports plain context managers —
+`metadata_layout`, `probe_directory`, `probe_database_path` — imported directly by the tests that need
+them. They are not fixtures because they take the *lock* as an argument, and a fixture cannot receive a
+value a test constructs. Each exists to give returned descriptors exactly one owner: `ensure_metadata_layout`
+hands back one descriptor per layout component, and a test that drops that return value leaks all four.
 
 **Conftest hygiene.** Several tasks below say "append to `conftest.py`". Append the *fixture bodies*,
 but consolidate imports into the single existing import block at the top of the file — repeating
@@ -394,7 +400,9 @@ def renameat2(olddirfd: int, oldpath: bytes, newdirfd: int, newpath: bytes, flag
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `uv run pytest tests/test_fs_syscalls.py -v`
-Expected: PASS (7 tests)
+Expected: PASS. Every test in the named files must pass; the only acceptable non-pass is a
+`test_volume`/`distinct_volume` skip with its stated reason. Do not accept a bare count as
+evidence — read the skip lines.
 
 - [ ] **Step 5: Write the failing platform-selection and purity tests**
 
@@ -534,7 +542,12 @@ def select_backend():
 
 In `python/tests/test_recovery_architecture.py`, delete
 `test_recovery_package_has_no_io_or_sqlite_imports` (lines 228-248). Its denylist is superseded by the
-allowlist in `test_fs_architecture.py`, which covers all of `atoms/core` including `recovery/`.
+allowlist in `test_fs_architecture.py`, which covers all of `atoms/core` including `recovery/` and
+forbids `atoms.fs` besides — a strict superset, so nothing is lost by removing it.
+
+Deleting that test leaves `_python_imports` (line 39) with no caller. Delete it in the same edit: a
+helper kept "in case" is how a denylist grows a second life. `ast` stays imported — other tests in the
+file use it.
 
 - [ ] **Step 9: Declare the package for packaging**
 
@@ -582,6 +595,12 @@ The protocol carries exactly one operation set per §5.5 capability and no `supp
 method — a backend that reported its own capabilities would make the evidence circular. Root
 establishment is specified here because `O_NOFOLLOW` guards only the final component.
 
+`UNSUPPORTED_ERRNO` lives in `backend.py` alongside the protocol rather than in `probe.py`, because it is
+part of the operation contract and has **two** consumers: the probe, and the bootstrap path in Task 4,
+which converts the traversal and lock entries to `CapabilityUnavailable` per design §10. `probe.py`
+imports `lock.py`, so a table defined in `probe.py` could not be reached from `lock.py` without a cycle,
+and a second copy would drift.
+
 **Files:**
 - Create: `python/src/atoms/fs/backend.py`
 - Create: `python/src/atoms/fs/linux.py`
@@ -601,6 +620,7 @@ establishment is specified here because `O_NOFOLLOW` guards only the final compo
     `open_regular_nofollow(parent_fd: int, name: str) -> int`,
     `symlink_fingerprint(parent_fd: int, name: str) -> tuple[os.stat_result, str]`,
     `lock_exclusive(fd: int) -> None`, `try_lock_exclusive(fd: int) -> bool`
+  - `UNSUPPORTED_ERRNO: dict[str, frozenset[int]]` in `atoms.fs.backend`, keyed by operation name
   - `LinuxBackend` implementing it
   - `tests.fs_support.resolve_test_volume() -> Path | None`
 
@@ -615,7 +635,31 @@ import stat
 
 import pytest
 
+from atoms.fs.backend import UNSUPPORTED_ERRNO
 from atoms.fs.linux import LinuxBackend
+
+
+def test_unsupported_errno_sets_exclude_ambiguous_generic_failures():
+    # A generic failure must never be readable as "this volume lacks the operation":
+    # that would report a durable volume as capability-poor (design §10).
+    for operation, codes in UNSUPPORTED_ERRNO.items():
+        assert errno.EBADF not in codes, operation
+        assert errno.EMFILE not in codes, operation
+        assert errno.EFAULT not in codes, operation
+
+
+def test_unsupported_errno_covers_every_probed_operation():
+    # The bootstrap path in Task 4 reads "traversal" and "lock" from this same table.
+    assert set(UNSUPPORTED_ERRNO) == {
+        "exchange",
+        "flush",
+        "link_anchor",
+        "lock",
+        "open_regular_nofollow",
+        "symlink_fingerprint",
+        "transfer_noclobber",
+        "traversal",
+    }
 
 
 def test_open_root_opens_an_existing_directory(test_volume, linux_backend):
@@ -676,10 +720,14 @@ def test_open_child_directory_refuses_a_symlink(test_volume, linux_backend):
 
 
 def test_open_child_directory_refuses_a_parent_component(test_volume, linux_backend):
+    # RESOLVE_BENEATH reports an escape as EXDEV. The exact code matters: the probe
+    # treats this refusal as evidence the guard works, so any other errno there is
+    # an unrelated failure and must propagate rather than be read as success.
     parent = linux_backend.open_root(str(test_volume))
     try:
-        with pytest.raises(OSError):
+        with pytest.raises(OSError) as caught:
             linux_backend.open_child_directory(parent, "..")
+        assert caught.value.errno == errno.EXDEV
     finally:
         os.close(parent)
 
@@ -893,8 +941,38 @@ trusted to assert.
 
 from __future__ import annotations
 
+import errno
 import os
 from typing import Protocol
+
+# Errno values that conclusively mean "this volume does not support the operation".
+#
+# EINVAL from renameat2 and EPERM from link are ambiguous in general — they equally
+# signal a malformed argument or a permission failure. What disambiguates them is
+# the probe precondition: every probe constructs its own operands, inside a
+# directory it created, under the held project lock, immediately before the call.
+# Arguments are therefore valid and permissions guaranteed by construction, so
+# neither interpretation is reachable. The same errno from any other call site
+# propagates.
+#
+# The table lives here, beside the protocol, because it has two consumers: probe.py
+# reports absence from it, and lock.py converts the "traversal" and "lock" entries to
+# CapabilityUnavailable on the bootstrap path (design §10). probe.py imports lock.py,
+# so defining it there would force either a cycle or a second copy that drifts.
+UNSUPPORTED_ERRNO: dict[str, frozenset[int]] = {
+    "exchange": frozenset({errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP, errno.ENOTSUP}),
+    "transfer_noclobber": frozenset(
+        {errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP, errno.ENOTSUP}
+    ),
+    "link_anchor": frozenset({errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP}),
+    "flush": frozenset({errno.EINVAL, errno.EOPNOTSUPP, errno.ENOTSUP}),
+    "open_regular_nofollow": frozenset({errno.EOPNOTSUPP, errno.ENOTSUP}),
+    "symlink_fingerprint": frozenset({errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP}),
+    "lock": frozenset({errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOTSUP}),
+    # ENOSYS is the kernel without openat2. EOPNOTSUPP/ENOTSUP is a backend that
+    # cannot supply the guarded walk at all — the shape a restricted backend takes.
+    "traversal": frozenset({errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP}),
+}
 
 
 class Backend(Protocol):
@@ -1016,7 +1094,9 @@ class LinuxBackend:
 - [ ] **Step 6: Run the tests to verify they pass**
 
 Run: `uv run pytest tests/test_fs_backend.py tests/test_fs_architecture.py -v`
-Expected: PASS (18 tests)
+Expected: PASS. Every test in the named files must pass; the only acceptable non-pass is a
+`test_volume`/`distinct_volume` skip with its stated reason. Do not accept a bare count as
+evidence — read the skip lines.
 
 - [ ] **Step 7: Commit**
 
@@ -1156,6 +1236,49 @@ def test_build_configuration_reads_per_mount_only_values(mountinfo_text):
     assert "dirsync" in configuration.barrier_options
 
 
+def test_build_configuration_normalizes_absent_xfs_options(mountinfo_text):
+    # Exact tuple, not membership: shipping a barrier table for a filesystem means
+    # shipping a durability claim about it, and a silently added or dropped option
+    # changes which allowlist entry a real volume matches.
+    entries = parse_mountinfo(mountinfo_text("xfs_defaults"))
+    entry = next(item for item in entries if item.mount_point == "/data")
+    configuration = build_configuration(entry, "7.1.5-arch1-1")
+    assert configuration.barrier_options == ("async", "barrier=1")
+
+
+def test_build_configuration_reads_xfs_super_only_values(mountinfo_text):
+    # wsync appears only in field 11, so a field-6-only parser reports the default.
+    entries = parse_mountinfo(mountinfo_text("xfs_wsync"))
+    entry = next(item for item in entries if item.mount_point == "/data")
+    configuration = build_configuration(entry, "7.1.5-arch1-1")
+    assert configuration.barrier_options == ("async", "barrier=1", "wsync")
+
+
+def test_build_configuration_normalizes_absent_btrfs_options(mountinfo_text):
+    entries = parse_mountinfo(mountinfo_text("btrfs_defaults"))
+    entry = next(item for item in entries if item.mount_point == "/data")
+    configuration = build_configuration(entry, "7.1.5-arch1-1")
+    assert configuration.barrier_options == ("barrier=1", "commit=30", "noflushoncommit")
+
+
+def test_build_configuration_reads_btrfs_super_only_values(mountinfo_text):
+    # An explicit flushoncommit and a non-default commit interval must both survive;
+    # normalizing either to its default would silently widen the certified claim.
+    entries = parse_mountinfo(mountinfo_text("btrfs_flushoncommit"))
+    entry = next(item for item in entries if item.mount_point == "/data")
+    configuration = build_configuration(entry, "7.1.5-arch1-1")
+    assert configuration.barrier_options == ("barrier=1", "commit=15", "flushoncommit")
+
+
+def test_every_supported_filesystem_has_normalization_coverage(mountinfo_text):
+    # A table entry with no fixture is an untested durability claim. This fails the
+    # moment a filesystem is added to the table without a defaults fixture.
+    for filesystem in ("ext4", "xfs", "btrfs"):
+        entries = parse_mountinfo(mountinfo_text(f"{filesystem}_defaults"))
+        entry = next(item for item in entries if item.mount_point == "/data")
+        assert build_configuration(entry, "7.1.5-arch1-1").filesystem_type == filesystem
+
+
 def test_build_configuration_carries_the_exact_kernel_and_backend_revision(mountinfo_text):
     entries = parse_mountinfo(mountinfo_text("ext4_defaults"))
     entry = next(item for item in entries if item.mount_point == "/data")
@@ -1225,6 +1348,25 @@ _MOUNTINFO_CASES = {
     ),
     "ext4_sync": (
         "41 25 259:2 / /data rw,sync,dirsync shared:2 - ext4 /dev/nvme0n1p2 rw\n"
+    ),
+    # Every filesystem in the barrier table gets a defaults fixture and a
+    # super-options-only fixture. Shipping a table without both would ship an
+    # untested durability claim (design §11.1).
+    "xfs_defaults": (
+        "41 25 259:2 / /data rw,noatime shared:2 - xfs /dev/nvme0n1p2 "
+        "rw,attr2,inode64,logbufs=8,logbsize=32k,noquota\n"
+    ),
+    "xfs_wsync": (
+        "41 25 259:2 / /data rw,noatime shared:2 - xfs /dev/nvme0n1p2 "
+        "rw,wsync,attr2,inode64,noquota\n"
+    ),
+    "btrfs_defaults": (
+        "41 25 0:33 /@ /data rw,noatime shared:2 - btrfs /dev/nvme0n1p2 "
+        "rw,space_cache=v2,subvolid=256,subvol=/@\n"
+    ),
+    "btrfs_flushoncommit": (
+        "41 25 0:33 /@ /data rw,noatime shared:2 - btrfs /dev/nvme0n1p2 "
+        "rw,flushoncommit,commit=15,space_cache=v2,subvolid=256,subvol=/@\n"
     ),
     "escaped_space": (
         "41 25 259:2 / /mnt/my\\040volume rw,noatime shared:2 - ext4 /dev/nvme0n1p2 rw\n"
@@ -1486,7 +1628,9 @@ def kernel_identifier() -> str:
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `uv run pytest tests/test_fs_volume.py -v`
-Expected: PASS (16 tests)
+Expected: PASS. Every test in the named files must pass; the only acceptable non-pass is a
+`test_volume`/`distinct_volume` skip with its stated reason. Do not accept a bare count as
+evidence — read the skip lines.
 
 - [ ] **Step 6: Commit**
 
@@ -1503,6 +1647,12 @@ git commit -m "feat(fs): resolve mount identity and durability configuration"
 rather than adopted. `HeldProjectLock` is factory-controlled because downstream signatures treat its
 type as proof a lock is held.
 
+Two things arrive here that a reader might expect later. The **restricted backend** comes in this task,
+not Task 5, because acquisition is the first place an absent capability must be refused. And root
+establishment must **not** normalize before the guarded walk: `os.path.abspath` calls `normpath`, which
+collapses `..` lexically, so `aliased/../elsewhere` becomes `elsewhere` and `RESOLVE_NO_SYMLINKS` never
+sees `aliased`. Normalization is therefore deferred until the walk has proved the path symlink-free.
+
 **Files:**
 - Create: `python/src/atoms/fs/lock.py`
 - Create: `python/src/atoms/fs/bootstrap.py`
@@ -1512,13 +1662,14 @@ type as proof a lock is held.
 - Modify: `python/tests/conftest.py`
 
 **Interfaces:**
-- Consumes: `Backend`, `atoms.fs.platform.select_backend`.
+- Consumes: `Backend`, `UNSUPPORTED_ERRNO`, `atoms.fs.platform.select_backend`.
 - Produces:
   - `HeldProjectLock` with `backend`, `metadata_root_fd`, `metadata_root_path`, `held`,
     `__enter__`, `__exit__`
-  - `acquire_project_lock(backend: Backend, metadata_root: str) -> HeldProjectLock`
+  - `acquire_project_lock(backend: Backend, metadata_root: str) -> HeldProjectLock`, raising
+    `CapabilityUnavailable` when `anchored_traversal` or `advisory_project_lock` is unavailable
   - `establish_root(backend, path: str, create: bool) -> tuple[int, str, bool]` returning
-    `(fd, normalized_path, created)`
+    `(fd, normalized_path, created)`, where normalization happens only after the guarded walk
   - `ensure_metadata_layout(lock: HeldProjectLock) -> dict[str, int]`
   - `reclaim_probe_survivors(lock: HeldProjectLock) -> None`
   - `verified_child_path(metadata_root_fd, metadata_root_path, expected_device, expected_inode, name) -> str`
@@ -1531,14 +1682,16 @@ Create `python/tests/test_fs_lock.py`:
 
 ```python
 import dataclasses
+import errno
 import os
 import subprocess
 import sys
 
 import pytest
 
-from atoms.core.errors import ProtocolError
-from atoms.fs.lock import HeldProjectLock, acquire_project_lock
+from atoms.core.capabilities import Capability
+from atoms.core.errors import CapabilityUnavailable, ProtocolError
+from atoms.fs.lock import HeldProjectLock, acquire_project_lock, establish_root
 
 
 def test_acquire_creates_metadata_root_and_lock(linux_backend, metadata_root):
@@ -1561,12 +1714,51 @@ def test_metadata_root_path_is_normalized_and_absolute(linux_backend, metadata_r
         assert lock.metadata_root_path == os.path.abspath(str(metadata_root))
 
 
+def test_establish_root_normalizes_only_after_the_guarded_walk(linux_backend, test_volume):
+    # os.path.abspath calls normpath, which collapses 'aliased/..' lexically to
+    # test_volume — a real directory that exists — so a normalize-first
+    # implementation would succeed here and never show the kernel the symlink.
+    # The path the caller wrote must reach openat2 with its spelling intact.
+    real = test_volume / "real"
+    real.mkdir()
+    (test_volume / "aliased").symlink_to(real)
+    with pytest.raises(OSError) as caught:
+        establish_root(linux_backend, str(test_volume / "aliased" / ".."), create=False)
+    assert caught.value.errno == errno.ELOOP
+
+
+def test_establish_root_resolves_a_parent_component_after_a_real_directory(
+    linux_backend, test_volume
+):
+    # The converse of the test above, so the guard is not merely refusing every '..':
+    # with no symlink in the path, the lexical and kernel resolutions agree, and
+    # normalization after the walk is what produces the returned pathname.
+    (test_volume / "real").mkdir()
+    fd, normalized, created = establish_root(
+        linux_backend, str(test_volume / "real" / ".."), create=False
+    )
+    try:
+        assert created is False
+        assert normalized == os.path.abspath(str(test_volume))
+        assert os.fstat(fd).st_ino == os.stat(test_volume).st_ino
+    finally:
+        os.close(fd)
+
+
+def test_acquire_refuses_a_parent_component_as_the_leaf(linux_backend, metadata_root):
+    # Because normalization is deferred, '..' can still be the final component when
+    # the creation branch is reached. mkdir('..') is not a coherent request.
+    with pytest.raises(ProtocolError, match="final component"):
+        acquire_project_lock(linux_backend, str(metadata_root / "absent" / ".."))
+
+
 def test_acquire_refuses_a_symlink_at_lock(linux_backend, metadata_root):
     metadata_root.mkdir(parents=True)
     (metadata_root / "lock").symlink_to("/etc/passwd")
-    with pytest.raises(OSError):
+    with pytest.raises(OSError) as caught:
         with acquire_project_lock(linux_backend, str(metadata_root)):
             pass
+    assert caught.value.errno == errno.ELOOP
 
 
 def test_acquire_refuses_a_directory_at_lock(linux_backend, metadata_root):
@@ -1580,9 +1772,30 @@ def test_acquire_refuses_a_directory_at_lock(linux_backend, metadata_root):
 def test_acquire_refuses_a_missing_parent(linux_backend, metadata_root):
     # A4a creates only the final leaf, never intermediate directories.
     deep = metadata_root / "absent" / "store"
-    with pytest.raises(OSError):
+    with pytest.raises(OSError) as caught:
         with acquire_project_lock(linux_backend, str(deep)):
             pass
+    assert caught.value.errno == errno.ENOENT
+
+
+def test_absent_anchored_traversal_refuses_with_capability_unavailable(
+    metadata_root, fake_backend
+):
+    # Design §10 assigns an unavailable bootstrap prerequisite to
+    # CapabilityUnavailable, not a bare OSError: nothing has gone wrong at the
+    # syscall level, the volume simply cannot supply the guarded walk. This is also
+    # the shape a kernel without openat2 takes, which reports ENOSYS.
+    backend = fake_backend(supplied=set(Capability) - {Capability.ANCHORED_TRAVERSAL})
+    with pytest.raises(CapabilityUnavailable, match="anchored_traversal"):
+        acquire_project_lock(backend, str(metadata_root))
+
+
+def test_absent_advisory_lock_refuses_with_capability_unavailable(
+    metadata_root, fake_backend
+):
+    backend = fake_backend(supplied=set(Capability) - {Capability.ADVISORY_PROJECT_LOCK})
+    with pytest.raises(CapabilityUnavailable, match="advisory_project_lock"):
+        acquire_project_lock(backend, str(metadata_root))
 
 
 def test_sets_the_sync_ignore_marker_on_creation(linux_backend, metadata_root):
@@ -1639,26 +1852,61 @@ def test_lock_refuses_ordinary_construction():
         HeldProjectLock()
 
 
+def test_lock_refuses_dataclass_replacement():
+    # HeldProjectLock is deliberately NOT a dataclass — it owns descriptors and a
+    # spent flag, which are not value semantics — so replace() refuses for want of
+    # __dataclass_fields__ rather than for want of the token. Either way, no copy of
+    # a held lock can be fabricated, which is what downstream signatures rely on.
+    with pytest.raises(TypeError):
+        dataclasses.replace(object.__new__(HeldProjectLock))
+
+
+_CONTENDER = (
+    "import fcntl, sys\n"
+    "handle = open(sys.argv[1], 'r+')\n"
+    "try:\n"
+    "    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+    "except BlockingIOError:\n"
+    "    sys.exit(3)\n"
+    "sys.exit(0)\n"
+)
+
+
 def test_a_second_process_cannot_acquire_the_same_lock(linux_backend, metadata_root):
     with acquire_project_lock(linux_backend, str(metadata_root)):
-        script = (
-            "import fcntl, sys\n"
-            f"handle = open({str(metadata_root / 'lock')!r}, 'r+')\n"
-            "try:\n"
-            "    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
-            "except OSError:\n"
-            "    sys.exit(3)\n"
-            "sys.exit(0)\n"
+        finished = subprocess.run(
+            [sys.executable, "-c", _CONTENDER, str(metadata_root / "lock")], timeout=30
         )
-        finished = subprocess.run([sys.executable, "-c", script], timeout=30)
     assert finished.returncode == 3
+
+
+def test_a_second_process_can_acquire_once_the_lock_is_released(
+    linux_backend, metadata_root
+):
+    # The other direction, which design §11.3 requires: without it, a lock that
+    # never grants to anyone would satisfy the exclusion test above.
+    with acquire_project_lock(linux_backend, str(metadata_root)):
+        pass
+    finished = subprocess.run(
+        [sys.executable, "-c", _CONTENDER, str(metadata_root / "lock")], timeout=30
+    )
+    assert finished.returncode == 0
 ```
 
-- [ ] **Step 2: Add the root fixtures**
+- [ ] **Step 2: Add the root fixtures, the restricted backend, and the layout owner**
+
+The restricted backend arrives here rather than in Task 5 because Task 4 is the first task that must
+refuse on an absent capability, and its tests need a backend that withholds one.
 
 Append to `python/tests/fs_support.py`:
 
 ```python
+import errno as _errno
+
+from atoms.core.capabilities import Capability
+from atoms.fs.linux import LinuxBackend
+
+
 def make_metadata_root(base):
     """A path that does NOT yet exist, so bootstrap creation is exercised."""
     return base / "metadata"
@@ -1668,13 +1916,92 @@ def make_project_root(base):
     root = base / "project"
     root.mkdir()
     return root
+
+
+class RestrictedBackend:
+    """A capability-restricted backend proving the protocol admits a non-Linux one.
+
+    It delegates to a real LinuxBackend for supplied capabilities and raises a
+    chosen errno for absent ones, so every refusal branch is reachable without a
+    filesystem that genuinely lacks the operation.
+    """
+
+    _ABSENT_ERRNO = _errno.EOPNOTSUPP
+
+    def __init__(self, supplied, lock_excludes=True, **errno_overrides):
+        self._supplied = set(supplied)
+        self._lock_excludes = lock_excludes
+        self._overrides = errno_overrides
+        self._real = LinuxBackend()
+
+    def _dispatch(self, capability, operation, *args):
+        # Keyed on '<operation>_errno' so a caller writes exchange_errno=EBADF and
+        # reads naturally, rather than passing a bare operation name as a kwarg.
+        override = self._overrides.get(f"{operation}_errno")
+        if override is not None:
+            raise OSError(override, "injected")
+        if capability not in self._supplied:
+            raise OSError(self._ABSENT_ERRNO, "capability withheld")
+        return getattr(self._real, operation)(*args)
+
+    def open_root(self, path):
+        return self._dispatch(Capability.ANCHORED_TRAVERSAL, "open_root", path)
+
+    def open_child_directory(self, parent_fd, name):
+        return self._dispatch(
+            Capability.ANCHORED_TRAVERSAL, "open_child_directory", parent_fd, name
+        )
+
+    def exchange(self, parent_fd, left, right):
+        return self._dispatch(Capability.ATOMIC_EXCHANGE, "exchange", parent_fd, left, right)
+
+    def transfer_noclobber(self, src_fd, src, dst_fd, dst):
+        return self._dispatch(
+            Capability.NOCLOBBER_TRANSFER, "transfer_noclobber", src_fd, src, dst_fd, dst
+        )
+
+    def link_anchor(self, src_fd, src, dst_fd, dst):
+        return self._dispatch(Capability.IDENTITY_ANCHOR, "link_anchor", src_fd, src, dst_fd, dst)
+
+    def flush_file(self, fd):
+        return self._dispatch(Capability.DURABLE_PUBLISH, "flush_file", fd)
+
+    def flush_directory(self, fd):
+        return self._dispatch(Capability.DURABLE_PUBLISH, "flush_directory", fd)
+
+    def open_regular_nofollow(self, parent_fd, name):
+        return self._dispatch(
+            Capability.NOFOLLOW_COHERENT_READ, "open_regular_nofollow", parent_fd, name
+        )
+
+    def symlink_fingerprint(self, parent_fd, name):
+        return self._dispatch(
+            Capability.SYMLINK_FINGERPRINT, "symlink_fingerprint", parent_fd, name
+        )
+
+    def lock_exclusive(self, fd):
+        return self._dispatch(Capability.ADVISORY_PROJECT_LOCK, "lock_exclusive", fd)
+
+    def try_lock_exclusive(self, fd):
+        if not self._lock_excludes:
+            # A filesystem where flock succeeds but does not actually exclude —
+            # the real case on NFS without a working lock daemon.
+            return True
+        return self._dispatch(Capability.ADVISORY_PROJECT_LOCK, "try_lock_exclusive", fd)
+
+
+def make_fake_backend():
+    def build(supplied, lock_excludes=True, **errno_overrides):
+        return RestrictedBackend(supplied, lock_excludes=lock_excludes, **errno_overrides)
+
+    return build
 ```
 
 Append to `python/tests/conftest.py`:
 
 ```python
 from atoms.fs.lock import acquire_project_lock
-from tests.fs_support import make_metadata_root, make_project_root
+from tests.fs_support import make_fake_backend, make_metadata_root, make_project_root
 
 
 @pytest.fixture
@@ -1693,6 +2020,11 @@ def held_lock(linux_backend):
         return acquire_project_lock(linux_backend, str(metadata_root))
 
     return acquire
+
+
+@pytest.fixture
+def fake_backend():
+    return make_fake_backend()
 ```
 
 - [ ] **Step 3: Run the tests to verify they fail**
@@ -1713,35 +2045,73 @@ import errno
 import os
 import stat
 
-from atoms.core.errors import ProtocolError
-from atoms.fs.backend import Backend
+from atoms.core.errors import CapabilityUnavailable, ProtocolError
+from atoms.fs.backend import UNSUPPORTED_ERRNO, Backend
 
 SYNC_IGNORE_ATTRIBUTE = "user.com.dropbox.ignored"
 
 _TOKEN = object()
 
 
+def _guarded_spelling(path: str) -> str:
+    """Absolute form of `path` with empty and '.' components dropped, '..' KEPT.
+
+    os.path.abspath must NOT be used before the guarded walk: it calls normpath,
+    which collapses '..' lexically, so 'aliased/../elsewhere' becomes 'elsewhere'
+    and RESOLVE_NO_SYMLINKS never sees 'aliased' at all. Dropping '' and '.' is safe
+    under any symlink arrangement — neither changes which entry a path names — but
+    every '..' must reach the kernel, which refuses it exactly when an earlier
+    component is a symlink and resolves it normally otherwise.
+
+    os.getcwd() is itself symlink-free, so prefixing it introduces no component the
+    kernel would have to resolve.
+    """
+    absolute = path if os.path.isabs(path) else os.path.join(os.getcwd(), path)
+    kept = [component for component in absolute.split(os.sep) if component not in ("", ".")]
+    return os.sep + os.sep.join(kept)
+
+
+def _guarded_open(backend: Backend, path: str) -> int:
+    """open_root, converting an unavailable guarded walk per design §10.
+
+    Reads the shared backend table rather than a local copy, so a kernel without
+    openat2 surfaces identically here and in the probe.
+    """
+    try:
+        return backend.open_root(path)
+    except OSError as caught:
+        if caught.errno in UNSUPPORTED_ERRNO["traversal"]:
+            raise CapabilityUnavailable(
+                f"anchored_traversal is unavailable, so no root can be guarded: {path!r}"
+            ) from caught
+        raise
+
+
 def establish_root(backend: Backend, path: str, create: bool) -> tuple[int, str, bool]:
     """Open a root through guarded traversal, optionally creating its final leaf.
 
-    Returns (descriptor, normalized path, created). The normalization is lexical,
-    which is safe precisely because the guarded walk refuses a symlink at every
-    component: with no symlink in the path, collapsing '.' and '..' cannot change
-    which entry it names.
+    Returns (descriptor, normalized path, created). Normalization runs only AFTER
+    the guarded walk succeeds, and that ordering is the whole point: the walk proves
+    no component is a symlink, and only then can collapsing '..' not change which
+    entry the path names.
     """
-    normalized = os.path.abspath(path)
+    spelled = _guarded_spelling(path)
     try:
-        return backend.open_root(normalized), normalized, False
+        fd = _guarded_open(backend, spelled)
     except OSError as caught:
         if not create or caught.errno != errno.ENOENT:
             raise
-    parent, leaf = os.path.split(normalized)
-    if not leaf:
-        raise ProtocolError(f"cannot create a root without a final component: {path!r}")
+    else:
+        return fd, os.path.normpath(spelled), False
+    parent, leaf = os.path.split(spelled)
+    if not leaf or leaf == "..":
+        raise ProtocolError(
+            f"cannot create a root whose final component is {leaf!r}: {path!r}"
+        )
     # Only the final leaf is created, and only relative to a guarded parent
     # descriptor. A missing parent refuses: a component walk that creates as it
     # goes has races this layer has no need to take on.
-    parent_fd = backend.open_root(parent)
+    parent_fd = _guarded_open(backend, parent)
     try:
         os.mkdir(leaf, mode=0o700, dir_fd=parent_fd)
         # Reopen through guarded traversal even though we just created it, so the
@@ -1751,8 +2121,8 @@ def establish_root(backend: Backend, path: str, create: bool) -> tuple[int, str,
         os.close(parent_fd)
     if not stat.S_ISDIR(os.fstat(fd).st_mode):
         os.close(fd)
-        raise ProtocolError(f"created metadata root is not a directory: {normalized!r}")
-    return fd, normalized, True
+        raise ProtocolError(f"created metadata root is not a directory: {spelled!r}")
+    return fd, os.path.normpath(spelled), True
 
 
 class HeldProjectLock:
@@ -1831,7 +2201,15 @@ def acquire_project_lock(backend: Backend, metadata_root: str) -> HeldProjectLoc
     try:
         if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
             raise ProtocolError("metadata_root/lock is not a regular file")
-        backend.lock_exclusive(lock_fd)
+        try:
+            backend.lock_exclusive(lock_fd)
+        except OSError as caught:
+            if caught.errno in UNSUPPORTED_ERRNO["lock"]:
+                raise CapabilityUnavailable(
+                    "advisory_project_lock is unavailable on this volume, so access to "
+                    "metadata_root cannot be serialized"
+                ) from caught
+            raise
     except BaseException:
         os.close(lock_fd)
         os.close(root_fd)
@@ -1848,14 +2226,44 @@ def acquire_project_lock(backend: Backend, metadata_root: str) -> HeldProjectLoc
 - [ ] **Step 5: Run the lock tests to verify they pass**
 
 Run: `uv run pytest tests/test_fs_lock.py -v`
-Expected: PASS (13 tests)
+Expected: PASS. Every test in the named files must pass; the only acceptable non-pass is a
+`test_volume`/`distinct_volume` skip with its stated reason. Do not accept a bare count as
+evidence — read the skip lines.
 
-- [ ] **Step 6: Write the failing bootstrap tests**
+- [ ] **Step 6: Add the layout owner and write the failing bootstrap tests**
+
+`ensure_metadata_layout` returns one retained descriptor per component, so every caller must own them.
+No test calls it directly; they go through a context manager that closes each exactly once.
+
+Append to `python/tests/fs_support.py`:
+
+```python
+import contextlib
+
+from atoms.fs.bootstrap import ensure_metadata_layout
+
+
+@contextlib.contextmanager
+def metadata_layout(lock):
+    """Own the descriptors ensure_metadata_layout returns; close each exactly once.
+
+    A test that drops the return value leaks one descriptor per layout component and
+    silently violates the plan's own close-exactly-once audit, which is why the audit
+    gets a helper rather than a reminder.
+    """
+    retained = ensure_metadata_layout(lock)
+    try:
+        yield retained
+    finally:
+        for fd in retained.values():
+            os.close(fd)
+```
 
 Create `python/tests/test_fs_bootstrap.py`:
 
 ```python
 import os
+import stat
 
 import pytest
 
@@ -1866,24 +2274,42 @@ from atoms.fs.bootstrap import (
     reclaim_probe_survivors,
     verified_child_path,
 )
+from tests.fs_support import metadata_layout
 
 
 def test_layout_creates_every_directory(held_lock, metadata_root):
     with held_lock(metadata_root) as lock:
-        ensure_metadata_layout(lock)
+        with metadata_layout(lock):
+            pass
     for relative in METADATA_LAYOUT:
         assert (metadata_root / relative).is_dir()
 
 
+def test_layout_returns_one_owned_descriptor_per_component(held_lock, metadata_root):
+    # The return value is the ownership contract: one descriptor per component,
+    # each a directory, each O_CLOEXEC, and each the caller's to close.
+    with held_lock(metadata_root) as lock:
+        with metadata_layout(lock) as retained:
+            assert sorted(retained) == sorted(METADATA_LAYOUT)
+            for relative, fd in retained.items():
+                assert stat.S_ISDIR(os.fstat(fd).st_mode), relative
+                assert os.get_inheritable(fd) is False, relative
+
+
 def test_layout_is_idempotent_over_existing_directories(held_lock, metadata_root):
     with held_lock(metadata_root) as lock:
-        ensure_metadata_layout(lock)
-        ensure_metadata_layout(lock)
+        with metadata_layout(lock):
+            pass
+        with metadata_layout(lock) as retained:
+            assert sorted(retained) == sorted(METADATA_LAYOUT)
     assert (metadata_root / "blobs" / "sha256").is_dir()
 
 
 def test_layout_refuses_a_symlink_occupying_a_name(held_lock, metadata_root):
     # Tolerating EEXIST without reopening would adopt whatever occupies the name.
+    # These two refusal tests are the only ones that call ensure_metadata_layout
+    # directly, and legitimately so: it raises, returns nothing, and closes what it
+    # had already opened, so there is no descriptor for a caller to own.
     with held_lock(metadata_root) as lock:
         os.symlink("/etc", "staging", dir_fd=lock.metadata_root_fd)
         with pytest.raises((OSError, ProtocolError)):
@@ -1906,23 +2332,23 @@ def test_reclamation_is_a_noop_when_probe_is_absent(held_lock, metadata_root):
 
 def test_reclamation_empties_a_real_probe_directory(held_lock, metadata_root):
     with held_lock(metadata_root) as lock:
-        ensure_metadata_layout(lock)
-        probe = metadata_root / "probe"
-        (probe / "nested").mkdir()
-        (probe / "nested" / "file").write_text("debris")
-        (probe / "loose").write_text("debris")
-        reclaim_probe_survivors(lock)
-        assert probe.is_dir()
-        assert list(probe.iterdir()) == []
+        with metadata_layout(lock):
+            probe = metadata_root / "probe"
+            (probe / "nested").mkdir()
+            (probe / "nested" / "file").write_text("debris")
+            (probe / "loose").write_text("debris")
+            reclaim_probe_survivors(lock)
+            assert probe.is_dir()
+            assert list(probe.iterdir()) == []
 
 
 def test_reclamation_does_not_follow_a_symlink_out_of_probe(held_lock, metadata_root, test_volume):
     outside = test_volume / "outside"
     outside.write_text("must survive")
     with held_lock(metadata_root) as lock:
-        ensure_metadata_layout(lock)
-        (metadata_root / "probe" / "escape").symlink_to(outside)
-        reclaim_probe_survivors(lock)
+        with metadata_layout(lock):
+            (metadata_root / "probe" / "escape").symlink_to(outside)
+            reclaim_probe_survivors(lock)
     assert outside.read_text() == "must survive"
     assert list((metadata_root / "probe").iterdir()) == []
 
@@ -1998,7 +2424,6 @@ Create `python/src/atoms/fs/bootstrap.py`:
 
 from __future__ import annotations
 
-import errno
 import os
 import stat
 
@@ -2121,7 +2546,9 @@ def verified_child_path(
 - [ ] **Step 9: Run the tests to verify they pass**
 
 Run: `uv run pytest tests/test_fs_bootstrap.py tests/test_fs_lock.py -v`
-Expected: PASS (25 tests)
+Expected: PASS. Every test in the named files must pass; the only acceptable non-pass is a
+`test_volume`/`distinct_volume` skip with its stated reason. Do not accept a bare count as
+evidence — read the skip lines.
 
 - [ ] **Step 10: Commit**
 
@@ -2143,17 +2570,51 @@ lock, which is what licenses an ambiguous errno to conclude "absent".
 - Create: `python/src/atoms/fs/probe.py`
 - Create: `python/tests/test_fs_probe.py`
 - Modify: `python/tests/fs_support.py`
-- Modify: `python/tests/conftest.py`
 
 **Interfaces:**
-- Consumes: `Backend`, `HeldProjectLock`, `bootstrap.verified_child_path`,
+- Consumes: `Backend`, `UNSUPPORTED_ERRNO`, `HeldProjectLock`, `bootstrap.verified_child_path`,
   `atoms.core.capabilities.Capability`.
 - Produces:
   - `probe_backend(backend: Backend, probe_root_fd: int, lock: HeldProjectLock) -> frozenset[Capability]`
-  - `certify_sqlite_wal(database_path: str) -> None` raising `CapabilityUnavailable`
-  - `UNSUPPORTED_ERRNO: dict[str, frozenset[int]]`
+  - `certify_sqlite_wal(database_path: str, cleanup: bool = False) -> None` raising
+    `CapabilityUnavailable`
+  - `tests.fs_support.probe_directory(lock)` context manager
 
-- [ ] **Step 1: Write the failing probe tests**
+- [ ] **Step 1: Add the probe-directory owner**
+
+Append to `python/tests/fs_support.py`:
+
+```python
+@contextlib.contextmanager
+def probe_directory(lock):
+    """Yield an owned descriptor to `probe/` with the whole layout owned around it.
+
+    Building the layout and then reopening `probe/` separately would strand the four
+    layout descriptors, so the probe descriptor is taken from the layout itself.
+    """
+    with metadata_layout(lock) as retained:
+        yield retained["probe"]
+
+
+@contextlib.contextmanager
+def probe_database_path(lock):
+    """Yield the verified pathname of a throwaway database inside `probe/`.
+
+    Goes through verified_child_path rather than joining, because that is the only
+    sanctioned way a pathname escapes the descriptor discipline (design §9.4).
+    """
+    with metadata_layout(lock):
+        info = os.fstat(lock.metadata_root_fd)
+        probe_dir = verified_child_path(
+            lock.metadata_root_fd, lock.metadata_root_path, info.st_dev, info.st_ino, "probe"
+        )
+        yield os.path.join(probe_dir, "certify.db")
+```
+
+Add `from atoms.fs.bootstrap import ensure_metadata_layout, verified_child_path` to the existing
+`fs_support.py` bootstrap import rather than adding a second import line.
+
+- [ ] **Step 2: Write the failing probe tests**
 
 Create `python/tests/test_fs_probe.py`:
 
@@ -2161,48 +2622,35 @@ Create `python/tests/test_fs_probe.py`:
 import errno
 import os
 import sqlite3
+import subprocess
 
 import pytest
 
 from atoms.core.capabilities import Capability
 from atoms.core.errors import CapabilityUnavailable
-from atoms.fs.bootstrap import ensure_metadata_layout, verified_child_path
-from atoms.fs.probe import UNSUPPORTED_ERRNO, certify_sqlite_wal, probe_backend
-
-
-def _probe_fd(lock):
-    ensure_metadata_layout(lock)
-    return lock.backend.open_child_directory(lock.metadata_root_fd, "probe")
+from atoms.fs.probe import certify_sqlite_wal, probe_backend
+from tests.fs_support import probe_database_path, probe_directory
 
 
 def test_real_volume_supplies_every_capability(held_lock, metadata_root):
     with held_lock(metadata_root) as lock:
-        probe_fd = _probe_fd(lock)
-        try:
+        with probe_directory(lock) as probe_fd:
             supplied = probe_backend(lock.backend, probe_fd, lock)
-        finally:
-            os.close(probe_fd)
     assert supplied == frozenset(Capability)
 
 
 def test_probe_leaves_no_survivors(held_lock, metadata_root):
     with held_lock(metadata_root) as lock:
-        probe_fd = _probe_fd(lock)
-        try:
+        with probe_directory(lock) as probe_fd:
             probe_backend(lock.backend, probe_fd, lock)
             assert os.listdir(probe_fd) == []
-        finally:
-            os.close(probe_fd)
 
 
 def test_missing_exchange_is_reported_not_raised(held_lock, metadata_root, fake_backend):
     backend = fake_backend(supplied=set(Capability) - {Capability.ATOMIC_EXCHANGE})
     with held_lock(metadata_root) as lock:
-        probe_fd = _probe_fd(lock)
-        try:
+        with probe_directory(lock) as probe_fd:
             supplied = probe_backend(backend, probe_fd, lock)
-        finally:
-            os.close(probe_fd)
     assert Capability.ATOMIC_EXCHANGE not in supplied
     assert Capability.NOCLOBBER_TRANSFER in supplied
 
@@ -2220,11 +2668,8 @@ def test_missing_exchange_is_reported_not_raised(held_lock, metadata_root, fake_
 def test_each_optional_capability_can_be_absent(held_lock, metadata_root, fake_backend, absent):
     backend = fake_backend(supplied=set(Capability) - {absent})
     with held_lock(metadata_root) as lock:
-        probe_fd = _probe_fd(lock)
-        try:
+        with probe_directory(lock) as probe_fd:
             supplied = probe_backend(backend, probe_fd, lock)
-        finally:
-            os.close(probe_fd)
     assert absent not in supplied
 
 
@@ -2234,70 +2679,109 @@ def test_unexpected_errno_propagates_rather_than_reporting_absence(
     # EBADF is a bug or an environmental failure, never an unsupported operation.
     backend = fake_backend(supplied=set(Capability), exchange_errno=errno.EBADF)
     with held_lock(metadata_root) as lock:
-        probe_fd = _probe_fd(lock)
-        try:
+        with probe_directory(lock) as probe_fd:
             with pytest.raises(OSError) as caught:
                 probe_backend(backend, probe_fd, lock)
             assert caught.value.errno == errno.EBADF
-        finally:
-            os.close(probe_fd)
 
 
-def test_unsupported_errno_sets_exclude_ambiguous_generic_failures():
-    for operation, codes in UNSUPPORTED_ERRNO.items():
-        assert errno.EBADF not in codes, operation
-        assert errno.EMFILE not in codes, operation
-        assert errno.EFAULT not in codes, operation
+@pytest.mark.parametrize("code", [errno.EBADF, errno.EIO])
+def test_a_traversal_refusal_with_the_wrong_errno_propagates(
+    held_lock, metadata_root, fake_backend, code
+):
+    # The traversal probe reads two refusals as evidence its guard works. Accepting
+    # any OSError there would let a volume failing for an unrelated reason report
+    # anchored_traversal present, which is the §10 propagation rule read backwards.
+    backend = fake_backend(supplied=set(Capability), open_child_directory_errno=code)
+    with held_lock(metadata_root) as lock:
+        with probe_directory(lock) as probe_fd:
+            with pytest.raises(OSError) as caught:
+                probe_backend(backend, probe_fd, lock)
+            assert caught.value.errno == code
+
+
+@pytest.mark.parametrize("code", [errno.EBADF, errno.EIO])
+def test_a_nofollow_refusal_with_the_wrong_errno_propagates(
+    held_lock, metadata_root, fake_backend, code
+):
+    backend = fake_backend(supplied=set(Capability), open_regular_nofollow_errno=code)
+    with held_lock(metadata_root) as lock:
+        with probe_directory(lock) as probe_fd:
+            with pytest.raises(OSError) as caught:
+                probe_backend(backend, probe_fd, lock)
+            assert caught.value.errno == code
 
 
 def test_sqlite_wal_certification_succeeds_on_the_test_volume(held_lock, metadata_root):
     with held_lock(metadata_root) as lock:
-        ensure_metadata_layout(lock)
-        info = os.fstat(lock.metadata_root_fd)
-        probe_dir = verified_child_path(
-            lock.metadata_root_fd, lock.metadata_root_path, info.st_dev, info.st_ino, "probe"
-        )
-        certify_sqlite_wal(os.path.join(probe_dir, "certify.db"))
+        with probe_database_path(lock) as database:
+            certify_sqlite_wal(database)
 
 
 def test_sqlite_certification_observes_the_commit_across_processes(held_lock, metadata_root):
     with held_lock(metadata_root) as lock:
-        ensure_metadata_layout(lock)
-        info = os.fstat(lock.metadata_root_fd)
-        probe_dir = verified_child_path(
-            lock.metadata_root_fd, lock.metadata_root_path, info.st_dev, info.st_ino, "probe"
-        )
-        database = os.path.join(probe_dir, "certify.db")
-        certify_sqlite_wal(database)
-        # The child's committed user_version=2 must be what survives.
-        connection = sqlite3.connect(database)
-        try:
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
-        finally:
-            connection.close()
+        with probe_database_path(lock) as database:
+            certify_sqlite_wal(database)
+            # The second child's committed user_version=2 must be what survives.
+            connection = sqlite3.connect(database)
+            try:
+                assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+            finally:
+                connection.close()
+
+
+def test_certification_uses_two_children_so_the_parent_can_release_between_them(
+    held_lock, metadata_root, monkeypatch
+):
+    # The parent must release the write lock BETWEEN the contending child and the
+    # writing child. One blocking child cannot express that: it would wait for the
+    # parent's commit while the parent waited for it to exit, and the choreography
+    # would resolve only by one side timing out. Two invocations make the release
+    # point explicit, and this test is what stops a later "simplification" back to
+    # one child from looking harmless.
+    real_run = subprocess.run
+    scripts = []
+
+    def recording_run(argv, **kwargs):
+        scripts.append(argv[2])
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr("atoms.fs.probe.subprocess.run", recording_run)
+    with held_lock(metadata_root) as lock:
+        with probe_database_path(lock) as database:
+            certify_sqlite_wal(database)
+    assert len(scripts) == 2
+    assert "user_version=2" not in scripts[0], "the contending child must not write"
+    assert "user_version=2" in scripts[1], "the writing child must run after the release"
 
 
 def test_sqlite_certification_removes_its_files(held_lock, metadata_root):
     with held_lock(metadata_root) as lock:
-        ensure_metadata_layout(lock)
-        probe_fd = lock.backend.open_child_directory(lock.metadata_root_fd, "probe")
-        try:
+        with probe_directory(lock) as probe_fd:
             info = os.fstat(lock.metadata_root_fd)
             probe_dir = verified_child_path(
                 lock.metadata_root_fd, lock.metadata_root_path, info.st_dev, info.st_ino, "probe"
             )
             certify_sqlite_wal(os.path.join(probe_dir, "certify.db"), cleanup=True)
             assert os.listdir(probe_fd) == []
-        finally:
-            os.close(probe_fd)
 
 
 def test_sqlite_certification_refuses_when_wal_is_unavailable(tmp_path, monkeypatch):
+    class Cursor:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchone(self):
+            return self._rows[0] if self._rows else None
+
     class RefusingConnection:
         def execute(self, statement, *args):
+            # Production calls .fetchone() on what execute returns, so the fake must
+            # be cursor-shaped. Returning a bare list raises AttributeError and the
+            # test would pass for the wrong reason.
             if "journal_mode" in statement:
-                return [("delete",)]
-            return []
+                return Cursor([("delete",)])
+            return Cursor([])
 
         def close(self):
             pass
@@ -2305,105 +2789,48 @@ def test_sqlite_certification_refuses_when_wal_is_unavailable(tmp_path, monkeypa
     monkeypatch.setattr("atoms.fs.probe.sqlite3.connect", lambda *a, **k: RefusingConnection())
     with pytest.raises(CapabilityUnavailable, match="WAL"):
         certify_sqlite_wal(str(tmp_path / "x.db"))
+
+
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [
+        (ChildExit.STALE_READ, "could not read"),
+        (ChildExit.ACQUIRED_WHILE_HELD, "acquired the write lock"),
+        (ChildExit.WRONG_REFUSAL, "SQLITE_BUSY"),
+    ],
+)
+def test_each_child_verdict_refuses_with_its_own_reason(
+    held_lock, metadata_root, monkeypatch, code, expected
+):
+    # Exit codes are named, not literal, so a reordering cannot silently remap
+    # 'refused with the wrong result code' onto 'read the wrong value'. WRONG_REFUSAL
+    # is the one that matters most: it is how a volume whose WAL index never opens
+    # is kept from masquerading as one that correctly excludes a second writer.
+    def fake_run(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, code, b"", b"")
+
+    monkeypatch.setattr("atoms.fs.probe.subprocess.run", fake_run)
+    with held_lock(metadata_root) as lock:
+        with probe_database_path(lock) as database:
+            with pytest.raises(CapabilityUnavailable, match=expected):
+                certify_sqlite_wal(database)
 ```
 
-- [ ] **Step 2: Add the fake backend**
-
-Append to `python/tests/fs_support.py`:
+The imports at the top of this file are, in full:
 
 ```python
-import errno as _errno
+import errno
+import os
+import sqlite3
+import subprocess
+
+import pytest
 
 from atoms.core.capabilities import Capability
-from atoms.fs.linux import LinuxBackend
-
-
-class RestrictedBackend:
-    """A capability-restricted backend proving the protocol admits a non-Linux one.
-
-    It delegates to a real LinuxBackend for supplied capabilities and raises a
-    chosen errno for absent ones, so every refusal branch is reachable without a
-    filesystem that genuinely lacks the operation.
-    """
-
-    _ABSENT_ERRNO = _errno.EOPNOTSUPP
-
-    def __init__(self, supplied, lock_excludes=True, **errno_overrides):
-        self._supplied = set(supplied)
-        self._lock_excludes = lock_excludes
-        self._overrides = errno_overrides
-        self._real = LinuxBackend()
-
-    def _dispatch(self, capability, operation, *args):
-        override = self._overrides.get(operation)
-        if override is not None:
-            raise OSError(override, "injected")
-        if capability not in self._supplied:
-            raise OSError(self._ABSENT_ERRNO, "capability withheld")
-        return getattr(self._real, operation)(*args)
-
-    def open_root(self, path):
-        return self._dispatch(Capability.ANCHORED_TRAVERSAL, "open_root", path)
-
-    def open_child_directory(self, parent_fd, name):
-        return self._dispatch(
-            Capability.ANCHORED_TRAVERSAL, "open_child_directory", parent_fd, name
-        )
-
-    def exchange(self, parent_fd, left, right):
-        return self._dispatch(Capability.ATOMIC_EXCHANGE, "exchange", parent_fd, left, right)
-
-    def transfer_noclobber(self, src_fd, src, dst_fd, dst):
-        return self._dispatch(
-            Capability.NOCLOBBER_TRANSFER, "transfer_noclobber", src_fd, src, dst_fd, dst
-        )
-
-    def link_anchor(self, src_fd, src, dst_fd, dst):
-        return self._dispatch(Capability.IDENTITY_ANCHOR, "link_anchor", src_fd, src, dst_fd, dst)
-
-    def flush_file(self, fd):
-        return self._dispatch(Capability.DURABLE_PUBLISH, "flush_file", fd)
-
-    def flush_directory(self, fd):
-        return self._dispatch(Capability.DURABLE_PUBLISH, "flush_directory", fd)
-
-    def open_regular_nofollow(self, parent_fd, name):
-        return self._dispatch(
-            Capability.NOFOLLOW_COHERENT_READ, "open_regular_nofollow", parent_fd, name
-        )
-
-    def symlink_fingerprint(self, parent_fd, name):
-        return self._dispatch(
-            Capability.SYMLINK_FINGERPRINT, "symlink_fingerprint", parent_fd, name
-        )
-
-    def lock_exclusive(self, fd):
-        return self._dispatch(Capability.ADVISORY_PROJECT_LOCK, "lock_exclusive", fd)
-
-    def try_lock_exclusive(self, fd):
-        if not self._lock_excludes:
-            # A filesystem where flock succeeds but does not actually exclude —
-            # the real case on NFS without a working lock daemon.
-            return True
-        return self._dispatch(Capability.ADVISORY_PROJECT_LOCK, "try_lock_exclusive", fd)
-
-
-def make_fake_backend():
-    def build(supplied, lock_excludes=True, **errno_overrides):
-        return RestrictedBackend(supplied, lock_excludes=lock_excludes, **errno_overrides)
-
-    return build
-```
-
-Append to `python/tests/conftest.py`:
-
-```python
-from tests.fs_support import make_fake_backend
-
-
-@pytest.fixture
-def fake_backend():
-    return make_fake_backend()
+from atoms.core.errors import CapabilityUnavailable
+from atoms.fs.bootstrap import verified_child_path
+from atoms.fs.probe import ChildExit, certify_sqlite_wal, probe_backend
+from tests.fs_support import probe_database_path, probe_directory
 ```
 
 - [ ] **Step 3: Run the tests to verify they fail**
@@ -2436,33 +2863,30 @@ import sys
 
 from atoms.core.capabilities import Capability
 from atoms.core.errors import CapabilityUnavailable
-from atoms.fs.backend import Backend
+from atoms.fs.backend import UNSUPPORTED_ERRNO, Backend
 from atoms.fs.lock import HeldProjectLock
 
-# Errno values that conclusively mean "this volume does not support the operation".
-#
-# EINVAL from renameat2 and EPERM from link are ambiguous in general — they equally
-# signal a malformed argument or a permission failure. What disambiguates them is
-# the probe precondition: every probe constructs its own operands, inside a
-# directory it created, under the held project lock, immediately before the call.
-# Arguments are therefore valid and permissions guaranteed by construction, so
-# neither interpretation is reachable. The same errno from any other call site
-# propagates.
-UNSUPPORTED_ERRNO: dict[str, frozenset[int]] = {
-    "exchange": frozenset({errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP, errno.ENOTSUP}),
-    "transfer_noclobber": frozenset(
-        {errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP, errno.ENOTSUP}
-    ),
-    "link_anchor": frozenset({errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP}),
-    "flush": frozenset({errno.EINVAL, errno.EOPNOTSUPP, errno.ENOTSUP}),
-    "open_regular_nofollow": frozenset({errno.EOPNOTSUPP, errno.ENOTSUP}),
-    "symlink_fingerprint": frozenset({errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP}),
-    "lock": frozenset({errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOTSUP}),
-    "traversal": frozenset({errno.ENOSYS}),
-}
+
+class ChildExit:
+    """Exit codes the §8.3 certification children use to report a specific verdict.
+
+    Named rather than literal so a later reordering cannot silently remap "refused
+    with the wrong result code" onto "read the wrong value" — two very different
+    conclusions about a volume.
+    """
+
+    OK = 0
+    STALE_READ = 3
+    ACQUIRED_WHILE_HELD = 4
+    WRONG_REFUSAL = 5
 
 
 def _supported(operation: str, probe) -> bool:
+    """Run `probe`; report absence only for an errno that conclusively means it.
+
+    This decides *availability*. It is not the right tool for a probe step whose
+    evidence is a refusal — see `_refused_with`.
+    """
     try:
         probe()
     except OSError as caught:
@@ -2470,6 +2894,28 @@ def _supported(operation: str, probe) -> bool:
             return False
         raise
     return True
+
+
+def _refused_with(expected: int, open_attempt) -> bool:
+    """True if `open_attempt` refused with exactly `expected`; False if it succeeded.
+
+    A guard is proved by the exact errno it refuses with, never by "some OSError
+    happened". Accepting any error here would let a volume failing for an unrelated
+    reason — EBADF from a descriptor bug, EIO from failing media — report the guard
+    as working, which is design §10's propagation rule read backwards. Anything
+    other than `expected` therefore propagates.
+
+    `open_attempt` returns a descriptor when the guard fails to refuse; it is closed
+    here so a failed guard does not also leak.
+    """
+    try:
+        opened = open_attempt()
+    except OSError as caught:
+        if caught.errno == expected:
+            return True
+        raise
+    os.close(opened)
+    return False
 
 
 def _write(parent_fd: int, name: str, payload: bytes) -> None:
@@ -2501,17 +2947,24 @@ def _probe_traversal(backend: Backend, probe_fd: int) -> bool:
     os.mkdir("real", mode=0o700, dir_fd=probe_fd)
     os.symlink("real", "escape", dir_fd=probe_fd)
     try:
-        if not _supported("traversal", lambda: backend.open_child_directory(probe_fd, "real")):
+        # One open, not two: the availability check and the descriptor it produces are
+        # the same call. Opening again to "get a real one" would discard a descriptor.
+        opened: list[int] = []
+
+        def attempt():
+            opened.append(backend.open_child_directory(probe_fd, "real"))
+
+        if not _supported("traversal", attempt):
             return False
-        opened = backend.open_child_directory(probe_fd, "real")
-        os.close(opened)
-        for refused in ("escape", ".."):
-            try:
-                fd = backend.open_child_directory(probe_fd, refused)
-            except OSError:
-                continue
-            os.close(fd)
-            return False
+        os.close(opened[0])
+        # RESOLVE_NO_SYMLINKS reports a symlink component as ELOOP; RESOLVE_BENEATH
+        # reports an escape as EXDEV. Both refusals must arrive with exactly that
+        # code, or the guard is not what proved itself.
+        for refused, expected in (("escape", errno.ELOOP), ("..", errno.EXDEV)):
+            if not _refused_with(
+                expected, lambda name=refused: backend.open_child_directory(probe_fd, name)
+            ):
+                return False
         return True
     finally:
         os.unlink("escape", dir_fd=probe_fd)
@@ -2635,12 +3088,11 @@ def _probe_nofollow_read(backend: Backend, probe_fd: int) -> bool:
                 return False
         finally:
             os.close(opened[0])
-        try:
-            leaked = backend.open_regular_nofollow(probe_fd, "alias")
-        except OSError:
-            return True
-        os.close(leaked)
-        return False
+        # O_NOFOLLOW on a symlink leaf refuses with exactly ELOOP. Any other errno
+        # is an unrelated failure and must not be read as a working guard.
+        return _refused_with(
+            errno.ELOOP, lambda: backend.open_regular_nofollow(probe_fd, "alias")
+        )
     finally:
         _clear(probe_fd)
 
@@ -2687,25 +3139,52 @@ def probe_backend(
     return frozenset(supplied)
 
 
-_CHILD_READER = """
+# Design §8.3 steps 4-5: read the parent's committed state concurrently with the
+# parent's held write lock, then require the write lock to refuse. busy_timeout is 0
+# so the refusal is immediate rather than a wait.
+_CHILD_CONTENDER = f"""
 import sqlite3, sys
-database = sys.argv[1]
-connection = sqlite3.connect(database, timeout=0, isolation_level=None)
+connection = sqlite3.connect(sys.argv[1], timeout=0, isolation_level=None)
 if connection.execute("PRAGMA user_version").fetchone()[0] != 1:
-    sys.exit(3)
+    sys.exit({ChildExit.STALE_READ})
 try:
     connection.execute("BEGIN IMMEDIATE")
-except sqlite3.OperationalError:
-    pass
-else:
-    sys.exit(4)
-connection.execute("PRAGMA busy_timeout=10000")
+except sqlite3.OperationalError as caught:
+    # Only SQLITE_BUSY proves cross-process write exclusion. SQLite distinguishes it
+    # from I/O, protocol, permission, and internal errors, and a volume whose WAL
+    # index never opens at all would raise one of those — indistinguishable from
+    # correct exclusion if any OperationalError were accepted. Compare the PRIMARY
+    # code so an extended SQLITE_BUSY_* variant still counts.
+    if caught.sqlite_errorcode & 0xFF != sqlite3.SQLITE_BUSY:
+        sys.exit({ChildExit.WRONG_REFUSAL})
+    connection.close()
+    sys.exit({ChildExit.OK})
+sys.exit({ChildExit.ACQUIRED_WHILE_HELD})
+"""
+
+# Design §8.3 step 7, run only after the parent has committed. A SEPARATE invocation:
+# the parent cannot wait for a child that is itself waiting for the parent's commit.
+_CHILD_WRITER = f"""
+import sqlite3, sys
+connection = sqlite3.connect(sys.argv[1], timeout=30, isolation_level=None)
 connection.execute("BEGIN IMMEDIATE")
 connection.execute("PRAGMA user_version=2")
 connection.execute("COMMIT")
 connection.close()
-sys.exit(0)
+sys.exit({ChildExit.OK})
 """
+
+
+def _run_child(script: str, database_path: str) -> subprocess.CompletedProcess:
+    """Run one certification child under a bounded timeout.
+
+    Each child re-resolves the database by pathname. That is acceptable only because
+    probe/ is engine-owned, sits under the held project lock, and contains no
+    transaction state; the exemption extends to nothing outside probe/.
+    """
+    return subprocess.run(
+        [sys.executable, "-c", script, database_path], timeout=60, capture_output=True
+    )
 
 
 def certify_sqlite_wal(database_path: str, cleanup: bool = False) -> None:
@@ -2717,9 +3196,12 @@ def certify_sqlite_wal(database_path: str, cleanup: bool = False) -> None:
     WAL but not SQLite's cross-process POSIX locking contract, and the shared-memory
     WAL index exists precisely to coordinate readers across processes.
 
-    The child receives a pathname and re-resolves it. That is acceptable only
-    because probe/ is engine-owned, sits under the held project lock, and contains
-    no transaction state; the exemption extends to nothing outside probe/.
+    The choreography runs as TWO child invocations. The parent must release its write
+    lock between the contending read (steps 4-5) and the child write (step 7), and a
+    single blocking child cannot express that: the parent would block waiting for a
+    child that is blocked waiting for the parent's commit, and the sequence would
+    resolve only by one side timing out. Splitting at the release point makes the
+    ordering explicit and the outcome deterministic.
     """
     parent = sqlite3.connect(database_path, isolation_level=None)
     try:
@@ -2730,24 +3212,38 @@ def certify_sqlite_wal(database_path: str, cleanup: bool = False) -> None:
             )
         parent.execute("PRAGMA synchronous=FULL")
         parent.execute("PRAGMA user_version=1")
+
         parent.execute("BEGIN IMMEDIATE")
-        finished = subprocess.run(
-            [sys.executable, "-c", _CHILD_READER, database_path],
-            timeout=60,
-            capture_output=True,
-        )
-        parent.execute("COMMIT")
-        if finished.returncode == 3:
+        try:
+            contended = _run_child(_CHILD_CONTENDER, database_path)
+        finally:
+            # Release before inspecting the verdict, so no refusal path can leave the
+            # write lock held while the second child needs it.
+            parent.execute("COMMIT")
+        if contended.returncode == ChildExit.STALE_READ:
             raise CapabilityUnavailable(
-                "a second process could not read the committed WAL state"
+                "a second process could not read the committed WAL state while a "
+                "writer held the lock"
             )
-        if finished.returncode == 4:
+        if contended.returncode == ChildExit.ACQUIRED_WHILE_HELD:
             raise CapabilityUnavailable(
                 "a second process acquired the write lock while it was held"
             )
-        if finished.returncode != 0:
+        if contended.returncode == ChildExit.WRONG_REFUSAL:
             raise CapabilityUnavailable(
-                f"SQLite-WAL certification child failed: {finished.stderr!r}"
+                "a second process was refused the write lock with something other "
+                "than SQLITE_BUSY, so cross-process exclusion is unproven"
+            )
+        if contended.returncode != ChildExit.OK:
+            raise CapabilityUnavailable(
+                f"SQLite-WAL contention child failed: {contended.stderr!r}"
+            )
+
+        wrote = _run_child(_CHILD_WRITER, database_path)
+        if wrote.returncode != ChildExit.OK:
+            raise CapabilityUnavailable(
+                f"a second process could not write once the lock was released: "
+                f"{wrote.stderr!r}"
             )
         observed = parent.execute("PRAGMA user_version").fetchone()[0]
         if observed != 2:
@@ -2767,7 +3263,9 @@ def certify_sqlite_wal(database_path: str, cleanup: bool = False) -> None:
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `uv run pytest tests/test_fs_probe.py -v`
-Expected: PASS (16 tests)
+Expected: PASS. Every test in the named files must pass; the only acceptable non-pass is a
+`test_volume`/`distinct_volume` skip with its stated reason. Do not accept a bare count as
+evidence — read the skip lines.
 
 - [ ] **Step 6: Commit**
 
@@ -2813,6 +3311,7 @@ import pytest
 from atoms.core.capabilities import Capability
 from atoms.core.errors import CapabilityUnavailable, ProtocolError
 from atoms.fs.binding import ProjectBinding, VolumeEvidence, bind_project_volume
+from atoms.fs.lock import acquire_project_lock
 from atoms.fs.volume import CERTIFIED_ALLOWLIST, DurabilityAllowlist
 
 
@@ -2884,24 +3383,14 @@ def test_cross_volume_roots_refuse(
             )
 
 
-def test_absent_anchored_traversal_refuses_before_a_lock_is_even_held(
-    metadata_root, fake_backend
-):
-    from atoms.fs.lock import acquire_project_lock
-
-    backend = fake_backend(supplied=set(Capability) - {Capability.ANCHORED_TRAVERSAL})
-    with pytest.raises(OSError):
-        acquire_project_lock(backend, str(metadata_root))
-
-
 def test_a_lock_that_does_not_exclude_refuses_binding(
     project_root, metadata_root, fake_backend, test_allowlist, test_storage_profile
 ):
     # The bootstrap-prerequisite check is not dead code. flock can succeed while
     # failing to exclude — the real case on NFS without a working lock daemon — so
     # the probe reports advisory_project_lock absent even though acquisition worked.
-    from atoms.fs.lock import acquire_project_lock
-
+    # (The refusals for a prerequisite that is unavailable *at acquisition* live in
+    # test_fs_lock.py, since acquire_project_lock is where they are converted.)
     backend = fake_backend(supplied=set(Capability), lock_excludes=False)
     with acquire_project_lock(backend, str(metadata_root)) as lock:
         allowlist = test_allowlist(lock, project_root, test_storage_profile)
@@ -2992,19 +3481,54 @@ def test_guarded_types_refuse_ordinary_construction(bound_volume):
             dataclasses.replace(binding.evidence, mount_id=1)
 
 
+def test_binding_refuses_dataclass_replacement(bound_volume):
+    # ProjectBinding is deliberately NOT a dataclass — it owns a descriptor and a
+    # spent flag, which are not value semantics — so replace() refuses for want of
+    # __dataclass_fields__ rather than for want of the token. Either way no copy of a
+    # live binding can be fabricated, which is what A4b will rely on (ledger #16).
+    with bound_volume() as binding:
+        with pytest.raises(TypeError):
+            dataclasses.replace(binding)
+
+
 def test_evidence_is_frozen(bound_volume):
     with bound_volume() as binding:
         with pytest.raises(dataclasses.FrozenInstanceError):
             binding.evidence.mount_id = 1
+
+
+def test_a_certification_failure_still_reclaims_probe_debris(
+    project_root, metadata_root, linux_backend, test_allowlist, test_storage_profile, monkeypatch
+):
+    # Reclamation is in a finally, not on the success path. A SQLite refusal is the
+    # exact shape that skips a success-only cleanup, and the debris it would strand
+    # sits in engine-owned space under the lock — where the next lease entry would
+    # find it and have to guess whose it was.
+    def refuse(database_path, cleanup=False):
+        os.close(os.open(database_path, os.O_CREAT | os.O_WRONLY | os.O_CLOEXEC, 0o600))
+        raise CapabilityUnavailable("injected certification failure")
+
+    monkeypatch.setattr("atoms.fs.binding.certify_sqlite_wal", refuse)
+    with acquire_project_lock(linux_backend, str(metadata_root)) as lock:
+        allowlist = test_allowlist(lock, project_root, test_storage_profile)
+        with pytest.raises(CapabilityUnavailable, match="injected"):
+            bind_project_volume(
+                str(project_root), lock, allowlist=allowlist, storage=test_storage_profile
+            )
+        probe_fd = lock.backend.open_child_directory(lock.metadata_root_fd, "probe")
+        try:
+            assert os.listdir(probe_fd) == []
+        finally:
+            os.close(probe_fd)
 ```
 
 - [ ] **Step 2: Add the binding fixtures**
 
 Append to `python/tests/fs_support.py`:
 
-```python
-import contextlib
+`contextlib` is already imported by Task 4's Step 6 append to this file; do not add it again.
 
+```python
 from atoms.fs.lock import acquire_project_lock
 from atoms.fs.volume import (
     AllowlistEntry,
@@ -3320,8 +3844,8 @@ def bind_project_volume(
             )
 
         retained = ensure_metadata_layout(lock)
-        probe_fd = retained[PROBE_DIRECTORY]
         try:
+            probe_fd = retained[PROBE_DIRECTORY]
             supplied = probe_backend(backend, probe_fd, lock)
             missing = _BOOTSTRAP_PREREQUISITES - supplied
             if missing:
@@ -3329,19 +3853,25 @@ def bind_project_volume(
                     "bootstrap prerequisites unavailable: "
                     + ", ".join(sorted(item.value for item in missing))
                 )
-            database = verified_child_path(
+            probe_dir = verified_child_path(
                 metadata_root_fd,
                 lock.metadata_root_path,
                 metadata_info.st_dev,
                 metadata_info.st_ino,
                 PROBE_DIRECTORY,
             )
-            certify_sqlite_wal(os.path.join(database, "certify.db"), cleanup=True)
+            certify_sqlite_wal(os.path.join(probe_dir, "certify.db"), cleanup=True)
         finally:
+            # Design §9.1 step 8 runs in a finally, not on the success path. A SQLite
+            # refusal, a subprocess timeout, or an unexpected errno are exactly the
+            # paths that skip a success-only cleanup, and each would strand debris in
+            # engine-owned space. If reclamation itself fails while another exception
+            # is unwinding, that failure surfaces with the original as its __context__:
+            # a broken metadata_root is worth reporting, and the next lease entry
+            # (ledger #17) reclaims again under the same held lock.
             for fd in retained.values():
                 os.close(fd)
-
-        reclaim_probe_survivors(lock)
+            reclaim_probe_survivors(lock)
 
         evidence = VolumeEvidence(
             configuration=configuration,
@@ -3407,7 +3937,9 @@ __all__ = [
 - [ ] **Step 6: Run the tests to verify they pass**
 
 Run: `uv run pytest tests/test_fs_binding.py -v`
-Expected: PASS (16 tests)
+Expected: PASS. Every test in the named files must pass; the only acceptable non-pass is a
+`test_volume`/`distinct_volume` skip with its stated reason. Do not accept a bare count as
+evidence — read the skip lines.
 
 - [ ] **Step 7: Commit**
 
@@ -3425,6 +3957,8 @@ Close the boundary with the mutation tests that prove ambiguous errno values are
 probe precondition, and update the ledger and `AGENTS.md` in the same commit.
 
 **Files:**
+- Create: `python/tests/architecture_support.py`
+- Modify: `python/tests/test_recovery_architecture.py`
 - Modify: `python/tests/test_fs_architecture.py`
 - Modify: `python/tests/test_fs_probe.py`
 - Modify: `docs/deferred-obligation-ledger.md`
@@ -3457,11 +3991,8 @@ def test_ambiguous_errno_is_licensed_only_by_the_probe_precondition(
     assert code in UNSUPPORTED_ERRNO[operation]
     backend = fake_backend(supplied=set(Capability), **{f"{operation}_errno": code})
     with held_lock(metadata_root) as lock:
-        probe_fd = _probe_fd(lock)
-        try:
+        with probe_directory(lock) as probe_fd:
             supplied = probe_backend(backend, probe_fd, lock)
-        finally:
-            os.close(probe_fd)
     assert len(supplied) < len(frozenset(Capability))
 
 
@@ -3472,32 +4003,95 @@ def test_precondition_violating_errno_propagates(
 ):
     backend = fake_backend(supplied=set(Capability), **{f"{operation}_errno": code})
     with held_lock(metadata_root) as lock:
-        probe_fd = _probe_fd(lock)
-        try:
+        with probe_directory(lock) as probe_fd:
             with pytest.raises(OSError) as caught:
                 probe_backend(backend, probe_fd, lock)
             assert caught.value.errno == code
-        finally:
-            os.close(probe_fd)
 ```
 
-The `RestrictedBackend._dispatch` override key is the operation name, so update `fs_support.py` to strip
-the `_errno` suffix:
+Add `from atoms.fs.backend import UNSUPPORTED_ERRNO` to the imports of
+`python/tests/test_fs_probe.py`. No `fs_support.py` change is needed: `RestrictedBackend._dispatch`
+already keys overrides on `f"{operation}_errno"` from Task 4, which is what these tests pass.
+
+- [ ] **Step 2: Extract the shared architecture scanner**
+
+The fixture-registry guard A3 already carries handles two things a fresh implementation gets wrong: a
+test's arguments are not all fixtures, and `pytest.mark.parametrize` names must be subtracted first.
+Reuse it rather than writing a second one — a hand-rolled scanner would reject A4a's `absent`,
+`operation`, and `code` parameters as missing fixtures.
+
+Create `python/tests/architecture_support.py` and **move** these into it verbatim from
+`python/tests/test_recovery_architecture.py`, renaming each to drop the leading underscore since they
+are now imported across modules: `_PYTEST_BUILTINS` → `PYTEST_BUILTINS`, `_decorator_name` →
+`decorator_name`, `_fixture_names` → `fixture_names`, `_parametrize_names` → `parametrize_names`,
+`_collected_test_functions` → `collected_test_functions`, and `_unregistered_test_arguments` →
+`unregistered_test_arguments`. The module needs `import ast` and `from pathlib import Path`.
+
+Give `unregistered_test_arguments` a third parameter so each suite scans its own files:
 
 ```python
-    def _dispatch(self, capability, operation, *args):
-        override = self._overrides.get(f"{operation}_errno")
-        if override is not None:
-            raise OSError(override, "injected")
-        if capability not in self._supplied:
-            raise OSError(self._ABSENT_ERRNO, "capability withheld")
-        return getattr(self._real, operation)(*args)
+def unregistered_test_arguments(
+    tests_root: Path,
+    registered: set[str],
+    pattern: str,
+) -> set[str]:
+    """Test arguments in `pattern` files that name no fixture in `registered`.
+
+    `pattern` is a parameter because two suites now share this scanner. Subtracting
+    parametrize_names first is not an optimization: a parametrized value is an
+    argument that is deliberately NOT a fixture, and reporting it missing would make
+    the guard fail on correct tests.
+    """
+    missing: set[str] = set()
+    for test_path in tests_root.glob(pattern):
+        tree = ast.parse(test_path.read_text(encoding="utf-8"))
+        for node, receivers in collected_test_functions(tree):
+            arguments = {
+                argument.arg
+                for argument in (
+                    *node.args.posonlyargs,
+                    *node.args.args,
+                    *node.args.kwonlyargs,
+                )
+            }
+            missing.update(
+                arguments
+                - parametrize_names(node)
+                - registered
+                - PYTEST_BUILTINS
+                - receivers
+            )
+    return missing
 ```
 
-Update `test_unexpected_errno_propagates_rather_than_reporting_absence` in
-`python/tests/test_fs_probe.py` to pass `exchange_errno=errno.EBADF`, matching the new key.
+Then in `python/tests/test_recovery_architecture.py`, delete the moved helpers, add
+`from tests.architecture_support import fixture_names, unregistered_test_arguments`, and pass the glob
+at both existing call sites:
 
-- [ ] **Step 2: Write the failing architecture tests**
+```python
+def test_recovery_fixture_registry_covers_every_test_argument():
+    tests_root = Path(__file__).parent
+    registered = fixture_names(tests_root / "conftest.py")
+    assert unregistered_test_arguments(tests_root, registered, "test_recovery_*.py") == set()
+
+
+def test_recovery_fixture_registry_scans_test_class_methods(tmp_path):
+    (tmp_path / "test_recovery_nested.py").write_text(
+        "class TestNested:\n"
+        "    def test_uses_fixture(self, missing_fixture):\n"
+        "        pass\n",
+        encoding="utf-8",
+    )
+
+    assert unregistered_test_arguments(tmp_path, set(), "test_recovery_*.py") == {
+        "missing_fixture"
+    }
+```
+
+Run `uv run pytest tests/test_recovery_architecture.py -v` and confirm it still passes before moving on.
+This step changes no A4a behavior; it exists so the next step has a correct scanner to call.
+
+- [ ] **Step 3: Write the failing architecture tests**
 
 Append to `python/tests/test_fs_architecture.py`:
 
@@ -3559,55 +4153,72 @@ def test_public_surface_is_exactly_the_documented_names():
     ]
 
 
-def test_every_test_fixture_is_registered():
-    conftest = (Path(__file__).parent / "conftest.py").read_text(encoding="utf-8")
-    registered = set(re.findall(r"^def (\w+)\(", conftest, flags=re.MULTILINE))
-    builtins = {
-        "monkeypatch",
-        "pytest",
-        "request",
-        "tmp_path",
-        "tmp_path_factory",
-        "capsys",
-        "caplog",
+def test_fs_fixture_registry_covers_every_test_argument():
+    tests_root = Path(__file__).parent
+    registered = fixture_names(tests_root / "conftest.py")
+    assert unregistered_test_arguments(tests_root, registered, "test_fs_*.py") == set()
+
+
+def test_fs_fixture_registry_subtracts_parametrized_arguments(tmp_path):
+    # The A4a suite parametrizes on 'absent', 'operation', 'code', and 'expected'.
+    # A scanner that treated every argument as a fixture would reject all four, so
+    # this pins the behavior that makes reusing A3's scanner worth the extraction.
+    (tmp_path / "test_fs_parametrized.py").write_text(
+        "import pytest\n"
+        "@pytest.mark.parametrize(('operation', 'code'), [('exchange', 22)])\n"
+        "def test_uses_parametrized_values(operation, code):\n"
+        "    pass\n"
+        "@pytest.mark.parametrize('absent', [1])\n"
+        "def test_uses_one_parametrized_value(absent):\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+
+    assert unregistered_test_arguments(tmp_path, set(), "test_fs_*.py") == set()
+
+
+def test_fs_fixture_registry_still_catches_a_genuine_omission(tmp_path):
+    # The converse, so the test above cannot pass by the scanner finding nothing.
+    (tmp_path / "test_fs_missing.py").write_text(
+        "def test_uses_unregistered(nonexistent_fixture):\n    pass\n",
+        encoding="utf-8",
+    )
+
+    assert unregistered_test_arguments(tmp_path, set(), "test_fs_*.py") == {
+        "nonexistent_fixture"
     }
-    for path in Path(__file__).parent.glob("test_fs_*.py"):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.FunctionDef) or not node.name.startswith("test_"):
-                continue
-            for argument in node.args.args:
-                if argument.arg in builtins or argument.arg in registered:
-                    continue
-                raise AssertionError(f"{path.name}::{node.name} uses unregistered {argument.arg!r}")
 ```
 
-Add `import re` to the imports of `python/tests/test_fs_architecture.py`.
+Add `from tests.architecture_support import fixture_names, unregistered_test_arguments` to the imports
+of `python/tests/test_fs_architecture.py`. The `ast` import Task 1 added is still used by
+`test_core_never_imports_the_filesystem_layer`; no `re` import is needed.
 
-- [ ] **Step 3: Run the tests to verify they fail**
+- [ ] **Step 4: Run the tests to verify they fail**
 
 Run: `uv run pytest tests/test_fs_architecture.py tests/test_fs_probe.py -v`
-Expected: FAIL on the new architecture and mutation assertions.
+Expected: FAIL on the new architecture assertions only. The errno mutation tests from Step 1 should
+**already pass** — Tasks 4 and 5 built the override keying and the exact-errno guards they exercise, so
+this is the confirmation that they did, not a red-to-green cycle.
 
-- [ ] **Step 4: Make the tests pass**
+- [ ] **Step 5: Make the tests pass**
 
-Apply the `fs_support.py` `_dispatch` change from Step 1. No other production change should be
-required; if `test_every_test_fixture_is_registered` fails, add the missing adapter to
-`python/tests/conftest.py` rather than renaming the test argument.
+No production change should be required. If `test_fs_fixture_registry_covers_every_test_argument`
+fails, add the missing adapter to `python/tests/conftest.py` rather than renaming the test argument —
+the guard exists to force that direction.
 
-- [ ] **Step 5: Run the full suite**
+- [ ] **Step 6: Run the full suite**
 
 Run: `uv run pytest -q && uv run ruff check && uv run pyright`
 Expected: all pass.
 
-- [ ] **Step 6: Update the ledger**
+- [ ] **Step 7: Update the ledger**
 
 In `docs/deferred-obligation-ledger.md`, leave entries 16, 17, and 18 open — their owners (A4b, A5)
 remain outstanding. Entry 6 stays open and owned by A4b: A4a supplies only the mechanism.
 
 Add no discharge rows. A4a discharges no existing entry.
 
-- [ ] **Step 7: Update `AGENTS.md`**
+- [ ] **Step 8: Update `AGENTS.md`**
 
 Replace the A4a bullet with:
 
@@ -3626,7 +4237,7 @@ Also update the trailing sentence: "No code in this repository mutates a filesys
 begins at A4a." becomes "A4a is the first layer that touches a filesystem; it writes only inside the
 engine-owned `metadata_root`, never a project path."
 
-- [ ] **Step 8: Update this plan's status**
+- [ ] **Step 9: Update this plan's status**
 
 Change the `**Status:**` line at the top of this plan to:
 
@@ -3635,10 +4246,11 @@ Change the `**Status:**` line at the top of this plan to:
 repository mutates a project path.
 ```
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
-git add tests/test_fs_architecture.py tests/test_fs_probe.py tests/fs_support.py \
+git add tests/architecture_support.py tests/test_recovery_architecture.py \
+        tests/test_fs_architecture.py tests/test_fs_probe.py \
         ../docs/deferred-obligation-ledger.md ../AGENTS.md \
         ../docs/plans/2026-07-29-plan-a4a-capability-backend.md
 git commit -m "test(fs): lock the errno contract and the a4a boundary"
@@ -3653,22 +4265,36 @@ Run before declaring A4a complete.
 - [ ] Every design §13 acceptance criterion maps to a passing test:
   1 → `test_core_imports_only_the_allowlisted_modules`; 2 → `test_select_backend_refuses_*`;
   3 → `test_fs_syscalls.py`; 4 → `test_fs_backend.py` plus `test_fs_probe.py`;
-  5 → `test_open_root_refuses_a_symlinked_ancestor`, `test_acquire_refuses_a_missing_parent`;
+  5 → `test_open_root_refuses_a_symlinked_ancestor`,
+  `test_establish_root_normalizes_only_after_the_guarded_walk`,
+  `test_establish_root_resolves_a_parent_component_after_a_real_directory`,
+  `test_acquire_refuses_a_missing_parent`, `test_acquire_refuses_a_parent_component_as_the_leaf`;
   6 → `test_cross_volume_roots_refuse`, `test_resolve_mount_entry_matches_on_mount_id_not_device`;
-  7 → `test_build_configuration_*`; 8 → `test_allowlist_matches_only_on_exact_configuration_and_profile`;
+  7 → `test_build_configuration_*` for all three filesystems plus
+  `test_every_supported_filesystem_has_normalization_coverage`;
+  8 → `test_allowlist_matches_only_on_exact_configuration_and_profile`;
   9 → `test_bind_requires_a_keyword_only_allowlist_with_no_default`, `test_no_production_caller_*`;
-  10 → `test_fs_lock.py` plus `test_fs_bootstrap.py`;
-  11 → `test_refusal_reclaims_existing_debris_but_writes_nothing_new`;
-  12 → `test_absent_anchored_traversal_refuses_before_a_lock_is_even_held`,
+  10 → `test_fs_lock.py` plus `test_fs_bootstrap.py`, including
+  `test_layout_returns_one_owned_descriptor_per_component`;
+  11 → `test_refusal_reclaims_existing_debris_but_writes_nothing_new`,
+  `test_a_certification_failure_still_reclaims_probe_debris`;
+  12 → `test_absent_anchored_traversal_refuses_with_capability_unavailable`,
+  `test_absent_advisory_lock_refuses_with_capability_unavailable`,
   `test_a_lock_that_does_not_exclude_refuses_binding`,
   `test_absent_optional_capability_binds_and_reports`,
   `test_sqlite_certification_observes_the_commit_across_processes`,
+  `test_certification_uses_two_children_so_the_parent_can_release_between_them`,
+  `test_each_child_verdict_refuses_with_its_own_reason`,
   `test_transfer_noclobber_across_distinct_parents`, `test_link_anchor_across_distinct_parents_*`;
   13 → `test_guarded_types_refuse_ordinary_construction`, `test_lock_refuses_ordinary_construction`,
+  `test_lock_refuses_dataclass_replacement`, `test_binding_refuses_dataclass_replacement`,
   `test_accessors_refuse_*`, `test_descriptors_are_cloexec`, `test_exit_is_idempotent`;
   14 → `test_verified_child_path_*`, `test_verified_metadata_path_delegates_to_the_shared_verifier`;
   15 → `test_precondition_violating_errno_propagates`,
-  `test_ambiguous_errno_is_licensed_only_by_the_probe_precondition`;
+  `test_ambiguous_errno_is_licensed_only_by_the_probe_precondition`,
+  `test_a_traversal_refusal_with_the_wrong_errno_propagates`,
+  `test_a_nofollow_refusal_with_the_wrong_errno_propagates`,
+  `test_unsupported_errno_sets_exclude_ambiguous_generic_failures`;
   16 → `test_volume` skip path, `distinct_volume` skip path;
   17 → the full-suite step of Task 7.
 - [ ] No probe result is described anywhere in code or comments as a durability guarantee.
@@ -3677,7 +4303,13 @@ Run before declaring A4a complete.
       optional capability.
 - [ ] No `isinstance` on a closed union; no new error type; no runtime dependency added.
 - [ ] `atoms/core` imports nothing outside the allowlist, and never `atoms.fs`.
-- [ ] Every descriptor A4a opens uses `O_CLOEXEC` and is closed exactly once by its owner.
+- [ ] Every descriptor A4a opens uses `O_CLOEXEC` and is closed exactly once by its owner. No test calls
+      `ensure_metadata_layout` directly — each goes through `metadata_layout`, `probe_directory`, or
+      `probe_database_path`, which own what it returns.
+- [ ] Every probe step whose evidence is a *refusal* asserts the exact errno. `grep -n "except OSError"`
+      over `src/atoms/fs/` should show no bare `except OSError:` that concludes success.
+- [ ] The second reclamation and the layout-descriptor closes sit in a `finally`, not on the success
+      path of `bind_project_volume`.
 - [ ] `uv run pytest -q`, `uv run ruff check`, and `uv run pyright` are clean; no line exceeds 120
       columns; the worktree is clean.
 

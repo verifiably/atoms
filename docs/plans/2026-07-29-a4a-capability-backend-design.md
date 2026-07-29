@@ -258,12 +258,25 @@ not been established yet and refusing a crossing here would refuse the legitimat
 simply lives on its own mount. Mount identity is proved afterwards, from the resulting descriptor
 (§6.1). The descriptor is opened `O_DIRECTORY | O_CLOEXEC` and `fstat`-verified to be a directory.
 
+**Normalization happens only after the guarded walk succeeds.** `os.path.abspath` calls `normpath`, which
+collapses `..` *lexically*: `aliased/../elsewhere` becomes `elsewhere` before `RESOLVE_NO_SYMLINKS` ever
+sees `aliased`. Normalizing first would therefore hand the kernel a path that names a different entry than
+the caller wrote, and the ancestor-symlink guarantee above would not hold for the path actually supplied.
+The walk receives the caller's exact component spelling, made absolute against the current directory —
+which `getcwd` already returns symlink-free — with only empty and `.` components dropped, since neither
+can change which entry a path names under any symlink arrangement. Every `..` reaches the kernel, which
+refuses it exactly when an earlier component is a symlink and resolves it normally otherwise. Only once
+the walk has proved the path contains no symlink is the returned pathname normalized, and at that point
+collapsing is sound by construction rather than by assumption.
+
 **Missing `metadata_root`.** Only the final leaf is created, and only relative to a descriptor:
 
 1. Guarded-open the parent with the same `RESOLVE_NO_SYMLINKS` walk. A missing parent **refuses** —
    A4a creates no intermediate directories, because a guarded component-by-component walk that also
    creates as it goes has races this layer has no need to take on.
-2. `mkdirat` the single leaf name relative to that parent descriptor.
+2. `mkdirat` the single leaf name relative to that parent descriptor. A final component of `..`, or an
+   empty one, refuses with `ProtocolError`: those are not creatable names, and because normalization is
+   deferred they can still be present here.
 3. Reopen the leaf with `open_child_directory` from the retained parent descriptor and `fstat`-verify it
    is a directory.
 
@@ -599,7 +612,7 @@ creates nothing and leaves no survivor.
 
 | Capability | Probe |
 | --- | --- |
-| `anchored_traversal` | Open `probe/` with `RESOLVE_BENEATH \| RESOLVE_NO_SYMLINKS \| RESOLVE_NO_XDEV`. Plant a symlink pointing at `..` and require the open to refuse; require a `..` component to refuse. Both the success and the refusals must hold. |
+| `anchored_traversal` | Open `probe/` with `RESOLVE_BENEATH \| RESOLVE_NO_SYMLINKS \| RESOLVE_NO_XDEV`. Plant a symlink pointing at `..` and require the open to fail with exactly `ELOOP`; require a `..` component to fail with exactly `EXDEV`. Both the success and the two exact refusals must hold. |
 | `advisory_project_lock` | Open a second, independent descriptor to `lock` and require `try_lock_exclusive` to return `False` against the already-held lock. Because `flock` is per-open-file-description, this contends correctly within one process. |
 | `atomic_exchange` | Create two files with distinct content, exchange them, verify both names now resolve to the swapped content. |
 | `noclobber_transfer` | **Across two distinct directories** under `probe/`: create a source in one and an existing destination in the other; require the transfer to fail with `EEXIST`; remove the destination; require the transfer to succeed. |
@@ -608,7 +621,14 @@ creates nothing and leaves no survivor.
 | `nofollow_coherent_read` | Open a regular file `O_RDONLY \| O_NOFOLLOW`, `fstat` and read from that one descriptor; then require the same open against a symlink leaf to fail with `ELOOP`. |
 | `symlink_fingerprint` | Create a symlink, then require `lstat` to report a symlink and `readlink` to return the exact target. |
 
-Every probe cleans up after itself; §7.3 reclamation runs again afterwards regardless.
+A refusal is evidence only when it is the **exact** expected errno. A probe that accepts any `OSError` as
+proof its guard works would report the capability present on a volume failing for an unrelated reason —
+`EBADF` from a descriptor bug, `EIO` from failing media — which is the §10 propagation rule read backwards.
+Each refusal step therefore names its errno, and anything else propagates.
+
+Every probe cleans up after itself; §7.3 reclamation runs again afterwards regardless, and that second
+reclamation is **exception-safe**: it runs whether the probe block succeeded, refused, or raised, because a
+SQLite refusal or a subprocess timeout would otherwise strand debris in engine-owned space.
 
 ### 8.3 SQLite-WAL hostability
 
@@ -625,23 +645,35 @@ admits materially different tests with materially different evidence. Every step
 | 2 | parent | `PRAGMA synchronous=FULL`, then commit `PRAGMA user_version=1` | committed |
 | 3 | parent | `BEGIN IMMEDIATE`, holding the write lock; keep the connection open | acquired |
 | 4 | child | open the same database, read `PRAGMA user_version` | returns `1` — a cross-process read **concurrent with a held writer**, the property the shared-memory WAL index exists to provide |
-| 5 | child | `BEGIN IMMEDIATE` with `busy_timeout=0` | fails `SQLITE_BUSY` — cross-process write exclusion |
+| 5 | child | `BEGIN IMMEDIATE` with `busy_timeout=0` | fails with primary result code exactly `SQLITE_BUSY` — cross-process write exclusion |
 | 6 | parent | `COMMIT` | released |
-| 7 | child | `BEGIN IMMEDIATE` with an explicit bounded `busy_timeout`, write `PRAGMA user_version=2`, commit, exit `0` | succeeds |
+| 7 | child | `BEGIN IMMEDIATE`, write `PRAGMA user_version=2`, commit, exit `0` | succeeds |
 | 8 | parent | read `PRAGMA user_version` in a fresh read transaction | returns `2` |
 
 Step 4 is the one that distinguishes this from a same-process test, and step 5 is the one that proves
-locking rather than merely concurrency. The child runs under a bounded subprocess timeout in addition to
-its `busy_timeout`, so a volume with broken locking fails the probe instead of hanging it. Afterwards the
-database, `-wal`, and `-shm` names are removed through anchored probe cleanup.
+locking rather than merely concurrency. Step 5 requires the **exact** primary result code: SQLite
+distinguishes `SQLITE_BUSY` from I/O, protocol, permission, and internal errors, and accepting any
+`OperationalError` there would let a volume that fails to open the WAL index at all masquerade as one that
+correctly excludes a second writer. The comparison is against the primary code (`errorcode & 0xFF`) so that
+an extended `SQLITE_BUSY_*` variant still counts.
+
+**Steps 3–7 are realized as two child invocations, not one.** The parent must release the write lock at
+step 6 *between* two things a child does, so a single blocking `subprocess.run` cannot express the sequence:
+the parent would sit waiting for a child that is itself waiting for the parent's commit, and the
+choreography would resolve only by one side timing out. The first child performs steps 4–5 and exits; the
+parent commits; the second child performs step 7. Nothing is weakened by the split — step 4 still reads
+concurrently with a held writer, and step 5 still contends against it — and the result is deterministic
+rather than dependent on two timeouts racing. Each child runs under a bounded subprocess timeout, so a
+volume with broken locking fails the probe instead of hanging it. Afterwards the database, `-wal`, and
+`-shm` names are removed through anchored probe cleanup.
 
 The second reader must be a subprocess, not a second connection in this process. A same-process
 connection exercises WAL but not SQLite's cross-process POSIX locking contract, and the shared-memory
 WAL index exists precisely to coordinate readers across processes — which is the property §5.5 requires
-certified. The child is spawned as `sys.executable -c` with a short inline reader.
+certified. Each child is spawned as `sys.executable -c` with a short inline script.
 
-This forces one documented exemption. The child cannot inherit an anchored descriptor, because SQLite
-opens by path and every descriptor A4a creates is `O_CLOEXEC`; so the child receives the probe database's
+This forces one documented exemption. A child cannot inherit an anchored descriptor, because SQLite
+opens by path and every descriptor A4a creates is `O_CLOEXEC`; so each child receives the probe database's
 path and re-resolves it. That is acceptable **only** because `probe/` is engine-owned, sits under the held
 project lock, and contains no transaction state. The exemption is scoped to this one probe and extends to
 nothing outside `probe/`.
@@ -678,8 +710,13 @@ Inside `bind_project_volume`, in this order:
 5. Match `(configuration, storage)` against the supplied allowlist; refuse on no match.
 6. Ensure the full metadata layout.
 7. Probe capabilities, then certify SQLite-WAL hostability.
-8. Reclaim again, leaving `probe/` empty.
+8. Reclaim again, leaving `probe/` empty. This runs in a `finally` around step 7, not after it: a
+   SQLite refusal, a subprocess timeout, or an unexpected errno must not leave debris behind, and those
+   are precisely the paths that skip a success-only cleanup.
 9. Build `VolumeEvidence`; return `ProjectBinding`.
+
+Every descriptor the layout returns at step 6 has exactly one owner: `bind_project_volume` closes each in
+the same `finally` that reclaims, and no other code path may adopt one.
 
 The order is load-bearing in two places.
 
@@ -847,7 +884,14 @@ lock, so a non-conforming entry there means the engine's private-namespace invar
 of who broke it. `CapabilityUnavailable` would be the wrong signal: nothing about the volume's
 capabilities is in question.
 
-`OSError` **propagates**. A4a does not blanket-convert it. At each probe, only the documented
+The two bootstrap prerequisites are refused *before* any probe runs, so their conversion happens on the
+bootstrap path rather than in the probe. `establish_root` and `acquire_project_lock` convert exactly the
+same per-operation unsupported-errno sets the probe uses — `anchored_traversal` for the guarded walk,
+`advisory_project_lock` for the lock acquisition — into `CapabilityUnavailable`, and propagate everything
+else. Sharing one table is deliberate: two tables would drift, and a kernel without `openat2` would then
+surface as a bare `ENOSYS` from one call site and a `CapabilityUnavailable` from another.
+
+`OSError` **propagates** otherwise. A4a does not blanket-convert it. At each probe, only the documented
 operation-specific errno values that conclusively mean *unsupported* conclude that a capability is absent;
 everything else propagates unchanged. `EBADF`, `EMFILE`, `EFAULT`, malformed arguments, and implementation
 faults are bugs or environmental failures, and turning them into `CapabilityUnavailable` would report a
@@ -878,7 +922,11 @@ absent capability.
 `mountinfo` and `fdinfo` parsing against captured fixture text, covering the cases a naive parser gets
 wrong: octal-escaped mount points (`\040` for a space), the variable-length optional fields terminated by
 `-`, and two bind mounts sharing `st_dev` with distinct mount IDs. Barrier-option normalization per
-filesystem type, and refusal of an unlisted type. Allowlist matching, including a near-miss differing only
+filesystem type, and refusal of an unlisted type. Each of `ext4`, `xfs`, and `btrfs` gets both an
+exact-defaults assertion — the whole normalized tuple, not a membership check, so a silently dropped or
+added option fails — and a field-origin fixture where a non-default value appears **only** in
+super-options, which a field-6-only parser would miss. Shipping a table for a filesystem with no fixture
+would mean shipping an untested durability claim. Allowlist matching, including a near-miss differing only
 in `declared_storage_profile`. Immutability and exact-match semantics of `VolumeConfiguration`,
 `StorageProfile`, and `DurabilityAllowlist`. Factory-guard refusals on all three guarded types —
 `VolumeEvidence`, `HeldProjectLock`, and `ProjectBinding` — covering both direct construction and
@@ -909,8 +957,12 @@ The default location is added to `.gitignore` in the same commit as the fixture.
 Real `flock` contention through a subprocess, in both directions. Real exchange, and real no-clobber
 transfer and link probes **across distinct parent directories**. Real cross-process SQLite-WAL
 certification through the §8.3 choreography, including the `SQLITE_BUSY` step. Root establishment through
-a **symlinked ancestor**, asserting refusal — the §5.4 guarantee that no runtime probe covers.
-Establishment of a missing `metadata_root` leaf, and refusal when its parent is missing.
+a **symlinked ancestor**, asserting refusal — the §5.4 guarantee that no runtime probe covers — and the
+case that separates kernel resolution from lexical normalization: a symlink followed by `..`, where
+`normpath` collapses to a real directory that exists and the kernel must still refuse. Its converse is
+asserted too, so the guard is not merely refusing everything: `..` after a *real* directory resolves and
+returns the normalized parent. Establishment of a missing `metadata_root` leaf, refusal when its parent is
+missing, and refusal when the leaf to be created is itself `..`.
 
 The bootstrap trust boundary gets direct coverage, since each case is a name an attacker or an accident
 could already occupy. A symlink planted at `lock` refuses, as does a non-regular file. A symlink planted
@@ -948,6 +1000,12 @@ Bind-mount tests require `unshare --mount --map-root-user` and skip when it is u
 The purity guard rewritten as the §4.2 allowlist and applied by `rglob("*.py")` over all of `atoms/core`.
 Packaging metadata and tests updated so the wheel declares `atoms.fs` and ships its `py.typed`.
 
+The fixture-registry guard A3 already carries is **extracted and reused**, not reimplemented. A second
+hand-rolled scanner would repeat the mistake A3's already handles: a test's arguments are not all fixtures,
+and `pytest.mark.parametrize` names must be subtracted before anything is called unregistered. The shared
+helper takes the filename glob as a parameter so A3 and A4a each scan their own suite, and a regression test
+asserts a parametrized argument is not reported missing.
+
 A4a **cannot** assert that production composition passes exactly `CERTIFIED_ALLOWLIST`, because no
 production composition root exists until A5; such a test would be vacuous or would force an out-of-scope
 entry point into this sub-plan. A4a therefore asserts only what is true at its own boundary: that the
@@ -983,8 +1041,10 @@ production-allowlist call-site assertion, owned by A5.
    `supplied_capabilities` method. Every method is exercised: the eight capability operations by the
    runtime probe that reports them, and `open_root` by the bootstrap plus its §5.4 ancestor-symlink test.
 5. `open_root` resolves with `RESOLVE_NO_SYMLINKS` over the whole path and refuses a symlinked ancestor;
-   a missing `metadata_root` leaf is created relative to a guarded parent descriptor and reverified, and
-   a missing parent refuses.
+   the caller's component spelling reaches the kernel un-collapsed, so a symlink followed by `..` refuses
+   rather than being normalized away, and the pathname is normalized only after the walk succeeds; a
+   missing `metadata_root` leaf is created relative to a guarded parent descriptor and reverified; a
+   missing parent refuses, as does a leaf of `..`.
 6. Mount identity is proved from held descriptors' mount IDs plus `st_dev`, and the roots must agree.
 7. An unlisted filesystem type refuses. `ext4`, `xfs`, and `btrfs` options normalize per the §6.2 table,
    each read from its stated `mountinfo` field, with fixtures where a non-default value appears only in
@@ -1015,7 +1075,9 @@ production-allowlist call-site assertion, owned by A5.
     7; `ProjectBinding.verified_metadata_path` delegates to it; no provisional binding is constructed; and
     the helper is not exported. A5 uses only the public method.
 15. `OSError` propagates except for the documented per-operation unsupported errno values, each licensed
-    by the §10 probe precondition and proved by a mutation test.
+    by the §10 probe precondition and proved by a mutation test. Every probe step that treats a *refusal*
+    as evidence requires the exact expected errno — `ELOOP`, `EXDEV`, `EEXIST`, `SQLITE_BUSY` — and the
+    two bootstrap prerequisites convert from the same shared errno table rather than a second copy.
 16. Tier 3 resolves its volume portably and skips with a precise reason rather than assuming this
     machine's ext4-and-tmpfs layout.
 17. All four verification tiers pass; Ruff and Pyright are clean; the ledger and `AGENTS.md` are updated
