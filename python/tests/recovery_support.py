@@ -1,3 +1,4 @@
+from itertools import product
 from typing import cast
 
 from atoms.core.compiler import compile_spec
@@ -8,6 +9,7 @@ from atoms.core.effects import (
     MoveNoClobber,
     ReplaceFile,
 )
+from atoms.core.errors import ProtocolError
 from atoms.core.fingerprint import ABSENT, DirectoryState, FileState, SymlinkState
 from atoms.core.recovery import (
     OBSERVED_ABSENT,
@@ -30,6 +32,7 @@ from atoms.core.recovery import (
     PersistentObservation,
     PreserveExternal,
     ProjectRoot,
+    RecoverySnapshot,
     RecoveryTopology,
     RemoveScratch,
     RollbackResult,
@@ -37,12 +40,14 @@ from atoms.core.recovery import (
     ScratchObservation,
     ScratchRole,
     SettlementKind,
+    TopologyDirectory,
     TopologyParent,
     TransactionState,
     TransformEffectTuple,
     TransitionEffectState,
     TransitionTransactionState,
     WorkRoot,
+    apply_recovery_plan,
     build_recovery_snapshot,
     classify_recovery,
 )
@@ -662,12 +667,18 @@ def make_delete_case(
                 if symlink
                 else ObservedFile(F, EntryIdentity())
             )
+        if name == "post":
+            return ObservedFile(G, EntryIdentity())
+        if name == "prefix":
+            return ObservedFile(_PREFIX, EntryIdentity())
         if name == "external":
             return (
                 ObservedSymlink(_EXTERNAL_SYMLINK)
                 if symlink
                 else ObservedFile(_EXTERNAL, EntryIdentity())
             )
+        if name == "foreign":
+            return ObservedSymlink(_EXTERNAL_SYMLINK)
         raise AssertionError(f"unknown delete observation name: {name}")
 
     topology = RecoveryTopology(
@@ -861,20 +872,20 @@ def make_directory_case(
 
 def make_directory_descendant_case(*, descendant_present: bool):
     effects = (
-        CreateDirectory("e1", "dir", D),
-        CreateFileNoClobber("e2", "dir/child.txt", F),
+        CreateDirectory("e1", "A", D),
+        CreateFileNoClobber("e2", "a/child.txt", F),
     )
     compiled = compile_spec(
         build_spec(
             consumer_tag="cnsmr",
             intent_digest=DIGEST,
             initial_surface={
-                "dir": ABSENT,
-                "dir/child.txt": ABSENT,
+                "A": ABSENT,
+                "a/child.txt": ABSENT,
             },
             final_surface={
-                "dir": D,
-                "dir/child.txt": F,
+                "A": D,
+                "a/child.txt": F,
             },
             effects=effects,
             dependencies=(("e1", "e2"),),
@@ -882,13 +893,13 @@ def make_directory_descendant_case(*, descendant_present: bool):
     )
     project = ProjectRoot()
     work_root = WorkRoot()
-    live = PersistentNode("dir")
+    live = PersistentNode("A")
     topology = RecoveryTopology(
         parents=(
             TopologyParent(work_root, project),
             TopologyParent(live, project),
             TopologyParent(ScratchNode("e1", ScratchRole.WORK), work_root),
-            TopologyParent(PersistentNode("dir/child.txt"), live),
+            TopologyParent(PersistentNode("a/child.txt"), live),
             TopologyParent(ScratchNode("e2", ScratchRole.STAGING), live),
         )
     )
@@ -913,11 +924,11 @@ def make_directory_descendant_case(*, descendant_present: bool):
         ),
         persistent_observations=(
             PersistentObservation(
-                "dir",
+                "A",
                 ObservedDirectory(D, EntryIdentity(), False),
             ),
             PersistentObservation(
-                "dir/child.txt",
+                "a/child.txt",
                 (
                     ObservedFile(F, EntryIdentity())
                     if descendant_present
@@ -1415,3 +1426,164 @@ def make_snapshot_pair_differing_only_dependencies():
         )
 
     return snapshot(left_compiled), snapshot(right_compiled)
+
+
+class _GeneratedSnapshots:
+    def try_build(
+        self,
+        transaction_state: TransactionState,
+        commit_decision: CommitDecision,
+        active: bool,
+        journal_states: tuple[
+            JournalState,
+            JournalState,
+            JournalState,
+        ],
+    ) -> RecoverySnapshot | None:
+        try:
+            return make_three_effect_snapshot(
+                transaction_state,
+                journal_states,
+                active=active,
+                commit_decision=commit_decision,
+            )
+        except ProtocolError:
+            return None
+
+    def count_three_effect_cases(self) -> tuple[int, int]:
+        accepted = 0
+        refused = 0
+        for (
+            transaction_state,
+            commit_decision,
+            active,
+            journal_states,
+        ) in product(
+            tuple(TransactionState),
+            tuple(CommitDecision),
+            (False, True),
+            product(tuple(JournalState), repeat=3),
+        ):
+            if (
+                self.try_build(
+                    transaction_state,
+                    commit_decision,
+                    active,
+                    cast(
+                        tuple[
+                            JournalState,
+                            JournalState,
+                            JournalState,
+                        ],
+                        journal_states,
+                    ),
+                )
+                is None
+            ):
+                refused += 1
+            else:
+                accepted += 1
+        return accepted, refused
+
+    def valid_case(self) -> RecoverySnapshot:
+        return create_snapshot()
+
+    def valid_case_with_identity(self) -> RecoverySnapshot:
+        source, _ = make_move_case(
+            "absent",
+            "pre",
+            "pre",
+            "destination_anchor_same",
+            JournalState.DONE,
+        )
+        return source
+
+    def deep_topology_case(self) -> RecoverySnapshot:
+        compiled = compiled_create()
+        project = ProjectRoot()
+        directories = tuple(
+            TopologyDirectory(index) for index in range(1100)
+        )
+        persistent = PersistentNode("a.txt")
+        scratch = ScratchNode("e1", ScratchRole.STAGING)
+        topology = RecoveryTopology(
+            parents=(
+                TopologyParent(directories[0], project),
+                *(
+                    TopologyParent(node, parent)
+                    for node, parent in zip(
+                        directories[1:],
+                        directories,
+                    )
+                ),
+                TopologyParent(persistent, directories[-1]),
+                TopologyParent(scratch, directories[-1]),
+            )
+        )
+        return build_recovery_snapshot(
+            compiled=compiled,
+            topology=topology,
+            transaction_state=TransactionState.APPLYING,
+            commit_decision=CommitDecision.UNCOMMITTED,
+            rollback_result=None,
+            halt_diagnostic=None,
+            active=True,
+            journals=(
+                EffectJournalState("e1", JournalState.PENDING),
+            ),
+            persistent_observations=(
+                PersistentObservation("a.txt", OBSERVED_ABSENT),
+            ),
+            scratch_observations=(
+                ScratchObservation(
+                    "e1",
+                    ScratchRole.STAGING,
+                    OBSERVED_ABSENT,
+                    None,
+                ),
+            ),
+        )
+
+
+def _reallocate_snapshot_identities(
+    source: RecoverySnapshot,
+) -> RecoverySnapshot:
+    renamed = reallocate_joint_identities(
+        JointObservation(
+            persistent=source.persistent_observations,
+            scratch=source.scratch_observations,
+            parent_occupancy=(),
+        )
+    )
+    return build_recovery_snapshot(
+        compiled=source.compiled,
+        topology=source.topology,
+        transaction_state=source.transaction_state,
+        commit_decision=source.commit_decision,
+        rollback_result=source.rollback_result,
+        halt_diagnostic=source.halt_diagnostic,
+        active=source.active,
+        journals=source.journals,
+        persistent_observations=renamed.persistent,
+        scratch_observations=renamed.scratch,
+    )
+
+
+def make_generated_snapshots():
+    return _GeneratedSnapshots()
+
+
+def make_identity_case():
+    original = make_generated_snapshots().valid_case_with_identity()
+    return original, _reallocate_snapshot_identities(original)
+
+
+def make_halt_restart_case():
+    source = make_committed_halt_source()
+    before = apply_recovery_plan(source, classify_recovery(source))
+    restarted = _reallocate_snapshot_identities(before)
+    after_restart = apply_recovery_plan(
+        restarted,
+        classify_recovery(restarted),
+    )
+    return before, after_restart

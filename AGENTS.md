@@ -17,9 +17,11 @@ Plan B is written only after Plan A's interfaces settle.
 - **A2 — compilation validation: implemented.** `compile_spec` in `atoms/core/compiler.py` produces
   the pure, filesystem-independent first-stage `CompiledSpec` proof; `paths.py` and `timeline.py`
   support it. A4 must produce the distinct `ProjectApprovedSpec` before A5–A8.
-- **A3 — executable recovery reference model: design approved; implementation plan under owner
-  review.** The approved design defines the pure production classifier, semantic plan, fresh-step
-  authorization, and abstract reducer. No A3 production code has landed. A4–A8: not started.
+- **A3 — executable recovery reference model: implemented.** The pure production authority exposes
+  `build_recovery_snapshot`, `classify_recovery`, `authorize_recovery_step`,
+  `reduce_recovery_plan_prefix`, and `apply_recovery_plan` with the closed recovery model, fresh-step
+  authorization, and abstract reducer. A4–A8 remain unimplemented, and no filesystem mutation code
+  has landed.
 
 Work lives under `python/` (`uv run pytest`, `uv run ruff check`, `uv run pyright`, all from
 `python/`). No code in this repository mutates a filesystem path yet; that begins at A4.

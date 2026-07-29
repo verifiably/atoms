@@ -11,8 +11,11 @@ from tests.recovery_support import (
     make_create_file_case,
     make_delete_case,
     make_directory_case,
+    make_generated_snapshots,
+    make_halt_restart_case,
     make_halted_authority_snapshot,
     make_halted_snapshot,
+    make_identity_case,
     make_move_case,
     make_noop_replace_case,
     make_pending_clean_case,
@@ -166,3 +169,18 @@ def snapshot_pair_differing_only_dependencies():
 @pytest.fixture
 def classifier_plan():
     return make_classifier_plan()
+
+
+@pytest.fixture
+def generated_snapshots():
+    return make_generated_snapshots()
+
+
+@pytest.fixture
+def identity_case():
+    return make_identity_case()
+
+
+@pytest.fixture
+def halt_restart_case():
+    return make_halt_restart_case()
