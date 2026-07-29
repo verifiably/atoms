@@ -2,13 +2,17 @@ import ast
 import inspect
 import subprocess
 import sys
+from importlib.util import resolve_name
 from pathlib import Path
 from typing import get_type_hints
+
+import pytest
 
 from atoms.core import recovery
 from atoms.core.compiler import CompiledSpec
 from atoms.core.spec import TransactionSpec
 
+_CLASSIFIER_MODULE = "atoms.core.recovery.classifier"
 _PYTEST_BUILTINS = {
     "cache",
     "capfd",
@@ -43,6 +47,42 @@ def _python_imports(source_path: Path) -> set[str]:
         elif isinstance(node, ast.ImportFrom) and node.module is not None:
             imports.add(node.module.split(".", 1)[0])
     return imports
+
+
+def _resolved_import_targets(
+    source: str,
+    *,
+    package: str,
+) -> set[str]:
+    tree = ast.parse(source)
+    targets: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            targets.update(alias.name for alias in node.names)
+            continue
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        module = node.module or ""
+        imported_from = (
+            resolve_name(f"{'.' * node.level}{module}", package)
+            if node.level
+            else module
+        )
+        targets.add(imported_from)
+        targets.update(
+            f"{imported_from}.{alias.name}"
+            for alias in node.names
+            if alias.name != "*"
+        )
+    return targets
+
+
+def _imports_classifier(source: str, *, package: str) -> bool:
+    return any(
+        target == _CLASSIFIER_MODULE
+        or target.startswith(f"{_CLASSIFIER_MODULE}.")
+        for target in _resolved_import_targets(source, package=package)
+    )
 
 
 def _decorator_name(decorator: ast.expr) -> str | None:
@@ -243,20 +283,29 @@ def test_authorization_does_not_import_the_classifier():
         / "recovery"
         / "authorization.py"
     )
-    tree = ast.parse(source_path.read_text(encoding="utf-8"))
-    imported_modules = {
-        node.module
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom)
-        and node.module is not None
-    }
-    imported_modules.update(
-        alias.name
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Import)
-        for alias in node.names
+    assert not _imports_classifier(
+        source_path.read_text(encoding="utf-8"),
+        package="atoms.core.recovery",
     )
-    assert "atoms.core.recovery.classifier" not in imported_modules
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from .classifier import classify_recovery as classify",
+        "from . import classifier as recovery_classifier",
+        "from atoms.core.recovery import classifier as recovery_classifier",
+    ],
+    ids=[
+        "relative-symbol",
+        "relative-module",
+        "absolute-package-member",
+    ],
+)
+def test_classifier_import_scanner_rejects_equivalent_static_imports(
+    source: str,
+):
+    assert _imports_classifier(source, package="atoms.core.recovery")
 
 
 def test_recovery_import_does_not_require_a_filesystem_backend():
