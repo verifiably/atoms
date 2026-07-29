@@ -3,6 +3,7 @@
 import pytest
 
 from tests.recovery_support import (
+    make_classifier_plan,
     make_committed_halt_source,
     make_committed_repeated_replace_snapshot,
     make_committed_snapshot,
@@ -160,3 +161,8 @@ def repeated_path_mid_plan_halt():
 @pytest.fixture
 def snapshot_pair_differing_only_dependencies():
     return make_snapshot_pair_differing_only_dependencies()
+
+
+@pytest.fixture
+def classifier_plan():
+    return make_classifier_plan()

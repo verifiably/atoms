@@ -1,3 +1,4 @@
+from atoms.core.recovery.authorization import authorize_recovery_step
 from atoms.core.recovery.classifier import classify_recovery
 from atoms.core.recovery.model import (
     OBSERVED_ABSENT,
@@ -109,6 +110,7 @@ __all__ = (
     "TransitionTransactionState",
     "WorkRoot",
     "apply_recovery_plan",
+    "authorize_recovery_step",
     "build_recovery_snapshot",
     "classify_recovery",
     "reduce_recovery_plan_prefix",

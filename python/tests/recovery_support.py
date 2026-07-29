@@ -44,6 +44,7 @@ from atoms.core.recovery import (
     TransitionTransactionState,
     WorkRoot,
     build_recovery_snapshot,
+    classify_recovery,
 )
 from atoms.core.recovery.journal import reconstruct_frontiers
 from atoms.core.spec import build_spec
@@ -294,6 +295,49 @@ def _joint(snapshot):
         scratch=snapshot.scratch_observations,
         parent_occupancy=(),
     )
+
+
+def reallocate_joint_identities(observation: JointObservation) -> JointObservation:
+    replacements: dict[EntryIdentity, EntryIdentity] = {}
+
+    def fresh_identity(identity: EntryIdentity) -> EntryIdentity:
+        replacement = replacements.get(identity)
+        if replacement is None:
+            replacement = EntryIdentity()
+            replacements[identity] = replacement
+        return replacement
+
+    def fresh_entry(entry):
+        if type(entry) is ObservedFile:
+            return ObservedFile(entry.state, fresh_identity(entry.identity))
+        if type(entry) is ObservedDirectory:
+            return ObservedDirectory(
+                entry.state,
+                fresh_identity(entry.identity),
+                entry.has_unmodeled_child,
+            )
+        return entry
+
+    return JointObservation(
+        persistent=tuple(
+            PersistentObservation(item.path, fresh_entry(item.entry))
+            for item in observation.persistent
+        ),
+        scratch=tuple(
+            ScratchObservation(
+                item.effect_id,
+                item.role,
+                fresh_entry(item.entry),
+                item.file_build_relation,
+            )
+            for item in observation.scratch
+        ),
+        parent_occupancy=observation.parent_occupancy,
+    )
+
+
+def make_classifier_plan():
+    return classify_recovery(create_snapshot())
 
 
 def _replace_snapshot():
