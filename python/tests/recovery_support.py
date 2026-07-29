@@ -2,6 +2,7 @@ from typing import cast
 
 from atoms.core.compiler import compile_spec
 from atoms.core.effects import ReplaceFile
+from atoms.core.fingerprint import FileState
 from atoms.core.recovery import (
     OBSERVED_ABSENT,
     CommitDecision,
@@ -10,16 +11,21 @@ from atoms.core.recovery import (
     EffectVariant,
     EntryIdentity,
     FileBuildRelation,
+    HaltDiagnostic,
+    HaltReason,
     JointObservation,
     JournalState,
     ObservedEntry,
     ObservedFile,
+    OperatorAction,
     PersistentNode,
     PersistentObservation,
     PreserveExternal,
+    ProjectRoot,
     RecoveryTopology,
     RemoveScratch,
     RollbackResult,
+    ScratchNode,
     ScratchObservation,
     ScratchRole,
     SettlementKind,
@@ -101,6 +107,115 @@ def make_terminal_snapshot():
     return create_snapshot(
         state=TransactionState.ROLLED_BACK,
         journal=JournalState.UNDONE,
+    )
+
+
+def make_three_effect_snapshot(
+    state: TransactionState,
+    states: tuple[JournalState, JournalState, JournalState],
+    *,
+    active: bool = True,
+    commit_decision: CommitDecision | None = None,
+    halt_diagnostic: HaltDiagnostic | None = None,
+):
+    h = FileState(content_hash="sha256:" + "3" * 64, mode=0o644, byte_len=7)
+    i = FileState(content_hash="sha256:" + "4" * 64, mode=0o644, byte_len=11)
+    effects = (
+        ReplaceFile("e1", "a.txt", F, G),
+        ReplaceFile("e2", "a.txt", G, h),
+        ReplaceFile("e3", "a.txt", h, i),
+    )
+    compiled = compile_spec(
+        build_spec(
+            consumer_tag="cnsmr",
+            intent_digest=DIGEST,
+            initial_surface={"a.txt": F},
+            final_surface={"a.txt": i},
+            effects=effects,
+            dependencies=(("e1", "e3"),),
+        )
+    )
+    project = ProjectRoot()
+    topology = RecoveryTopology(
+        parents=(
+            TopologyParent(node=PersistentNode("a.txt"), parent=project),
+            *(
+                TopologyParent(
+                    node=ScratchNode(effect.effect_id, ScratchRole.STAGING),
+                    parent=project,
+                )
+                for effect in effects
+            ),
+        )
+    )
+    actual_decision = (
+        CommitDecision.COMMITTED
+        if commit_decision is None and state is TransactionState.COMMITTED
+        else CommitDecision.UNCOMMITTED
+        if commit_decision is None
+        else commit_decision
+    )
+    return build_recovery_snapshot(
+        compiled=compiled,
+        topology=topology,
+        transaction_state=state,
+        commit_decision=actual_decision,
+        rollback_result=(
+            RollbackResult.RESTORED
+            if state is TransactionState.ROLLED_BACK
+            else None
+        ),
+        halt_diagnostic=halt_diagnostic,
+        active=active,
+        journals=tuple(
+            EffectJournalState(effect.effect_id, journal)
+            for effect, journal in zip(effects, states, strict=True)
+        ),
+        persistent_observations=(
+            PersistentObservation("a.txt", OBSERVED_ABSENT),
+        ),
+        scratch_observations=tuple(
+            ScratchObservation(
+                effect.effect_id,
+                ScratchRole.STAGING,
+                OBSERVED_ABSENT,
+                None,
+            )
+            for effect in effects
+        ),
+    )
+
+
+def make_halted_authority_snapshot(
+    states: tuple[JournalState, JournalState, JournalState],
+    *,
+    active: bool,
+    commit_decision: CommitDecision = CommitDecision.UNCOMMITTED,
+):
+    journals = tuple(
+        EffectJournalState(effect_id, journal)
+        for effect_id, journal in zip(("e1", "e2", "e3"), states, strict=True)
+    )
+    diagnostic = HaltDiagnostic(
+        pre_halt_state=TransactionState.ROLLING_BACK,
+        commit_decision=commit_decision,
+        journals=journals,
+        projected_transaction_state=TransactionState.ROLLING_BACK,
+        projected_journals=journals,
+        effect_id=None,
+        paths=(),
+        expected=(),
+        observed=(),
+        identity_relations=(),
+        reason=HaltReason.EFFECT_TUPLE_UNATTRIBUTABLE,
+        operator_action=OperatorAction.INSPECT_PRESERVED_EVIDENCE,
+    )
+    return make_three_effect_snapshot(
+        TransactionState.HALTED,
+        states,
+        active=active,
+        commit_decision=commit_decision,
+        halt_diagnostic=diagnostic,
     )
 
 
