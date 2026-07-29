@@ -12,8 +12,9 @@ from atoms.core.effects import (
     MoveNoClobber,
     ReplaceFile,
 )
-from atoms.core.errors import ProtocolError
+from atoms.core.errors import ProtocolError, SpecValidationError
 from atoms.core.fingerprint import AbsentState, DirectoryState, FileState, SymlinkState
+from atoms.core.paths import require_rel_path
 from atoms.core.recovery.model import (
     CommitDecision,
     DiagnosticEntry,
@@ -251,7 +252,9 @@ def _validate_persistent_coverage(
     for observation in observations:
         _require_exact(observation, PersistentObservation, "persistent_observations")
         _require_exact(observation.path, str, "persistent_observations")
-    if tuple(observation.path for observation in observations) != expected_paths:
+    if len(observations) != len(expected_paths) or {observation.path for observation in observations} != set(
+        expected_paths
+    ):
         _fail("persistent_observations do not provide exact compiled path coverage")
 
 
@@ -264,7 +267,9 @@ def _validate_scratch_coverage(
         _require_exact(observation, ScratchObservation, "scratch_observations")
         _require_exact(observation.effect_id, str, "scratch_observations")
         _require_exact(observation.role, ScratchRole, "scratch_observations")
-    if tuple((observation.effect_id, observation.role) for observation in observations) != expected:
+    if len(observations) != len(expected) or {
+        (observation.effect_id, observation.role) for observation in observations
+    } != set(expected):
         _fail("scratch_observations do not provide exact compiled scratch coverage")
 
 
@@ -291,6 +296,8 @@ def _validate_topology(compiled: CompiledSpec, topology: RecoveryTopology) -> No
 
     if project not in nodes:
         _fail("topology is missing the project root")
+    if any(node != project and node not in parents for node in nodes):
+        _fail("topology node is missing a parent")
     if WorkRoot() in parents and parents[WorkRoot()] != project:
         _fail("topology work root must be parented by the project root")
 
@@ -448,7 +455,7 @@ def _validate_halt_diagnostic(diagnostic: HaltDiagnostic | None) -> None:
         _fail("halt_diagnostic projected journals have the wrong effect vector")
     if diagnostic.effect_id is not None:
         _require_exact(diagnostic.effect_id, str, "halt_diagnostic")
-    _validate_sorted_strings(diagnostic.paths, "halt_diagnostic.paths")
+    _validate_diagnostic_paths(diagnostic.paths)
     _validate_diagnostic_entries(diagnostic.expected, "halt_diagnostic.expected")
     _validate_diagnostic_entries(diagnostic.observed, "halt_diagnostic.observed")
     _validate_identity_relations(diagnostic.identity_relations)
@@ -473,6 +480,15 @@ def _validate_sorted_strings(items: object, label: str) -> None:
     strings = cast(tuple[str, ...], values)
     if tuple(sorted(strings)) != strings or len(set(strings)) != len(strings):
         _fail(f"{label} must be sorted and unique")
+
+
+def _validate_diagnostic_paths(paths: object) -> None:
+    _validate_sorted_strings(paths, "halt_diagnostic.paths")
+    for path in cast(tuple[str, ...], paths):
+        try:
+            require_rel_path("halt_diagnostic.paths", path)
+        except SpecValidationError:
+            _fail("halt_diagnostic.paths must contain project-relative paths")
 
 
 def _validate_diagnostic_entries(items: object, label: str) -> None:

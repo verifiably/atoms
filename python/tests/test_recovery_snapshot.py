@@ -196,6 +196,115 @@ def test_snapshot_refuses_cyclic_topology():
         )
 
 
+def test_snapshot_refuses_unparented_endpoint_with_protocol_error():
+    topology = RecoveryTopology(
+        parents=(
+            TopologyParent(TopologyDirectory(1), PersistentNode("a.txt")),
+            TopologyParent(ScratchNode("e1", ScratchRole.STAGING), ProjectRoot()),
+        )
+    )
+    with pytest.raises(ProtocolError, match="topology node is missing a parent"):
+        build_recovery_snapshot(
+            compiled=compiled_create(),
+            topology=topology,
+            transaction_state=TransactionState.APPLYING,
+            commit_decision=CommitDecision.UNCOMMITTED,
+            rollback_result=None,
+            halt_diagnostic=None,
+            active=True,
+            journals=(EffectJournalState("e1", JournalState.PENDING),),
+            persistent_observations=(PersistentObservation("a.txt", OBSERVED_ABSENT),),
+            scratch_observations=(
+                ScratchObservation("e1", ScratchRole.STAGING, OBSERVED_ABSENT, None),
+            ),
+        )
+
+
+def test_snapshot_accepts_permuted_persistent_and_scratch_coverage():
+    compiled = _compiled_nested_create()
+    project = ProjectRoot()
+    topology = RecoveryTopology(
+        parents=(
+            *(TopologyParent(PersistentNode(path), project) for path in ("one/a.txt", "one/b.txt", "two/c.txt")),
+            *(TopologyParent(ScratchNode(f"e{index}", ScratchRole.STAGING), project) for index in range(1, 4)),
+        )
+    )
+    persistent = tuple(
+        PersistentObservation(path, OBSERVED_ABSENT)
+        for path in ("two/c.txt", "one/b.txt", "one/a.txt")
+    )
+    scratch = tuple(
+        ScratchObservation(f"e{index}", ScratchRole.STAGING, OBSERVED_ABSENT, None)
+        for index in (3, 2, 1)
+    )
+    snapshot = build_recovery_snapshot(
+        compiled=compiled,
+        topology=topology,
+        transaction_state=TransactionState.APPLYING,
+        commit_decision=CommitDecision.UNCOMMITTED,
+        rollback_result=None,
+        halt_diagnostic=None,
+        active=True,
+        journals=tuple(EffectJournalState(f"e{index}", JournalState.PENDING) for index in range(1, 4)),
+        persistent_observations=persistent,
+        scratch_observations=scratch,
+    )
+    assert snapshot.persistent_observations == persistent
+    assert snapshot.scratch_observations == scratch
+
+
+@pytest.mark.parametrize(
+    ("field", "members"),
+    [
+        (
+            "persistent_observations",
+            (
+                PersistentObservation("a.txt", OBSERVED_ABSENT),
+                PersistentObservation("a.txt", OBSERVED_ABSENT),
+            ),
+        ),
+        (
+            "persistent_observations",
+            (
+                PersistentObservation("a.txt", OBSERVED_ABSENT),
+                PersistentObservation("extra.txt", OBSERVED_ABSENT),
+            ),
+        ),
+        (
+            "scratch_observations",
+            (
+                ScratchObservation("e1", ScratchRole.STAGING, OBSERVED_ABSENT, None),
+                ScratchObservation("e1", ScratchRole.STAGING, OBSERVED_ABSENT, None),
+            ),
+        ),
+        (
+            "scratch_observations",
+            (
+                ScratchObservation("e1", ScratchRole.STAGING, OBSERVED_ABSENT, None),
+                ScratchObservation("extra", ScratchRole.STAGING, OBSERVED_ABSENT, None),
+            ),
+        ),
+    ],
+)
+def test_snapshot_refuses_duplicate_or_extra_unordered_coverage(field, members):
+    snapshot = create_snapshot()
+    values = {
+        "compiled": snapshot.compiled,
+        "topology": snapshot.topology,
+        "transaction_state": snapshot.transaction_state,
+        "commit_decision": snapshot.commit_decision,
+        "rollback_result": snapshot.rollback_result,
+        "halt_diagnostic": snapshot.halt_diagnostic,
+        "active": snapshot.active,
+        "journals": snapshot.journals,
+        "persistent_observations": snapshot.persistent_observations,
+        "scratch_observations": snapshot.scratch_observations,
+    }
+    values[field] = members
+    with pytest.raises(ProtocolError, match=field):
+        build_recovery_snapshot(**values)
+
+
 def test_snapshot_refuses_wrong_scratch_role():
     snapshot = create_snapshot()
     with pytest.raises(ProtocolError, match="scratch_observations"):
@@ -290,6 +399,12 @@ def test_halt_diagnostic_accepts_an_absent_projected_entry():
 def test_snapshot_refuses_halted_diagnostic_mismatch():
     diagnostic = _halt_diagnostic(commit_decision=CommitDecision.COMMITTED)
     with pytest.raises(ProtocolError, match="halt_diagnostic does not match"):
+        create_snapshot(state=TransactionState.HALTED, halt_diagnostic=diagnostic)
+
+
+def test_snapshot_refuses_absolute_halt_diagnostic_path():
+    diagnostic = replace(_halt_diagnostic(), paths=("/outside",))
+    with pytest.raises(ProtocolError, match="halt_diagnostic.paths"):
         create_snapshot(state=TransactionState.HALTED, halt_diagnostic=diagnostic)
 
 
