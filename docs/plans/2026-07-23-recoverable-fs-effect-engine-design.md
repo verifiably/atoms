@@ -1283,6 +1283,11 @@ decision and token-free diagnostic from its first halt. Across a process restart
 compared up to renaming of regenerated snapshot-local identity tokens; the diagnostic itself remains
 exactly equal.
 
+Classification and semantic-plan construction are identity-conservative: they reuse the tokens in
+the coherent source observation and never allocate a new token. A mutating step's expected tuple is
+bound after all preceding metadata steps, including normalization of construction-only evidence when
+`STARTED` becomes `UNDO_STARTED`.
+
 Table and property tests cover every variant, forward/reverse state, named intermediate, and
 unattributable state. Generated valid effect sequences prove:
 

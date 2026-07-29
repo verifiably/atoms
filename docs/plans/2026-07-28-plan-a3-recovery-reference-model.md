@@ -44,6 +44,8 @@ which refines [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-r
 - **Identity universes:** one coherent observation reuses one token for every slot naming the same
   entry and uses distinct tokens for distinct entries. Every fresh observation regenerates all tokens;
   cross-observation comparison uses non-identity fields plus named-slot identity partitions.
+- **Identity conservation:** classifiers, plan builders, diagnostics, authorization, and the reducer
+  never allocate `EntryIdentity`; they only retain, move, compare, or project observation tokens.
 - **Ordering:** compiled effect order is authoritative. `dependencies` never schedule recovery.
 - **Mutation discipline:** use TDD for every task. Run the named failing test before production edits.
 - **Commits:** no AI-attribution trailers. Documentation paths use `~/d/atoms/...`, never host-specific
@@ -59,6 +61,7 @@ which refines [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-r
 | `python/src/atoms/core/recovery/plan.py` | Guarded plan/step values and internal plan factories |
 | `python/src/atoms/core/recovery/journal.py` | Transaction-state matrix, journal languages, path frontiers |
 | `python/src/atoms/core/recovery/variants.py` | Five joint effect classifiers |
+| `python/src/atoms/core/recovery/diagnostics.py` | Shared token-free tuple and identity projections |
 | `python/src/atoms/core/recovery/classifier.py` | All-evidence-first transaction planning |
 | `python/src/atoms/core/recovery/reducer.py` | Prefix and full abstract plan reduction |
 | `python/src/atoms/core/recovery/authorization.py` | Fresh observation comparison and authorized-step factory |
@@ -105,15 +108,17 @@ directly by non-pytest checks. No test may name a fixture absent from this regis
 | `replace_started_case` | Task 4 | callable returning a STARTED replace snapshot and its `UNDO_STARTED` transition |
 | `replace_transform_case` | Task 4 | callable returning a STARTED replace whose tuple moves live off `pre` |
 | `three_effect_snapshot` | Task 5 | callable returning a three-effect snapshot for a state/journal vector |
-| `replace_case` | Task 6 | callable constructing the named live/staging/journal tuple and reconstructed frontiers |
+| `halted_authority_snapshot` | Task 5 | callable halted snapshot with matching frozen vector and active flag |
+| `replace_case` | Task 6 | callable building live/staging/journal/frontiers, optionally committed |
 | `noop_replace_case` | Task 6 | same as `replace_case`, with exact `pre == post` |
-| `create_file_case` | Task 6 | callable constructing the named live/staging/journal tuple and frontiers |
+| `create_file_case` | Task 6 | callable building live/staging/journal/frontiers, optionally committed |
 | `pending_drift_case` | Task 6 | callable returning a pending create with external live drift |
+| `pending_clean_case` | Task 6 | callable returning a pending create at its initial tuple |
 | `pending_scratch_case` | Task 6 | callable returning a pending create with surviving staging |
 | `undone_drift_case` | Task 6 | callable returning an undone create with non-initial live evidence |
-| `delete_case` | Task 7 | callable constructing the named live/tombstone/journal tuple and frontiers |
-| `move_case` | Task 7 | callable constructing source/destination/anchor states and the requested identity partition |
-| `directory_case` | Task 7 | callable constructing live/work states, identity relation, occupancy, and frontiers |
+| `delete_case` | Task 7 | callable building live/tombstone/journal/frontiers, optionally committed |
+| `move_case` | Task 7 | callable building move states/identity partition, optionally committed |
+| `directory_case` | Task 7 | callable building directory states/occupancy, optionally committed |
 | `two_effect_snapshot` | Task 8 | callable selecting a named decision case for each of two effects |
 | `committed_snapshot` | Task 8 | committed all-DONE snapshot with removable terminal scratch |
 | `prepared_drift_snapshot` | Task 8 | prepared all-PENDING snapshot with external live drift |
@@ -121,9 +126,9 @@ directly by non-pytest checks. No test may name a fixture absent from this regis
 | `recovery_case` | Task 8 | callable returning named restored/refused/committed/halt fixed-point sources |
 | `committed_halt_source` | Task 8 | committed source whose cleanup tuple requires a halt |
 | `repeated_path_mid_plan_halt` | Task 8 | earlier effect halts after a later repair projection |
-| `snapshot_pair_differing_only_dependencies` | Task 8 | equal snapshots except for compiled dependency edges |
+| `snapshot_pair_differing_only_dependencies` | Task 8 | dependency-only compiled difference; observations shared |
 | `classifier_plan` | Task 9 | action plan containing at least one filesystem-mutating step |
-| `generated_snapshots` | Task 10 | finite generator exposing the three methods Task 10 names |
+| `generated_snapshots` | Task 10 | finite generator exposing every method Task 10 names |
 | `identity_case` | Task 10 | pair of snapshots differing only by a consistent identity-token alpha-renaming |
 | `halt_restart_case` | Task 10 | pair of halted snapshots with equal diagnostics and regenerated observation tokens |
 
@@ -513,7 +518,7 @@ def create_snapshot(
         if (
             relation is _DEFAULT
             and journal is JournalState.STARTED
-            and isinstance(staged, ObservedFile)
+            and type(staged) is ObservedFile
         )
         else None
         if relation is _DEFAULT
@@ -641,6 +646,7 @@ Create `python/src/atoms/core/recovery/snapshot.py`. Use exact dataclasses:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import NoReturn
 
 from atoms.core.compiler import CompiledSpec
 from atoms.core.effects import (
@@ -709,7 +715,7 @@ class RecoveryTopology:
 _SNAPSHOT_TOKEN = object()
 
 
-def _fail(message: str) -> None:
+def _fail(message: str) -> NoReturn:
     raise ProtocolError(message)
 
 
@@ -1172,7 +1178,7 @@ class HaltPlan:
     bound_snapshot: RecoverySnapshot
     disposition: PlanDisposition = field(init=False)
     diagnostic: HaltDiagnostic
-    steps: tuple[TransitionTransactionState, ...] = field(init=False)
+    steps: tuple[TransitionTransactionState, ...]
 
     def __init__(
         self,
@@ -1376,9 +1382,10 @@ def test_action_plan_factory_derives_result_from_disposition(disposition):
 
 Also assert direct construction and both `replace(plan)` forms fail for all three variants and
 `AuthorizedStep`, always with `match="classify_recovery"` (or
-`match="authorize_recovery_step"` for `AuthorizedStep`). `HaltPlan` and `NoRecoveryPlan` mark their
-derived `disposition`/`steps` fields `init=False`, so `replace` reaches the factory guard rather than
-failing on an unexpected keyword argument.
+`match="authorize_recovery_step"` for `AuthorizedStep`). `HaltPlan` marks only its derived
+`disposition` as `init=False`; `steps` remains an ordinary field because its guarded `__init__`
+requires it. `NoRecoveryPlan` marks both derived fields `init=False`. These declarations make
+`replace` supply exactly the guarded constructor's required keywords and reach the token check.
 
 - [ ] **Step 5: Run focused and full checks**
 
@@ -1420,7 +1427,9 @@ authorization a precise logical source and models crash points between durable s
   - `reduce_recovery_plan_prefix(snapshot, plan, completed_steps) -> RecoverySnapshot`;
   - `apply_recovery_plan(snapshot, plan) -> RecoverySnapshot`;
   - internal `_apply_steps(snapshot, steps) -> RecoverySnapshot`, reused by Task 8's pure planning
-    cursor so classification and execution cannot diverge.
+    cursor so classification and execution cannot diverge;
+  - internal `_normalize_joint_observation(snapshot, observation) -> JointObservation`, reused by
+    Tasks 8 and 9 whenever evidence is rebound to a different journal prefix.
 
 - [ ] **Step 1: Write failing prefix and source-binding tests**
 
@@ -1591,6 +1600,13 @@ Then call `build_recovery_snapshot` with the normalized exact values so every in
 validated. A mismatch is `ProtocolError`, not a semantic halt: a factory plan applied in order to its
 bound logical source cannot legitimately disagree with itself.
 
+`_normalize_joint_observation(snapshot, observation)` applies the identical rule to a step-sized
+observation. It preserves every entry, identity token, occupancy fact, and required relation, changing
+only a relation that the snapshot's journal state and the observation's live/staging tuple make
+irrelevant to `None`. It never allocates identity or invents a build relation. Task 8 uses it while
+binding provisional variant steps to their post-transition cursor; Task 9 uses it before rebuilding a
+mismatch snapshot.
+
 For directory observations, recompute modeled occupancy from `RecoveryTopology` after each
 `TransformEffectTuple`; preserve `has_unmodeled_child`.
 
@@ -1696,7 +1712,12 @@ from atoms.core.recovery import (
     JournalState,
     TransactionState,
 )
-from atoms.core.recovery.journal import AuthorityKind, classify_transaction_authority
+from atoms.core.recovery.journal import (
+    AuthorityKind,
+    FrontierDirection,
+    classify_transaction_authority,
+    reconstruct_frontiers,
+)
 from tests.recovery_support import create_snapshot
 
 
@@ -1770,6 +1791,38 @@ def test_rolling_back_rejects_undone_after_pending(three_effect_snapshot, states
     decision = classify_transaction_authority(snapshot)
     assert decision.kind is AuthorityKind.HALT
     assert decision.halt_reason is HaltReason.JOURNAL_TOPOLOGY_INVALID
+
+
+@pytest.mark.parametrize(
+    ("state", "states"),
+    [
+        (TransactionState.PREPARED, (JournalState.DONE,) * 3),
+        (
+            TransactionState.ROLLED_BACK,
+            (JournalState.DONE, JournalState.UNDONE, JournalState.PENDING),
+        ),
+    ],
+)
+def test_each_state_uses_its_own_journal_language(
+    three_effect_snapshot,
+    state,
+    states,
+):
+    decision = classify_transaction_authority(three_effect_snapshot(state, states))
+    assert decision.kind is AuthorityKind.HALT
+    assert decision.halt_reason is HaltReason.JOURNAL_TOPOLOGY_INVALID
+
+
+@pytest.mark.parametrize("active", [False, True])
+def test_halted_short_circuits_language_rederivation(
+    halted_authority_snapshot,
+    active,
+):
+    snapshot = halted_authority_snapshot(
+        (JournalState.DONE, JournalState.PENDING, JournalState.UNDONE),
+        active=active,
+    )
+    assert classify_transaction_authority(snapshot).kind is AuthorityKind.STABLE_HALT
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -1857,20 +1910,44 @@ def _reverse_language(states):
             continue
         return False
     return True
+
+
+def _rolled_back_language(states):
+    pending = False
+    for state in states:
+        if state is JournalState.PENDING:
+            pending = True
+            continue
+        if state is JournalState.UNDONE and not pending:
+            continue
+        return False
+    return True
 ```
 
 `expected_state` is the continuity baseline: the path state before the selected occurrence for a
 forward frontier and after it for a reverse frontier. `admissible_states` is the closed set for the
 selected journal state. A `STARTED` frontier therefore retains one baseline while explicitly carrying
 its pre/intermediate/post admissible states; consumers never mistake the baseline for the whole set.
-Task 5 adds the `three_effect_snapshot` adapter to `conftest.py`.
+Task 5 adds the `three_effect_snapshot` and `halted_authority_snapshot` adapters to `conftest.py`.
+
+Assign languages exactly:
+
+| Transaction state | Required journal language |
+| --- | --- |
+| `PREPARED` | `_all(states, PENDING)` |
+| `APPLYING` | `_forward_language(states)` |
+| `APPLIED` | `_all(states, DONE)` |
+| `ROLLING_BACK` | `_forward_language(states) or _reverse_language(states)` |
+| `COMMITTED` | `_all(states, DONE)` |
+| `ROLLED_BACK` | `_rolled_back_language(states)` (`UNDONE* PENDING*`, no `DONE` prefix) |
+| `HALTED` | no language selection; return the frozen stable halt |
 
 `classify_transaction_authority` applies this exact precedence:
 
 ```text
 1. exact state/commit-decision compatibility;
-2. legal journal language for that state;
-3. HALTED → STABLE_HALT regardless of active binding; coherence was enforced by the snapshot factory;
+2. HALTED → STABLE_HALT regardless of active binding; coherence was enforced by the snapshot factory;
+3. legal journal language for the non-halted state;
 4. detached terminal → NO_RECOVERY;
 5. detached nonterminal → HALT / ACTIVE_BINDING_MISSING;
 6. active ROLLED_BACK → DETACH;
@@ -1881,7 +1958,9 @@ For `COMMITTED`, require `COMMITTED` decision and all `DONE`. For every precommi
 `ROLLED_BACK`, require `UNCOMMITTED`. `HALTED` preserves either decision.
 
 Add one active and one detached `HALTED` test; both must return `STABLE_HALT` with the exact stored
-diagnostic and no attempt to invent an active binding.
+diagnostic and no attempt to invent an active binding. Build each over a frozen
+`(DONE, PENDING, UNDONE)` vector that is not legal for any non-halted state; this locks
+the pre-language `HALTED` short circuit.
 
 - [ ] **Step 4: Implement frontier reconstruction**
 
@@ -1909,15 +1988,32 @@ def reconstruct_frontiers(snapshot: RecoverySnapshot) -> tuple[PathFrontier, ...
     return tuple(frontiers)
 ```
 
-`_forward_frontier` chooses the last `DONE`, or the one following `STARTED`, and returns the exact
-pre/post expected state described in design §6.2. `_reverse_frontier` chooses the latest occurrence in
-`DONE | STARTED | UNDO_STARTED`; all-`UNDONE`/`PENDING` returns `INITIAL` with the timeline's first
-pre-state. Include tests for repeated-path timelines and a crash between one `DONE` and the next
-`STARTED`.
+`_forward_frontier` chooses the unique `STARTED` occurrence when present, otherwise the last `DONE`;
+its baseline is the selected occurrence's `pre` for `STARTED` and `post` for `DONE`.
+`_reverse_frontier` chooses the latest occurrence in `DONE | STARTED | UNDO_STARTED`;
+all-`UNDONE`/`PENDING` returns `INITIAL` with the timeline's first pre-state. Include tests for
+repeated-path timelines and a crash between one `DONE` and the next `STARTED`.
+
+An all-`PENDING` forward timeline also returns `INITIAL` at the timeline's first pre-state:
+
+```python
+def test_all_pending_forward_frontier_is_initial():
+    snapshot = create_snapshot(
+        state=TransactionState.PREPARED,
+        journal=JournalState.PENDING,
+    )
+    frontier = reconstruct_frontiers(snapshot)[0]
+    assert frontier.direction is FrontierDirection.INITIAL
+    assert frontier.expected_state == snapshot.compiled.timelines[0].occurrences[0].pre
+```
+
+Within production `classify_recovery`, every uncommitted active state transitions to
+`ROLLING_BACK` before frontier reconstruction, so forward reconstruction there serves committed
+cleanup. Direct Task 5/6 classifier tests still exercise forward in-flight frontiers.
 
 - [ ] **Step 5: Mutation-lock the load-bearing grammar**
 
-Temporarily replace the two rolling-back recognizers with one
+Temporarily replace the `ROLLING_BACK` union of forward/reverse recognizers with one
 `DONE* (STARTED | UNDO_STARTED)? UNDONE* PENDING*` implementation.
 
 Run: `uv run pytest tests/test_recovery_journal.py -v`
@@ -1981,13 +2077,13 @@ Index this table by `type(effect)`; never derive a free-form variant string from
 
 - [ ] **Step 1: Write failing replace table tests**
 
-Create `python/tests/test_recovery_variants_files.py` with a fixture that builds a one-effect compiled
-replace snapshot for arbitrary live/staging observations and journal state. Parameterize the general
-table:
+Create `python/tests/test_recovery_variants_files.py` using the registered `replace_case` callable,
+which builds a one-effect compiled replace snapshot for arbitrary live/staging observations and
+journal state. Parameterize the general table:
 
 Task 6 adds `replace_case`, `noop_replace_case`, `create_file_case`, `pending_drift_case`,
-`pending_scratch_case`, and `undone_drift_case` adapters to `conftest.py` in the same commit as their
-`make_*` factories.
+`pending_clean_case`, `pending_scratch_case`, and `undone_drift_case` adapters to `conftest.py` in the
+same commit as their `make_*` factories.
 
 ```python
 import pytest
@@ -2072,15 +2168,83 @@ def test_create_file_joint_table(create_file_case, live_name, staging_name, jour
 For every parameterized test, also assert a foreign or diverged staging observation halts without a
 mutation step.
 
+Exercise the committed-cleanup rows directly in Task 6:
+
+```python
+@pytest.mark.parametrize(
+    ("live_name", "staging_name", "expected"),
+    [
+        ("post", "pre", "remove_scratch"),
+        ("post", "absent", "no_action"),
+    ],
+)
+def test_replace_committed_cleanup_rows(
+    replace_case,
+    live_name,
+    staging_name,
+    expected,
+):
+    snapshot, frontiers = replace_case(
+        live_name,
+        staging_name,
+        JournalState.DONE,
+        committed=True,
+    )
+    assert classify_effect(snapshot, 0, frontiers).kind.value == expected
+
+
+@pytest.mark.parametrize(
+    ("staging_name", "expected"),
+    [("same", "remove_scratch"), ("absent", "no_action")],
+)
+def test_noop_replace_committed_cleanup_rows(
+    noop_replace_case,
+    staging_name,
+    expected,
+):
+    snapshot, frontiers = noop_replace_case(
+        staging_name,
+        JournalState.DONE,
+        committed=True,
+    )
+    assert classify_effect(snapshot, 0, frontiers).kind.value == expected
+
+
+@pytest.mark.parametrize(
+    ("staging_name", "expected"),
+    [("absent", "no_action"), ("post", "halt")],
+)
+def test_create_file_committed_cleanup_rows(
+    create_file_case,
+    staging_name,
+    expected,
+):
+    snapshot, frontiers = create_file_case(
+        "post",
+        staging_name,
+        JournalState.DONE,
+        committed=True,
+    )
+    assert classify_effect(snapshot, 0, frontiers).kind.value == expected
+```
+
 - [ ] **Step 3: Write failing non-in-flight evidence tests**
 
 ```python
 def test_pending_live_drift_is_preserved_and_refused(pending_drift_case):
     snapshot, frontiers = pending_drift_case()
     decision = classify_effect(snapshot, 0, frontiers)
+    assert decision.kind is EffectDecisionKind.PRESERVE_EXTERNAL
     assert decision.refused
     assert decision.halt_reason is None
     assert any(type(step) is PreserveExternal for step in decision.steps)
+
+
+def test_pending_initial_tuple_is_explicit_no_action(pending_clean_case):
+    snapshot, frontiers = pending_clean_case()
+    decision = classify_effect(snapshot, 0, frontiers)
+    assert decision.kind is EffectDecisionKind.NO_ACTION
+    assert decision.steps == ()
 
 
 def test_pending_scratch_survivor_halts(pending_scratch_case):
@@ -2140,6 +2304,8 @@ class EntryClass(Enum):
 
 
 class EffectDecisionKind(Enum):
+    NO_ACTION = "no_action"
+    PRESERVE_EXTERNAL = "preserve_external"
     UNDO_WITHOUT_MUTATION = "undo_without_mutation"
     REMOVE_SCRATCH = "remove_scratch"
     EXCHANGE_BACK = "exchange_back"
@@ -2189,8 +2355,11 @@ otherwise `EXTERNAL`. The no-op replace classifier bypasses this pre-before-post
 dedicated table.
 
 Add step builders `_transform`, `_remove_scratch`, and `_preserve`. Each captures the complete current
-joint observation as `expected_before` and constructs the exact logical `result_after`; no builder may
-drop the sibling live/scratch node.
+joint observation as a provisional `expected_before` and constructs the exact logical `result_after`;
+no builder may drop the sibling live/scratch node. Builders are identity-conservative: every result
+reuses tokens from the input tuple according to the declared transfer and no builder calls
+`EntryIdentity()`. Task 8 rebases provisional mutating-step observations against the pure cursor after
+its preceding metadata transition before the steps enter a `RecoveryPlan`.
 
 - [ ] **Step 6: Implement the two exact decision tables**
 
@@ -2198,11 +2367,11 @@ Before variant dispatch, handle the two non-in-flight states for every variant:
 
 ```text
 PENDING:
-    scratch absent + every owned path at its PathFrontier.expected_state → no action;
-    scratch absent + any owned path drift → PreserveExternal for those paths, refused outcome;
+    scratch absent + every owned path at its PathFrontier.expected_state → NO_ACTION;
+    scratch absent + any owned path drift → PRESERVE_EXTERNAL for those paths, refused outcome;
     any scratch survivor → halt and preserve it (the effect never acquired mutation authority).
 UNDONE:
-    scratch absent + every owned path at its initial/reverse-frontier state → no action;
+    scratch absent + every owned path at its initial/reverse-frontier state → NO_ACTION;
     any other tuple → halt and preserve all evidence.
 ```
 
@@ -2251,10 +2420,11 @@ Encode these replace outcomes exactly:
 | `UNDO_STARTED` | `(pre,post)` | `remove_scratch` |
 | `UNDO_STARTED` | `(pre,A)` | `already_undone` |
 | uncommitted `DONE` | `(post,pre)` only | transition-ready `exchange_back` |
-| committed `DONE` | `(post,pre|A)` | remove retained exact pre if present |
+| committed `DONE` | `(post,pre)` / `(post,A)` | `REMOVE_SCRATCH` / `NO_ACTION` |
 
 For `pre == post`, encode the dedicated design §9.1 matrix before the general classifier. `(same,X)`
-always halts; uncommitted `DONE (same,A)` halts; `(same,same)` leaves live and removes staging.
+always halts; uncommitted `DONE (same,A)` halts. Committed `(same,same)` removes staging and
+committed `(same,A)` is `NO_ACTION`.
 
 Encode these create-file outcomes exactly:
 
@@ -2267,7 +2437,7 @@ Encode these create-file outcomes exactly:
 | `UNDO_STARTED` | `(post,A)` | quarantine/remove live post |
 | `UNDO_STARTED` | `(A,post)` | remove quarantined post |
 | `UNDO_STARTED` | `(A,A)` | already undone |
-| uncommitted/committed `DONE` | `(post,A)` only | rollback or final cleanup respectively |
+| uncommitted/committed `DONE` | `(post,A)` only | remove live for rollback / committed `NO_ACTION` |
 
 Every tuple not listed returns `_halt(expected, observed)` and no semantic mutation. Non-halt
 decisions carry the same two complete joint observations with `halt_reason=None`, so later plan or
@@ -2417,6 +2587,56 @@ def test_create_directory_joint_table(
 Add a resolved-topology case where declared descendants are present before reverse ordering and absent
 after their simulated reversal. The parent directory may be removed only in the latter prefix.
 
+Exercise every committed-cleanup row directly in Task 7:
+
+```python
+@pytest.mark.parametrize(
+    ("tombstone_name", "expected"),
+    [("pre", "remove_scratch"), ("absent", "no_action")],
+)
+def test_delete_committed_cleanup_rows(delete_case, tombstone_name, expected):
+    snapshot, frontiers = delete_case(
+        "absent",
+        tombstone_name,
+        JournalState.DONE,
+        committed=True,
+    )
+    assert classify_effect(snapshot, 0, frontiers).kind.value == expected
+
+
+@pytest.mark.parametrize(
+    ("anchor", "relation", "expected"),
+    [
+        ("pre", "destination_anchor_same", "remove_anchor"),
+        ("absent", None, "no_action"),
+    ],
+)
+def test_move_committed_cleanup_rows(move_case, anchor, relation, expected):
+    snapshot, frontiers = move_case(
+        "absent",
+        "pre",
+        anchor,
+        relation,
+        committed=True,
+    )
+    assert classify_effect(snapshot, 0, frontiers).kind.value == expected
+
+
+@pytest.mark.parametrize(
+    ("work", "relation", "expected"),
+    [("absent", None, "no_action"), ("post", "same", "halt")],
+)
+def test_directory_committed_cleanup_rows(directory_case, work, relation, expected):
+    snapshot, frontiers = directory_case(
+        "post",
+        work,
+        relation,
+        False,
+        committed=True,
+    )
+    assert classify_effect(snapshot, 0, frontiers).kind.value == expected
+```
+
 - [ ] **Step 4: Run tests to verify Task 6 stubs fail**
 
 Run: `uv run pytest tests/test_recovery_variants_paths.py -v`
@@ -2433,7 +2653,7 @@ Replace the stubs with the exact tables:
 | Delete `STARTED` | `(A,pre)` | restore tombstone no-clobber |
 | Delete `UNDO_STARTED` | `(A,pre)` / `(pre,A)` | retry restore / already restored |
 | Delete uncommitted `DONE` | `(A,pre)` only | restore |
-| Delete committed | `(A,pre)` / `(A,A)` | remove retained tombstone / already clean |
+| Delete committed | `(A,pre)` / `(A,A)` | `REMOVE_SCRATCH` / `NO_ACTION` |
 | Move any forward/reverse frontier | `(pre,A,A)` | nothing landed |
 | Move | `(pre,A,pre)`, source `==` anchor | remove anchor |
 | Move | `(A,pre,pre)`, destination `==` anchor | restore source |
@@ -2441,7 +2661,7 @@ Replace the stubs with the exact tables:
 | Move | `(A,A,pre)` | restore source from anchor |
 | Move | source `==` anchor plus foreign destination | preserve destination, remove anchor, refuse |
 | Move uncommitted `DONE` | `(A,pre,pre)`, destination `==` anchor only | ordinary rollback |
-| Move committed | prior tuple or `(A,pre,A)` | cleanup or already clean |
+| Move committed | `(A,pre,pre)` same / `(A,pre,A)` | `REMOVE_ANCHOR` / `NO_ACTION` |
 
 Move result steps must converge through `(pre,A,pre)` with source `==` anchor, then remove the anchor.
 Record only `DiagnosticIdentityRelation("source", "anchor", SAME)` or its destination equivalent in
@@ -2461,7 +2681,7 @@ Encode:
 
 Any unmodeled child needed for removal returns `DIRECTORY_NOT_EMPTY`. Under uncommitted `DONE`, accept
 only `(post,A)` and only after declared descendants have reversed. Under committed cleanup, accept only
-`(post,A)`. A `DONE` work survivor is a contradiction.
+`(post,A)` as `NO_ACTION`. A `DONE` work survivor is a contradiction.
 
 Use `RecoveryTopology` parent edges, not lexical string prefixes, to enumerate modeled direct
 descendants.
@@ -2497,6 +2717,7 @@ must inspect every persistent/scratch observation before emitting any semantic s
 token-free diagnostics for every halt.
 
 **Files:**
+- Create: `python/src/atoms/core/recovery/diagnostics.py`
 - Create: `python/src/atoms/core/recovery/classifier.py`
 - Create: `python/tests/test_recovery_classifier.py`
 - Modify: `python/src/atoms/core/recovery/__init__.py`
@@ -2512,7 +2733,7 @@ token-free diagnostics for every halt.
 Create `python/tests/test_recovery_classifier.py`:
 
 Task 8 adds `two_effect_snapshot`, `committed_snapshot`, `prepared_drift_snapshot`,
-`halted_snapshot`, `recovery_case`, `committed_halt_source`, and
+`halted_snapshot`, `recovery_case`, `committed_halt_source`,
 `repeated_path_mid_plan_halt`, and `snapshot_pair_differing_only_dependencies` adapters to
 `conftest.py` in the same commit as their `make_*` factories.
 
@@ -2526,10 +2747,12 @@ from atoms.core.recovery import (
     HaltReason,
     JournalState,
     PlanDisposition,
+    RemoveScratch,
     RollbackResult,
     TransactionState,
     TransitionEffectState,
     TransitionTransactionState,
+    TransformEffectTuple,
     apply_recovery_plan,
     classify_recovery,
 )
@@ -2559,7 +2782,8 @@ def test_active_rolled_back_detaches_without_filesystem_step():
 
 
 def test_uncommitted_rollback_orders_metadata_around_effect_steps():
-    plan = classify_recovery(create_snapshot())
+    source = create_snapshot()
+    plan = classify_recovery(source)
     assert plan.disposition is PlanDisposition.ROLL_BACK
     assert isinstance(plan.steps[0], TransitionTransactionState)
     assert plan.steps[0].to_state is TransactionState.ROLLING_BACK
@@ -2653,7 +2877,10 @@ Expected: FAIL because `classify_recovery` is not exported.
 
 - [ ] **Step 4: Implement token-free halt construction**
 
-Create `python/src/atoms/core/recovery/classifier.py`. Add:
+Create `python/src/atoms/core/recovery/diagnostics.py` with `_diagnostic_paths`,
+`_project_entries`, `_project_identity_relations`, and `_diagnostic`. The module imports only closed
+model/plan/snapshot values; it does not classify. Both `classifier.py` and Task 9's
+`authorization.py` import these helpers from `diagnostics.py`. Add:
 
 ```python
 def _diagnostic(
@@ -2692,6 +2919,9 @@ def _diagnostic(
         ),
     )
 ```
+
+Create `python/src/atoms/core/recovery/classifier.py` and import `_diagnostic` from
+`diagnostics.py`; classifier owns `_halt_plan`, not diagnostic projection.
 
 The durable fields always come from the snapshot to which the halt transition will be applied.
 `projected_*` fields identify the pure cursor whose tuple produced `expected` and `observed`. For an
@@ -2810,10 +3040,62 @@ decision semantic steps
 STARTED, DONE, or UNDO_STARTED: TransitionEffectState(UNDO_STARTED → UNDONE)
 ```
 
+Variant classifiers return provisional semantic steps together with the original classification
+evidence. `_reverse_effect_steps` must bind those steps to the cursor on which they will execute:
+import `replace` from `dataclasses` and `_normalize_joint_observation` from `reducer.py`.
+
+```python
+def _bind_effect_steps(cursor, provisional_steps):
+    bound = []
+    current = cursor
+    for provisional in provisional_steps:
+        step = provisional
+        if type(provisional) in {TransformEffectTuple, RemoveScratch}:
+            expected = _joint_from_cursor(current, provisional.expected_before)
+            result_after = _normalize_joint_observation(
+                current,
+                provisional.result_after,
+            )
+            step = replace(
+                provisional,
+                expected_before=expected,
+                result_after=result_after,
+            )
+        bound.append(step)
+        current = _apply_steps(current, (step,))
+    return tuple(bound), current
+```
+
+`_joint_from_cursor` uses the template's exact persistent path, scratch effect/role, and parent-node
+keys to select the corresponding current cursor values and recompute parent occupancy. It then calls
+`_normalize_joint_observation`; it never copies a stale relation or allocates an identity.
+
+For `STARTED`/`DONE`, `_reverse_effect_steps` first applies the provisional
+`TransitionEffectState(... -> UNDO_STARTED)` to a private cursor, then calls `_bind_effect_steps`.
+For `PENDING`/`UNDONE` it binds against the incoming cursor. It appends the final
+`UNDO_STARTED -> UNDONE` transition only after the returned semantic cursor is settled. The
+classification `decision.expected`/`decision.observed` remain unchanged for diagnostics.
+
 The cursor is never exposed and performs no I/O. It exists so repeated-path and ancestor-dependent
 effects are classified against exactly the prefix their plan step will later see. If a later
 classification halts, the returned `HaltPlan` is bound to `source` and contains no accumulated action
 steps; the simulated cursor has not mutated real evidence.
+
+Add a focused reduction lock for the rebased construction relation:
+
+```python
+def test_post_transition_step_precondition_is_rebased():
+    source = create_snapshot()
+    plan = classify_recovery(source)
+    mutating = next(
+        step
+        for step in plan.steps
+        if type(step) in {TransformEffectTuple, RemoveScratch}
+    )
+    assert mutating.expected_before.scratch[0].file_build_relation is None
+    terminal = apply_recovery_plan(source, plan)
+    assert terminal.transaction_state is TransactionState.ROLLED_BACK
+```
 
 `_committed_plan` first verifies every live path against the compiled final surface, then walks effects
 in compiled order, classifies each against a reducer-backed cursor, and appends only committed scratch
@@ -2837,6 +3119,8 @@ def test_already_halted_reuses_exact_diagnostic(halted_snapshot):
 
 def test_dependencies_do_not_change_plan(snapshot_pair_differing_only_dependencies):
     left, right = snapshot_pair_differing_only_dependencies
+    assert left.persistent_observations is right.persistent_observations
+    assert left.scratch_observations is right.scratch_observations
     left_plan = classify_recovery(left)
     right_plan = classify_recovery(right)
     assert left_plan.disposition == right_plan.disposition
@@ -2860,6 +3144,12 @@ def test_committed_halt_retains_decision_and_diagnostic(committed_halt_source):
     assert apply_recovery_plan(halted, classify_recovery(halted)) == halted
 ```
 
+`make_snapshot_pair_differing_only_dependencies` compiles two specs whose only unequal field is
+`dependencies`, then passes the same topology, journal tuple, persistent-observation tuple, and
+scratch-observation tuple objects to both snapshot-factory calls. It must not call an observation
+builder twice. Together with the identity-conservation constraint, literal step equality then tests
+dependency irrelevance rather than accidentally testing two token universes.
+
 - [ ] **Step 7: Run focused and full checks**
 
 Run:
@@ -2876,7 +3166,8 @@ Expected: all pass.
 - [ ] **Step 8: Commit**
 
 ```bash
-git add src/atoms/core/recovery/classifier.py src/atoms/core/recovery/__init__.py \
+git add src/atoms/core/recovery/classifier.py src/atoms/core/recovery/diagnostics.py \
+  src/atoms/core/recovery/__init__.py \
   tests/conftest.py tests/test_recovery_classifier.py tests/recovery_support.py
 git commit -m "feat(recovery): classify complete recovery plans"
 ```
@@ -2897,7 +3188,7 @@ fresh conflict substituted.
 - Modify: `python/tests/conftest.py`
 
 **Interfaces:**
-- Consumes: `RecoveryPlan`, reducer prefix operation, classifier diagnostic projection.
+- Consumes: `RecoveryPlan`, reducer prefix/normalization operations, shared diagnostic projections.
 - Produces:
   - `authorize_recovery_step(plan, step_index, observed) -> AuthorizedStep | HaltPlan`.
 
@@ -2909,12 +3200,15 @@ Task 9 adds the `classifier_plan` adapter to `conftest.py` in the same commit as
 `make_classifier_plan`.
 
 ```python
+from dataclasses import replace
+
 import pytest
 
 from atoms.core.errors import ProtocolError
 from atoms.core.recovery import (
     AuthorizedStep,
     EntryIdentity,
+    FileBuildRelation,
     HaltReason,
     JointObservation,
     ObservedFile,
@@ -2969,6 +3263,19 @@ def test_nonmutating_step_index_is_protocol_error():
     plan = classify_recovery(create_snapshot())
     with pytest.raises(ProtocolError, match="filesystem-mutating"):
         authorize_recovery_step(plan, 0, JointObservation((), (), ()))
+
+
+def test_mismatch_halt_normalizes_stale_construction_relation():
+    plan = classify_recovery(create_snapshot())
+    index, step = first_mutating_step(plan)
+    stale_scratch = replace(
+        step.expected_before.scratch[0],
+        file_build_relation=FileBuildRelation.EXACT,
+    )
+    stale = replace(step.expected_before, scratch=(stale_scratch,))
+    result = authorize_recovery_step(plan, index, stale)
+    assert result.diagnostic.reason is HaltReason.PLAN_PRECONDITION_CHANGED
+    assert result.bound_snapshot.scratch_observations[0].file_build_relation is None
 ```
 
 Add exact-type, negative, out-of-range, and `bool` step-index cases.
@@ -3027,6 +3334,9 @@ It never compares a token from `expected` with a token from `observed`. The
 token, and reuses that new token for every occurrence of the old one; the test above therefore fails
 if authorization regresses to dataclass equality or loses an identity relation.
 
+`authorization.py` imports `_diagnostic`, `_project_entries`, and
+`_project_identity_relations` from `diagnostics.py`, never from `classifier.py`.
+
 ```python
 def _authorization_projection(observation: JointObservation):
     return (
@@ -3081,22 +3391,43 @@ def reallocate_joint_identities(observation: JointObservation) -> JointObservati
 
 `_precondition_changed_halt`:
 
-1. merges the fresh conflicting observation into the prefix snapshot;
-2. builds a token-free diagnostic with `PLAN_PRECONDITION_CHANGED`;
-3. returns `_new_halt_plan` bound to that conflicting prefix;
-4. includes exactly one transaction transition to `HALTED`;
-5. emits no project or scratch mutation.
+1. computes `normalized = _normalize_joint_observation(prefix, observed)`;
+2. merges `normalized` into the prefix snapshot and rebuilds it through `build_recovery_snapshot`;
+3. builds a token-free diagnostic with `PLAN_PRECONDITION_CHANGED` from the original `expected` and
+   `observed` tuples, so normalization does not erase the mismatch evidence;
+4. returns `_new_halt_plan` bound to that normalized conflicting prefix;
+5. includes exactly one transaction transition to `HALTED`;
+6. emits no project or scratch mutation.
 
 - [ ] **Step 4: Mutation-lock no reclassification**
 
-Keep a standing assertion that the authorization module has no classifier import, then authorize a
-well-shaped mismatching observation:
+Keep a standing AST assertion that the authorization module has no classifier import, then authorize
+a well-shaped mismatching observation:
 
 ```python
 def test_mismatch_does_not_reclassify(classifier_plan):
+    import ast
+    import inspect
+
     import atoms.core.recovery.authorization as module
 
-    assert not hasattr(module, "classify_recovery")
+    tree = ast.parse(inspect.getsource(module))
+    classifier_imports = [
+        node
+        for node in ast.walk(tree)
+        if (
+            isinstance(node, ast.ImportFrom)
+            and node.module == "atoms.core.recovery.classifier"
+        )
+        or (
+            isinstance(node, ast.Import)
+            and any(
+                alias.name == "atoms.core.recovery.classifier"
+                for alias in node.names
+            )
+        )
+    ]
+    assert classifier_imports == []
     index, step = first_mutating_step(classifier_plan)
     original = step.expected_before.persistent[0]
     changed = JointObservation(
@@ -3178,15 +3509,12 @@ from atoms.core.recovery import (
 
 @pytest.mark.parametrize(
     ("transaction_state", "commit_decision", "active", "journal_states"),
-    [
-        (state, decision, active, journals)
-        for state, decision, active, journals in product(
-            tuple(TransactionState),
-            tuple(CommitDecision),
-            (False, True),
-            tuple(product(tuple(JournalState), repeat=3)),
-        )
-    ],
+    product(
+        tuple(TransactionState),
+        tuple(CommitDecision),
+        (False, True),
+        product(tuple(JournalState), repeat=3),
+    ),
 )
 def test_every_well_formed_state_vector_classifies(
     generated_snapshots,
@@ -3217,6 +3545,11 @@ def test_state_vector_generator_is_nonvacuous(generated_snapshots):
 exception escapes. `count_three_effect_cases` traverses the identical Cartesian product and counts
 accepted/refused values, preventing a vacuous refuse-all generator.
 
+This intentionally collects `7 * 2 * 2 * 125 = 3,500` pure cases. Run the focused Task 10 property
+file once before the full suite and record its duration; a development-machine target below 15 seconds
+is acceptable. If construction exceeds that target, optimize shared immutable fixture inputs without
+sampling or reducing the Cartesian product. Do not add a wall-clock assertion to the test suite.
+
 - [ ] **Step 2: Add variant and identity-partition properties**
 
 Generate:
@@ -3238,6 +3571,12 @@ def test_identity_alpha_renaming_preserves_classification(identity_case):
     )
 
 
+def test_plan_conserves_source_identity_tokens(generated_snapshots):
+    source = generated_snapshots.valid_case_with_identity()
+    plan = classify_recovery(source)
+    assert plan_identity_tokens(plan) <= snapshot_identity_tokens(source)
+
+
 def test_halt_diagnostic_round_trips_across_token_universe(halt_restart_case):
     before, after_restart = halt_restart_case
     assert before.halt_diagnostic == after_restart.halt_diagnostic
@@ -3246,6 +3585,8 @@ def test_halt_diagnostic_round_trips_across_token_universe(halt_restart_case):
 
 `plan_projection` removes `EntryIdentity` objects but retains every named-slot identity relation,
 disposition, reason, and semantic step.
+`snapshot_identity_tokens` and `plan_identity_tokens` walk the closed snapshot/step dataclasses by
+exact type and return the existing token objects as sets; neither helper constructs an identity.
 
 - [ ] **Step 3: Add convergence, determinism, and totality properties**
 
@@ -3354,17 +3695,22 @@ Apply one mutation at a time, run the named focused tests, and revert each mutat
 | share APPLIED and COMMITTED decision | committed-never-rolls-back |
 | accept STARTED followed by UNDONE | journal-language regression |
 | accept UNDONE after the PENDING tail begins | reverse-language tail regression |
+| validate a HALTED vector as an ordinary journal language | stable-halt short-circuit |
 | recompute halted diagnostic | restart diagnostic equality |
 | store raw identity token in diagnostic | token-free field/round-trip test |
+| allocate a fresh identity in a step builder | plan identity-conservation property |
 | require prefix relation for completed replace | conditional relation test |
 | dispatch no-op replace through general rows | no-op precedence matrix |
 | compare fresh authorization by raw dataclass equality | fresh alpha-renamed authorization |
 | authorize stale observation | authorization mismatch |
 | authorize non-mutating step | protocol-error test |
+| import classifier from authorization | authorization import-boundary AST test |
 | use lexical topology | resolved descendant test |
+| give a symlink a decisive opaque identity | delete-symlink identity mutation |
 | treat every absent scratch as landed | variant absence matrices |
 | omit reverse intermediate | reducer prefix/fixed-point test |
 | retain construction relation after leaving STARTED/pre | reducer relation-transition tests |
+| skip post-transition mutating-step rebinding | post-transition precondition reduction |
 | catch unexpected exception | internal-fault propagation |
 
 - [ ] **Step 6: Run final repository verification**
@@ -3372,6 +3718,7 @@ Apply one mutation at a time, run the named focused tests, and revert each mutat
 Run from `python/`:
 
 ```bash
+uv run pytest tests/test_recovery_properties.py -q --durations=10
 uv run pytest -o addopts=
 uv run ruff check .
 uv run pyright
@@ -3405,14 +3752,19 @@ Before implementation begins, verify:
 - [ ] Every public type named in the A3 design is defined in Tasks 1–3.
 - [ ] All five public operations are introduced once and exported from `recovery/__init__.py`.
 - [ ] Every journal language and state/commit/active combination maps to Task 5 or Task 8.
+- [ ] `HALTED` short-circuits before journal-language selection; `ROLLED_BACK` cannot admit `DONE`.
 - [ ] Every row in all five variant tables is exercised in Tasks 6–7 and the finite generators.
 - [ ] `DONE` rollback has explicit per-variant coverage separate from `UNDO_STARTED`.
 - [ ] No-op replace has its own precedence and mutation test.
 - [ ] Diagnostics distinguish durable source journals from projected conflict journals and retain
   named-slot relations, never identity tokens.
 - [ ] Conditional `file_build_relation` evidence is tested in both required and forbidden positions.
+- [ ] Mutating-step preconditions are rebound after preceding metadata transitions, and mismatch
+  snapshots use the same relation normalizer.
 - [ ] Prefix reduction precedes fresh authorization, and non-mutating steps cannot be authorized.
 - [ ] Fresh authorization compares exact non-identity fields plus identity partitions, not tokens.
+- [ ] Step construction is identity-conservative and dependency-only fixtures share observation
+  tuples.
 - [ ] Repeated-path planning advances a pure cursor through Task 4's reducer before classifying each
   earlier effect; no second projection algorithm exists.
 - [ ] Reducer fixed points cover restored, refused, committed, first-halt, repeated-halt, and detached

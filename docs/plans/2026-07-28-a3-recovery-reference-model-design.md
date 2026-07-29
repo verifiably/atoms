@@ -257,6 +257,9 @@ Within one coherent observation, A6/A7 allocate exactly one token for each obser
 and reuse it in every named slot that denotes that entry. Distinct entries receive distinct tokens.
 Every separately captured observation creates a fresh token universe: identity meaning is the
 equality partition among named slots, never equality with a token from an earlier observation.
+Classification and plan construction are identity-conservative: they may copy or move tokens already
+present in the source snapshot, but never allocate an `EntryIdentity`. Only an observation producer
+creates tokens.
 
 A symlink carries no A3 identity. Its observation is the weaker `lstat` + `readlink`
 `symlink_fingerprint` contract from authority §§5.5 and 6; it is not descriptor-coherent and A3 never
@@ -401,7 +404,9 @@ not invent free-form codes.
 
 An already `HALTED` snapshot returns its frozen halt diagnostic without changing project state,
 scratch state, commit decision, or diagnostic. If its active binding is unexpectedly absent, A3 still
-does not invent or attach a new binding.
+does not invent or attach a new binding. This stable-halt decision occurs before selecting a journal
+language: the vector was frozen and validated against the diagnostic by the snapshot factory and is
+not re-derived as a forward or reverse history.
 
 The compiled effect sequence is the only execution order. `dependencies` carry no scheduling
 information and never affect A3 classification or A7 execution.
@@ -417,6 +422,11 @@ Each reconstructed `PathFrontier` carries both a continuity baseline and the clo
 admissible at the selected occurrence. For an in-flight `STARTED` occurrence the baseline is still one
 state, while the admissible set contains pre/intermediate/post as the variant defines. Consumers never
 treat the baseline as the whole admissible set.
+
+An all-`PENDING` forward timeline is `INITIAL` at its first declared pre-state. Production
+`classify_recovery` changes every uncommitted active transaction to `ROLLING_BACK` before it
+reconstructs effect frontiers, so its forward reconstruction is used by committed cleanup; direct
+variant tests still exercise the forward in-flight vocabulary.
 
 All persistent paths owned by one effect are classified together. A move can never be "landed" for
 its destination while independently "not landed" for its source.
@@ -477,6 +487,13 @@ payload rules make the metadata ordering in ledger entry 12 expressible rather t
 - the resulting logical after-tuple; and
 - required identity, prefix, and occupancy relations.
 
+Its expected before-tuple is the complete logical observation immediately before that filesystem
+step, after every earlier metadata and semantic step in the plan. If `STARTED -> UNDO_STARTED` makes
+a construction-only `file_build_relation` irrelevant, the bound step precondition carries `None`,
+even though the classification evidence that selected the settlement retains the original relation.
+Plan construction binds or rebases semantic steps against this post-transition pure cursor; it never
+weakens reducer or authorization equality.
+
 Settlement kinds express intent — restore pre-state, remove an attributable creation, repair an
 intermediate to pre-state, or finish an already-landed undo. They do not name `renameat2`, `unlink`,
 `rmdir`, `fsync`, or another backend primitive.
@@ -511,8 +528,10 @@ mismatch halt uses
 `reduce_recovery_plan_prefix(plan.bound_snapshot, plan, completed_steps=step_index)` as that prefix,
 where `plan.bound_snapshot` denotes the plan's value-equal bound source snapshot. The conflicting
 observation is substituted at the selected step; the mismatch halt is not incorrectly bound to the
-plan's original, unreduced source state. Held descriptors and atomic capabilities close the remaining
-observation-to-operation window according to §§6 and 9 of the authority design.
+plan's original, unreduced source state. Before the conflicting prefix snapshot is rebuilt, its
+conditional `file_build_relation` fields are normalized against the prefix journal and conflicting
+live/staging tuple by the same helper as ordinary reduction. Held descriptors and atomic capabilities
+close the remaining observation-to-operation window according to §§6 and 9 of the authority design.
 
 ### 7.4 Halt diagnostics
 
@@ -829,7 +848,10 @@ Properties lock:
 - plan/source binding and exact step authorization;
 - fresh authorization succeeds across consistently regenerated identity tokens;
 - construction evidence is required only in §5.4's two forward cases;
+- each mutating step's expected tuple equals its reduced post-metadata prefix;
+- a mismatch halt normalizes conditional construction evidence without erasing diagnostic evidence;
 - identity-token renaming invariance;
+- classification and plan construction allocate no identity tokens;
 - reducer convergence and second-pass idempotence;
 - totality for every well-formed generated snapshot; and
 - internal faults are not normalized into domain refusals.
@@ -839,6 +861,7 @@ Mutation checks must demonstrate that the tests fail when:
 - a move is classified per path rather than jointly;
 - committed and applied states share a decision;
 - a `ROLLING_BACK` history accepts `STARTED` followed by `UNDONE`;
+- a `HALTED` vector is reinterpreted through an ordinary journal language;
 - an already halted snapshot recomputes its diagnostic from state `HALTED`;
 - a stale step is authorized;
 - fresh but alpha-renamed identity evidence is rejected;
@@ -846,6 +869,7 @@ Mutation checks must demonstrate that the tests fail when:
 - a symlink is given decisive opaque identity;
 - a no-op replace is dispatched through the overlapping general rows;
 - a completed replace requires a planned-blob relation for its displaced preimage;
+- a step builder allocates a new identity token;
 - resolved topology is replaced by lexical topology;
 - scratch absence is treated uniformly across variants; or
 - the reducer omits a reverse intermediate.
