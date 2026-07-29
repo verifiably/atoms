@@ -20,8 +20,11 @@ from atoms.core.recovery.model import (
     ScratchObservation,
     ScratchRole,
 )
-from atoms.core.recovery.plan import JointObservation
-from atoms.core.recovery.snapshot import RecoverySnapshot
+from atoms.core.recovery.plan import JointObservation, ParentOccupancy
+from atoms.core.recovery.snapshot import (
+    RecoverySnapshot,
+    _validate_topology_node,
+)
 
 
 def _persistent_slot(path: str) -> str:
@@ -62,6 +65,7 @@ def _named_entries(
         or type(observation.parent_occupancy) is not tuple
     ):
         raise ProtocolError("diagnostic evidence fields must be exact tuples")
+    _validate_parent_occupancy(observation.parent_occupancy)
 
     entries: list[
         tuple[str, ObservedEntry, FileBuildRelation | None]
@@ -103,6 +107,27 @@ def _named_entries(
     if len(set(slots)) != len(slots):
         raise ProtocolError("diagnostic evidence slots must be unique")
     return tuple(entries)
+
+
+def _validate_parent_occupancy(
+    occupancy: tuple[ParentOccupancy, ...],
+) -> None:
+    for item in occupancy:
+        if type(item) is not ParentOccupancy:
+            raise ProtocolError(
+                "diagnostic parent occupancy has the wrong exact runtime type"
+            )
+        _validate_topology_node(item.parent)
+        if type(item.present_children) is not tuple:
+            raise ProtocolError(
+                "diagnostic parent occupancy children must be an exact tuple"
+            )
+        for child in item.present_children:
+            _validate_topology_node(child)
+        if type(item.has_unmodeled_child) is not bool:
+            raise ProtocolError(
+                "diagnostic parent occupancy flag must be an exact bool"
+            )
 
 
 def _diagnostic_paths(

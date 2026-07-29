@@ -21,6 +21,7 @@ from atoms.core.recovery.model import (
     ObservedFile,
     ObservedSymlink,
     RollbackResult,
+    ScratchRole,
     TransactionState,
 )
 from atoms.core.recovery.plan import (
@@ -37,18 +38,87 @@ from atoms.core.recovery.plan import (
     _new_action_plan,
     _new_halt_plan,
     _new_no_recovery_plan,
+    _validate_steps,
 )
 from atoms.core.recovery.reducer import (
     _apply_steps,
     _current_joint_observation,
     _normalize_joint_observation,
+    _validate_identity_relations,
+    _validate_joint_coverage,
 )
-from atoms.core.recovery.snapshot import RecoverySnapshot
+from atoms.core.recovery.snapshot import (
+    RecoverySnapshot,
+    _validate_topology_node,
+)
 from atoms.core.recovery.variants import (
     EffectDecision,
+    EffectDecisionKind,
     classify_committed_cleanup,
     classify_effect,
 )
+
+_SEMANTIC_DECISION_STEP_TYPES = {
+    TransformEffectTuple,
+    RemoveScratch,
+    PreserveExternal,
+}
+
+_DECISION_STEP_SHAPES = {
+    EffectDecisionKind.NO_ACTION: frozenset({()}),
+    EffectDecisionKind.PRESERVE_EXTERNAL: frozenset(
+        {(PreserveExternal,)}
+    ),
+    EffectDecisionKind.UNDO_WITHOUT_MUTATION: frozenset({()}),
+    EffectDecisionKind.REMOVE_SCRATCH: frozenset({(RemoveScratch,)}),
+    EffectDecisionKind.EXCHANGE_BACK: frozenset(
+        {(TransformEffectTuple, RemoveScratch)}
+    ),
+    EffectDecisionKind.REFUSED_EXCHANGE_BACK: frozenset(
+        {(TransformEffectTuple, PreserveExternal, RemoveScratch)}
+    ),
+    EffectDecisionKind.ALREADY_UNDONE: frozenset({()}),
+    EffectDecisionKind.REMOVE_LIVE_CREATION: frozenset(
+        {(TransformEffectTuple, RemoveScratch)}
+    ),
+    EffectDecisionKind.REFUSED_PRESERVE_LIVE: frozenset(
+        {
+            (PreserveExternal,),
+            (PreserveExternal, RemoveScratch),
+        }
+    ),
+    EffectDecisionKind.RESTORE_TOMBSTONE: frozenset(
+        {(TransformEffectTuple,)}
+    ),
+    EffectDecisionKind.REMOVE_ANCHOR: frozenset({(RemoveScratch,)}),
+    EffectDecisionKind.RESTORE_SOURCE: frozenset(
+        {(TransformEffectTuple, RemoveScratch)}
+    ),
+    EffectDecisionKind.REMOVE_DESTINATION: frozenset(
+        {(TransformEffectTuple, RemoveScratch)}
+    ),
+    EffectDecisionKind.RESTORE_FROM_ANCHOR: frozenset(
+        {(TransformEffectTuple, RemoveScratch)}
+    ),
+    EffectDecisionKind.REFUSED_PRESERVE_DESTINATION: frozenset(
+        {(PreserveExternal, RemoveScratch)}
+    ),
+    EffectDecisionKind.REMOVE_WORK: frozenset({(RemoveScratch,)}),
+    EffectDecisionKind.REMOVE_LIVE_DIRECTORY: frozenset(
+        {(TransformEffectTuple,)}
+    ),
+    EffectDecisionKind.REMOVE_DUAL_NAME_DIRECTORY: frozenset(
+        {(RemoveScratch, TransformEffectTuple)}
+    ),
+    EffectDecisionKind.HALT: frozenset({()}),
+}
+
+_REFUSED_DECISION_KINDS = {
+    EffectDecisionKind.PRESERVE_EXTERNAL,
+    EffectDecisionKind.REFUSED_EXCHANGE_BACK,
+    EffectDecisionKind.REFUSED_PRESERVE_LIVE,
+    EffectDecisionKind.REFUSED_PRESERVE_DESTINATION,
+}
 
 
 def classify_recovery(snapshot: RecoverySnapshot) -> RecoveryPlan:
@@ -195,8 +265,50 @@ def _rollback_plan(source: RecoverySnapshot) -> RecoveryPlan:
 def _validate_effect_decision(decision: EffectDecision) -> None:
     if type(decision) is not EffectDecision:
         raise ProtocolError("effect classifier returned the wrong exact decision type")
-    if type(decision.steps) is not tuple:
-        raise ProtocolError("effect decision steps must be an exact tuple")
+    if type(decision.kind) is not EffectDecisionKind:
+        raise ProtocolError("effect decision kind must be an exact EffectDecisionKind")
+    _validate_steps(decision.steps)
+    if any(
+        type(step) not in _SEMANTIC_DECISION_STEP_TYPES
+        for step in decision.steps
+    ):
+        raise ProtocolError(
+            "effect decision steps must be closed semantic step variants"
+        )
+    for step in decision.steps:
+        if type(step) is TransformEffectTuple:
+            transform = cast(TransformEffectTuple, step)
+            if type(transform.effect_id) is not str:
+                raise ProtocolError(
+                    "effect decision transform effect_id must be an exact string"
+                )
+            _validate_identity_relations(transform.identity_relations)
+            _validate_joint_coverage(
+                transform.expected_before,
+                transform.result_after,
+            )
+        elif type(step) is RemoveScratch:
+            remove = cast(RemoveScratch, step)
+            if type(remove.effect_id) is not str:
+                raise ProtocolError(
+                    "effect decision scratch effect_id must be an exact string"
+                )
+            if type(remove.role) is not ScratchRole:
+                raise ProtocolError(
+                    "effect decision scratch role must be an exact ScratchRole"
+                )
+            _validate_joint_coverage(
+                remove.expected_before,
+                remove.result_after,
+            )
+        else:
+            preserve = cast(PreserveExternal, step)
+            if type(preserve.nodes) is not tuple:
+                raise ProtocolError(
+                    "effect decision preserved nodes must be an exact tuple"
+                )
+            for node in preserve.nodes:
+                _validate_topology_node(node)
     if type(decision.refused) is not bool:
         raise ProtocolError("effect decision refused flag must be an exact bool")
     if (
@@ -209,6 +321,30 @@ def _validate_effect_decision(decision: EffectDecision) -> None:
         or type(decision.observed) is not JointObservation
     ):
         raise ProtocolError("effect decision evidence must be exact joint observations")
+    _validate_joint_coverage(decision.expected, decision.observed)
+
+    if decision.kind is EffectDecisionKind.HALT:
+        if (
+            decision.steps
+            or decision.refused
+            or decision.halt_reason is None
+        ):
+            raise ProtocolError("effect halt decision payload is inconsistent")
+        return
+    if decision.halt_reason is not None:
+        raise ProtocolError(
+            "non-halt effect decision may not carry a halt reason"
+        )
+    if decision.refused is not (decision.kind in _REFUSED_DECISION_KINDS):
+        raise ProtocolError(
+            "effect decision refused flag is inconsistent with its kind"
+        )
+    step_shape = tuple(type(step) for step in decision.steps)
+    allowed_shapes = _DECISION_STEP_SHAPES.get(decision.kind)
+    if allowed_shapes is None or step_shape not in allowed_shapes:
+        raise ProtocolError(
+            "effect decision step payload is inconsistent with its kind"
+        )
 
 
 def _reverse_effect_steps(

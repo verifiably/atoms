@@ -1,22 +1,31 @@
+from dataclasses import replace
 from typing import cast
 
 import pytest
 
 import atoms.core.recovery.classifier as classifier_module
+import atoms.core.recovery.diagnostics as diagnostics_module
 from atoms.core.errors import ProtocolError
 from atoms.core.recovery import (
     OBSERVED_ABSENT,
     ActionPlan,
     CommitDecision,
     DetachActive,
+    EffectVariant,
     HaltPlan,
     HaltReason,
     JointObservation,
     JournalState,
+    ParentOccupancy,
+    PersistentNode,
     PersistentObservation,
     PlanDisposition,
+    PreserveExternal,
+    ProjectRoot,
     RemoveScratch,
     RollbackResult,
+    ScratchRole,
+    SettlementKind,
     TransactionState,
     TransformEffectTuple,
     TransitionEffectState,
@@ -25,6 +34,7 @@ from atoms.core.recovery import (
     classify_recovery,
     reduce_recovery_plan_prefix,
 )
+from atoms.core.recovery.variants import EffectDecision, EffectDecisionKind
 from tests.recovery_support import (
     create_snapshot,
     make_committed_halt_source,
@@ -232,6 +242,220 @@ def test_classifier_checks_every_effect_before_building_action_steps(
     )
 
 
+def test_classifier_rejects_non_enum_effect_decision_kind(monkeypatch):
+    original = classifier_module.classify_effect
+
+    def malformed(snapshot, effect_index, frontiers):
+        decision = original(snapshot, effect_index, frontiers)
+        return replace(
+            decision,
+            kind=cast(EffectDecisionKind, "halt"),
+        )
+
+    monkeypatch.setattr(classifier_module, "classify_effect", malformed)
+
+    with pytest.raises(ProtocolError, match="decision kind"):
+        classify_recovery(create_snapshot())
+
+
+def test_classifier_rejects_halt_decision_with_steps(monkeypatch):
+    original = classifier_module.classify_effect
+
+    def malformed(snapshot, effect_index, frontiers):
+        decision = original(snapshot, effect_index, frontiers)
+        assert decision.steps
+        return replace(
+            decision,
+            kind=EffectDecisionKind.HALT,
+            halt_reason=HaltReason.EFFECT_TUPLE_UNATTRIBUTABLE,
+        )
+
+    monkeypatch.setattr(classifier_module, "classify_effect", malformed)
+
+    with pytest.raises(ProtocolError, match="halt decision payload"):
+        classify_recovery(create_snapshot())
+
+
+def test_effect_decision_validator_rejects_closed_step_and_nested_enum_corruption():
+    source = create_snapshot()
+    evidence = JointObservation(
+        persistent=source.persistent_observations,
+        scratch=source.scratch_observations,
+        parent_occupancy=(),
+    )
+    remove = RemoveScratch(
+        effect_id="e1",
+        role=ScratchRole.STAGING,
+        expected_before=evidence,
+        result_after=evidence,
+    )
+    transform = TransformEffectTuple(
+        effect_id="e1",
+        variant=EffectVariant.CREATE_FILE_NO_CLOBBER,
+        settlement=SettlementKind.REMOVE_ATTRIBUTABLE_CREATION,
+        expected_before=evidence,
+        result_after=evidence,
+        identity_relations=(),
+    )
+    base = EffectDecision(
+        kind=EffectDecisionKind.NO_ACTION,
+        steps=(),
+        refused=False,
+        halt_reason=None,
+        expected=evidence,
+        observed=evidence,
+    )
+    malformed = (
+        replace(
+            base,
+            kind=EffectDecisionKind.REMOVE_SCRATCH,
+            steps=(cast(RemoveScratch, object()),),
+        ),
+        replace(
+            base,
+            kind=EffectDecisionKind.REMOVE_SCRATCH,
+            steps=(
+                replace(
+                    remove,
+                    role=cast(ScratchRole, "staging"),
+                ),
+            ),
+        ),
+        replace(
+            base,
+            kind=EffectDecisionKind.REMOVE_LIVE_CREATION,
+            steps=(
+                replace(
+                    transform,
+                    variant=cast(EffectVariant, "create_file_no_clobber"),
+                ),
+            ),
+        ),
+        replace(
+            base,
+            kind=EffectDecisionKind.REMOVE_LIVE_CREATION,
+            steps=(
+                replace(
+                    transform,
+                    settlement=cast(
+                        SettlementKind,
+                        "remove_attributable_creation",
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    for decision in malformed:
+        with pytest.raises(ProtocolError):
+            classifier_module._validate_effect_decision(decision)
+
+
+def test_effect_decision_validator_rejects_kind_payload_inconsistency():
+    source = create_snapshot()
+    evidence = JointObservation(
+        persistent=source.persistent_observations,
+        scratch=source.scratch_observations,
+        parent_occupancy=(),
+    )
+    base = EffectDecision(
+        kind=EffectDecisionKind.NO_ACTION,
+        steps=(),
+        refused=False,
+        halt_reason=None,
+        expected=evidence,
+        observed=evidence,
+    )
+    preserve = PreserveExternal(nodes=(PersistentNode("a.txt"),))
+    malformed = (
+        replace(
+            base,
+            kind=EffectDecisionKind.HALT,
+        ),
+        replace(
+            base,
+            halt_reason=HaltReason.EFFECT_TUPLE_UNATTRIBUTABLE,
+        ),
+        replace(
+            base,
+            refused=True,
+        ),
+        replace(
+            base,
+            kind=EffectDecisionKind.PRESERVE_EXTERNAL,
+            steps=(preserve,),
+        ),
+        replace(
+            base,
+            kind=EffectDecisionKind.REMOVE_LIVE_CREATION,
+            steps=(preserve,),
+        ),
+        replace(
+            base,
+            refused=cast(bool, 1),
+        ),
+    )
+
+    for decision in malformed:
+        with pytest.raises(ProtocolError):
+            classifier_module._validate_effect_decision(decision)
+
+
+@pytest.mark.parametrize(
+    "occupancy",
+    [
+        pytest.param(cast(ParentOccupancy, object()), id="member"),
+        pytest.param(
+            ParentOccupancy(
+                parent=cast(ProjectRoot, object()),
+                present_children=(),
+                has_unmodeled_child=False,
+            ),
+            id="parent",
+        ),
+        pytest.param(
+            ParentOccupancy(
+                parent=ProjectRoot(),
+                present_children=cast(tuple[ProjectRoot, ...], []),
+                has_unmodeled_child=False,
+            ),
+            id="children-tuple",
+        ),
+        pytest.param(
+            ParentOccupancy(
+                parent=ProjectRoot(),
+                present_children=(cast(ProjectRoot, object()),),
+                has_unmodeled_child=False,
+            ),
+            id="child",
+        ),
+        pytest.param(
+            ParentOccupancy(
+                parent=ProjectRoot(),
+                present_children=(),
+                has_unmodeled_child=cast(bool, 0),
+            ),
+            id="boolean",
+        ),
+    ],
+)
+def test_diagnostic_rejects_malformed_parent_occupancy(occupancy):
+    source = create_snapshot()
+    evidence = JointObservation(
+        persistent=source.persistent_observations,
+        scratch=source.scratch_observations,
+        parent_occupancy=(occupancy,),
+    )
+
+    with pytest.raises(ProtocolError):
+        diagnostics_module._diagnostic(
+            source,
+            reason=HaltReason.EFFECT_TUPLE_UNATTRIBUTABLE,
+            expected=evidence,
+            observed=evidence,
+        )
+
+
 def test_mid_plan_halt_labels_projected_journals_without_rewriting_durable_source(
     repeated_path_mid_plan_halt,
 ):
@@ -349,9 +573,55 @@ def test_dependencies_do_not_change_plan(
     assert left_plan.steps == right_plan.steps
 
 
-def test_classifier_plan_reaches_second_pass_fixed_point(recovery_case):
-    source = recovery_case("restored")
-    next_snapshot = apply_recovery_plan(source, classify_recovery(source))
+@pytest.mark.parametrize(
+    (
+        "case",
+        "expected_disposition",
+        "expected_terminal_state",
+        "expected_rollback_result",
+    ),
+    [
+        (
+            "restored",
+            PlanDisposition.ROLL_BACK,
+            TransactionState.ROLLED_BACK,
+            RollbackResult.RESTORED,
+        ),
+        (
+            "refused",
+            PlanDisposition.ROLL_BACK_REFUSED,
+            TransactionState.ROLLED_BACK,
+            RollbackResult.EXTERNAL_DRIFT_PRESERVED,
+        ),
+        (
+            "committed",
+            PlanDisposition.COMMITTED_CLEANUP,
+            TransactionState.COMMITTED,
+            None,
+        ),
+        (
+            "halt",
+            PlanDisposition.HALT,
+            TransactionState.HALTED,
+            None,
+        ),
+    ],
+)
+def test_classifier_plan_reaches_second_pass_fixed_point(
+    recovery_case,
+    case,
+    expected_disposition,
+    expected_terminal_state,
+    expected_rollback_result,
+):
+    source = recovery_case(case)
+    first_plan = classify_recovery(source)
+    assert first_plan.disposition is expected_disposition
+
+    next_snapshot = apply_recovery_plan(source, first_plan)
+    assert next_snapshot.transaction_state is expected_terminal_state
+    assert next_snapshot.rollback_result is expected_rollback_result
+
     fixed = apply_recovery_plan(
         next_snapshot,
         classify_recovery(next_snapshot),
