@@ -110,7 +110,7 @@ def test_absent_staging_forbids_relation():
         "scratch_observations",
     ],
 )
-def test_snapshot_refuses_subclass_or_wrong_exact_type(field):
+def test_snapshot_refuses_wrong_exact_top_level_type(field):
     snapshot = create_snapshot()
     values = {
         "compiled": snapshot.compiled,

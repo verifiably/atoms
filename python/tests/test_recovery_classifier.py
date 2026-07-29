@@ -11,6 +11,7 @@ from atoms.core.recovery import (
     ActionPlan,
     CommitDecision,
     DetachActive,
+    EffectJournalState,
     EffectVariant,
     HaltPlan,
     HaltReason,
@@ -31,6 +32,7 @@ from atoms.core.recovery import (
     TransitionEffectState,
     TransitionTransactionState,
     apply_recovery_plan,
+    build_recovery_snapshot,
     classify_recovery,
     reduce_recovery_plan_prefix,
 )
@@ -117,6 +119,54 @@ def test_committed_repeated_replace_cleanup_uses_final_surface_authority(
     assert (
         apply_recovery_plan(terminal, classify_recovery(terminal))
         == terminal
+    )
+
+
+def test_committed_later_mismatch_discards_earlier_cleanup_projection(
+    committed_repeated_replace_snapshot,
+):
+    valid = committed_repeated_replace_snapshot
+    mismatched_second = replace(
+        valid.scratch_observations[1],
+        entry=valid.scratch_observations[0].entry,
+    )
+    source = build_recovery_snapshot(
+        compiled=valid.compiled,
+        topology=valid.topology,
+        transaction_state=valid.transaction_state,
+        commit_decision=valid.commit_decision,
+        rollback_result=valid.rollback_result,
+        halt_diagnostic=valid.halt_diagnostic,
+        active=valid.active,
+        journals=valid.journals,
+        persistent_observations=valid.persistent_observations,
+        scratch_observations=(
+            valid.scratch_observations[0],
+            mismatched_second,
+        ),
+    )
+
+    plan = classify_recovery(source)
+
+    assert type(plan) is HaltPlan
+    assert tuple(type(step) for step in plan.steps) == (
+        TransitionTransactionState,
+    )
+    transition = cast(TransitionTransactionState, plan.steps[0])
+    assert transition.from_state is TransactionState.COMMITTED
+    assert transition.to_state is TransactionState.HALTED
+    assert not any(type(step) is RemoveScratch for step in plan.steps)
+
+    halted = apply_recovery_plan(source, plan)
+    assert len(halted.scratch_observations) == 2
+    assert halted.scratch_observations == source.scratch_observations
+    assert all(
+        after.entry is before.entry
+        for after, before in zip(
+            halted.scratch_observations,
+            source.scratch_observations,
+            strict=True,
+        )
     )
 
 
@@ -464,10 +514,13 @@ def test_mid_plan_halt_labels_projected_journals_without_rewriting_durable_sourc
     assert type(plan) is HaltPlan
     diagnostic = plan.diagnostic
     assert diagnostic.journals == source.journals
-    assert diagnostic.projected_journals != diagnostic.journals
     assert (
         diagnostic.projected_transaction_state
         is TransactionState.ROLLING_BACK
+    )
+    assert diagnostic.projected_journals == (
+        EffectJournalState("e1", JournalState.DONE),
+        EffectJournalState("e2", JournalState.UNDONE),
     )
 
 

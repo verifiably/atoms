@@ -5,6 +5,7 @@ import pytest
 
 from atoms.core.errors import ProtocolError
 from atoms.core.recovery import (
+    OBSERVED_ABSENT,
     AuthorizedStep,
     EntryIdentity,
     FileBuildRelation,
@@ -14,6 +15,8 @@ from atoms.core.recovery import (
     JointObservation,
     JournalState,
     ObservedFile,
+    ParentOccupancy,
+    PersistentNode,
     PersistentObservation,
     PlanDisposition,
     RecoveryPlan,
@@ -25,7 +28,11 @@ from atoms.core.recovery import (
     classify_recovery,
     reduce_recovery_plan_prefix,
 )
-from tests.recovery_support import create_snapshot, reallocate_joint_identities
+from tests.recovery_support import (
+    create_snapshot,
+    make_directory_descendant_case,
+    reallocate_joint_identities,
+)
 from tests.support import G
 
 
@@ -245,6 +252,108 @@ def test_named_slot_identity_partition_change_halts(replace_case):
         IdentityRelation.DIFFERENT,
         IdentityRelation.SAME,
     )
+
+
+def test_nonempty_parent_occupancy_exact_match_authorizes():
+    source, _ = make_directory_descendant_case(descendant_present=False)
+    plan = classify_recovery(source)
+    index, step = first_mutating_step(plan)
+    assert step.expected_before.parent_occupancy == (
+        ParentOccupancy(
+            parent=PersistentNode("A"),
+            present_children=(),
+            has_unmodeled_child=False,
+        ),
+    )
+    fresh = reallocate_joint_identities(step.expected_before)
+
+    authorized = authorize_recovery_step(plan, index, fresh)
+
+    assert type(authorized) is AuthorizedStep
+    assert authorized.step is step
+
+
+def test_nonempty_parent_occupancy_mismatch_halts():
+    source, _ = make_directory_descendant_case(descendant_present=False)
+    plan = classify_recovery(source)
+    index, step = first_mutating_step(plan)
+    assert step.expected_before.parent_occupancy == (
+        ParentOccupancy(
+            parent=PersistentNode("A"),
+            present_children=(),
+            has_unmodeled_child=False,
+        ),
+    )
+    fresh = reallocate_joint_identities(step.expected_before)
+    changed = replace(
+        fresh,
+        parent_occupancy=(
+            replace(
+                fresh.parent_occupancy[0],
+                has_unmodeled_child=True,
+            ),
+        ),
+    )
+    halted = authorize_recovery_step(plan, index, changed)
+
+    assert type(halted) is HaltPlan
+    assert halted.diagnostic.reason is HaltReason.PLAN_PRECONDITION_CHANGED
+
+
+def test_later_mutating_authorization_uses_complete_reduced_prefix(
+    committed_repeated_replace_snapshot,
+):
+    source = committed_repeated_replace_snapshot
+    plan = classify_recovery(source)
+    mutating_steps = [
+        (
+            index,
+            cast(TransformEffectTuple | RemoveScratch, step),
+        )
+        for index, step in enumerate(plan.steps)
+        if type(step) in {TransformEffectTuple, RemoveScratch}
+    ]
+    assert len(mutating_steps) == 2
+    index, step = mutating_steps[1]
+    prefix = reduce_recovery_plan_prefix(
+        plan.bound_snapshot,
+        plan,
+        completed_steps=index,
+    )
+    assert prefix.scratch_observations[0].entry is OBSERVED_ABSENT
+    assert (
+        prefix.scratch_observations[1].entry
+        is source.scratch_observations[1].entry
+    )
+    fresh = reallocate_joint_identities(step.expected_before)
+
+    authorized = authorize_recovery_step(plan, index, fresh)
+
+    assert type(authorized) is AuthorizedStep
+    assert authorized.step is step
+
+    changed = replace(
+        fresh,
+        scratch=(
+            replace(
+                fresh.scratch[0],
+                entry=OBSERVED_ABSENT,
+            ),
+        ),
+    )
+    halted = authorize_recovery_step(plan, index, changed)
+
+    assert type(halted) is HaltPlan
+    assert halted.diagnostic.reason is HaltReason.PLAN_PRECONDITION_CHANGED
+    assert halted.bound_snapshot.journals == prefix.journals
+    assert (
+        halted.bound_snapshot.persistent_observations
+        == prefix.persistent_observations
+    )
+    assert tuple(
+        item.entry
+        for item in halted.bound_snapshot.scratch_observations
+    ) == (OBSERVED_ABSENT, OBSERVED_ABSENT)
 
 
 def test_committed_remove_scratch_authorizes_only_fresh_scratch_evidence(

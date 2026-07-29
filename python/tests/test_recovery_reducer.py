@@ -1,4 +1,5 @@
 from dataclasses import fields, replace
+from typing import cast
 
 import pytest
 
@@ -739,6 +740,17 @@ def test_preserve_external_refuses_unknown_nodes():
         _apply_steps(
             snapshot,
             (PreserveExternal(nodes=(PersistentNode("unknown.txt"),)),),
+        )
+
+
+def test_preserve_external_validates_malformed_nodes_before_hashing():
+    snapshot = create_snapshot()
+    malformed = PersistentNode(cast(str, []))
+
+    with pytest.raises(ProtocolError, match="topology persistent node path"):
+        _apply_steps(
+            snapshot,
+            (PreserveExternal(nodes=(malformed,)),),
         )
 
 

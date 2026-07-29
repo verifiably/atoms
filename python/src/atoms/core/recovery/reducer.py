@@ -402,11 +402,13 @@ def _preserve_external(
     step = raw_step
     if type(step.nodes) is not tuple:
         raise ProtocolError("preserved nodes must be an exact tuple")
+    for node in step.nodes:
+        _validate_topology_node(node)
     if len(set(step.nodes)) != len(step.nodes):
         raise ProtocolError("preserved nodes must be unique")
     topology_nodes = _topology_nodes(snapshot)
     for node in step.nodes:
-        if type(node) not in _TOPOLOGY_NODE_TYPES or node not in topology_nodes:
+        if node not in topology_nodes:
             raise ProtocolError("preserve external names an unknown topology node")
     return snapshot
 
