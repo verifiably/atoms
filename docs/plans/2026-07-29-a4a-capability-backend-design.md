@@ -119,7 +119,7 @@ python/src/atoms/fs/
 ├── volume.py              # VolumeConfiguration, StorageProfile, DurabilityAllowlist,
 │                          # CERTIFIED_ALLOWLIST, mountinfo/fdinfo resolution
 ├── lock.py                # HeldProjectLock, acquire_project_lock
-├── bootstrap.py           # metadata layout, reclaim_probe_survivors
+├── bootstrap.py           # metadata layout, reclaim_probe_survivors, verified_child_path
 ├── probe.py               # probe_backend, SQLite-WAL certification
 └── binding.py             # VolumeEvidence, ProjectBinding, bind_project_volume
 ```
@@ -538,7 +538,8 @@ reopening would accept whatever already occupies the name — a symlink pointing
 regular file — as though A4a had created it. Because `open_child_directory` refuses symlinks and mount
 crossings, an occupied name can only pass by being a real directory beneath the metadata root.
 
-A4a creates no database and defines no schema.
+A4a creates no **persistent store** database and defines no schema. The §8.3 probe deliberately creates a
+throwaway database inside `probe/` and removes it; that is not the store.
 
 ### 7.3 Probe-survivor reclamation
 
@@ -548,8 +549,22 @@ def reclaim_probe_survivors(lock: HeldProjectLock) -> None: ...
 
 Reclamation takes the `HeldProjectLock` to force the proof at the type level. It walks `probe/` through
 anchored `unlinkat`/`rmdir` relative to retained descriptors, **never following symlinks**, and is
-**unconditional** — it does not attempt to distinguish a live probe from debris, because under the held
-lock there can be no live probe but its own.
+**unconditional** with respect to *contents* — it does not attempt to distinguish a live probe from
+debris, because under the held lock there can be no live probe but its own.
+
+`probe/` **itself** is a different question, and reclamation runs before layout creation (§9.1 step 4), so
+it is reclamation and not the `EEXIST` path that meets an anomalous `probe/` first:
+
+- **Absent:** no-op. Reclamation never creates it.
+- **A real directory:** open it through `open_child_directory` and empty it.
+- **A symlink, a non-directory, or a mount point:** `open_child_directory` refuses, and reclamation
+  **refuses** rather than unlinking the leaf.
+
+Refusing is the deliberate choice. Unlinking would be A4a destroying something it did not create, on a
+guess about what it was for; and `probe/` is engine-owned space under the held project lock, so anything
+non-conforming there means the engine's private namespace invariant is already broken. That is why the
+refusal is `ProtocolError` rather than `CapabilityUnavailable` — nothing about the volume's capabilities
+is in question.
 
 A kill during probing therefore leaves only attributable, mutation-free debris inside a reserved
 engine-owned namespace, discarded before any transaction record exists.
@@ -656,8 +671,8 @@ Inside `bind_project_volume`, in this order:
 
 1. Open the project root anchored; retain the descriptor. (The metadata root is already held by `lock`.)
 2. Resolve each held descriptor's mount ID from `/proc/self/fdinfo/<fd>`, match into `mountinfo`, and
-   require both roots to agree on mount ID and `st_dev`. Retain the metadata root's `st_dev`/`st_ino`
-   for A4b's exclusion check.
+   require both roots to agree on mount ID and `st_dev`. Retain the metadata root's `st_dev`/`st_ino` —
+   used both for A4b's exclusion check and, from step 7 onward, by the §9.4 verifier.
 3. Resolve `VolumeConfiguration` from the matched `mountinfo` entry.
 4. **Reclaim any pre-existing `probe/`**, without creating it if absent.
 5. Match `(configuration, storage)` against the supplied allowlist; refuse on no match.
@@ -783,13 +798,34 @@ def verified_metadata_path(self, name: str) -> str:
 ```
 
 The operation requires an active binding, rejects any `name` that is not a single path component, and
-before returning **re-confirms** that the retained metadata-root descriptor still reports the
-`st_dev`/`st_ino` recorded in `VolumeEvidence`, raising `ProtocolError` on a mismatch. That is the
-verify-then-open the authority requires, performed at the moment of use rather than trusted from
-bootstrap.
+before returning **re-confirms** that the retained metadata-root descriptor still reports the recorded
+`st_dev`/`st_ino`, raising `ProtocolError` on a mismatch. That is the verify-then-open the authority
+requires, performed at the moment of use rather than trusted from bootstrap.
 
-Both consumers go through it: the §8.3 SQLite probe uses it for the database it hands its child, and A5
-uses it for `atoms.db`. Neither builds a path any other way.
+**The SQLite probe needs this before any binding exists.** Certification runs at §9.1 step 7, while
+`VolumeEvidence` and `ProjectBinding` are not built until step 9. The resolution is not the problem — the
+normalized path and the root's `st_dev`/`st_ino` are both established at step 2 — but the *method* is
+unavailable, and constructing a provisional or partly-initialized binding to reach it would defeat the
+factory boundary that makes a `ProjectBinding` mean something.
+
+The sequence therefore stays as it is, and one **shared internal verifier** in `bootstrap.py` carries the
+logic:
+
+```python
+def verified_child_path(metadata_root_fd: int, metadata_root_path: str,
+                        expected_device: int, expected_inode: int, name: str) -> str: ...
+```
+
+It validates that `name` is a single component, `fstat`s the descriptor, refuses on any `st_dev`/`st_ino`
+mismatch, and returns the joined path. The §8.3 probe calls it directly with the values retained at step
+2. `ProjectBinding.verified_metadata_path` delegates to the same function, passing the identity from its
+frozen `VolumeEvidence` and the path from its lock. There is exactly one implementation, so the probe and
+A5 cannot diverge.
+
+It lives in `bootstrap.py` rather than `binding.py` so that `probe.py` need not import `binding.py`,
+which would invert the module dependency.
+
+**A5 uses only the public binding method.** The internal verifier is not part of `atoms/fs/__init__.py`.
 
 This does not close the authority's cooperating-process gap, and does not claim to. Mutating or replacing
 `metadata_root` or an ancestor while a lease is active still voids the recovery guarantee; the project
@@ -803,8 +839,13 @@ the barrier-option table; an unresolvable mount identity; a mount-identity or `s
 the roots; a configuration and profile pair absent from the supplied allowlist; unavailable
 `anchored_traversal` or `advisory_project_lock`; and a volume that cannot host SQLite-WAL.
 
-`ProtocolError` is raised for internal contract violations — using a spent binding, or any state A4a's own
-construction should have made impossible.
+`ProtocolError` is raised for internal contract violations — using a spent binding or a released lock, a
+`verified_child_path` component or identity check that fails, `lock` or a layout name occupied by
+something that is not the expected file type, and a `probe/` that reclamation cannot open as a directory.
+The last three concern *external* state, but `metadata_root` is engine-owned space held under the project
+lock, so a non-conforming entry there means the engine's private-namespace invariant is broken regardless
+of who broke it. `CapabilityUnavailable` would be the wrong signal: nothing about the volume's
+capabilities is in question.
 
 `OSError` **propagates**. A4a does not blanket-convert it. At each probe, only the documented
 operation-specific errno values that conclusively mean *unsupported* conclude that a capability is absent;
@@ -839,8 +880,9 @@ wrong: octal-escaped mount points (`\040` for a space), the variable-length opti
 `-`, and two bind mounts sharing `st_dev` with distinct mount IDs. Barrier-option normalization per
 filesystem type, and refusal of an unlisted type. Allowlist matching, including a near-miss differing only
 in `declared_storage_profile`. Immutability and exact-match semantics of `VolumeConfiguration`,
-`StorageProfile`, and `DurabilityAllowlist`. Factory-guard refusals on `VolumeEvidence` and
-`ProjectBinding`, including `dataclasses.replace`.
+`StorageProfile`, and `DurabilityAllowlist`. Factory-guard refusals on all three guarded types —
+`VolumeEvidence`, `HeldProjectLock`, and `ProjectBinding` — covering both direct construction and
+`dataclasses.replace`, since each is relied on as proof by a downstream signature.
 
 ### 11.2 Tier 2 — fake backend
 
@@ -871,11 +913,16 @@ a **symlinked ancestor**, asserting refusal — the §5.4 guarantee that no runt
 Establishment of a missing `metadata_root` leaf, and refusal when its parent is missing.
 
 The bootstrap trust boundary gets direct coverage, since each case is a name an attacker or an accident
-could already occupy: a symlink planted at `lock` refuses; a non-regular file at `lock` refuses; a symlink
-planted at `probe/`, `staging/`, `work/`, or `blobs/` refuses on the `EEXIST` path rather than being
-adopted; a real pre-existing directory at each of those names is reopened and accepted. The sync-ignore
-marker is asserted present on a freshly created `metadata_root` where the filesystem supports extended
-attributes, and a forced `setxattr` failure is asserted not to fail bootstrap.
+could already occupy. A symlink planted at `lock` refuses, as does a non-regular file. A symlink planted
+at `staging/`, `work/`, or `blobs/` refuses on the `EEXIST` path rather than being adopted, and a real
+pre-existing directory at each of those names is reopened and accepted.
+
+`probe/` is asserted separately, because reclamation reaches it before layout creation ever runs: a
+symlink or non-directory at `probe/` must be refused by **reclamation** per §7.3, and the test asserts the
+planted leaf still exists afterwards — proving reclamation refused rather than silently unlinked it.
+
+The sync-ignore marker is asserted present on a freshly created `metadata_root` where the filesystem
+supports extended attributes, and a forced `setxattr` failure is asserted not to fail bootstrap.
 
 `verified_metadata_path` is exercised for its component check, its active-only guard, and its
 `st_dev`/`st_ino` re-confirmation.
@@ -951,8 +998,9 @@ production-allowlist call-site assertion, owned by A5.
 10. Bootstrap creates only engine-owned state under `metadata_root`, and reclamation is unconditional,
     symlink-safe, and takes `HeldProjectLock`. `lock` is opened descriptor-relative with `O_NOFOLLOW` and
     verified to be a regular file; every layout directory is reopened through `open_child_directory` on
-    both the created and `EEXIST` paths; the sync-ignore marker is set best-effort on creation and its
-    failure does not fail bootstrap.
+    both the created and `EEXIST` paths; a symlink or non-directory at `probe/` is refused by reclamation
+    rather than unlinked; the sync-ignore marker is set best-effort on creation and its failure does not
+    fail bootstrap.
 11. Reclamation of a pre-existing `probe/` precedes allowlist refusal, and refusal writes nothing new.
 12. Absent `anchored_traversal` or `advisory_project_lock` refuses; absent optional capabilities are
     reported; absent SQLite-WAL hostability refuses, certified across **two processes** through the §8.3
@@ -962,9 +1010,10 @@ production-allowlist call-site assertion, owned by A5.
     exit, and `ProtocolError` from every accessor once spent or once the lock is released — **except**
     `evidence` and `active` on the binding and `held` on the lock, which are deliberately readable
     afterwards so a diagnostic can inspect a released resource.
-14. `verified_metadata_path` returns a single-component child of the verified, normalized metadata-root
-    pathname, re-confirming `st_dev`/`st_ino` at each call; the §8.3 probe and A5 use no other means of
-    constructing a database path.
+14. One shared `verified_child_path` in `bootstrap.py` implements component validation and
+    `st_dev`/`st_ino` re-confirmation. The §8.3 probe calls it directly, since no binding exists at step
+    7; `ProjectBinding.verified_metadata_path` delegates to it; no provisional binding is constructed; and
+    the helper is not exported. A5 uses only the public method.
 15. `OSError` propagates except for the documented per-operation unsupported errno values, each licensed
     by the §10 probe precondition and proved by a mutation test.
 16. Tier 3 resolves its volume portably and skips with a precise reason rather than assuming this
