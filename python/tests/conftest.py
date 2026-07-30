@@ -9,11 +9,14 @@ from atoms.fs.linux import LinuxBackend
 from atoms.fs.lock import acquire_project_lock
 from atoms.fs.volume import StorageProfile
 from tests.fs_support import (
+    find_distinct_mount,
+    make_bound_volume,
     make_fake_backend,
     make_fdinfo_text,
     make_metadata_root,
     make_mountinfo_text,
     make_project_root,
+    make_test_allowlist,
     test_volume_or_skip_reason,
 )
 from tests.recovery_support import (
@@ -250,3 +253,23 @@ def fdinfo_text():
 @pytest.fixture
 def test_storage_profile():
     return StorageProfile(profile_id="atoms-test-profile")
+
+
+@pytest.fixture
+def test_allowlist():
+    return make_test_allowlist()
+
+
+@pytest.fixture
+def bound_volume(project_root, metadata_root, test_storage_profile):
+    return make_bound_volume(
+        make_fake_backend(), project_root, metadata_root, test_storage_profile
+    )
+
+
+@pytest.fixture
+def distinct_volume(test_volume):
+    found = find_distinct_mount(test_volume)
+    if found is None:
+        pytest.skip("no writable mount with a distinct mount id is available")
+    return Path(tempfile.mkdtemp(dir=found))

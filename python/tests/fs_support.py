@@ -10,6 +10,15 @@ from pathlib import Path
 from atoms.core.capabilities import Capability
 from atoms.fs.bootstrap import close_layout, ensure_metadata_layout, verified_child_path
 from atoms.fs.linux import LinuxBackend
+from atoms.fs.lock import acquire_project_lock
+from atoms.fs.volume import (
+    AllowlistEntry,
+    DurabilityAllowlist,
+    build_configuration,
+    kernel_identifier,
+    read_mountinfo,
+    resolve_mount_entry,
+)
 
 SUPPORTED_FILESYSTEMS = frozenset({"ext4", "xfs", "btrfs"})
 
@@ -342,3 +351,78 @@ def probe_database_path(lock):
             lock.metadata_root_fd, lock.metadata_root_path, info.st_dev, info.st_ino, "probe"
         )
         yield os.path.join(probe_dir, "certify.db")
+
+
+def build_test_allowlist(lock, project_root, storage):
+    """A singleton allowlist naming the resolved tuple of the actual test volume.
+
+    This is the deliberate test assumption made visible: production passes
+    CERTIFIED_ALLOWLIST, which ships empty. Tuple-resolution correctness is proved
+    separately against fixture mountinfo text, never by this live-volume path.
+    """
+    backend = lock.backend
+    fd = backend.open_root(str(project_root))
+    try:
+        entry = resolve_mount_entry(fd, read_mountinfo())
+    finally:
+        os.close(fd)
+    configuration = build_configuration(entry, kernel_identifier())
+    return DurabilityAllowlist(
+        entries=frozenset(
+            {
+                AllowlistEntry(
+                    configuration=configuration,
+                    storage=storage,
+                    certification_ref="test-injected-not-crash-certified",
+                )
+            }
+        )
+    )
+
+
+def make_test_allowlist():
+    return build_test_allowlist
+
+
+def make_bound_volume(backend_factory, project_root, metadata_root, storage):
+    from atoms.fs.binding import bind_project_volume
+
+    @contextlib.contextmanager
+    def bind(withhold=frozenset()):
+        from atoms.core.capabilities import Capability
+
+        backend = (
+            backend_factory(supplied=set(Capability) - set(withhold))
+            if withhold
+            else LinuxBackend()
+        )
+        with acquire_project_lock(backend, str(metadata_root)) as lock:
+            allowlist = build_test_allowlist(lock, project_root, storage)
+            with bind_project_volume(
+                str(project_root), lock, allowlist=allowlist, storage=storage
+            ) as binding:
+                yield binding
+
+    return bind
+
+
+def find_distinct_mount(base):
+    """A writable directory on a mount whose ID differs from `base`'s, or None."""
+    base_fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        from atoms.fs.volume import read_mount_id
+
+        base_id = read_mount_id(base_fd)
+    finally:
+        os.close(base_fd)
+    for candidate in ("/tmp", "/dev/shm", f"/run/user/{os.getuid()}"):
+        path = Path(candidate)
+        if not path.is_dir() or not os.access(path, os.W_OK):
+            continue
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            if read_mount_id(fd) != base_id:
+                return path
+        finally:
+            os.close(fd)
+    return None
