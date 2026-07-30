@@ -51,7 +51,10 @@ refines [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recover
   the §10 probe precondition.
 - **Exact runtime types:** closed unions dispatch on `type(x) is T`, never `isinstance`.
 - **Enums:** plain `Enum` with string `.value` members. Do not use `str, Enum`.
-- **Mutation discipline:** use TDD for every task. Run the named failing test before production edits.
+- **Mutation discipline:** use TDD for every task that changes production behavior. Run the named failing
+  test before production edits. Task 7 adds characterization and architecture locks over behavior already
+  delivered by Tasks 1–6; its named checkpoint must pass and any failure is a deviation to fix, not a
+  fictitious RED state.
 - **Commits:** no AI-attribution trailers. Documentation paths use `~/d/atoms/...`, never host-specific
   absolute paths.
 
@@ -79,7 +82,7 @@ refines [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recover
 | `python/tests/test_fs_lock.py` | Lock acquisition, guards, factory control |
 | `python/tests/test_fs_bootstrap.py` | Layout, reclamation, verified paths, xattr marker |
 | `python/tests/test_fs_probe.py` | Capability probes and SQLite-WAL choreography |
-| `python/tests/test_fs_binding.py` | Sequence, refusals, lifetimes, evidence |
+| `python/tests/test_fs_binding.py` | Sequence, refusals, lifetimes, evidence, real bind-mount identity |
 | `python/tests/test_fs_architecture.py` | Purity allowlist, exports, packaging, no-production-caller |
 
 ## Design-to-task map
@@ -92,7 +95,7 @@ refines [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recover
 | §7.1 lock; §7.2 layout; §7.3 reclamation; §9.4 `verified_child_path` | 4 |
 | §8.1 functional probes; §8.2 per-capability probes; §8.3 SQLite-WAL | 5 |
 | §9.1 sequence; §9.2 evidence; §9.3 binding lifetime; §9.4 public method | 6 |
-| §10 errno triage mutations; §11.4 architecture; §12 obligations; status sync | 7 |
+| §10 table-derived errno triage mutations; §11.4 architecture; §12 obligations; status sync | 7 |
 
 ## Fixture registry
 
@@ -116,10 +119,12 @@ non-builtin pytest argument missing from `conftest.py`.
 | `bound_volume` | Task 6 | callable yielding an active `ProjectBinding` on `test_volume` |
 | `distinct_volume` | Task 6 | `Path` on a writable mount with a different mount ID; skips if none |
 
-`fake_backend`'s `supplied` is a `set[Capability]`; each `<operation>_errno` keyword injects that errno at
-that operation, and `override_names` narrows the injection to specific final components. That narrowing is
-required wherever a probe reads a *refusal* as evidence: those probes call the same operation twice, and an
-unscoped injection lands on the earlier availability call instead of the step under test.
+`fake_backend`'s `supplied` is a `set[Capability]`; each method-level `<operation>_errno` keyword injects
+that errno at one concrete backend method, while each `UNSUPPORTED_ERRNO` contract key
+(`<contract>_errno`) injects across the method set that implements that capability. `override_names`
+narrows either form to specific final components. That narrowing is required wherever a probe reads a
+*refusal* as evidence: those probes call the same operation twice, and an unscoped injection lands on the
+earlier availability call instead of the step under test.
 
 Not every shared helper is a fixture. `tests.fs_support` also exports plain context managers —
 `metadata_layout`, `probe_directory`, `probe_database_path` — imported directly by the tests that need
@@ -650,6 +655,9 @@ def test_unsupported_errno_sets_exclude_ambiguous_generic_failures():
         assert errno.EBADF not in codes, operation
         assert errno.EMFILE not in codes, operation
         assert errno.EFAULT not in codes, operation
+    # flock(2) defines ENOLCK as exhaustion of kernel lock-record memory, not lack
+    # of advisory-lock support. It is environmental failure and must propagate.
+    assert errno.ENOLCK not in UNSUPPORTED_ERRNO["lock"]
 
 
 def test_unsupported_errno_covers_every_probed_operation():
@@ -963,16 +971,36 @@ from typing import Protocol
 # reports absence from it, and lock.py converts the "traversal" and "lock" entries to
 # CapabilityUnavailable on the bootstrap path (design §10). probe.py imports lock.py,
 # so defining it there would force either a cycle or a second copy that drifts.
+#
+# Primary manual bases, recorded per operation rather than inferred:
+# - renameat2(2): EINVAL when the filesystem does not support a requested flag.
+# - link(2): EPERM when the filesystem does not support hard links.
+# - fsync(2): EINVAL when the descriptor's object does not support synchronization.
+# - symlink(2): EPERM when the filesystem does not support symbolic-link creation;
+#   the probe stages creation inside the symlink_fingerprint capability check.
+# - errno(3): ENOSYS is "function not implemented"; ENOTSUP is "operation not
+#   supported". ENOTSUP and EOPNOTSUPP have the same numeric value on Linux, but
+#   both spellings remain because a structural Backend may come from another OS.
+# - flock(2): ENOLCK means lock-record memory exhaustion, so it is deliberately
+#   absent here and propagates.
 UNSUPPORTED_ERRNO: dict[str, frozenset[int]] = {
+    # renameat2(2) RENAME_EXCHANGE.
     "exchange": frozenset({errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP, errno.ENOTSUP}),
+    # renameat2(2) RENAME_NOREPLACE.
     "transfer_noclobber": frozenset(
         {errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP, errno.ENOTSUP}
     ),
+    # link(2), plus the semantic Backend "operation not supported" result.
     "link_anchor": frozenset({errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP}),
+    # fsync(2), plus the semantic Backend "operation not supported" result.
     "flush": frozenset({errno.EINVAL, errno.EOPNOTSUPP, errno.ENOTSUP}),
+    # open(2) has no Linux-specific unsupported O_NOFOLLOW result; this is the
+    # semantic Backend result only.
     "open_regular_nofollow": frozenset({errno.EOPNOTSUPP, errno.ENOTSUP}),
+    # symlink(2), plus the semantic Backend "operation not supported" result.
     "symlink_fingerprint": frozenset({errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP}),
-    "lock": frozenset({errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOTSUP}),
+    # Semantic Backend result only. flock(2) ENOLCK is transient exhaustion.
+    "lock": frozenset({errno.EOPNOTSUPP, errno.ENOTSUP}),
     # ENOSYS is the kernel without openat2. EOPNOTSUPP/ENOTSUP is a backend that
     # cannot supply the guarded walk at all — the shape a restricted backend takes.
     "traversal": frozenset({errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP}),
@@ -1152,6 +1180,7 @@ import pytest
 
 from atoms.core.errors import CapabilityUnavailable
 from atoms.fs.volume import (
+    _BARRIER_OPTIONS,
     CERTIFIED_ALLOWLIST,
     AllowlistEntry,
     DurabilityAllowlist,
@@ -1275,12 +1304,25 @@ def test_build_configuration_reads_btrfs_super_only_values(mountinfo_text):
 
 
 def test_every_supported_filesystem_has_normalization_coverage(mountinfo_text):
-    # A table entry with no fixture is an untested durability claim. This fails the
-    # moment a filesystem is added to the table without a defaults fixture.
-    for filesystem in ("ext4", "xfs", "btrfs"):
-        entries = parse_mountinfo(mountinfo_text(f"{filesystem}_defaults"))
-        entry = next(item for item in entries if item.mount_point == "/data")
-        assert build_configuration(entry, "7.1.5-arch1-1").filesystem_type == filesystem
+    # The production table is the source of truth. A hard-coded loop over the three
+    # current filesystems would keep passing when a fourth table entry was added.
+    super_only_cases = {
+        "ext4": "ext4_writeback",
+        "xfs": "xfs_wsync",
+        "btrfs": "btrfs_flushoncommit",
+    }
+    assert set(_BARRIER_OPTIONS) == set(super_only_cases)
+    for filesystem in _BARRIER_OPTIONS:
+        defaults = parse_mountinfo(mountinfo_text(f"{filesystem}_defaults"))
+        default_entry = next(item for item in defaults if item.mount_point == "/data")
+        assert (
+            build_configuration(default_entry, "7.1.5-arch1-1").filesystem_type
+            == filesystem
+        )
+
+        super_only = parse_mountinfo(mountinfo_text(super_only_cases[filesystem]))
+        super_entry = next(item for item in super_only if item.mount_point == "/data")
+        assert build_configuration(super_entry, "7.1.5-arch1-1").filesystem_type == filesystem
 
 
 def test_build_configuration_carries_the_exact_kernel_and_backend_revision(mountinfo_text):
@@ -1849,6 +1891,14 @@ def test_absent_anchored_traversal_refuses_with_capability_unavailable(
         acquire_project_lock(backend, str(metadata_root))
 
 
+def test_openat2_enosys_refuses_with_capability_unavailable(metadata_root, fake_backend):
+    # A current test kernel supplies openat2, so force its operational absence.
+    # This must take the shared traversal conversion path, not escape as OSError.
+    backend = fake_backend(supplied=set(Capability), traversal_errno=errno.ENOSYS)
+    with pytest.raises(CapabilityUnavailable, match="anchored_traversal"):
+        acquire_project_lock(backend, str(metadata_root))
+
+
 def test_absent_advisory_lock_refuses_with_capability_unavailable(
     metadata_root, fake_backend
 ):
@@ -1861,8 +1911,14 @@ def test_sets_the_sync_ignore_marker_on_creation(linux_backend, metadata_root):
     with acquire_project_lock(linux_backend, str(metadata_root)) as lock:
         try:
             value = os.getxattr(lock.metadata_root_fd, "user.com.dropbox.ignored")
-        except OSError:
-            pytest.skip("filesystem does not support user extended attributes")
+        except OSError as caught:
+            # getxattr(2): ENOTSUP/EOPNOTSUPP means xattrs are unsupported or
+            # disabled. ENODATA means the implementation failed to create this
+            # specific marker and must fail rather than laundering the defect as a
+            # platform skip.
+            if caught.errno in {errno.ENOTSUP, errno.EOPNOTSUPP}:
+                pytest.skip("filesystem does not support user extended attributes")
+            raise
         assert value == b"1"
 
 
@@ -2031,7 +2087,12 @@ class RestrictedBackend:
     chosen errno for absent ones, so every refusal branch is reachable without a
     filesystem that genuinely lacks the operation.
 
-    `override_names` narrows an errno override to specific final components. This is
+    A method-level key such as `open_child_directory_errno` targets one concrete
+    method. A contract-level key from UNSUPPORTED_ERRNO, such as `traversal_errno`
+    or `flush_errno`, targets every method implementing that capability. The latter
+    is what lets the table-derived mutation matrix cover every operation key.
+
+    `override_names` narrows either form to specific final components. This is
     load-bearing, not a convenience: a probe whose evidence is a refusal calls the
     same operation twice — once to establish availability, once to require the
     refusal — and an unscoped override fails the FIRST call, so the test would pass
@@ -2050,10 +2111,13 @@ class RestrictedBackend:
         self._overrides = errno_overrides
         self._real = LinuxBackend()
 
-    def _dispatch(self, capability, operation, *args, name=None):
-        # Keyed on '<operation>_errno' so a caller writes exchange_errno=EBADF and
-        # reads naturally, rather than passing a bare operation name as a kwarg.
+    def _dispatch(self, capability, operation, *args, contract=None, name=None):
+        # Method-level overrides preserve the named-refusal injection used by the
+        # exact-errno guard tests. Contract-level overrides key directly from
+        # UNSUPPORTED_ERRNO and drive its complete generated matrix.
         override = self._overrides.get(f"{operation}_errno")
+        if override is None and contract is not None:
+            override = self._overrides.get(f"{contract}_errno")
         if override is not None and (
             self._override_names is None or name in self._override_names
         ):
@@ -2063,29 +2127,65 @@ class RestrictedBackend:
         return getattr(self._real, operation)(*args)
 
     def open_root(self, path):
-        return self._dispatch(Capability.ANCHORED_TRAVERSAL, "open_root", path, name=path)
+        return self._dispatch(
+            Capability.ANCHORED_TRAVERSAL,
+            "open_root",
+            path,
+            contract="traversal",
+            name=path,
+        )
 
     def open_child_directory(self, parent_fd, name):
         return self._dispatch(
-            Capability.ANCHORED_TRAVERSAL, "open_child_directory", parent_fd, name, name=name
+            Capability.ANCHORED_TRAVERSAL,
+            "open_child_directory",
+            parent_fd,
+            name,
+            contract="traversal",
+            name=name,
         )
 
     def exchange(self, parent_fd, left, right):
-        return self._dispatch(Capability.ATOMIC_EXCHANGE, "exchange", parent_fd, left, right)
+        return self._dispatch(
+            Capability.ATOMIC_EXCHANGE,
+            "exchange",
+            parent_fd,
+            left,
+            right,
+            contract="exchange",
+        )
 
     def transfer_noclobber(self, src_fd, src, dst_fd, dst):
         return self._dispatch(
-            Capability.NOCLOBBER_TRANSFER, "transfer_noclobber", src_fd, src, dst_fd, dst
+            Capability.NOCLOBBER_TRANSFER,
+            "transfer_noclobber",
+            src_fd,
+            src,
+            dst_fd,
+            dst,
+            contract="transfer_noclobber",
         )
 
     def link_anchor(self, src_fd, src, dst_fd, dst):
-        return self._dispatch(Capability.IDENTITY_ANCHOR, "link_anchor", src_fd, src, dst_fd, dst)
+        return self._dispatch(
+            Capability.IDENTITY_ANCHOR,
+            "link_anchor",
+            src_fd,
+            src,
+            dst_fd,
+            dst,
+            contract="link_anchor",
+        )
 
     def flush_file(self, fd):
-        return self._dispatch(Capability.DURABLE_PUBLISH, "flush_file", fd)
+        return self._dispatch(
+            Capability.DURABLE_PUBLISH, "flush_file", fd, contract="flush"
+        )
 
     def flush_directory(self, fd):
-        return self._dispatch(Capability.DURABLE_PUBLISH, "flush_directory", fd)
+        return self._dispatch(
+            Capability.DURABLE_PUBLISH, "flush_directory", fd, contract="flush"
+        )
 
     def open_regular_nofollow(self, parent_fd, name):
         return self._dispatch(
@@ -2093,23 +2193,39 @@ class RestrictedBackend:
             "open_regular_nofollow",
             parent_fd,
             name,
+            contract="open_regular_nofollow",
             name=name,
         )
 
     def symlink_fingerprint(self, parent_fd, name):
         return self._dispatch(
-            Capability.SYMLINK_FINGERPRINT, "symlink_fingerprint", parent_fd, name, name=name
+            Capability.SYMLINK_FINGERPRINT,
+            "symlink_fingerprint",
+            parent_fd,
+            name,
+            contract="symlink_fingerprint",
+            name=name,
         )
 
     def lock_exclusive(self, fd):
-        return self._dispatch(Capability.ADVISORY_PROJECT_LOCK, "lock_exclusive", fd)
+        return self._dispatch(
+            Capability.ADVISORY_PROJECT_LOCK,
+            "lock_exclusive",
+            fd,
+            contract="lock",
+        )
 
     def try_lock_exclusive(self, fd):
         if not self._lock_excludes:
             # A filesystem where flock succeeds but does not actually exclude —
             # the real case on NFS without a working lock daemon.
             return True
-        return self._dispatch(Capability.ADVISORY_PROJECT_LOCK, "try_lock_exclusive", fd)
+        return self._dispatch(
+            Capability.ADVISORY_PROJECT_LOCK,
+            "try_lock_exclusive",
+            fd,
+            contract="lock",
+        )
 
 
 def make_fake_backend():
@@ -2399,8 +2515,10 @@ evidence — read the skip lines.
 
 - [ ] **Step 6: Add the layout owner and write the failing bootstrap tests**
 
-`ensure_metadata_layout` returns one retained descriptor per component, so every caller must own them.
-No test calls it directly; they go through a context manager that closes each exactly once.
+`ensure_metadata_layout` returns one retained descriptor per component, so every **successful** caller
+must own the returned mapping. Successful tests go through a context manager that closes each descriptor
+exactly once. A failure-path test may call it directly only when it requires an exception before any
+mapping is returned and verifies that the function unwound every descriptor it had acquired.
 
 Append to `python/tests/fs_support.py`:
 
@@ -2555,9 +2673,9 @@ def test_layout_is_idempotent_over_existing_directories(held_lock, metadata_root
 
 def test_layout_refuses_a_symlink_occupying_a_name(held_lock, metadata_root):
     # Tolerating EEXIST without reopening would adopt whatever occupies the name.
-    # These two refusal tests are the only ones that call ensure_metadata_layout
-    # directly, and legitimately so: it raises, returns nothing, and closes what it
-    # had already opened, so there is no descriptor for a caller to own.
+    # Failure-path tests call ensure_metadata_layout directly legitimately: it
+    # raises, returns nothing, and closes what it had already opened, so there is no
+    # descriptor mapping for a caller to own.
     with held_lock(metadata_root) as lock:
         os.symlink("/etc", "staging", dir_fd=lock.metadata_root_fd)
         with pytest.raises((OSError, ProtocolError)):
@@ -2934,8 +3052,7 @@ def test_missing_exchange_is_reported_not_raised(held_lock, metadata_root, fake_
     with held_lock(metadata_root) as lock:
         with probe_directory(lock) as probe_fd:
             supplied = probe_backend(backend, probe_fd, lock)
-    assert Capability.ATOMIC_EXCHANGE not in supplied
-    assert Capability.NOCLOBBER_TRANSFER in supplied
+    assert supplied == frozenset(set(Capability) - {Capability.ATOMIC_EXCHANGE})
 
 
 @pytest.mark.parametrize(
@@ -2953,7 +3070,7 @@ def test_each_optional_capability_can_be_absent(held_lock, metadata_root, fake_b
     with held_lock(metadata_root) as lock:
         with probe_directory(lock) as probe_fd:
             supplied = probe_backend(backend, probe_fd, lock)
-    assert absent not in supplied
+    assert supplied == frozenset(set(Capability) - {absent})
 
 
 def test_unexpected_errno_propagates_rather_than_reporting_absence(
@@ -3449,7 +3566,14 @@ def _probe_nofollow_read(backend: Backend, probe_fd: int) -> bool:
 
 def _probe_symlink_fingerprint(backend: Backend, probe_fd: int) -> bool:
     with _staged(probe_fd):
-        os.symlink("../target", "alias", dir_fd=probe_fd)
+        # symlink(2) reports EPERM when this filesystem cannot create symlinks.
+        # Creation belongs inside the same capability check as lstat/readlink;
+        # staging it outside _supported would let an optional absence escape.
+        if not _supported(
+            "symlink_fingerprint",
+            lambda: os.symlink("../target", "alias", dir_fd=probe_fd),
+        ):
+            return False
         captured: list[tuple] = []
 
         def attempt():
@@ -3672,6 +3796,9 @@ Create `python/tests/test_fs_binding.py`:
 import dataclasses
 import errno
 import os
+import shutil
+import subprocess
+import sys
 
 import pytest
 
@@ -3681,6 +3808,65 @@ from atoms.fs.binding import ProjectBinding, VolumeEvidence, bind_project_volume
 from atoms.fs.bootstrap import close_layout
 from atoms.fs.lock import acquire_project_lock
 from atoms.fs.volume import CERTIFIED_ALLOWLIST, DurabilityAllowlist
+
+_OPTIONAL_CAPABILITIES = tuple(
+    capability
+    for capability in Capability
+    if capability
+    not in {Capability.ANCHORED_TRAVERSAL, Capability.ADVISORY_PROJECT_LOCK}
+)
+
+_BIND_MOUNT_CHILD = r"""
+import os
+import subprocess
+import sys
+
+from atoms.core.errors import CapabilityUnavailable
+from atoms.fs.binding import bind_project_volume
+from atoms.fs.linux import LinuxBackend
+from atoms.fs.lock import acquire_project_lock
+from atoms.fs.volume import DurabilityAllowlist, StorageProfile, read_mount_id
+
+source, target, metadata_root, mount_program = sys.argv[1:]
+mounted = subprocess.run(
+    [mount_program, "--bind", source, target],
+    capture_output=True,
+    text=True,
+)
+if mounted.returncode != 0:
+    print(mounted.stderr.strip(), file=sys.stderr)
+    sys.exit(77)
+
+backend = LinuxBackend()
+source_fd = backend.open_root(source)
+target_fd = backend.open_root(target)
+try:
+    if os.fstat(source_fd).st_dev != os.fstat(target_fd).st_dev:
+        print("bind mount did not preserve st_dev", file=sys.stderr)
+        sys.exit(10)
+    if read_mount_id(source_fd) == read_mount_id(target_fd):
+        print("bind mount did not create a distinct mount ID", file=sys.stderr)
+        sys.exit(11)
+finally:
+    os.close(target_fd)
+    os.close(source_fd)
+
+with acquire_project_lock(backend, metadata_root) as lock:
+    try:
+        bind_project_volume(
+            os.path.join(target, "project"),
+            lock,
+            allowlist=DurabilityAllowlist(entries=frozenset()),
+            storage=StorageProfile(profile_id="bind-mount-test"),
+        )
+    except CapabilityUnavailable as caught:
+        if "same volume" not in str(caught):
+            print(f"wrong refusal: {caught}", file=sys.stderr)
+            sys.exit(12)
+    else:
+        print("equal-st_dev roots with distinct mount IDs were admitted", file=sys.stderr)
+        sys.exit(13)
+"""
 
 
 def test_binding_succeeds_and_reports_supplied_capabilities(bound_volume):
@@ -3751,6 +3937,57 @@ def test_cross_volume_roots_refuse(
             )
 
 
+def test_real_bind_mount_with_equal_device_and_distinct_mount_id_refuses(test_volume):
+    # The captured mountinfo fixture proves the parser distinction everywhere. This
+    # Tier 3 test proves the live descriptor path and binding decision when namespace
+    # support is available.
+    unshare = shutil.which("unshare")
+    mount_program = shutil.which("mount")
+    if unshare is None or mount_program is None:
+        missing = "unshare" if unshare is None else "mount"
+        pytest.skip(f"real bind-mount test requires the {missing!r} program")
+
+    namespace_probe = subprocess.run(
+        [unshare, "--mount", "--map-root-user", "--", "true"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if namespace_probe.returncode != 0:
+        reason = namespace_probe.stderr.strip() or "no diagnostic"
+        pytest.skip(f"user/mount namespaces unavailable: {reason}")
+
+    source = test_volume / "bind-source"
+    target = test_volume / "bind-target"
+    source.mkdir()
+    target.mkdir()
+    (source / "project").mkdir()
+    metadata_root = source / "metadata"
+
+    finished = subprocess.run(
+        [
+            unshare,
+            "--mount",
+            "--map-root-user",
+            "--",
+            sys.executable,
+            "-c",
+            _BIND_MOUNT_CHILD,
+            str(source),
+            str(target),
+            str(metadata_root),
+            mount_program,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if finished.returncode == 77:
+        reason = finished.stderr.strip() or "no diagnostic"
+        pytest.skip(f"isolated bind mount unavailable: {reason}")
+    assert finished.returncode == 0, finished.stderr
+
+
 def test_a_lock_that_does_not_exclude_refuses_binding(
     project_root, metadata_root, fake_backend, test_allowlist, test_storage_profile
 ):
@@ -3771,9 +4008,12 @@ def test_a_lock_that_does_not_exclude_refuses_binding(
             )
 
 
-def test_absent_optional_capability_binds_and_reports(bound_volume):
-    with bound_volume(withhold={Capability.ATOMIC_EXCHANGE}) as binding:
-        assert Capability.ATOMIC_EXCHANGE not in binding.evidence.supplied_capabilities
+@pytest.mark.parametrize("absent", _OPTIONAL_CAPABILITIES)
+def test_each_absent_optional_capability_binds_and_reports_exactly(bound_volume, absent):
+    with bound_volume(withhold={absent}) as binding:
+        assert binding.evidence.supplied_capabilities == frozenset(
+            set(Capability) - {absent}
+        )
         assert binding.active is True
 
 
@@ -4354,8 +4594,9 @@ __all__ = [
 
 Run: `uv run pytest tests/test_fs_binding.py -v`
 Expected: PASS. Every test in the named files must pass; the only acceptable non-pass is a
-`test_volume`/`distinct_volume` skip with its stated reason. Do not accept a bare count as
-evidence — read the skip lines.
+`test_volume`/`distinct_volume` skip with its stated reason or the real bind-mount test's precise
+missing-program, namespace-unavailable, or isolated-mount-unavailable reason. Do not accept a bare count
+as evidence — read the skip lines.
 
 - [ ] **Step 7: Commit**
 
@@ -4369,8 +4610,10 @@ git commit -m "feat(fs): bind a certified project volume to frozen evidence"
 
 ### Task 7: Errno mutations, architecture enforcement, and status sync
 
-Close the boundary with the mutation tests that prove ambiguous errno values are licensed only by the
-probe precondition, and update the ledger and `AGENTS.md` in the same commit.
+Close the boundary with table-derived characterization tests that prove unsupported errno values are
+classified only under their valid probe/bootstrap preconditions, and update the ledger and `AGENTS.md`
+in the same commit. Tasks 1–6 already implement the behavior, so this task locks it without inventing a
+production RED state.
 
 **Files:**
 - Create: `python/tests/architecture_support.py`
@@ -4385,49 +4628,118 @@ probe precondition, and update the ledger and `AGENTS.md` in the same commit.
 - Consumes: everything from Tasks 1-6.
 - Produces: no new production interface.
 
-- [ ] **Step 1: Write the failing errno mutation tests**
+- [ ] **Step 1: Add the table-derived errno characterization and mutation matrix**
 
 Append to `python/tests/test_fs_probe.py`:
 
 ```python
+_OPERATION_CAPABILITY = {
+    "exchange": Capability.ATOMIC_EXCHANGE,
+    "transfer_noclobber": Capability.NOCLOBBER_TRANSFER,
+    "link_anchor": Capability.IDENTITY_ANCHOR,
+    "flush": Capability.DURABLE_PUBLISH,
+    "open_regular_nofollow": Capability.NOFOLLOW_COHERENT_READ,
+    "symlink_fingerprint": Capability.SYMLINK_FINGERPRINT,
+    "lock": Capability.ADVISORY_PROJECT_LOCK,
+    "traversal": Capability.ANCHORED_TRAVERSAL,
+}
+
+# Generated from production, with ENOTSUP/EOPNOTSUPP deduplicated by numeric value
+# on Linux. A copied list could silently miss a newly admitted table entry.
+_EFFECTIVE_UNSUPPORTED_PAIRS = tuple(
+    (operation, code)
+    for operation, codes in UNSUPPORTED_ERRNO.items()
+    for code in sorted(codes)
+)
+
+_BOOTSTRAP_OPERATIONS = frozenset({"lock", "traversal"})
+
+
+def test_operational_enosys_cases_are_in_the_generated_matrix():
+    # A current kernel will not naturally return these, so the fake must keep the
+    # openat2 and both renameat2 operational-absence paths reachable.
+    for operation in ("traversal", "exchange", "transfer_noclobber"):
+        assert (operation, errno.ENOSYS) in _EFFECTIVE_UNSUPPORTED_PAIRS
+
+
 @pytest.mark.parametrize(
     ("operation", "code"),
     [
-        ("exchange", errno.EINVAL),
-        ("transfer_noclobber", errno.EINVAL),
-        ("link_anchor", errno.EPERM),
+        pair
+        for pair in _EFFECTIVE_UNSUPPORTED_PAIRS
+        if pair[0] not in _BOOTSTRAP_OPERATIONS
     ],
 )
-def test_ambiguous_errno_is_licensed_only_by_the_probe_precondition(
+def test_each_effective_unsupported_errno_removes_exactly_its_capability(
     held_lock, metadata_root, fake_backend, operation, code
 ):
-    # EINVAL and EPERM are ambiguous in general. Inside the probe they conclude
-    # "absent" because operands are constructed by the probe itself; the same
-    # errno from any other call site must propagate.
-    assert code in UNSUPPORTED_ERRNO[operation]
+    # This is the licensed half: the probe owns valid operands under the lock.
     backend = fake_backend(supplied=set(Capability), **{f"{operation}_errno": code})
     with held_lock(metadata_root) as lock:
         with probe_directory(lock) as probe_fd:
             supplied = probe_backend(backend, probe_fd, lock)
-    assert len(supplied) < len(frozenset(Capability))
+    assert supplied == frozenset(
+        set(Capability) - {_OPERATION_CAPABILITY[operation]}
+    )
 
 
-@pytest.mark.parametrize("code", [errno.EBADF, errno.EMFILE, errno.EFAULT])
-@pytest.mark.parametrize("operation", ["exchange", "transfer_noclobber", "link_anchor"])
-def test_precondition_violating_errno_propagates(
-    held_lock, metadata_root, fake_backend, operation, code
+@pytest.mark.parametrize(
+    ("operation", "code"),
+    [
+        pair
+        for pair in _EFFECTIVE_UNSUPPORTED_PAIRS
+        if pair[0] in _BOOTSTRAP_OPERATIONS
+    ],
+)
+def test_each_bootstrap_unsupported_errno_refuses_before_probing(
+    metadata_root, fake_backend, operation, code
 ):
     backend = fake_backend(supplied=set(Capability), **{f"{operation}_errno": code})
-    with held_lock(metadata_root) as lock:
-        with probe_directory(lock) as probe_fd:
-            with pytest.raises(OSError) as caught:
-                probe_backend(backend, probe_fd, lock)
-            assert caught.value.errno == code
+    expected = (
+        "anchored_traversal"
+        if operation == "traversal"
+        else "advisory_project_lock"
+    )
+    with pytest.raises(CapabilityUnavailable, match=expected):
+        acquire_project_lock(backend, str(metadata_root))
+
+
+def _invoke_with_violated_precondition(backend, operation):
+    # Every call has a wrong descriptor and/or malformed empty component. It runs
+    # directly against Backend, outside probe_backend's licensed precondition.
+    if operation == "exchange":
+        return backend.exchange(-1, "", "")
+    if operation == "transfer_noclobber":
+        return backend.transfer_noclobber(-1, "", -1, "")
+    if operation == "link_anchor":
+        return backend.link_anchor(-1, "", -1, "")
+    if operation == "flush":
+        return backend.flush_file(-1)
+    if operation == "open_regular_nofollow":
+        return backend.open_regular_nofollow(-1, "")
+    if operation == "symlink_fingerprint":
+        return backend.symlink_fingerprint(-1, "")
+    if operation == "lock":
+        return backend.try_lock_exclusive(-1)
+    if operation == "traversal":
+        return backend.open_child_directory(-1, "..")
+    raise AssertionError(f"unmapped operation: {operation}")
+
+
+@pytest.mark.parametrize(("operation", "code"), _EFFECTIVE_UNSUPPORTED_PAIRS)
+def test_each_effective_unsupported_errno_propagates_outside_the_precondition(
+    fake_backend, operation, code
+):
+    backend = fake_backend(supplied=set(Capability), **{f"{operation}_errno": code})
+    with pytest.raises(OSError) as caught:
+        _invoke_with_violated_precondition(backend, operation)
+    assert caught.value.errno == code
 ```
 
-Add `from atoms.fs.backend import UNSUPPORTED_ERRNO` to the imports of
-`python/tests/test_fs_probe.py`. No `fs_support.py` change is needed: `RestrictedBackend._dispatch`
-already keys overrides on `f"{operation}_errno"` from Task 4, which is what these tests pass.
+Add `from atoms.fs.backend import UNSUPPORTED_ERRNO` and
+`from atoms.fs.lock import acquire_project_lock` to the imports of
+`python/tests/test_fs_probe.py`. Task 4's restricted backend accepts both method-level overrides used by
+the named-refusal tests and the contract-level keys generated here.
 
 - [ ] **Step 2: Extract the shared architecture scanner**
 
@@ -4507,7 +4819,7 @@ def test_recovery_fixture_registry_scans_test_class_methods(tmp_path):
 Run `uv run pytest tests/test_recovery_architecture.py -v` and confirm it still passes before moving on.
 This step changes no A4a behavior; it exists so the next step has a correct scanner to call.
 
-- [ ] **Step 3: Write the failing architecture tests**
+- [ ] **Step 3: Add the architecture characterization tests**
 
 Append to `python/tests/test_fs_architecture.py`:
 
@@ -4609,23 +4921,25 @@ Add `from tests.architecture_support import fixture_names, unregistered_test_arg
 of `python/tests/test_fs_architecture.py`. The `ast` import Task 1 added is still used by
 `test_core_never_imports_the_filesystem_layer`; no `re` import is needed.
 
-- [ ] **Step 4: Run the tests to verify they fail**
+- [ ] **Step 4: Run the characterization checkpoint**
 
 Run: `uv run pytest tests/test_fs_architecture.py tests/test_fs_probe.py -v`
-Expected: FAIL on the new architecture assertions only. The errno mutation tests from Step 1 should
-**already pass** — Tasks 4 and 5 built the override keying and the exact-errno guards they exercise, so
-this is the confirmation that they did, not a red-to-green cycle.
+Expected: PASS. Tasks 1–6 already built the signature, exports, fixture adapters, contract-level errno
+injection, and exact-errno guards these tests characterize. Read every result: this is a confirmation
+checkpoint, not a red-to-green cycle.
 
-- [ ] **Step 5: Make the tests pass**
+- [ ] **Step 5: Resolve any characterization deviation at its owning task**
 
-No production change should be required. If `test_fs_fixture_registry_covers_every_test_argument`
-fails, add the missing adapter to `python/tests/conftest.py` rather than renaming the test argument —
-the guard exists to force that direction.
+If Step 4 passes, make no edit in this step. If it fails, stop Task 7 and repair the deviation in the
+earlier task that owns the asserted behavior, then rerun Step 4. A missing fixture is repaired by adding
+the adapter to `python/tests/conftest.py`, never by renaming the test argument. Task 7 must not manufacture
+a production change merely to create a RED/GREEN story.
 
 - [ ] **Step 6: Run the full suite**
 
 Run: `uv run pytest -q && uv run ruff check && uv run pyright`
-Expected: all pass.
+Expected: all pass, with only the explicitly named `test_volume`, `distinct_volume`, xattr-unsupported,
+or real-bind-mount environment skips accepted after reading their reasons.
 
 - [ ] **Step 7: Update the ledger**
 
@@ -4680,18 +4994,22 @@ Run before declaring A4a complete.
 
 - [ ] Every design §13 acceptance criterion maps to a passing test:
   1 → `test_core_imports_only_the_allowlisted_modules`; 2 → `test_select_backend_refuses_*`;
-  3 → `test_fs_syscalls.py`; 4 → `test_fs_backend.py` plus `test_fs_probe.py`;
+  3 → `test_fs_syscalls.py`, `test_operational_enosys_cases_are_in_the_generated_matrix`;
+  4 → `test_fs_backend.py` plus `test_fs_probe.py`;
   5 → `test_open_root_refuses_a_symlinked_ancestor`,
   `test_establish_root_normalizes_only_after_the_guarded_walk`,
   `test_establish_root_resolves_a_parent_component_after_a_real_directory`,
   `test_acquire_refuses_a_missing_parent`, `test_acquire_refuses_a_parent_component_as_the_leaf`;
-  6 → `test_cross_volume_roots_refuse`, `test_resolve_mount_entry_matches_on_mount_id_not_device`;
+  6 → `test_cross_volume_roots_refuse`, `test_resolve_mount_entry_matches_on_mount_id_not_device`,
+  `test_real_bind_mount_with_equal_device_and_distinct_mount_id_refuses`;
   7 → `test_build_configuration_*` for all three filesystems plus
   `test_every_supported_filesystem_has_normalization_coverage`;
   8 → `test_allowlist_matches_only_on_exact_configuration_and_profile`;
   9 → `test_bind_requires_a_keyword_only_allowlist_with_no_default`, `test_no_production_caller_*`;
   10 → `test_fs_lock.py` plus `test_fs_bootstrap.py`, including
-  `test_layout_returns_one_owned_descriptor_per_component`;
+  `test_layout_returns_one_owned_descriptor_per_component`,
+  `test_sets_the_sync_ignore_marker_on_creation`,
+  `test_sync_ignore_marker_failure_does_not_fail_bootstrap`;
   11 → `test_refusal_reclaims_existing_debris_but_writes_nothing_new`,
   `test_a_certification_failure_still_reclaims_probe_debris`,
   `test_a_descriptor_release_failure_still_reclaims`,
@@ -4706,7 +5024,10 @@ Run before declaring A4a complete.
   12 → `test_absent_anchored_traversal_refuses_with_capability_unavailable`,
   `test_absent_advisory_lock_refuses_with_capability_unavailable`,
   `test_a_lock_that_does_not_exclude_refuses_binding`,
-  `test_absent_optional_capability_binds_and_reports`,
+  `test_each_absent_optional_capability_binds_and_reports_exactly`,
+  `test_openat2_enosys_refuses_with_capability_unavailable`,
+  `test_operational_enosys_cases_are_in_the_generated_matrix`,
+  `test_each_effective_unsupported_errno_removes_exactly_its_capability`,
   `test_sqlite_certification_observes_the_commit_across_processes`,
   `test_certification_uses_two_children_so_the_parent_can_release_between_them`,
   `test_each_child_verdict_refuses_with_its_own_reason`,
@@ -4716,12 +5037,14 @@ Run before declaring A4a complete.
   `test_lock_refuses_dataclass_replacement`, `test_binding_refuses_dataclass_replacement`,
   `test_accessors_refuse_*`, `test_descriptors_are_cloexec`, `test_exit_is_idempotent`;
   14 → `test_verified_child_path_*`, `test_verified_metadata_path_delegates_to_the_shared_verifier`;
-  15 → `test_precondition_violating_errno_propagates`,
-  `test_ambiguous_errno_is_licensed_only_by_the_probe_precondition`,
+  15 → `test_each_effective_unsupported_errno_removes_exactly_its_capability`,
+  `test_each_bootstrap_unsupported_errno_refuses_before_probing`,
+  `test_each_effective_unsupported_errno_propagates_outside_the_precondition`,
   `test_a_traversal_refusal_with_the_wrong_errno_propagates`,
   `test_a_nofollow_refusal_with_the_wrong_errno_propagates`,
   `test_unsupported_errno_sets_exclude_ambiguous_generic_failures`;
-  16 → `test_volume` skip path, `distinct_volume` skip path;
+  16 → `test_volume` skip path, `distinct_volume` skip path,
+  `test_real_bind_mount_with_equal_device_and_distinct_mount_id_refuses` namespace skip paths;
   17 → the full-suite step of Task 7.
 - [ ] No probe result is described anywhere in code or comments as a durability guarantee.
 - [ ] `bind_project_volume` refuses only on: platform, architecture, unlisted filesystem, unresolvable
@@ -4729,14 +5052,17 @@ Run before declaring A4a complete.
       optional capability.
 - [ ] No `isinstance` on a closed union; no new error type; no runtime dependency added.
 - [ ] `atoms/core` imports nothing outside the allowlist, and never `atoms.fs`.
-- [ ] Every descriptor A4a opens uses `O_CLOEXEC` and is closed exactly once by its owner. No test calls
-      `ensure_metadata_layout` directly — each goes through `metadata_layout`, `probe_directory`, or
-      `probe_database_path`, which own what it returns.
+- [ ] Every descriptor A4a opens uses `O_CLOEXEC` and is closed exactly once by its owner. Every
+      successful test call to `ensure_metadata_layout` goes through `metadata_layout`,
+      `probe_directory`, or `probe_database_path`; a direct failure-path call requires an exception
+      before return and verifies complete unwind.
 - [ ] Every probe step whose evidence is a *refusal* asserts the exact errno. `grep -n "except OSError"`
       over `src/atoms/fs/` should show no bare `except OSError:` that concludes success.
-- [ ] Every mutation test for a refusal-as-evidence step passes `override_names`. An unscoped injection
-      lands on the earlier availability call and the test stops discriminating — it would still pass with
-      `_refused_with` weakened to accept any `OSError`, which is the only thing it exists to catch.
+- [ ] Every mutation test for a **refusal-as-evidence** step passes `override_names`. An unscoped
+      injection lands on the earlier availability call and the test stops discriminating — it would
+      still pass with `_refused_with` weakened to accept any `OSError`, which is the only thing it exists
+      to catch. The table-derived availability matrix is deliberately unscoped and separately pairs each
+      effective errno with an invalid direct-call propagation test.
 - [ ] Reclamation sits in the **outer** `finally` of `bind_project_volume`, so a failing descriptor
       release cannot skip it, and the layout closes sit in a `finally` rather than on the success path.
 - [ ] Every explicit multi-descriptor batch release goes through `close_all`. `grep -n "os.close"

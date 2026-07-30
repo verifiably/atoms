@@ -949,11 +949,37 @@ the **probe precondition**:
 That precondition is what licenses an ambiguous errno to conclude "absent", and it holds only for the
 probe. The same errno arriving from any other call site propagates.
 
-Two consequences bind the plan. Each operation's unsupported-errno set is fixed against its manual page
-with the specific documented sentence recorded beside it — not inferred. And each set is proved by a
-**mutation test**: for every errno in it, a call made with the precondition deliberately violated
-(malformed argument, wrong descriptor) must propagate as `OSError` rather than being reported as an
-absent capability.
+The unsupported table is fixed by the following primary-manual bases. `ENOTSUP` and `EOPNOTSUPP` have the
+same numeric value on Linux (`errno(3)`), so they form one **effective** mutation case even though both
+spellings remain in the source table for a structural backend implemented on a platform where they may
+differ.
+
+| Operation key | Effective unsupported errnos | Documented basis |
+| --- | --- | --- |
+| `exchange` | `ENOSYS`, `EINVAL`, `ENOTSUP`/`EOPNOTSUPP` | `renameat2(2)` documents `EINVAL` when the filesystem does not support a requested flag; `errno(3)` defines `ENOSYS` as “function not implemented” and `ENOTSUP` as “operation not supported” |
+| `transfer_noclobber` | `ENOSYS`, `EINVAL`, `ENOTSUP`/`EOPNOTSUPP` | the same `renameat2(2)` flag-support rule as `exchange`; the raw-syscall fallback makes `ENOSYS` operational evidence |
+| `link_anchor` | `EPERM`, `ENOTSUP`/`EOPNOTSUPP` | `link(2)` documents `EPERM` when the filesystem does not support hard links |
+| `flush` | `EINVAL`, `ENOTSUP`/`EOPNOTSUPP` | `fsync(2)` documents `EINVAL` when the descriptor's object does not support synchronization; the probe supplies only its own valid regular-file and directory descriptors |
+| `open_regular_nofollow` | `ENOTSUP`/`EOPNOTSUPP` | Linux `open(2)` has no operation-specific “unsupported `O_NOFOLLOW`” errno; this value is solely the semantic-backend “operation not supported” result defined by `errno(3)` |
+| `symlink_fingerprint` | `EPERM`, `ENOTSUP`/`EOPNOTSUPP` | `symlink(2)` documents `EPERM` when the filesystem does not support creating symbolic links; creation is therefore inside this capability's `_supported` scope before `lstat`/`readlink` are checked |
+| `lock` | `ENOTSUP`/`EOPNOTSUPP` | this is solely the semantic-backend “operation not supported” result; `flock(2)`'s `ENOLCK` means the kernel ran out of memory for lock records and therefore **propagates** rather than concluding absence |
+| `traversal` | `ENOSYS`, `ENOTSUP`/`EOPNOTSUPP` | `openat2(2)` is Linux-only and `errno(3)` defines `ENOSYS` as “function not implemented”; `ENOTSUP` is the semantic-backend refusal used when guarded traversal cannot be supplied |
+
+Two consequences bind the plan.
+
+1. The table in `backend.py` records the same per-operation bases beside the values; it does not infer
+   additional “unsupported” errors from a broad exception.
+2. The test matrix is generated from the table's **effective numeric pairs**, not copied by hand. For
+   every `(operation, errno)` pair it proves both halves of the boundary:
+   - injected under the valid precondition, an optional operation removes exactly its capability while a
+     bootstrap prerequisite refuses with its named `CapabilityUnavailable` before probing; and
+   - injected into a direct Backend call made with a wrong descriptor or malformed name, outside
+     `probe_backend` and its licensed precondition, the exact `OSError` propagates.
+
+The second half is deliberately outside `_supported`: passing an invalid call to `_supported` would
+violate its caller contract and then ask the helper to detect a fact it cannot observe. The paired tests
+instead prove that classification is confined to the valid probe and cannot leak into ordinary Backend
+use.
 
 ## 11. Verification
 
@@ -965,9 +991,11 @@ wrong: octal-escaped mount points (`\040` for a space), the variable-length opti
 filesystem type, and refusal of an unlisted type. Each of `ext4`, `xfs`, and `btrfs` gets both an
 exact-defaults assertion — the whole normalized tuple, not a membership check, so a silently dropped or
 added option fails — and a field-origin fixture where a non-default value appears **only** in
-super-options, which a field-6-only parser would miss. Shipping a table for a filesystem with no fixture
-would mean shipping an untested durability claim. Allowlist matching, including a near-miss differing only
-in `declared_storage_profile`. Immutability and exact-match semantics of `VolumeConfiguration`,
+super-options, which a field-6-only parser would miss. The coverage test derives its filesystem keys from
+the production barrier table and requires a defaults and super-options-only fixture for every key, so
+adding a table entry without both fixtures fails. Shipping a table for a filesystem with no fixture would
+mean shipping an untested durability claim. Allowlist matching, including a near-miss differing only in
+`declared_storage_profile`. Immutability and exact-match semantics of `VolumeConfiguration`,
 `StorageProfile`, and `DurabilityAllowlist`. Factory-guard refusals on all three guarded types —
 `VolumeEvidence`, `HeldProjectLock`, and `ProjectBinding` — covering both direct construction and
 `dataclasses.replace`, since each is relied on as proof by a downstream signature.
@@ -975,12 +1003,13 @@ in `declared_storage_profile`. Immutability and exact-match semantics of `Volume
 ### 11.2 Tier 2 — fake backend
 
 A capability-restricted test backend implementing `Backend` structurally drives `probe_backend` across
-capability subsets, asserting the reported set is exactly the supplied one. The refusal matrix is
-exhaustive here: absent `anchored_traversal` or `advisory_project_lock` refuses binding; any optional
-capability absent binds successfully with that capability reported missing. The fake backend also forces
-`ENOSYS` from `openat2` and `renameat2`, which a current kernel will not produce naturally, and forces
-each non-unsupported errno to confirm it propagates as `OSError` rather than becoming
-`CapabilityUnavailable`.
+capability subsets, asserting the reported set is exactly the supplied one — never merely that one named
+capability is absent. The refusal matrix is exhaustive here: absent `anchored_traversal` or
+`advisory_project_lock` refuses binding; each optional capability in turn is withheld and binds
+successfully with the complete remaining set reported. The fake backend also forces `ENOSYS` for
+traversal and both rename-backed capabilities, which a current kernel will not produce naturally, and
+drives every effective pair in the §10 unsupported table through both the valid-precondition
+(probe or bootstrap) and invalid-direct-call halves of the mutation matrix.
 
 Injection is **scoped to the call whose outcome the probe reads as evidence**. A fake that raises on every
 call of an operation fails the earlier availability call instead, so the test passes without the refusal
@@ -1021,7 +1050,10 @@ symlink or non-directory at `probe/` must be refused by **reclamation** per §7.
 planted leaf still exists afterwards — proving reclamation refused rather than silently unlinked it.
 
 The sync-ignore marker is asserted present on a freshly created `metadata_root` where the filesystem
-supports extended attributes, and a forced `setxattr` failure is asserted not to fail bootstrap.
+supports extended attributes, and a forced `setxattr` failure is asserted not to fail bootstrap. The
+presence test skips only for `ENOTSUP`/`EOPNOTSUPP`, which `getxattr(2)` defines as xattrs unsupported or
+disabled. `ENODATA` means the named attribute is missing and therefore fails the test; it must never be
+misreported as an unsupported environment.
 
 `verified_metadata_path` is exercised for its component check, its active-only guard, and its
 `st_dev`/`st_ino` re-confirmation.
@@ -1046,8 +1078,13 @@ Two ordering locks, both encoding decisions that would otherwise regress silentl
   `probe/` empty;
 - a binding that has exited raises `ProtocolError` on use while its `VolumeEvidence` stays readable.
 
-Bind-mount tests require `unshare --mount --map-root-user` and skip when it is unavailable; the
-`st_dev`-sharing case is covered unconditionally in Tier 1 against fixture data.
+The real bind-mount test creates a source tree and a bind target beneath `test_volume`, enters
+`unshare --mount --map-root-user`, and bind-mounts the source onto the target. It proves the held
+descriptors have equal `st_dev` and distinct mount IDs, then requires `bind_project_volume` to refuse the
+project-root/metadata-root pair before allowlist matching. It skips only when `unshare` or `mount` is
+missing, user/mount namespaces are disabled, or the isolated bind mount itself is denied, and includes
+the command's diagnostic in the skip reason. The captured `st_dev`-sharing case remains covered
+unconditionally in Tier 1.
 
 ### 11.4 Tier 4 — architecture and packaging
 
@@ -1099,12 +1136,15 @@ production-allowlist call-site assertion, owned by A5.
    rather than being normalized away, and the pathname is normalized only after the walk succeeds; a
    missing `metadata_root` leaf is created relative to a guarded parent descriptor and reverified; a
    missing parent refuses, as does a leaf of `..`.
-6. Mount identity is proved from held descriptors' mount IDs plus `st_dev`, and the roots must agree.
+6. Mount identity is proved from held descriptors' mount IDs plus `st_dev`, and the roots must agree. A
+   real isolated bind mount proves equal-`st_dev`/different-mount-ID roots refuse, with only the explicit
+   §11.3 namespace-unavailable skip.
 7. An unlisted filesystem type refuses. `ext4`, `xfs`, and `btrfs` options normalize per the §6.2 table,
    each read from its stated `mountinfo` field, with fixtures where a non-default value appears only in
-   super-options. `VolumeConfiguration` carries `backend_revision`, the exact `kernel_identifier`, and
-   `durability_features`; no certified entry references a feature without a resolver, and no widening is
-   obtained by truncation.
+   super-options. Fixture coverage is keyed from the production barrier table, so a new filesystem cannot
+   be added without its two required fixtures. `VolumeConfiguration` carries `backend_revision`, the exact
+   `kernel_identifier`, and `durability_features`; no certified entry references a feature without a
+   resolver, and no widening is obtained by truncation.
 8. `StorageProfile` is declaration-only, required, keyword-only, exact-match, and surfaced as
    `declared_storage_profile`.
 9. The `allowlist` parameter is required and keyword-only; `CERTIFIED_ALLOWLIST` is empty; there is no
@@ -1114,7 +1154,8 @@ production-allowlist call-site assertion, owned by A5.
     verified to be a regular file; every layout directory is reopened through `open_child_directory` on
     both the created and `EEXIST` paths; a symlink or non-directory at `probe/` is refused by reclamation
     rather than unlinked; the sync-ignore marker is set best-effort on creation and its failure does not
-    fail bootstrap.
+    fail bootstrap. Its presence test treats only `ENOTSUP`/`EOPNOTSUPP` as an environmental skip and
+    fails on `ENODATA`.
 11. Reclamation of a pre-existing `probe/` precedes allowlist refusal, and refusal writes nothing new. The
     second reclamation runs in an outer `finally` and is reached even when releasing a layout descriptor
     fails; every probe stages its acquisitions inside its own cleanup scope, so failing on the second of two
@@ -1138,12 +1179,15 @@ production-allowlist call-site assertion, owned by A5.
     7; `ProjectBinding.verified_metadata_path` delegates to it; no provisional binding is constructed; and
     the helper is not exported. A5 uses only the public method.
 15. `OSError` propagates except for the documented per-operation unsupported errno values, each licensed
-    by the §10 probe precondition and proved by a mutation test. Every probe step that treats a *refusal*
-    as evidence requires the exact expected errno — `ELOOP`, `EXDEV`, `EEXIST`, `SQLITE_BUSY` — and the
-    two bootstrap prerequisites convert from the same shared errno table rather than a second copy. Each
-    such step's mutation test injects at the named refusal target, so the assertion fails if the step is
-    weakened to accept any `OSError`.
+    by the §10 probe/bootstrap precondition. A matrix derived from every effective numeric pair proves
+    exact capability subtraction or named prerequisite refusal under a valid precondition, and exact
+    propagation from an invalid direct call. Every probe step that treats a *refusal* as evidence
+    requires the exact expected errno — `ELOOP`, `EXDEV`,
+    `EEXIST`, `SQLITE_BUSY` — and the two bootstrap prerequisites convert from the same shared errno table
+    rather than a second copy. Each such step's mutation test injects at the named refusal target, so the
+    assertion fails if the step is weakened to accept any `OSError`.
 16. Tier 3 resolves its volume portably and skips with a precise reason rather than assuming this
-    machine's ext4-and-tmpfs layout.
+    machine's ext4-and-tmpfs layout; its isolated real bind-mount test proves mount ID, not `st_dev`,
+    controls same-volume admission.
 17. All four verification tiers pass; Ruff and Pyright are clean; the ledger and `AGENTS.md` are updated
     in the same commit.
