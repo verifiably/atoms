@@ -28,9 +28,12 @@ Plan B is written only after Plan A's interfaces settle.
   `renameat2`, mount-identity and durability-configuration resolution, the §5.5 bootstrap under an
   explicit `HeldProjectLock`, the empirical capability probe, and `bind_project_volume`.
   `CERTIFIED_ALLOWLIST` ships empty, so production binding refuses every volume until A8
-  crash-certifies a configuration tuple. **A4b — rooted project approval** remains unimplemented and
-  owns `approve_for_project`, `ProjectApprovedSpec`, and ledger entries #2, #3 (its part), #4, #5,
-  #6, #9, #10, #11, and #16.
+  crash-certifies a configuration tuple.
+- **A4b — rooted project approval: split, designed, unimplemented.** A4b-1 owns the resolution
+  mechanism — `PathResolver`, lookup-constraint reading, real-filesystem limits, containment, and
+  mount membership — and sees no `CompiledSpec`. A4b-2 owns the judgment: `approve_for_project`,
+  `ProjectApprovedSpec`, and ledger entries #2, #3 (its part), #4, #5, #6, #9, #10, #11, #16, and #20.
+  A4b-1 approves only non-casefold ext4; XFS, Btrfs, and casefold directories fail closed.
 
 Work lives under `python/` (`uv run pytest`, `uv run ruff check`, `uv run pyright`, all from
 `python/`).
