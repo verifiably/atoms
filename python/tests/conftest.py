@@ -1,7 +1,12 @@
 """Explicit recovery-model fixture registry."""
 
+import tempfile
+from pathlib import Path
+
 import pytest
 
+from atoms.fs.linux import LinuxBackend
+from tests.fs_support import test_volume_or_skip_reason
 from tests.recovery_support import (
     make_classifier_plan,
     make_committed_halt_source,
@@ -184,3 +189,17 @@ def identity_case():
 @pytest.fixture
 def halt_restart_case():
     return make_halt_restart_case()
+
+
+@pytest.fixture
+def test_volume(tmp_path_factory):
+    base, reason = test_volume_or_skip_reason()
+    if base is None:
+        pytest.skip(reason)
+    base.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(dir=base))
+
+
+@pytest.fixture
+def linux_backend():
+    return LinuxBackend()

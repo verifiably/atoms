@@ -30,6 +30,6 @@ def select_backend():
         raise CapabilityUnavailable(
             f"unsupported architecture {machine!r}: no syscall table entry"
         )
-    from atoms.fs.linux import LinuxBackend  # type: ignore[reportMissingImports]
+    from atoms.fs.linux import LinuxBackend
 
     return LinuxBackend()
