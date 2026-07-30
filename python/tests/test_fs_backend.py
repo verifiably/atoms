@@ -206,3 +206,16 @@ def test_try_lock_exclusive_contends_across_open_file_descriptions(test_volume, 
     finally:
         os.close(first)
         os.close(second)
+
+
+def test_try_lock_exclusive_propagates_eacces(monkeypatch, linux_backend):
+    failure = OSError(errno.EACCES, "injected environmental failure")
+
+    def raise_eacces(_fd, _operation):
+        raise failure
+
+    monkeypatch.setattr("atoms.fs.linux.fcntl.flock", raise_eacces)
+
+    with pytest.raises(OSError) as caught:
+        linux_backend.try_lock_exclusive(42)
+    assert caught.value is failure

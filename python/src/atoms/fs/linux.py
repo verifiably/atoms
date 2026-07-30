@@ -77,7 +77,7 @@ class LinuxBackend:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as caught:
-            if caught.errno in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK):
+            if caught.errno == errno.EWOULDBLOCK:
                 return False
             raise
         return True
