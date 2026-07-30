@@ -22,7 +22,8 @@ Plan B is written only after Plan A's interfaces settle.
   `reduce_recovery_plan_prefix`, and `apply_recovery_plan` with the closed recovery model, fresh-step
   authorization, and abstract reducer. A4b and A5–A8 remain unimplemented, and no project mutation code
   has landed.
-- **A4a — capability backend and project volume binding: implemented.** `python/src/atoms/fs/`
+- **A4a — capability backend and project volume binding: implemented on 2026-07-30.**
+  `python/src/atoms/fs/`
   holds the `Backend` protocol and its Linux implementation, `ctypes` bindings for `openat2` and
   `renameat2`, mount-identity and durability-configuration resolution, the §5.5 bootstrap under an
   explicit `HeldProjectLock`, the empirical capability probe, and `bind_project_volume`.
@@ -32,8 +33,8 @@ Plan B is written only after Plan A's interfaces settle.
   #6, #9, #10, #11, and #16.
 
 Work lives under `python/` (`uv run pytest`, `uv run ruff check`, `uv run pyright`, all from
-`python/`). A4a is the first layer that touches a filesystem; it writes only inside the
-engine-owned `metadata_root`, never a project path.
+`python/`).
+A4a mutates only engine-owned `metadata_root`, never project paths.
 
 ## Authority order
 

@@ -24,8 +24,8 @@ embedding a resource.
 refines [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md)
 §§5.4, 5.5, 6, 7, and 13.2. Where they disagree, the authority design wins.
 
-**Status:** Implemented on 2026-07-29. A4b and A5–A8 remain unimplemented; no code in this
-repository mutates a project path.
+**Status:** Implemented on 2026-07-30. A4b and A5–A8 remain unimplemented;
+A4a mutates only engine-owned `metadata_root`, never project paths.
 
 ## Global Constraints
 
@@ -4865,18 +4865,104 @@ def test_certified_allowlist_is_empty_so_population_is_deliberate():
     assert CERTIFIED_ALLOWLIST == DurabilityAllowlist(entries=frozenset())
 
 
+_BIND_PROJECT_VOLUME_TARGETS = {
+    "atoms.fs.bind_project_volume",
+    "atoms.fs.binding.bind_project_volume",
+}
+
+
+def _source_module(source_root: Path, source_path: Path) -> tuple[str, str]:
+    parts = source_path.relative_to(source_root).with_suffix("").parts
+    if parts[-1] == "__init__":
+        module = ".".join(parts[:-1])
+        return module, module
+    module = ".".join(parts)
+    return module, module.rpartition(".")[0]
+
+
+def _dotted_name(expression: ast.expr) -> str | None:
+    if isinstance(expression, ast.Name):
+        return expression.id
+    if isinstance(expression, ast.Attribute):
+        parent = _dotted_name(expression.value)
+        if parent is not None:
+            return f"{parent}.{expression.attr}"
+    return None
+
+
+def _import_aliases(tree: ast.Module, *, module: str, package: str) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    if module == "atoms.fs.binding":
+        aliases["bind_project_volume"] = "atoms.fs.binding.bind_project_volume"
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for imported in node.names:
+                local = imported.asname or imported.name.split(".", 1)[0]
+                aliases[local] = imported.name if imported.asname else local
+            continue
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        imported_from = (
+            resolve_name(
+                f"{'.' * node.level}{node.module or ''}",
+                package,
+            )
+            if node.level
+            else node.module or ""
+        )
+        for imported in node.names:
+            if imported.name == "*":
+                if imported_from in {"atoms.fs", "atoms.fs.binding"}:
+                    aliases["bind_project_volume"] = (
+                        f"{imported_from}.bind_project_volume"
+                    )
+                continue
+            aliases[imported.asname or imported.name] = (
+                f"{imported_from}.{imported.name}"
+            )
+    return aliases
+
+
+def _calls_bind_project_volume(
+    tree: ast.Module,
+    *,
+    module: str,
+    package: str,
+) -> bool:
+    aliases = _import_aliases(tree, module=module, package=package)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        called = _dotted_name(node.func)
+        if called is None:
+            continue
+        head, separator, tail = called.partition(".")
+        resolved_head = aliases.get(head, head)
+        resolved = (
+            f"{resolved_head}.{tail}"
+            if separator
+            else resolved_head
+        )
+        if resolved in _BIND_PROJECT_VOLUME_TARGETS:
+            return True
+    return False
+
+
+def _production_bind_callers(source_root: Path) -> set[Path]:
+    callers: set[Path] = set()
+    for source_path in source_root.rglob("*.py"):
+        module, package = _source_module(source_root, source_path)
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        if _calls_bind_project_volume(tree, module=module, package=package):
+            callers.add(source_path)
+    return callers
+
+
 def test_no_production_caller_of_bind_exists_yet():
     # A4a has no production composition root, so it cannot assert which allowlist
     # is passed. That call-site assertion is ledger entry #18, owned by A5.
     source_root = Path(__file__).parents[1] / "src"
-    callers = [
-        path
-        for path in source_root.rglob("*.py")
-        if "bind_project_volume(" in path.read_text(encoding="utf-8")
-        and path.name != "binding.py"
-        and path.name != "__init__.py"
-    ]
-    assert callers == []
+    assert _production_bind_callers(source_root) == set()
 
 
 def test_verified_child_path_is_not_exported():
@@ -4942,6 +5028,12 @@ Add `from tests.architecture_support import fixture_names, unregistered_test_arg
 of `python/tests/test_fs_architecture.py`. The `ast` import Task 1 added is still used by
 `test_core_never_imports_the_filesystem_layer`; no `re` import is needed.
 
+Review fix round 1 adds synthetic caller mutations in `atoms/app/__init__.py`,
+`atoms/other/binding.py`, imported-alias and module-alias forms, plus calls inside the exact defining
+and re-export modules. Pure definition and re-export nodes remain non-callers. A separate architecture
+assertion requires this plan, the A4a design, and `AGENTS.md` to agree on the 2026-07-30 implementation
+date, the remaining unimplemented sub-plans, and the metadata-root-only mutation scope.
+
 - [ ] **Step 4: Run the characterization checkpoint**
 
 Run: `uv run pytest tests/test_fs_architecture.py tests/test_fs_probe.py -v`
@@ -4974,7 +5066,8 @@ Add no discharge rows. A4a discharges no existing entry.
 Replace the A4a bullet with:
 
 ```markdown
-- **A4a — capability backend and project volume binding: implemented.** `python/src/atoms/fs/`
+- **A4a — capability backend and project volume binding: implemented on 2026-07-30.**
+  `python/src/atoms/fs/`
   holds the `Backend` protocol and its Linux implementation, `ctypes` bindings for `openat2` and
   `renameat2`, mount-identity and durability-configuration resolution, the §5.5 bootstrap under an
   explicit `HeldProjectLock`, the empirical capability probe, and `bind_project_volume`.
@@ -4985,16 +5078,15 @@ Replace the A4a bullet with:
 ```
 
 Also update the trailing sentence: "No code in this repository mutates a filesystem path yet; that
-begins at A4a." becomes "A4a is the first layer that touches a filesystem; it writes only inside the
-engine-owned `metadata_root`, never a project path."
+begins at A4a." becomes "A4a mutates only engine-owned `metadata_root`, never project paths."
 
 - [ ] **Step 9: Update this plan's status**
 
 Change the `**Status:**` line at the top of this plan to:
 
 ```markdown
-**Status:** Implemented on 2026-07-29. A4b and A5–A8 remain unimplemented; no code in this
-repository mutates a project path.
+**Status:** Implemented on 2026-07-30. A4b and A5–A8 remain unimplemented;
+A4a mutates only engine-owned `metadata_root`, never project paths.
 ```
 
 - [ ] **Step 10: Commit**

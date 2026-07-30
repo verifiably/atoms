@@ -1,6 +1,7 @@
 # A4a — platform capability backend and project volume binding
 
-**Status:** Draft for owner review. No A4a production code may land until this design is approved.
+**Status:** Implemented on 2026-07-30. A4b and A5–A8 remain unimplemented;
+A4a mutates only engine-owned `metadata_root`, never project paths.
 
 **Authority:** [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md).
 Where this document and the authority design disagree, the authority wins.
@@ -1110,7 +1111,10 @@ production composition root exists until A5; such a test would be vacuous or wou
 entry point into this sub-plan. A4a therefore asserts only what is true at its own boundary: that the
 `allowlist` parameter is required and keyword-only, that `CERTIFIED_ALLOWLIST` is empty so its future
 population is a deliberate act, and that no production caller of `bind_project_volume` exists yet. The
-call-site assertion becomes ledger entry #18, owned by A5.
+call-site assertion becomes ledger entry #18, owned by A5. The caller guard parses every production
+Python file with `ast`, resolves direct imports, imported aliases, and module aliases, and recognizes
+the exact definition and re-export as non-call nodes rather than exempting every file named
+`binding.py` or `__init__.py`.
 
 ## 12. Deferred and delivery obligations
 
