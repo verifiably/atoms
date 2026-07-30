@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 
 from atoms.core.capabilities import Capability
-from atoms.fs.bootstrap import close_layout, ensure_metadata_layout
+from atoms.fs.bootstrap import close_layout, ensure_metadata_layout, verified_child_path
 from atoms.fs.linux import LinuxBackend
 
 SUPPORTED_FILESYSTEMS = frozenset({"ext4", "xfs", "btrfs"})
@@ -316,3 +316,29 @@ def metadata_layout(lock):
         yield retained
     finally:
         close_layout(retained)
+
+
+@contextlib.contextmanager
+def probe_directory(lock):
+    """Yield an owned descriptor to `probe/` with the whole layout owned around it.
+
+    Building the layout and then reopening `probe/` separately would strand the four
+    layout descriptors, so the probe descriptor is taken from the layout itself.
+    """
+    with metadata_layout(lock) as retained:
+        yield retained["probe"]
+
+
+@contextlib.contextmanager
+def probe_database_path(lock):
+    """Yield the verified pathname of a throwaway database inside `probe/`.
+
+    Goes through verified_child_path rather than joining, because that is the only
+    sanctioned way a pathname escapes the descriptor discipline (design §9.4).
+    """
+    with metadata_layout(lock):
+        info = os.fstat(lock.metadata_root_fd)
+        probe_dir = verified_child_path(
+            lock.metadata_root_fd, lock.metadata_root_path, info.st_dev, info.st_ino, "probe"
+        )
+        yield os.path.join(probe_dir, "certify.db")
