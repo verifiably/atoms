@@ -1315,14 +1315,19 @@ def test_every_supported_filesystem_has_normalization_coverage(mountinfo_text):
     for filesystem in _BARRIER_OPTIONS:
         defaults = parse_mountinfo(mountinfo_text(f"{filesystem}_defaults"))
         default_entry = next(item for item in defaults if item.mount_point == "/data")
-        assert (
-            build_configuration(default_entry, "7.1.5-arch1-1").filesystem_type
-            == filesystem
-        )
+        default_configuration = build_configuration(default_entry, "7.1.5-arch1-1")
+        assert default_configuration.filesystem_type == filesystem
 
         super_only = parse_mountinfo(mountinfo_text(super_only_cases[filesystem]))
         super_entry = next(item for item in super_only if item.mount_point == "/data")
-        assert build_configuration(super_entry, "7.1.5-arch1-1").filesystem_type == filesystem
+        super_configuration = build_configuration(super_entry, "7.1.5-arch1-1")
+        assert super_configuration.filesystem_type == filesystem
+        # The coverage fixture must actually isolate a non-default value in field 11.
+        # Mapping a filesystem to its defaults fixture would otherwise satisfy the
+        # key-set check without exercising super-options parsing.
+        assert super_entry.mount_options == default_entry.mount_options
+        assert super_entry.super_options != default_entry.super_options
+        assert super_configuration.barrier_options != default_configuration.barrier_options
 
 
 def test_build_configuration_carries_the_exact_kernel_and_backend_revision(mountinfo_text):
@@ -3055,16 +3060,15 @@ def test_missing_exchange_is_reported_not_raised(held_lock, metadata_root, fake_
     assert supplied == frozenset(set(Capability) - {Capability.ATOMIC_EXCHANGE})
 
 
-@pytest.mark.parametrize(
-    "absent",
-    [
-        Capability.NOCLOBBER_TRANSFER,
-        Capability.IDENTITY_ANCHOR,
-        Capability.DURABLE_PUBLISH,
-        Capability.NOFOLLOW_COHERENT_READ,
-        Capability.SYMLINK_FINGERPRINT,
-    ],
+_OPTIONAL_CAPABILITIES = tuple(
+    capability
+    for capability in Capability
+    if capability
+    not in {Capability.ANCHORED_TRAVERSAL, Capability.ADVISORY_PROJECT_LOCK}
 )
+
+
+@pytest.mark.parametrize("absent", _OPTIONAL_CAPABILITIES)
 def test_each_optional_capability_can_be_absent(held_lock, metadata_root, fake_backend, absent):
     backend = fake_backend(supplied=set(Capability) - {absent})
     with held_lock(metadata_root) as lock:
@@ -3566,9 +3570,11 @@ def _probe_nofollow_read(backend: Backend, probe_fd: int) -> bool:
 
 def _probe_symlink_fingerprint(backend: Backend, probe_fd: int) -> bool:
     with _staged(probe_fd):
-        # symlink(2) reports EPERM when this filesystem cannot create symlinks.
-        # Creation belongs inside the same capability check as lstat/readlink;
-        # staging it outside _supported would let an optional absence escape.
+        # symlink(2) reports EPERM when this filesystem cannot create symlinks,
+        # and EPERM is part of symlink_fingerprint's own unsupported set. That is
+        # why creation belongs inside this capability's _supported call. This is
+        # specific to that documented basis, not a general staging rule for the
+        # traversal and nofollow probes.
         if not _supported(
             "symlink_fingerprint",
             lambda: os.symlink("../target", "alias", dir_fd=probe_fd),
@@ -4165,9 +4171,12 @@ def test_a_descriptor_release_failure_still_reclaims(
 
 Append to `python/tests/fs_support.py`:
 
-`contextlib` is already imported by Task 4's Step 6 append to this file; do not add it again. Task 4 also
-added `from atoms.fs.lock import close_all`, so extend that line to
-`from atoms.fs.lock import acquire_project_lock, close_all` rather than adding a second one.
+`contextlib` is already imported by Task 4's Step 6 append to this file; do not add it again. Add the
+following import to the consolidated import block:
+
+```python
+from atoms.fs.lock import acquire_project_lock
+```
 
 ```python
 from atoms.fs.volume import (
@@ -4704,42 +4713,48 @@ def test_each_bootstrap_unsupported_errno_refuses_before_probing(
         acquire_project_lock(backend, str(metadata_root))
 
 
-def _invoke_with_violated_precondition(backend, operation):
-    # Every call has a wrong descriptor and/or malformed empty component. It runs
-    # directly against Backend, outside probe_backend's licensed precondition.
+def _invoke_with_invalid_descriptor(backend, operation):
+    # Non-empty components are load-bearing: an empty pathname produces ENOENT
+    # before the kernel consults the invalid descriptor. These calls exercise the
+    # real Linux backend outside probe_backend's licensed precondition.
     if operation == "exchange":
-        return backend.exchange(-1, "", "")
+        return backend.exchange(-1, "left", "right")
     if operation == "transfer_noclobber":
-        return backend.transfer_noclobber(-1, "", -1, "")
+        return backend.transfer_noclobber(-1, "source", -1, "destination")
     if operation == "link_anchor":
-        return backend.link_anchor(-1, "", -1, "")
+        return backend.link_anchor(-1, "source", -1, "anchor")
     if operation == "flush":
         return backend.flush_file(-1)
     if operation == "open_regular_nofollow":
-        return backend.open_regular_nofollow(-1, "")
+        return backend.open_regular_nofollow(-1, "entry")
     if operation == "symlink_fingerprint":
-        return backend.symlink_fingerprint(-1, "")
+        return backend.symlink_fingerprint(-1, "entry")
     if operation == "lock":
         return backend.try_lock_exclusive(-1)
     if operation == "traversal":
-        return backend.open_child_directory(-1, "..")
+        return backend.open_child_directory(-1, "entry")
     raise AssertionError(f"unmapped operation: {operation}")
 
 
-@pytest.mark.parametrize(("operation", "code"), _EFFECTIVE_UNSUPPORTED_PAIRS)
-def test_each_effective_unsupported_errno_propagates_outside_the_precondition(
-    fake_backend, operation, code
+@pytest.mark.parametrize("operation", tuple(_OPERATION_CAPABILITY))
+def test_linux_backend_propagates_ebadf_outside_probe_precondition(
+    linux_backend, operation
 ):
-    backend = fake_backend(supplied=set(Capability), **{f"{operation}_errno": code})
+    # This half observes the real backend; dictating an errno through RestrictedBackend
+    # would only prove that the test double can raise. EBADF is never availability
+    # evidence, so every operation must expose it unchanged.
+    assert all(errno.EBADF not in codes for codes in UNSUPPORTED_ERRNO.values())
     with pytest.raises(OSError) as caught:
-        _invoke_with_violated_precondition(backend, operation)
-    assert caught.value.errno == code
+        _invoke_with_invalid_descriptor(linux_backend, operation)
+    assert caught.value.errno == errno.EBADF
 ```
 
 Add `from atoms.fs.backend import UNSUPPORTED_ERRNO` and
 `from atoms.fs.lock import acquire_project_lock` to the imports of
 `python/tests/test_fs_probe.py`. Task 4's restricted backend accepts both method-level overrides used by
-the named-refusal tests and the contract-level keys generated here.
+the named-refusal tests and the contract-level keys generated by the classification half. The propagation
+half intentionally uses the real `linux_backend` fixture, so an injected exception cannot bypass the
+operation under test.
 
 - [ ] **Step 2: Extract the shared architecture scanner**
 
@@ -5039,7 +5054,7 @@ Run before declaring A4a complete.
   14 → `test_verified_child_path_*`, `test_verified_metadata_path_delegates_to_the_shared_verifier`;
   15 → `test_each_effective_unsupported_errno_removes_exactly_its_capability`,
   `test_each_bootstrap_unsupported_errno_refuses_before_probing`,
-  `test_each_effective_unsupported_errno_propagates_outside_the_precondition`,
+  `test_linux_backend_propagates_ebadf_outside_probe_precondition`,
   `test_a_traversal_refusal_with_the_wrong_errno_propagates`,
   `test_a_nofollow_refusal_with_the_wrong_errno_propagates`,
   `test_unsupported_errno_sets_exclude_ambiguous_generic_failures`;

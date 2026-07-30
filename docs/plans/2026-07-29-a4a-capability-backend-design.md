@@ -969,17 +969,20 @@ Two consequences bind the plan.
 
 1. The table in `backend.py` records the same per-operation bases beside the values; it does not infer
    additional “unsupported” errors from a broad exception.
-2. The test matrix is generated from the table's **effective numeric pairs**, not copied by hand. For
-   every `(operation, errno)` pair it proves both halves of the boundary:
-   - injected under the valid precondition, an optional operation removes exactly its capability while a
-     bootstrap prerequisite refuses with its named `CapabilityUnavailable` before probing; and
-   - injected into a direct Backend call made with a wrong descriptor or malformed name, outside
-     `probe_backend` and its licensed precondition, the exact `OSError` propagates.
+2. The classification matrix is generated from the table's **effective numeric pairs**, not copied by
+   hand. For every `(operation, errno)` pair injected under the valid precondition, an optional operation
+   removes exactly its capability while a bootstrap prerequisite refuses with its named
+   `CapabilityUnavailable` before probing.
+3. A separate matrix calls the real `LinuxBackend` once per operation outside `probe_backend`, using
+   `fd=-1` and non-empty components. It observes — never injects — exact `EBADF`, asserts that `EBADF`
+   belongs to no unsupported set, and requires the raw `OSError` to reach the caller.
 
-The second half is deliberately outside `_supported`: passing an invalid call to `_supported` would
-violate its caller contract and then ask the helper to detect a fact it cannot observe. The paired tests
-instead prove that classification is confined to the valid probe and cannot leak into ordinary Backend
-use.
+The tests deliberately separate those claims. A fake that raises a requested errno before delegating can
+prove the probe's classification table, but it cannot prove anything about ordinary backend propagation.
+Conversely, a malformed real call cannot be made to emit every unsupported errno: empty names produce
+`ENOENT`, while non-empty names under an invalid descriptor produce deterministic `EBADF`. The real-backend
+matrix therefore proves that unexpected errors are not classified at the backend boundary; the generated
+fake-backend matrix proves exactly which errors are classified at the probe/bootstrap boundary.
 
 ## 11. Verification
 
@@ -993,10 +996,13 @@ exact-defaults assertion — the whole normalized tuple, not a membership check,
 added option fails — and a field-origin fixture where a non-default value appears **only** in
 super-options, which a field-6-only parser would miss. The coverage test derives its filesystem keys from
 the production barrier table and requires a defaults and super-options-only fixture for every key, so
-adding a table entry without both fixtures fails. Shipping a table for a filesystem with no fixture would
-mean shipping an untested durability claim. Allowlist matching, including a near-miss differing only in
-`declared_storage_profile`. Immutability and exact-match semantics of `VolumeConfiguration`,
-`StorageProfile`, and `DurabilityAllowlist`. Factory-guard refusals on all three guarded types —
+adding a table entry without both fixtures fails. It also requires equal per-mount options, unequal
+super-options, and unequal normalized barrier tuples between each pair, so mapping the purported
+super-options case back to defaults cannot satisfy the coverage gate. Shipping a table for a filesystem
+with no discriminating fixture would mean shipping an untested durability claim. Allowlist matching,
+including a near-miss differing only in `declared_storage_profile`. Immutability and exact-match semantics
+of `VolumeConfiguration`, `StorageProfile`, and `DurabilityAllowlist`. Factory-guard refusals on all three
+guarded types —
 `VolumeEvidence`, `HeldProjectLock`, and `ProjectBinding` — covering both direct construction and
 `dataclasses.replace`, since each is relied on as proof by a downstream signature.
 
@@ -1180,8 +1186,10 @@ production-allowlist call-site assertion, owned by A5.
     the helper is not exported. A5 uses only the public method.
 15. `OSError` propagates except for the documented per-operation unsupported errno values, each licensed
     by the §10 probe/bootstrap precondition. A matrix derived from every effective numeric pair proves
-    exact capability subtraction or named prerequisite refusal under a valid precondition, and exact
-    propagation from an invalid direct call. Every probe step that treats a *refusal* as evidence
+    exact capability subtraction or named prerequisite refusal under a valid precondition. A distinct
+    real-`LinuxBackend` matrix observes exact `EBADF` from an invalid descriptor for every operation,
+    proves `EBADF` belongs to no unsupported set, and requires it to propagate unclassified. Every probe
+    step that treats a *refusal* as evidence
     requires the exact expected errno — `ELOOP`, `EXDEV`,
     `EEXIST`, `SQLITE_BUSY` — and the two bootstrap prerequisites convert from the same shared errno table
     rather than a second copy. Each such step's mutation test injects at the named refusal target, so the
