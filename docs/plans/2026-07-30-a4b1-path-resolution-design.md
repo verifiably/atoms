@@ -34,7 +34,8 @@ them exactly, which today means non-casefold ext4 and nothing else.
 - `PathResolver`, `ResolvedPrefix`, and the anchored walk, including frontier classification.
 - Real-filesystem `NAME_MAX` and `PATH_MAX` enforcement (ledger #4).
 - Containment, metadata-root exclusion by identity, and mount-membership refusal (ledger #5).
-- Lookup facts for the physical `work/` directory, for A4b-2's WORK scratch role.
+- Lookup facts for the existing `metadata_root/work` **base**, from which A4b-2 derives the
+  per-transaction `work/<txid>/` directory that carries A3's logical `WorkRoot`.
 - The constraint-inheritance rule for directories the transaction will create.
 - `ProjectApprovalRefused`, and the authority §11 amendment that introduces it.
 
@@ -350,7 +351,11 @@ resolve(rel_path) -> ResolvedPrefix
           other        -> propagates unwrapped
       identity = FilesystemIdentity(fstat(child))
       identity == metadata root                    -> ProjectApprovalRefused
-      facts = memo.get(identity) or DirectoryFacts(identity, read_lookup_constraints(child, fs_type))
+      facts = memo.get(identity)
+      if facts is None:                                        # one constraints read per directory,
+          constraints = read_lookup_constraints(child, fs_type)  # not per path through it
+          facts = DirectoryFacts(identity, constraints)
+          memo[identity] = facts                               # the insertion the memo exists for
       facts.constraints.lookup_proof is UNREPRODUCIBLE_CASEFOLD -> ProjectApprovalRefused
       close(fd) unless fd is the borrowed root ; fd = child
 
@@ -379,7 +384,8 @@ with zero `openat2` calls.
 `resolve()` accepts **declared persistent paths only**. `require_rel_path` rejects any component that
 aliases the reserved scratch sigil, which is correct for persistent paths and would lock A4b-2 out of
 the scratch distinctness it owns. A4b-2 resolves the scratch *parent* — a persistent path's parent, or
-the work root — and validates each generated leaf name against that parent's approved `name_max`.
+the derived `work/<txid>/` directory — and validates each generated leaf name against that parent's
+approved `name_max`.
 There is no scratch mode on this signature.
 
 ### 6.4 Observing a present entry
@@ -449,14 +455,18 @@ therefore remain equal while its `LookupProof` changes, so ledger #19's comparis
 Its three independent checks — identity, `LookupProof`, and mount membership — are the actual safety
 mechanism, and none of them is redundant.
 
-### 6.6 `work_root_facts()`
+### 6.6 `work_base_facts()`
 
-A4b-2 needs lookup facts for the physical work directory. Non-WORK scratch roles sit beside their
-resolved persistent parent, but `CreateDirectory` takes `ScratchRole.WORK`, which lives under
-`metadata_root/work` — and `CreateDirectory` is the only effect that takes it.
+`CreateDirectory` takes `ScratchRole.WORK` and is the only effect that does. Its staging does **not**
+live directly in `metadata_root/work`: authority §7 places effect-time engine staging in
+`work/<txid>/`, a per-transaction namespace. A3's logical `WorkRoot` corresponds to that transaction
+directory, not to the shared base.
+
+A4b-1 observes only the **existing base**, and the method is named for what it observes so that
+mistaking one level for the other is harder:
 
 ```
-work_root_facts()                        # private, lazy, memoized on success only
+work_base_facts()                        # private, lazy, memoized on success only
     backend = binding.backend            # liveness FIRST, before the memo is consulted, so a
     parent  = binding.metadata_root_fd   # cached result still fails after closure or lock release
     if cached is not None: return cached
@@ -464,11 +474,28 @@ work_root_facts()                        # private, lazy, memoized on success on
     fd = backend.open_child_directory(parent, "work")          # guarded traversal
         ENOENT, ENOTDIR, ELOOP, EXDEV -> ProtocolError
         any other OSError             -> propagates unchanged
-    read_mount_id(fd) != evidence.mount_id                     -> ProtocolError
-    constraints = read_lookup_constraints(fd, fs_type)
-    constraints.lookup_proof is UNREPRODUCIBLE_CASEFOLD        -> ProjectApprovalRefused
-    cached = DirectoryFacts(fstat(fd), constraints)            # cached only on success
-    close(fd)
+    try:
+        read_mount_id(fd) != evidence.mount_id                 -> ProtocolError
+        constraints = read_lookup_constraints(fd, fs_type)
+        constraints.lookup_proof is UNREPRODUCIBLE_CASEFOLD    -> ProjectApprovalRefused
+        facts = DirectoryFacts(fstat(fd), constraints)
+    except BaseException:
+        close_all((fd,)) ; raise
+    close_all((fd,))                     # may raise; nothing is cached if it does
+    cached = facts                       # cached only after successful release
+    return facts
+```
+
+`work/<txid>/` does not exist at approval time, so A4b-2 derives it rather than observing it. The
+complete chain is A4b-2's, and stating it here is what keeps A4b-1's narrower role legible:
+
+```
+metadata_root/work facts                       (A4b-1, observed)
+  -> validate the concrete <txid> component against work.name_max
+  -> inherited_constraints(work.constraints, "ext4")
+  -> constraints of physical work/<txid>
+  -> logical A3 WorkRoot
+  -> validate each CreateDirectory WORK leaf against those derived constraints
 ```
 
 Only the documented namespace contradictions become `ProtocolError`: `work/` is engine-owned, created
@@ -477,17 +504,21 @@ violated internal invariant. `EIO`, `EMFILE`, and similar system failures are no
 and propagate unchanged, preserving §7's no-blanket rule.
 
 Liveness is read **before** the memo is consulted, so memoization cannot become a bypass: a resolver
-whose binding is closed after the first call must still fail on the second. Only a successful result
-is cached, so a refusal is never converted into a cached success on a later call. A casefolded `work/`
+whose binding is closed after the first call must still fail on the second. A casefolded `work/`
 raises `ProjectApprovalRefused` like any other unreproducible directory — `metadata_root` is
 engine-owned, but its lookup relation is no more reproducible than a project directory's.
+
+The cache is populated **after** the descriptor is released, not before. Assigning it earlier would
+mean a failing `close` propagates its error while leaving the observation cached, so the next call
+returns facts derived from an observation whose release failed. Release is therefore the last step
+that can fail, and only a call that survives it caches anything.
 
 It is lazy so that an unapprovable `work/` cannot refuse a specification that contains no
 `CreateDirectory`.
 
-A3's `_validate_topology` requires `WorkRoot` be parented by `ProjectRoot` **logically**, while `work/`
-sits physically under `metadata_root`. A4b-2 emits the logical edge and takes the physical facts from
-here; the two are not in conflict.
+A3's `_validate_topology` requires `WorkRoot` be parented by `ProjectRoot` **logically**, while
+`work/<txid>/` sits physically under `metadata_root`. A4b-2 emits the logical edge and derives the
+physical constraints through the chain above; the two are not in conflict.
 
 ## 7. Error contract
 
@@ -600,11 +631,16 @@ already proved works on this host:
 **Created-directory constraints**: create a real directory, read its observed constraints, and assert
 they equal `inherited_constraints` applied to its parent. Without this the §5.4 rule is only prose.
 
-**`work_root_facts()`**: lazy (not called during construction), memoized (one open across repeated
+**`work_base_facts()`**: lazy (not called during construction), memoized (one open across repeated
 calls), mount-checked, casefold-refusing, and closing its descriptor on every failure path. One test
 populates the memo, closes the binding, and calls again — it must raise `ProtocolError`, proving
-memoization is not a liveness bypass. Another proves a refusal is not cached: a failing call followed
-by a succeeding one must re-open. A4b-2 later locks "called iff a `CreateDirectory` exists."
+memoization is not a liveness bypass. Another injects a **failing `close`** specifically: the call
+raises, and the following call must re-open rather than return a cached result, proving the cache is
+populated only after successful release. A4b-2 later locks "called iff a `CreateDirectory` exists."
+
+**Memo sharing**: two paths through one directory perform exactly **one** `read_lookup_constraints`
+call, asserted by counting. Without the insertion this passes only by accident of the walk being
+re-run, so the count is the test, not the result.
 
 **Hard links**: two declared paths linked to one file resolve to equal leaf identities with distinct
 spelling and parent provenance. Whether topology merges them is an A4b-2 test, not this one.
@@ -628,8 +664,8 @@ skipping — an explicit opt-in that silently does nothing is worse than no opt-
 One-time setup. `mkfs` is unprivileged; only the mount is not:
 
 ```bash
-IMG=~/.local/share/atoms/casefold.img
-MNT=~/.local/share/atoms/casefold
+IMG=~/d/atoms-test-volumes/casefold.img
+MNT=~/d/atoms-test-volumes/casefold
 
 mkdir -p "$(dirname "$IMG")" "$MNT"
 truncate -s 256M "$IMG"
@@ -642,7 +678,8 @@ export ATOMS_CASEFOLD_VOLUME="$MNT"
 cd ~/d/atoms/python && uv run pytest
 ```
 
-The image lives outside the repository so no test artifact can land in `~/d/atoms/`.
+`~/d/atoms-test-volumes/` is a sibling of the repository, not a directory inside it, so no test
+artifact can land in `~/d/atoms/`.
 
 The suite creates `plain/` and `folded/`, sets `chattr +F folded/` while it is empty, and asserts:
 
@@ -717,11 +754,13 @@ support, and Btrfs support. All three are refused, and refusal admits nothing.
     exactly once with the valid parent descriptor and component.
 12. A closed binding or released lock fails every `resolve()` with `ProtocolError`, before any
     evidence-derived refusal.
-13. `work_root_facts()` is lazy, mount-checked, casefold-refusing, releases its descriptor on every
-    failure path, caches only successes, and reads liveness before its memo — so a call after the
-    binding closes still raises `ProtocolError`.
+13. `work_base_facts()` observes the existing `work/` base only, is lazy, mount-checked,
+    casefold-refusing, releases its descriptor on every failure path, reads liveness before its memo,
+    and caches only after successful release — so a call after the binding closes raises
+    `ProtocolError`, and a call whose `close` fails is not cached.
 14. Observed constraints of a really-created directory equal `inherited_constraints` applied to its
     parent.
 15. `read_lookup_constraints` is tested directly, not only through the resolver.
-16. `ruff check` and `pyright` pass; neither `atoms.fs.resolve` nor `atoms.fs.lookup` imports
+16. Two paths through one directory perform exactly one `read_lookup_constraints` call.
+17. `ruff check` and `pyright` pass; neither `atoms.fs.resolve` nor `atoms.fs.lookup` imports
     `atoms.core.compiler`, `atoms.core.spec`, or `atoms.core.recovery`.
