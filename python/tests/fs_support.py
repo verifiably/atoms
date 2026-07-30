@@ -19,6 +19,11 @@ _MOUNTINFO_CASES = {
     "ext4_sync": (
         "41 25 259:2 / /data rw,sync,dirsync shared:2 - ext4 /dev/nvme0n1p2 rw\n"
     ),
+    "ext4_wrong_field_decoys": (
+        "41 25 259:2 / /data rw,noatime,nobarrier,data=writeback,"
+        "journal_async_commit,commit=15 shared:2 - ext4 /dev/nvme0n1p2 "
+        "rw,sync,dirsync\n"
+    ),
     # Every filesystem in the barrier table gets a defaults fixture and a
     # super-options-only fixture. Shipping a table without both would ship an
     # untested durability claim (design §11.1).
@@ -30,6 +35,10 @@ _MOUNTINFO_CASES = {
         "41 25 259:2 / /data rw,noatime shared:2 - xfs /dev/nvme0n1p2 "
         "rw,wsync,attr2,inode64,noquota\n"
     ),
+    "xfs_wrong_field_decoys": (
+        "41 25 259:2 / /data rw,noatime,nobarrier,wsync shared:2 - xfs "
+        "/dev/nvme0n1p2 rw,sync\n"
+    ),
     "btrfs_defaults": (
         "41 25 0:33 /@ /data rw,noatime shared:2 - btrfs /dev/nvme0n1p2 "
         "rw,space_cache=v2,subvolid=256,subvol=/@\n"
@@ -37,6 +46,10 @@ _MOUNTINFO_CASES = {
     "btrfs_flushoncommit": (
         "41 25 0:33 /@ /data rw,noatime shared:2 - btrfs /dev/nvme0n1p2 "
         "rw,flushoncommit,commit=15,space_cache=v2,subvolid=256,subvol=/@\n"
+    ),
+    "btrfs_wrong_field_decoys": (
+        "41 25 0:33 /@ /data rw,noatime,nobarrier,flushoncommit,commit=15,"
+        "notreelog shared:2 - btrfs /dev/nvme0n1p2 rw\n"
     ),
     "escaped_space": (
         "41 25 259:2 / /mnt/my\\040volume rw,noatime shared:2 - ext4 /dev/nvme0n1p2 rw\n"

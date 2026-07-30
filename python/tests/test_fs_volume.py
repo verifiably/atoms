@@ -17,6 +17,36 @@ from atoms.fs.volume import (
 )
 
 
+def _configuration() -> VolumeConfiguration:
+    return VolumeConfiguration(
+        backend_id="linux",
+        backend_revision="linux-1",
+        kernel_identifier="7.1.5-arch1-1",
+        filesystem_type="ext4",
+        barrier_options=("async", "barrier=1", "commit=5", "data=ordered"),
+        durability_features=(),
+    )
+
+
+def _value_family(
+    storage: StorageProfile | None = None,
+) -> tuple[
+    VolumeConfiguration,
+    StorageProfile,
+    AllowlistEntry,
+    DurabilityAllowlist,
+]:
+    configuration = _configuration()
+    declared_storage = storage or StorageProfile(profile_id="atoms-test-profile")
+    entry = AllowlistEntry(
+        configuration=configuration,
+        storage=declared_storage,
+        certification_ref="crash-2026-07-29-a",
+    )
+    allowlist = DurabilityAllowlist(entries=frozenset({entry}))
+    return configuration, declared_storage, entry, allowlist
+
+
 def test_parse_mountinfo_separates_per_mount_and_super_options(mountinfo_text):
     entries = parse_mountinfo(mountinfo_text("ext4_writeback"))
     entry = next(item for item in entries if item.mount_point == "/data")
@@ -154,6 +184,37 @@ def test_every_supported_filesystem_has_normalization_coverage(mountinfo_text):
         assert super_configuration.barrier_options != default_configuration.barrier_options
 
 
+def test_every_barrier_option_ignores_a_wrong_field_decoy(mountinfo_text):
+    wrong_field_cases = {
+        "ext4": (
+            "ext4_wrong_field_decoys",
+            ("async", "barrier=1", "commit=5", "data=ordered"),
+        ),
+        "xfs": ("xfs_wrong_field_decoys", ("async", "barrier=1")),
+        "btrfs": (
+            "btrfs_wrong_field_decoys",
+            ("barrier=1", "commit=30", "noflushoncommit"),
+        ),
+    }
+    assert set(_BARRIER_OPTIONS) == set(wrong_field_cases)
+    for filesystem, table in _BARRIER_OPTIONS.items():
+        case, expected = wrong_field_cases[filesystem]
+        entry = parse_mountinfo(mountinfo_text(case))[0]
+        for name, source, _absent in table:
+            wrong_options = (
+                entry.mount_options if source == "super" else entry.super_options
+            )
+            assert any(
+                option == name
+                or option.startswith(f"{name}=")
+                or option == f"no{name}"
+                for option in wrong_options
+            ), f"{filesystem} fixture lacks wrong-field decoy for {name}"
+        assert (
+            build_configuration(entry, "7.1.5-arch1-1").barrier_options == expected
+        )
+
+
 def test_build_configuration_carries_the_exact_kernel_and_backend_revision(mountinfo_text):
     entries = parse_mountinfo(mountinfo_text("ext4_defaults"))
     entry = next(item for item in entries if item.mount_point == "/data")
@@ -181,27 +242,133 @@ def test_certified_allowlist_ships_empty():
     assert CERTIFIED_ALLOWLIST.entries == frozenset()
 
 
-def test_allowlist_matches_only_on_exact_configuration_and_profile(test_storage_profile):
-    configuration = VolumeConfiguration(
-        backend_id="linux",
-        backend_revision="linux-1",
-        kernel_identifier="7.1.5-arch1-1",
-        filesystem_type="ext4",
-        barrier_options=("async", "barrier=1", "commit=5", "data=ordered"),
-        durability_features=(),
-    )
-    entry = AllowlistEntry(
-        configuration=configuration,
-        storage=test_storage_profile,
-        certification_ref="crash-2026-07-29-a",
-    )
-    allowlist = DurabilityAllowlist(entries=frozenset({entry}))
-    assert allowlist.match(configuration, test_storage_profile) is entry
-    assert allowlist.match(configuration, StorageProfile(profile_id="other")) is None
-    widened = dataclasses.replace(configuration, kernel_identifier="7.1.6-arch1-1")
-    assert allowlist.match(widened, test_storage_profile) is None
+def test_allowlist_matches_equal_but_distinct_configuration_and_profile(
+    test_storage_profile,
+):
+    configuration, storage, entry, allowlist = _value_family(test_storage_profile)
+    equal_configuration = dataclasses.replace(configuration)
+    equal_storage = dataclasses.replace(storage)
+    assert equal_configuration is not configuration
+    assert equal_storage is not storage
+    assert allowlist.match(equal_configuration, equal_storage) is entry
 
 
-def test_value_types_are_frozen(test_storage_profile):
+@pytest.mark.parametrize(
+    "near_miss",
+    [
+        pytest.param(
+            lambda configuration, storage: (
+                dataclasses.replace(configuration, backend_id="other"),
+                dataclasses.replace(storage),
+            ),
+            id="configuration.backend_id",
+        ),
+        pytest.param(
+            lambda configuration, storage: (
+                dataclasses.replace(configuration, backend_revision="linux-2"),
+                dataclasses.replace(storage),
+            ),
+            id="configuration.backend_revision",
+        ),
+        pytest.param(
+            lambda configuration, storage: (
+                dataclasses.replace(
+                    configuration, kernel_identifier="7.1.6-arch1-1"
+                ),
+                dataclasses.replace(storage),
+            ),
+            id="configuration.kernel_identifier",
+        ),
+        pytest.param(
+            lambda configuration, storage: (
+                dataclasses.replace(configuration, filesystem_type="xfs"),
+                dataclasses.replace(storage),
+            ),
+            id="configuration.filesystem_type",
+        ),
+        pytest.param(
+            lambda configuration, storage: (
+                dataclasses.replace(
+                    configuration,
+                    barrier_options=("async", "barrier=0", "commit=5", "data=ordered"),
+                ),
+                dataclasses.replace(storage),
+            ),
+            id="configuration.barrier_options",
+        ),
+        pytest.param(
+            lambda configuration, storage: (
+                dataclasses.replace(configuration, durability_features=("metadata_csum",)),
+                dataclasses.replace(storage),
+            ),
+            id="configuration.durability_features",
+        ),
+        pytest.param(
+            lambda configuration, storage: (
+                dataclasses.replace(configuration),
+                dataclasses.replace(storage, profile_id="other"),
+            ),
+            id="storage.profile_id",
+        ),
+    ],
+)
+def test_allowlist_refuses_a_near_miss_in_every_matched_field(near_miss):
+    configuration, storage, _entry, allowlist = _value_family()
+    candidate_configuration, candidate_storage = near_miss(configuration, storage)
+    assert allowlist.match(candidate_configuration, candidate_storage) is None
+
+
+@pytest.mark.parametrize(
+    "value_factory",
+    [
+        pytest.param(lambda: _value_family()[0], id="VolumeConfiguration"),
+        pytest.param(lambda: _value_family()[1], id="StorageProfile"),
+        pytest.param(lambda: _value_family()[2], id="AllowlistEntry"),
+        pytest.param(lambda: _value_family()[3], id="DurabilityAllowlist"),
+    ],
+)
+def test_equal_value_objects_have_equal_hashes(value_factory):
+    value = value_factory()
+    equal_value = dataclasses.replace(value)
+    assert equal_value is not value
+    assert equal_value == value
+    assert hash(equal_value) == hash(value)
+
+
+@pytest.mark.parametrize(
+    ("value_factory", "field_name", "replacement"),
+    [
+        pytest.param(
+            _configuration,
+            "backend_id",
+            "other",
+            id="VolumeConfiguration",
+        ),
+        pytest.param(
+            lambda: StorageProfile(profile_id="atoms-test-profile"),
+            "profile_id",
+            "other",
+            id="StorageProfile",
+        ),
+        pytest.param(
+            lambda: AllowlistEntry(
+                configuration=_configuration(),
+                storage=StorageProfile(profile_id="atoms-test-profile"),
+                certification_ref="crash-2026-07-29-a",
+            ),
+            "certification_ref",
+            "other",
+            id="AllowlistEntry",
+        ),
+        pytest.param(
+            DurabilityAllowlist,
+            "entries",
+            frozenset(),
+            id="DurabilityAllowlist",
+        ),
+    ],
+)
+def test_value_types_are_frozen(value_factory, field_name, replacement):
+    value = value_factory()
     with pytest.raises(dataclasses.FrozenInstanceError):
-        test_storage_profile.profile_id = "mutated"
+        setattr(value, field_name, replacement)
