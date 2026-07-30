@@ -1674,9 +1674,13 @@ sees `aliased`. Normalization is therefore deferred until the walk has proved th
     `CapabilityUnavailable` when `anchored_traversal` or `advisory_project_lock` is unavailable
   - `establish_root(backend, path: str, create: bool) -> tuple[int, str, bool]` returning
     `(fd, normalized_path, created)`, where normalization happens only after the guarded walk
-  - `close_all(fds: Iterable[int]) -> None`, attempting every close and raising the first failure;
-    used by `HeldProjectLock.__exit__`, `ensure_metadata_layout`'s unwind, and Task 6's binding
+  - `close_all(fds: Iterable[int]) -> None`, attempting every close and raising the first failure. Every
+    multi-descriptor release goes through it: `HeldProjectLock.__exit__`, `acquire_project_lock`'s
+    unwind, `ensure_metadata_layout`'s unwind, and `close_layout`. Callers pass descriptors in reverse
+    acquisition order; `close_all` does not reorder.
   - `ensure_metadata_layout(lock: HeldProjectLock) -> dict[str, int]`
+  - `close_layout(retained: dict[str, int]) -> None`, releasing the retained set in reverse opening
+    order — the sole owner of that ordering, used by the binding and by the test helper
   - `reclaim_probe_survivors(lock: HeldProjectLock) -> None`
   - `verified_child_path(metadata_root_fd, metadata_root_path, expected_device, expected_inode, name) -> str`
   - `METADATA_LAYOUT = ("probe", "staging", "work", "blobs/sha256")`
@@ -1877,6 +1881,29 @@ def test_close_all_attempts_every_descriptor_and_raises_the_first_failure(test_v
     with pytest.raises(OSError) as reached:
         os.fstat(second)
     assert reached.value.errno == errno.EBADF
+
+
+def test_close_all_raises_the_first_of_several_failures(monkeypatch):
+    # The test above has one real failure, so it proves "keep going" but not the stated
+    # precedence. Two failures with distinct errnos make "the FIRST failure" observable:
+    # a `first = caught` that kept overwriting would surface ENOSPC instead.
+    #
+    # The descriptors are fictitious numbers, never closed, because failing_close raises
+    # before touching them. The patch is scoped to one call: `atoms.fs.lock.os` IS the
+    # os module, so a wider window would replace close for everything inside it.
+    codes = {4242: errno.EIO, 4243: errno.ENOSPC}
+    attempted = []
+
+    def failing_close(fd):
+        attempted.append(fd)
+        raise OSError(codes[fd], "injected")
+
+    with monkeypatch.context() as patched:
+        patched.setattr("atoms.fs.lock.os.close", failing_close)
+        with pytest.raises(OSError) as caught:
+            close_all((4242, 4243))
+    assert caught.value.errno == errno.EIO, "the first failure is what propagates"
+    assert attempted == [4242, 4243], "a failure must not stop the remaining closes"
 
 
 def test_lock_refuses_ordinary_construction():
@@ -2198,11 +2225,20 @@ def establish_root(backend: Backend, path: str, create: bool) -> tuple[int, str,
         # Reopen through guarded traversal even though we just created it, so the
         # descriptor is guard-checked on the same terms as the existing-root case.
         fd = backend.open_child_directory(parent_fd, leaf)
-    finally:
+    except BaseException:
         os.close(parent_fd)
-    if not stat.S_ISDIR(os.fstat(fd).st_mode):
+        raise
+    # `fd` is owned from here on, so BOTH remaining steps run under that ownership.
+    # A `finally: os.close(parent_fd)` around the block above would leak `fd` if that
+    # close failed, and an `fstat` that raises leaves `fd` exactly as open as one
+    # reporting the wrong type — the leak is in the validation, not just its verdict.
+    try:
+        os.close(parent_fd)
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise ProtocolError(f"created metadata root is not a directory: {spelled!r}")
+    except BaseException:
         os.close(fd)
-        raise ProtocolError(f"created metadata root is not a directory: {spelled!r}")
+        raise
     return fd, os.path.normpath(spelled), True
 
 
@@ -2296,8 +2332,10 @@ def acquire_project_lock(backend: Backend, metadata_root: str) -> HeldProjectLoc
                 ) from caught
             raise
     except BaseException:
-        os.close(lock_fd)
-        os.close(root_fd)
+        # One pass, not two sequential closes: a failure closing `lock_fd` must not
+        # abandon `root_fd`, and this unwind runs on the CapabilityUnavailable path
+        # that an unlockable volume takes, where a leak would be permanent.
+        close_all((lock_fd, root_fd))
         raise
     return HeldProjectLock(
         _construction_token=_TOKEN,
@@ -2325,8 +2363,7 @@ Append to `python/tests/fs_support.py`:
 ```python
 import contextlib
 
-from atoms.fs.bootstrap import ensure_metadata_layout
-from atoms.fs.lock import close_all
+from atoms.fs.bootstrap import close_layout, ensure_metadata_layout
 
 
 @contextlib.contextmanager
@@ -2335,15 +2372,15 @@ def metadata_layout(lock):
 
     A test that drops the return value leaks one descriptor per layout component and
     silently violates the plan's own close-exactly-once audit, which is why the audit
-    gets a helper rather than a reminder. Release goes through the same close_all
-    production uses, so the helper cannot pass while production's release path is
-    weaker than it.
+    gets a helper rather than a reminder. Release goes through the same close_layout
+    production uses, so the helper cannot pass while production releases in a
+    different order or with a weaker guarantee.
     """
     retained = ensure_metadata_layout(lock)
     try:
         yield retained
     finally:
-        close_all(retained.values())
+        close_layout(retained)
 ```
 
 Create `python/tests/test_fs_bootstrap.py`:
@@ -2361,6 +2398,7 @@ from atoms.fs.bootstrap import (
     reclaim_probe_survivors,
     verified_child_path,
 )
+from atoms.fs.lock import close_all
 from tests.fs_support import metadata_layout
 
 
@@ -2381,6 +2419,31 @@ def test_layout_returns_one_owned_descriptor_per_component(held_lock, metadata_r
             for relative, fd in retained.items():
                 assert stat.S_ISDIR(os.fstat(fd).st_mode), relative
                 assert os.get_inheritable(fd) is False, relative
+
+
+def test_layout_descriptors_are_released_in_reverse_opening_order(
+    held_lock, metadata_root, monkeypatch
+):
+    # Design §7.2 and §9.3: nested descriptors are released child-before-parent, so no
+    # release depends on one already gone. `retained` is insertion-ordered by
+    # METADATA_LAYOUT, which makes values() OPENING order — passing it straight to
+    # close_all reverses nothing and reads as correct, which is why the order is
+    # pinned here rather than left to the comment in close_layout.
+    calls = []
+
+    def recording(fds):
+        order = list(fds)
+        calls.append(order)
+        close_all(order)
+
+    monkeypatch.setattr("atoms.fs.bootstrap.close_all", recording)
+    with held_lock(metadata_root) as lock:
+        with metadata_layout(lock) as retained:
+            opening_order = list(retained.values())
+    # The last close_all is close_layout's; earlier ones released the intermediate
+    # `blobs` descriptor on the way to `blobs/sha256`.
+    assert calls[-1] == list(reversed(opening_order))
+    assert calls[-1] != opening_order, "four distinct descriptors, so this is not a tie"
 
 
 def test_layout_is_idempotent_over_existing_directories(held_lock, metadata_root):
@@ -2534,10 +2597,30 @@ def _open_or_create_child(backend, parent_fd: int, name: str) -> int:
     except FileExistsError:
         pass
     fd = backend.open_child_directory(parent_fd, name)
-    if not stat.S_ISDIR(os.fstat(fd).st_mode):
+    # The verification runs under the descriptor's ownership, not beside it: an fstat
+    # that raises leaves `fd` exactly as open as one that reports the wrong type, so
+    # closing only on the wrong-type branch leaks on the other.
+    try:
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise ProtocolError(f"metadata layout component is not a directory: {name!r}")
+    except BaseException:
         os.close(fd)
-        raise ProtocolError(f"metadata layout component is not a directory: {name!r}")
+        raise
     return fd
+
+
+def close_layout(retained: dict[str, int]) -> None:
+    """Release retained layout descriptors in reverse opening order (design §7.2, §9.3).
+
+    `retained` is insertion-ordered by METADATA_LAYOUT, so `values()` is *opening*
+    order and must be reversed. Reverse order is the rule for nested descriptors: a
+    child is released before the parent it was reached through, so no release ever
+    depends on a descriptor that is already gone.
+
+    This is the single place that knows the ordering. Production and the test helper
+    both call it, so neither can release in an order the other does not.
+    """
+    close_all(reversed(list(retained.values())))
 
 
 def ensure_metadata_layout(lock: HeldProjectLock) -> dict[str, int]:
@@ -2557,10 +2640,16 @@ def ensure_metadata_layout(lock: HeldProjectLock) -> dict[str, int]:
             # fails part-way does not abandon the rest. If a close does fail, that
             # failure propagates with the original refusal as its __context__ — the
             # same rule the binding's final reclamation follows.
-            close_all((*opened, *retained.values()))
+            #
+            # Acquisition order is `retained` then this component's `opened` chain,
+            # parent to child, so reversing the concatenation is reverse acquisition
+            # order: deepest first, and the lock's metadata root — which we never
+            # opened — untouched.
+            close_all(reversed([*retained.values(), *opened]))
             raise
         retained[relative] = opened[-1]
-        close_all(opened[:-1])
+        # The intermediate ancestors of the retained leaf, deepest first.
+        close_all(reversed(opened[:-1]))
     return retained
 
 
@@ -3479,7 +3568,8 @@ import pytest
 from atoms.core.capabilities import Capability
 from atoms.core.errors import CapabilityUnavailable, ProtocolError
 from atoms.fs.binding import ProjectBinding, VolumeEvidence, bind_project_volume
-from atoms.fs.lock import acquire_project_lock, close_all
+from atoms.fs.bootstrap import close_layout
+from atoms.fs.lock import acquire_project_lock
 from atoms.fs.volume import CERTIFIED_ALLOWLIST, DurabilityAllowlist
 
 
@@ -3701,12 +3791,12 @@ def test_a_descriptor_release_failure_still_reclaims(
     def leaves_debris(database_path, cleanup=False):
         os.close(os.open(database_path, os.O_CREAT | os.O_WRONLY | os.O_CLOEXEC, 0o600))
 
-    def failing_release(fds):
-        close_all(fds)
+    def failing_release(retained):
+        close_layout(retained)
         raise OSError(errno.EIO, "injected release failure")
 
     monkeypatch.setattr("atoms.fs.binding.certify_sqlite_wal", leaves_debris)
-    monkeypatch.setattr("atoms.fs.binding.close_all", failing_release)
+    monkeypatch.setattr("atoms.fs.binding.close_layout", failing_release)
     with acquire_project_lock(linux_backend, str(metadata_root)) as lock:
         allowlist = test_allowlist(lock, project_root, test_storage_profile)
         with pytest.raises(OSError) as caught:
@@ -3875,11 +3965,12 @@ from atoms.core.errors import CapabilityUnavailable, ProtocolError
 from atoms.fs.backend import Backend
 from atoms.fs.bootstrap import (
     PROBE_DIRECTORY,
+    close_layout,
     ensure_metadata_layout,
     reclaim_probe_survivors,
     verified_child_path,
 )
-from atoms.fs.lock import HeldProjectLock, close_all, establish_root
+from atoms.fs.lock import HeldProjectLock, establish_root
 from atoms.fs.probe import certify_sqlite_wal, probe_backend
 from atoms.fs.volume import (
     AllowlistEntry,
@@ -4080,10 +4171,11 @@ def bind_project_volume(
             # Reclamation sits in the OUTER finally so a failing descriptor release
             # cannot skip it — releasing and reclaiming are independent obligations,
             # and the one that leaves state on disk is the one that must not be
-            # conditional on the other. close_all likewise attempts every descriptor
-            # rather than abandoning the rest after the first failure.
+            # conditional on the other. close_layout likewise attempts every
+            # descriptor rather than abandoning the rest after the first failure, and
+            # releases them in reverse opening order per design §9.3.
             try:
-                close_all(retained.values())
+                close_layout(retained)
             finally:
                 reclaim_probe_survivors(lock)
 
@@ -4494,7 +4586,9 @@ Run before declaring A4a complete.
   `test_a_certification_failure_still_reclaims_probe_debris`,
   `test_a_descriptor_release_failure_still_reclaims`,
   `test_a_failed_second_child_open_leaks_no_descriptor`,
-  `test_close_all_attempts_every_descriptor_and_raises_the_first_failure`;
+  `test_close_all_attempts_every_descriptor_and_raises_the_first_failure`,
+  `test_close_all_raises_the_first_of_several_failures`,
+  `test_layout_descriptors_are_released_in_reverse_opening_order`;
   12 → `test_absent_anchored_traversal_refuses_with_capability_unavailable`,
   `test_absent_advisory_lock_refuses_with_capability_unavailable`,
   `test_a_lock_that_does_not_exclude_refuses_binding`,
@@ -4531,9 +4625,17 @@ Run before declaring A4a complete.
       `_refused_with` weakened to accept any `OSError`, which is the only thing it exists to catch.
 - [ ] Reclamation sits in the **outer** `finally` of `bind_project_volume`, so a failing descriptor
       release cannot skip it, and the layout closes sit in a `finally` rather than on the success path.
-- [ ] Every multi-descriptor release goes through `close_all`; `grep -n "for fd in" src/atoms/fs/` should
-      show no loop calling `os.close` directly. Every probe that creates or opens more than one thing
-      stages it inside `_staged` or `_child_pair`, so failing on the second releases the first.
+- [ ] Every multi-descriptor release goes through `close_all`. `grep -n "os.close" src/atoms/fs/` should
+      show only *single*-descriptor closes outside `close_all` itself — no two adjacent `os.close` calls,
+      anywhere, including unwind blocks. `grep -n "retained.values()" src/atoms/fs/` should show exactly
+      two hits, both in `bootstrap.py` and both inside a `reversed(...)`: `close_layout` and the layout
+      unwind. Any hit in `binding.py` or in a test means the reversal was bypassed. Every probe that
+      creates or opens more than one thing stages it inside `_staged` or `_child_pair`, so failing on the
+      second releases the first.
+- [ ] Every descriptor opened through a parent is owned before it is validated. `os.fstat` on a fresh
+      descriptor sits inside a `try` whose handler closes it, and a parent released after a child was
+      opened through it is released under that child's ownership — a `finally: os.close(parent)` that
+      leaves the child unowned is the defect.
 - [ ] No failure of a certification child escapes as `subprocess.TimeoutExpired`; `grep -n "timeout"
       src/atoms/fs/probe.py` shows the bound and its single conversion site.
 - [ ] `uv run pytest -q`, `uv run ruff check`, and `uv run pyright` are clean; no line exceeds 120

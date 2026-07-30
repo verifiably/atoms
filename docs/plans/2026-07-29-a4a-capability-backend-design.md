@@ -551,6 +551,17 @@ reopening would accept whatever already occupies the name — a symlink pointing
 regular file — as though A4a had created it. Because `open_child_directory` refuses symlinks and mount
 crossings, an occupied name can only pass by being a real directory beneath the metadata root.
 
+Step 3's refusal happens **under the new descriptor's ownership**, not beside it: a verification that
+itself fails leaves the descriptor exactly as open as one that reports the wrong type, so closing only on
+the wrong-type branch leaks on the other. The same holds wherever a descriptor is opened through a parent
+that must then be released — releasing the parent and validating the child are both fallible, and neither
+may strand the child.
+
+The retained set is released in **reverse opening order**, child before the parent it was reached through,
+so no release depends on a descriptor already gone. Because the retained mapping is ordered by the layout
+sequence, that release order is the reverse of the mapping's own — one function owns the reversal, and both
+production and the tests go through it rather than each iterating the mapping directly.
+
 A4a creates no **persistent store** database and defines no schema. The §8.3 probe deliberately creates a
 throwaway database inside `probe/` and removes it; that is not the store.
 
@@ -635,7 +646,13 @@ scope**, so a probe that creates two operands or opens two descriptors and fails
 releases the first — the two-directory `noclobber_transfer` and `identity_anchor` probes are where this
 bites, since each opens a second child directory after the first is already open. And **every release is
 attempted**: a failing close does not un-open the descriptors after it, so a loop that lets the first
-failure escape leaks every later one for the process lifetime, and reclamation must still be reached.
+failure escape leaks every later one for the process lifetime, and reclamation must still be reached. When
+several releases fail, the **first** failure is the one raised — it is the one with a cause, and the rest
+are usually that cause repeated.
+
+Both properties are carried by one release function rather than restated at each site: every place that
+releases more than one descriptor — the lock's pair, its acquisition unwind, the layout's retained set and
+its partial unwind — goes through it, in reverse acquisition order.
 
 ### 8.3 SQLite-WAL hostability
 
@@ -726,7 +743,10 @@ Inside `bind_project_volume`, in this order:
 9. Build `VolumeEvidence`; return `ProjectBinding`.
 
 Every descriptor the layout returns at step 6 has exactly one owner: `bind_project_volume` closes each in
-the same `finally` that reclaims, and no other code path may adopt one.
+the same `finally` that reclaims — in the §7.2 reverse opening order, through the one function that owns
+that ordering — and no other code path may adopt one. Reclamation sits in an *outer* `finally` around that
+release, because releasing descriptors and emptying `probe/` are independent obligations and the one that
+leaves state on disk must not become conditional on the one that does not.
 
 The order is load-bearing in two places.
 
@@ -1005,10 +1025,12 @@ separate filesystem, which is true here but not portable.
 Reclamation with planted debris: a file, a nested directory, and a symlink pointing *outside* `probe/`,
 asserting the debris is removed and the symlink's target survives.
 
-Release failure is exercised, since it is the one cleanup path no ordinary run reaches: a forced `close`
-failure while releasing the project lock must still attempt the second descriptor, and a forced failure
-releasing a layout descriptor must still reach reclamation. A certification child that exceeds its timeout
-is forced too, asserting `CapabilityUnavailable` naming the phase rather than a `TimeoutExpired`.
+Release failure is exercised, since it is the one cleanup path no ordinary run reaches: a real failing
+close must still attempt the descriptors after it, two failures with distinct errno values must surface the
+first, and a forced failure releasing a layout descriptor must still reach reclamation. The layout's
+release order is pinned by a test, not left to the reversal's comment — passing the retained mapping
+straight through reverses nothing and reads as correct. A certification child that exceeds its timeout is
+forced too, asserting `CapabilityUnavailable` naming the phase rather than a `TimeoutExpired`.
 
 Two ordering locks, both encoding decisions that would otherwise regress silently:
 
@@ -1086,9 +1108,12 @@ production-allowlist call-site assertion, owned by A5.
     rather than unlinked; the sync-ignore marker is set best-effort on creation and its failure does not
     fail bootstrap.
 11. Reclamation of a pre-existing `probe/` precedes allowlist refusal, and refusal writes nothing new. The
-    second reclamation runs in a `finally` and is reached even when releasing a layout descriptor fails;
-    every probe stages its acquisitions inside its own cleanup scope, so failing on the second of two
-    leaves nothing open and nothing behind; and every multi-descriptor release attempts each close.
+    second reclamation runs in an outer `finally` and is reached even when releasing a layout descriptor
+    fails; every probe stages its acquisitions inside its own cleanup scope, so failing on the second of two
+    leaves nothing open and nothing behind; every descriptor opened through a parent is owned before it is
+    validated, so neither a failing validation nor a failing parent release strands it; and every
+    multi-descriptor release goes through the one function that attempts each close, raises the first
+    failure, and releases in reverse acquisition order.
 12. Absent `anchored_traversal` or `advisory_project_lock` refuses; absent optional capabilities are
     reported; absent SQLite-WAL hostability refuses, certified across **two processes** through the §8.3
     choreography, with a child that exceeds its bounded timeout refusing as `CapabilityUnavailable` naming
