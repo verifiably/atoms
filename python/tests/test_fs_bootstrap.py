@@ -4,6 +4,7 @@ import stat
 
 import pytest
 
+from atoms.core.capabilities import Capability
 from atoms.core.errors import ProtocolError
 from atoms.fs.bootstrap import (
     METADATA_LAYOUT,
@@ -11,7 +12,7 @@ from atoms.fs.bootstrap import (
     reclaim_probe_survivors,
     verified_child_path,
 )
-from atoms.fs.lock import close_all
+from atoms.fs.lock import acquire_project_lock, close_all
 from tests.fs_support import metadata_layout
 
 
@@ -81,6 +82,38 @@ def test_failed_intermediate_release_unwinds_the_retained_layout(
             ensure_metadata_layout(lock)
         assert caught.value.errno == errno.EIO
         assert injected is True
+        assert len(os.listdir("/proc/self/fd")) == before
+
+
+def test_intermediate_release_failure_precedes_retained_layout_release_failure(
+    held_lock, metadata_root, monkeypatch
+):
+    # Releasing the `blobs` intermediate fails first; unwinding the four retained
+    # leaf descriptors fails second. Both calls really close every descriptor before
+    # raising so the count proves complete unwind, while distinct errnos pin the
+    # first-failure precedence across the nested cleanup boundary.
+    real_close_all = close_all
+    nonempty_releases = []
+    errors = (errno.EIO, errno.ENOSPC)
+
+    def fail_each_nonempty_release(fds):
+        order = list(fds)
+        real_close_all(order)
+        if order:
+            code = errors[len(nonempty_releases)]
+            nonempty_releases.append(order)
+            raise OSError(code, "injected release failure")
+
+    with held_lock(metadata_root) as lock:
+        before = len(os.listdir("/proc/self/fd"))
+        monkeypatch.setattr(
+            "atoms.fs.bootstrap.close_all", fail_each_nonempty_release
+        )
+        with pytest.raises(OSError) as caught:
+            ensure_metadata_layout(lock)
+        assert caught.value.errno == errno.EIO
+        assert [len(order) for order in nonempty_releases] == [1, 4]
+        assert len({fd for order in nonempty_releases for fd in order}) == 5
         assert len(os.listdir("/proc/self/fd")) == before
 
 
@@ -182,11 +215,64 @@ def test_reclamation_refuses_a_symlink_at_probe_itself(
 
 
 def test_reclamation_refuses_a_regular_file_at_probe(held_lock, metadata_root):
+    payload = b"engine-owned name must survive refusal"
     with held_lock(metadata_root) as lock:
         fd = os.open("probe", os.O_CREAT | os.O_WRONLY, 0o600, dir_fd=lock.metadata_root_fd)
-        os.close(fd)
-        with pytest.raises((OSError, ProtocolError)):
+        try:
+            assert os.write(fd, payload) == len(payload)
+            before = os.fstat(fd)
+        finally:
+            os.close(fd)
+
+        with pytest.raises(ProtocolError, match="refusing to unlink"):
             reclaim_probe_survivors(lock)
+
+        after = os.lstat("probe", dir_fd=lock.metadata_root_fd)
+        assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+        read_fd = os.open(
+            "probe",
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=lock.metadata_root_fd,
+        )
+        try:
+            assert os.read(read_fd, len(payload) + 1) == payload
+        finally:
+            os.close(read_fd)
+
+
+def test_reclamation_refuses_probe_mount_point_without_touching_it(
+    metadata_root, fake_backend
+):
+    # A name-scoped EXDEV models RESOLVE_NO_XDEV refusing `probe` itself. The
+    # refusal must propagate, and neither the directory nor its survivor evidence
+    # may be guessed away.
+    backend = fake_backend(
+        supplied=set(Capability),
+        override_names={"probe"},
+        open_child_directory_errno=errno.EXDEV,
+    )
+    payload = b"mounted survivor evidence"
+    with acquire_project_lock(backend, str(metadata_root)) as lock:
+        os.mkdir("probe", mode=0o700, dir_fd=lock.metadata_root_fd)
+        before = os.lstat("probe", dir_fd=lock.metadata_root_fd)
+        survivor_fd = os.open(
+            "probe/survivor",
+            os.O_CREAT | os.O_WRONLY | os.O_CLOEXEC,
+            0o600,
+            dir_fd=lock.metadata_root_fd,
+        )
+        try:
+            assert os.write(survivor_fd, payload) == len(payload)
+        finally:
+            os.close(survivor_fd)
+
+        with pytest.raises(OSError) as caught:
+            reclaim_probe_survivors(lock)
+        assert caught.value.errno == errno.EXDEV
+
+        after = os.lstat("probe", dir_fd=lock.metadata_root_fd)
+        assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+        assert (metadata_root / "probe" / "survivor").read_bytes() == payload
 
 
 def test_verified_child_path_joins_after_confirming_identity(held_lock, metadata_root):

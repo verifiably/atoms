@@ -1,6 +1,9 @@
+import copy
 import dataclasses
 import errno
 import os
+import pickle
+import stat
 import subprocess
 import sys
 
@@ -94,6 +97,33 @@ def test_establish_root_parent_close_failure_releases_the_child(
     assert len(os.listdir("/proc/self/fd")) == before
 
 
+def test_establish_root_preserves_parent_close_failure_when_child_close_also_fails(
+    linux_backend, metadata_root, monkeypatch
+):
+    # Both close attempts really release their descriptor before raising. The first
+    # failure therefore remains the causal error, while distinct errnos prove the
+    # later child-release failure cannot replace it.
+    real_close = os.close
+    attempted = []
+    errors = (errno.EIO, errno.ENOSPC)
+
+    def fail_each_close(fd):
+        code = errors[len(attempted)]
+        attempted.append(fd)
+        real_close(fd)
+        raise OSError(code, "injected release failure")
+
+    before = len(os.listdir("/proc/self/fd"))
+    with monkeypatch.context() as patched:
+        patched.setattr("atoms.fs.lock.os.close", fail_each_close)
+        with pytest.raises(OSError) as caught:
+            establish_root(linux_backend, str(metadata_root), create=True)
+    assert caught.value.errno == errno.EIO
+    assert len(attempted) == 2
+    assert attempted[0] != attempted[1]
+    assert len(os.listdir("/proc/self/fd")) == before
+
+
 def test_establish_root_fstat_failure_releases_the_child(
     linux_backend, metadata_root, monkeypatch
 ):
@@ -129,14 +159,20 @@ def test_acquire_refuses_a_symlink_at_lock(linux_backend, metadata_root):
     assert caught.value.errno == errno.ELOOP
 
 
-def test_acquire_refuses_a_directory_at_lock(linux_backend, metadata_root):
+def test_acquire_refuses_a_fifo_at_lock_after_regular_file_validation(
+    linux_backend, metadata_root
+):
+    # Opening a directory O_RDWR can fail before fstat, so it would not prove the
+    # explicit regular-file validation exists. A FIFO opens O_RDWR without blocking
+    # and reaches fstat; removing the validation lets flock succeed.
     metadata_root.mkdir(parents=True)
-    (metadata_root / "lock").mkdir()
+    os.mkfifo(metadata_root / "lock", mode=0o600)
     with (
-        pytest.raises((OSError, ProtocolError)),
+        pytest.raises(ProtocolError, match="regular file"),
         acquire_project_lock(linux_backend, str(metadata_root)),
     ):
         pass
+    assert stat.S_ISFIFO(os.lstat(metadata_root / "lock").st_mode)
 
 
 def test_acquire_refuses_a_missing_parent(linux_backend, metadata_root):
@@ -213,11 +249,24 @@ def test_accessors_refuse_after_release(linux_backend, metadata_root):
         _ = lock.backend
 
 
-def test_release_is_idempotent(linux_backend, metadata_root):
-    with acquire_project_lock(linux_backend, str(metadata_root)) as lock:
+def test_release_is_idempotent_without_a_second_close(
+    linux_backend, metadata_root, monkeypatch
+):
+    releases = []
+
+    def recording_close_all(fds):
+        order = tuple(fds)
+        releases.append(order)
+        close_all(order)
+
+    lock = acquire_project_lock(linux_backend, str(metadata_root))
+    monkeypatch.setattr("atoms.fs.lock.close_all", recording_close_all)
+    with lock:
         pass
+    assert len(releases) == 1
     lock.__exit__(None, None, None)
     assert lock.held is False
+    assert len(releases) == 1
 
 
 def test_exceptional_exit_still_releases(linux_backend, metadata_root):
@@ -291,6 +340,50 @@ def test_lock_refuses_dataclass_replacement():
     # a held lock can be fabricated, which is what downstream signatures rely on.
     with pytest.raises(TypeError):
         dataclasses.replace(object.__new__(HeldProjectLock))  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("duplicate", "message"),
+    [
+        pytest.param(copy.copy, "cannot be copied", id="copy"),
+        pytest.param(copy.deepcopy, "cannot be deep-copied", id="deepcopy"),
+        pytest.param(
+            lambda value: pickle.loads(pickle.dumps(value)),
+            "cannot be pickled",
+            id="pickle-round-trip",
+        ),
+    ],
+)
+def test_held_lock_refuses_duplicate_ownership(
+    linux_backend, metadata_root, monkeypatch, duplicate, message
+):
+    # Each generic duplication route would otherwise manufacture a second live owner
+    # of the same descriptor integers. Refusal must leave the real owner usable, and
+    # its eventual exit must remain the descriptors' one release.
+    releases = []
+
+    def recording_close_all(fds):
+        order = tuple(fds)
+        releases.append(order)
+        close_all(order)
+
+    with acquire_project_lock(linux_backend, str(metadata_root)) as lock:
+        root_fd = lock.metadata_root_fd
+        root_identity = os.fstat(root_fd)
+        monkeypatch.setattr("atoms.fs.lock.close_all", recording_close_all)
+
+        with pytest.raises(TypeError, match=message):
+            duplicate(lock)
+
+        assert lock.held is True
+        assert os.fstat(root_fd) == root_identity
+
+    assert len(releases) == 1
+    assert len(releases[0]) == 2
+    assert releases[0].count(root_fd) == 1
+    with pytest.raises(OSError) as caught:
+        os.fstat(root_fd)
+    assert caught.value.errno == errno.EBADF
 
 
 _CONTENDER = (

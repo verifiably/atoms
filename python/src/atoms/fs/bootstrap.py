@@ -79,11 +79,15 @@ def ensure_metadata_layout(lock: HeldProjectLock) -> dict[str, int]:
         # The intermediate ancestors of the retained leaf, deepest first.
         try:
             close_all(reversed(opened[:-1]))
-        except BaseException:
+        except BaseException as first:
             # The leaf is already in `retained`, so ownership cannot be returned to a
             # caller when an intermediate release fails. Unwind the complete retained
-            # set before propagating that release failure.
-            close_layout(retained)
+            # set before propagating that FIRST release failure. A retained-layout
+            # close failure remains its context but cannot replace it.
+            try:
+                close_layout(retained)
+            except OSError:
+                raise first
             raise
     return retained
 

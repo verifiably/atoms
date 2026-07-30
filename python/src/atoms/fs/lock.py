@@ -6,7 +6,7 @@ import errno
 import os
 import stat
 from collections.abc import Iterable
-from typing import Self
+from typing import Never, Self
 
 from atoms.core.errors import CapabilityUnavailable, ProtocolError
 from atoms.fs.backend import UNSUPPORTED_ERRNO, Backend
@@ -109,10 +109,19 @@ def establish_root(backend: Backend, path: str, create: bool) -> tuple[int, str,
         raise
     # `fd` is owned from here on, so BOTH remaining steps run under that ownership.
     # A `finally: os.close(parent_fd)` around the block above would leak `fd` if that
-    # close failed, and an `fstat` that raises leaves `fd` exactly as open as one
-    # reporting the wrong type — the leak is in the validation, not just its verdict.
+    # close failed. A later child-close failure is retained as context but cannot
+    # replace that first parent-close failure.
     try:
         os.close(parent_fd)
+    except BaseException as first:
+        try:
+            os.close(fd)
+        except OSError:
+            raise first
+        raise
+    # An `fstat` that raises leaves `fd` exactly as open as one reporting the wrong
+    # type — the leak is in the validation, not just its verdict.
+    try:
         if not stat.S_ISDIR(os.fstat(fd).st_mode):
             raise ProtocolError(f"created metadata root is not a directory: {spelled!r}")
     except BaseException:
@@ -139,6 +148,18 @@ class HeldProjectLock:
         self._root_path = kwargs["root_path"]
         self._lock_fd = kwargs["lock_fd"]
         self._held = True
+
+    def __copy__(self) -> Never:
+        raise TypeError("HeldProjectLock cannot be copied")
+
+    def __deepcopy__(self, memo: dict[int, object]) -> Never:
+        raise TypeError("HeldProjectLock cannot be deep-copied")
+
+    def __reduce__(self) -> Never:
+        raise TypeError("HeldProjectLock cannot be pickled")
+
+    def __reduce_ex__(self, protocol: int) -> Never:
+        raise TypeError("HeldProjectLock cannot be pickled")
 
     def _require_held(self) -> None:
         if not self._held:
