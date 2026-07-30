@@ -36,19 +36,6 @@ _PYTEST_BUILTINS = {
 }
 
 
-def _python_imports(source_path: Path) -> set[str]:
-    tree = ast.parse(source_path.read_text(encoding="utf-8"))
-    imports: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            imports.update(
-                alias.name.split(".", 1)[0] for alias in node.names
-            )
-        elif isinstance(node, ast.ImportFrom) and node.module is not None:
-            imports.add(node.module.split(".", 1)[0])
-    return imports
-
-
 def _resolved_import_targets(
     source: str,
     *,
@@ -223,29 +210,6 @@ def test_public_surface_has_exactly_five_operations():
         "reduce_recovery_plan_prefix",
         "apply_recovery_plan",
     }
-
-
-def test_recovery_package_has_no_io_or_sqlite_imports():
-    root = (
-        Path(__file__).parents[1]
-        / "src"
-        / "atoms"
-        / "core"
-        / "recovery"
-    )
-    forbidden = {
-        "ctypes",
-        "datetime",
-        "os",
-        "pathlib",
-        "random",
-        "secrets",
-        "sqlite3",
-        "subprocess",
-        "time",
-    }
-    for source_path in root.glob("*.py"):
-        assert not _python_imports(source_path) & forbidden, source_path
 
 
 def test_a3_does_not_accept_raw_transaction_spec():

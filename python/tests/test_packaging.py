@@ -9,3 +9,10 @@ def test_py_typed_marker_present_in_source_package():
     # building and inspecting the wheel (see the packaging-verification step).
     marker = Path(atoms.core.__file__).with_name("py.typed")
     assert marker.is_file(), "PEP 561 py.typed marker must sit in atoms.core"
+
+
+def test_py_typed_marker_present_in_fs_package():
+    import atoms.fs
+
+    marker = Path(atoms.fs.__file__).with_name("py.typed")
+    assert marker.is_file(), "PEP 561 py.typed marker must sit in atoms.fs"

@@ -1,6 +1,6 @@
 [project]
 name = "atoms-core"
-import-names = ["atoms.core"]
+import-names = ["atoms.core", "atoms.fs"]
 import-namespaces = ["atoms"]
 version = "0.1.0"
 description = "Atoms core: a recoverable filesystem effect engine (pure model)"

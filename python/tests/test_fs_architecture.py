@@ -1,0 +1,138 @@
+import ast
+import ctypes
+import importlib
+import sys
+from importlib.util import resolve_name
+from pathlib import Path
+
+import pytest
+
+from atoms.core.errors import CapabilityUnavailable
+from atoms.fs import platform as fs_platform
+
+_CORE_IMPORT_ALLOWLIST = {
+    "__future__",
+    "atoms",
+    "collections",
+    "dataclasses",
+    "enum",
+    "functools",
+    "itertools",
+    "json",
+    "re",
+    "typing",
+    "unicodedata",
+}
+
+
+def _top_level_imports(source_path: Path) -> set[str]:
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name.split(".", 1)[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            names.add(node.module.split(".", 1)[0])
+    return names
+
+
+def _core_modules() -> list[Path]:
+    root = Path(__file__).parents[1] / "src" / "atoms" / "core"
+    return sorted(root.rglob("*.py"))
+
+
+def _core_package(source_path: Path) -> str:
+    source_root = Path(__file__).parents[1] / "src"
+    return ".".join(source_path.relative_to(source_root).parent.parts)
+
+
+def _imports_filesystem_layer(tree: ast.Module, *, package: str) -> bool:
+    targets: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            targets.update(alias.name for alias in node.names)
+            continue
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        module = node.module or ""
+        imported_from = (
+            resolve_name(f"{'.' * node.level}{module}", package)
+            if node.level
+            else module
+        )
+        targets.add(imported_from)
+        targets.update(
+            f"{imported_from}.{alias.name}"
+            for alias in node.names
+            if alias.name != "*"
+        )
+    return any(target == "atoms.fs" or target.startswith("atoms.fs.") for target in targets)
+
+
+@pytest.mark.parametrize(
+    ("source", "package"),
+    [
+        ("from atoms import fs", "atoms.core"),
+        ("from .. import fs", "atoms.core"),
+    ],
+)
+def test_filesystem_import_scanner_detects_alias_and_relative_imports(
+    source: str,
+    package: str,
+):
+    assert _imports_filesystem_layer(ast.parse(source), package=package)
+
+
+def test_core_imports_only_the_allowlisted_modules():
+    # An allowlist, not a denylist: a denylist only ever forbids what someone
+    # thought to enumerate, and fcntl/platform/shutil/tempfile were all omitted.
+    assert _core_modules(), "expected to find modules under atoms/core"
+    for source_path in _core_modules():
+        disallowed = _top_level_imports(source_path) - _CORE_IMPORT_ALLOWLIST
+        assert not disallowed, f"{source_path} imports {sorted(disallowed)}"
+
+
+def test_core_never_imports_the_filesystem_layer():
+    for source_path in _core_modules():
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        assert not _imports_filesystem_layer(tree, package=_core_package(source_path)), source_path
+
+
+def test_select_backend_refuses_a_non_linux_platform(monkeypatch):
+    monkeypatch.setattr(fs_platform.sys, "platform", "darwin")
+    with pytest.raises(CapabilityUnavailable, match="platform"):
+        fs_platform.select_backend()
+
+
+def test_select_backend_refuses_an_unlisted_architecture(monkeypatch):
+    monkeypatch.setattr(fs_platform.sys, "platform", "linux")
+    monkeypatch.setattr(fs_platform.platform, "machine", lambda: "riscv64")
+    with pytest.raises(CapabilityUnavailable, match="architecture"):
+        fs_platform.select_backend()
+
+
+def test_select_backend_performs_no_io(monkeypatch):
+    def explode(*args, **kwargs):
+        raise AssertionError("select_backend must not touch the filesystem")
+
+    monkeypatch.setattr(fs_platform.os, "open", explode, raising=False)
+    monkeypatch.setattr(fs_platform.sys, "platform", "linux")
+    monkeypatch.setattr(fs_platform.platform, "machine", lambda: "riscv64")
+    with pytest.raises(CapabilityUnavailable):
+        fs_platform.select_backend()
+
+
+def test_non_linux_platform_refusal_does_not_load_linux_syscalls(monkeypatch):
+    class LibcWithoutSyscall:
+        pass
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(ctypes, "CDLL", lambda *args, **kwargs: LibcWithoutSyscall())
+    monkeypatch.delitem(sys.modules, "atoms.fs.platform")
+    monkeypatch.delitem(sys.modules, "atoms.fs.syscalls.linux")
+    monkeypatch.delattr(sys.modules["atoms.fs.syscalls"], "linux", raising=False)
+
+    reloaded_platform = importlib.import_module("atoms.fs.platform")
+
+    with pytest.raises(CapabilityUnavailable, match="platform"):
+        reloaded_platform.select_backend()
