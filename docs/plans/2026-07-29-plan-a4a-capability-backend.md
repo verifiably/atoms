@@ -1760,6 +1760,50 @@ def test_establish_root_resolves_a_parent_component_after_a_real_directory(
         os.close(fd)
 
 
+def test_establish_root_parent_close_failure_releases_the_child(
+    linux_backend, metadata_root, monkeypatch
+):
+    # Once open_child_directory returns, the child must be owned before releasing its
+    # parent: a failed parent close otherwise exits with no returned fd and leaks the
+    # child. The injected close really releases the parent before raising, so the fd
+    # count isolates the child rather than counting an intentionally failed release.
+    real_close = os.close
+    calls = 0
+
+    def fail_first_close(fd):
+        nonlocal calls
+        calls += 1
+        real_close(fd)
+        if calls == 1:
+            raise OSError(errno.EIO, "injected parent release failure")
+
+    before = len(os.listdir("/proc/self/fd"))
+    with monkeypatch.context() as patched:
+        patched.setattr("atoms.fs.lock.os.close", fail_first_close)
+        with pytest.raises(OSError) as caught:
+            establish_root(linux_backend, str(metadata_root), create=True)
+    assert caught.value.errno == errno.EIO
+    assert calls == 2, "the child must be released after the parent release fails"
+    assert len(os.listdir("/proc/self/fd")) == before
+
+
+def test_establish_root_fstat_failure_releases_the_child(
+    linux_backend, metadata_root, monkeypatch
+):
+    # Validation can raise rather than merely report the wrong type. The fresh child
+    # descriptor is already owned when fstat runs, so both outcomes release it.
+    def fail_fstat(fd):
+        raise OSError(errno.EIO, "injected child validation failure")
+
+    before = len(os.listdir("/proc/self/fd"))
+    with monkeypatch.context() as patched:
+        patched.setattr("atoms.fs.lock.os.fstat", fail_fstat)
+        with pytest.raises(OSError) as caught:
+            establish_root(linux_backend, str(metadata_root), create=True)
+    assert caught.value.errno == errno.EIO
+    assert len(os.listdir("/proc/self/fd")) == before
+
+
 def test_acquire_refuses_a_parent_component_as_the_leaf(linux_backend, metadata_root):
     # Because normalization is deferred, '..' can still be the final component when
     # the creation branch is reached. mkdir('..') is not a coherent request.
@@ -2386,6 +2430,7 @@ def metadata_layout(lock):
 Create `python/tests/test_fs_bootstrap.py`:
 
 ```python
+import errno
 import os
 import stat
 
@@ -2439,11 +2484,64 @@ def test_layout_descriptors_are_released_in_reverse_opening_order(
     monkeypatch.setattr("atoms.fs.bootstrap.close_all", recording)
     with held_lock(metadata_root) as lock:
         with metadata_layout(lock) as retained:
-            opening_order = list(retained.values())
+            opening_order = [retained[relative] for relative in METADATA_LAYOUT]
     # The last close_all is close_layout's; earlier ones released the intermediate
     # `blobs` descriptor on the way to `blobs/sha256`.
     assert calls[-1] == list(reversed(opening_order))
     assert calls[-1] != opening_order, "four distinct descriptors, so this is not a tie"
+
+
+def test_failed_intermediate_release_unwinds_the_retained_layout(
+    held_lock, metadata_root, monkeypatch
+):
+    # `blobs/sha256` opens an intermediate `blobs` descriptor before the retained
+    # leaf. If releasing that intermediate fails after the leaf enters `retained`,
+    # ensure_metadata_layout returns no mapping for the caller to own; it must unwind
+    # the whole retained set itself.
+    real_close_all = close_all
+    injected = False
+
+    def fail_nonempty_intermediate(fds):
+        nonlocal injected
+        order = list(fds)
+        real_close_all(order)
+        if order and not injected:
+            injected = True
+            raise OSError(errno.EIO, "injected intermediate release failure")
+
+    with held_lock(metadata_root) as lock:
+        before = len(os.listdir("/proc/self/fd"))
+        monkeypatch.setattr("atoms.fs.bootstrap.close_all", fail_nonempty_intermediate)
+        with pytest.raises(OSError) as caught:
+            ensure_metadata_layout(lock)
+        assert caught.value.errno == errno.EIO
+        assert injected is True
+        assert len(os.listdir("/proc/self/fd")) == before
+
+
+def test_layout_fstat_failure_releases_every_owned_descriptor(
+    held_lock, metadata_root, monkeypatch
+):
+    # _open_or_create_child owns each fresh descriptor before validating it. A
+    # validation syscall that raises therefore releases the fresh descriptor plus
+    # every descriptor retained by earlier layout components.
+    real_fstat = os.fstat
+    calls = 0
+
+    def fail_second_validation(fd):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError(errno.EIO, "injected layout validation failure")
+        return real_fstat(fd)
+
+    with held_lock(metadata_root) as lock:
+        before = len(os.listdir("/proc/self/fd"))
+        monkeypatch.setattr("atoms.fs.bootstrap.os.fstat", fail_second_validation)
+        with pytest.raises(OSError) as caught:
+            ensure_metadata_layout(lock)
+        assert caught.value.errno == errno.EIO
+        assert len(os.listdir("/proc/self/fd")) == before
 
 
 def test_layout_is_idempotent_over_existing_directories(held_lock, metadata_root):
@@ -2649,7 +2747,14 @@ def ensure_metadata_layout(lock: HeldProjectLock) -> dict[str, int]:
             raise
         retained[relative] = opened[-1]
         # The intermediate ancestors of the retained leaf, deepest first.
-        close_all(reversed(opened[:-1]))
+        try:
+            close_all(reversed(opened[:-1]))
+        except BaseException:
+            # The leaf is already in `retained`, so ownership cannot be returned to a
+            # caller when an intermediate release fails. Unwind the complete retained
+            # set before propagating that release failure.
+            close_layout(retained)
+            raise
     return retained
 
 
@@ -3195,6 +3300,11 @@ def _child_pair(backend: Backend, probe_fd: int) -> Iterator[tuple[int, int]]:
     directory is emptied before its own descriptor closes and `probe/` is emptied
     last, once `src` and `dst` are empty enough to remove. It also keeps unwinding
     after a callback raises, so one failing release cannot strand the others.
+
+    This is heterogeneous cleanup, not a `close_all` batch: ExitStack preserves its
+    standard chained-exception behavior if more than one clear/close callback fails.
+    The first-failure precedence contract applies only within one explicit descriptor
+    batch passed to `close_all`.
     """
     with contextlib.ExitStack() as stack:
         stack.callback(_clear, probe_fd)
@@ -4588,7 +4698,11 @@ Run before declaring A4a complete.
   `test_a_failed_second_child_open_leaks_no_descriptor`,
   `test_close_all_attempts_every_descriptor_and_raises_the_first_failure`,
   `test_close_all_raises_the_first_of_several_failures`,
-  `test_layout_descriptors_are_released_in_reverse_opening_order`;
+  `test_layout_descriptors_are_released_in_reverse_opening_order`,
+  `test_establish_root_parent_close_failure_releases_the_child`,
+  `test_establish_root_fstat_failure_releases_the_child`,
+  `test_failed_intermediate_release_unwinds_the_retained_layout`,
+  `test_layout_fstat_failure_releases_every_owned_descriptor`;
   12 → `test_absent_anchored_traversal_refuses_with_capability_unavailable`,
   `test_absent_advisory_lock_refuses_with_capability_unavailable`,
   `test_a_lock_that_does_not_exclude_refuses_binding`,
@@ -4625,13 +4739,14 @@ Run before declaring A4a complete.
       `_refused_with` weakened to accept any `OSError`, which is the only thing it exists to catch.
 - [ ] Reclamation sits in the **outer** `finally` of `bind_project_volume`, so a failing descriptor
       release cannot skip it, and the layout closes sit in a `finally` rather than on the success path.
-- [ ] Every multi-descriptor release goes through `close_all`. `grep -n "os.close" src/atoms/fs/` should
-      show only *single*-descriptor closes outside `close_all` itself — no two adjacent `os.close` calls,
-      anywhere, including unwind blocks. `grep -n "retained.values()" src/atoms/fs/` should show exactly
-      two hits, both in `bootstrap.py` and both inside a `reversed(...)`: `close_layout` and the layout
-      unwind. Any hit in `binding.py` or in a test means the reversal was bypassed. Every probe that
-      creates or opens more than one thing stages it inside `_staged` or `_child_pair`, so failing on the
-      second releases the first.
+- [ ] Every explicit multi-descriptor batch release goes through `close_all`. `grep -n "os.close"
+      src/atoms/fs/` should show only *single*-descriptor closes outside `close_all` itself — no two
+      adjacent `os.close` calls, anywhere, including unwind blocks. `grep -n "retained.values()"
+      src/atoms/fs/` should show exactly two hits, both in `bootstrap.py` and both inside a
+      `reversed(...)`: `close_layout` and the layout acquisition unwind. Any hit in `binding.py` or in a
+      test means the reversal was bypassed. Every probe that creates or opens more than one thing stages
+      it inside `_staged` or `_child_pair`, so failing on the second releases the first. `_child_pair`
+      remains the documented heterogeneous `ExitStack` exception to batch-level first-failure precedence.
 - [ ] Every descriptor opened through a parent is owned before it is validated. `os.fstat` on a fresh
       descriptor sits inside a `try` whose handler closes it, and a parent released after a child was
       opened through it is released under that child's ownership — a `finally: os.close(parent)` that

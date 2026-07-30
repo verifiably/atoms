@@ -562,6 +562,11 @@ so no release depends on a descriptor already gone. Because the retained mapping
 sequence, that release order is the reverse of the mapping's own — one function owns the reversal, and both
 production and the tests go through it rather than each iterating the mapping directly.
 
+Ownership also covers the transition from construction to the retained set. If releasing an intermediate
+ancestor fails after the leaf has been retained, the whole retained set is released before that failure
+propagates; otherwise the factory would return no mapping while leaving every previously retained
+descriptor open.
+
 A4a creates no **persistent store** database and defines no schema. The §8.3 probe deliberately creates a
 throwaway database inside `probe/` and removes it; that is not the store.
 
@@ -647,12 +652,15 @@ releases the first — the two-directory `noclobber_transfer` and `identity_anch
 bites, since each opens a second child directory after the first is already open. And **every release is
 attempted**: a failing close does not un-open the descriptors after it, so a loop that lets the first
 failure escape leaks every later one for the process lifetime, and reclamation must still be reached. When
-several releases fail, the **first** failure is the one raised — it is the one with a cause, and the rest
-are usually that cause repeated.
+several descriptor closes in one `close_all` batch fail, the **first** failure is the one raised — it is the
+one with a cause, and the rest are usually that cause repeated.
 
-Both properties are carried by one release function rather than restated at each site: every place that
-releases more than one descriptor — the lock's pair, its acquisition unwind, the layout's retained set and
-its partial unwind — goes through it, in reverse acquisition order.
+Both properties are carried by one release function rather than restated at each explicit batch-release
+site: the lock's pair, its acquisition unwind, the layout's retained set, and its partial unwind all go
+through it, in reverse acquisition order. `_child_pair` is the deliberate heterogeneous exception: its
+`ExitStack` interleaves directory clearing with descriptor closes, attempts every registered action in
+reverse order, and preserves the standard chained-exception behavior. First-failure precedence is claimed
+for a `close_all` descriptor batch, not across different kinds of cleanup callback.
 
 ### 8.3 SQLite-WAL hostability
 
@@ -1112,8 +1120,10 @@ production-allowlist call-site assertion, owned by A5.
     fails; every probe stages its acquisitions inside its own cleanup scope, so failing on the second of two
     leaves nothing open and nothing behind; every descriptor opened through a parent is owned before it is
     validated, so neither a failing validation nor a failing parent release strands it; and every
-    multi-descriptor release goes through the one function that attempts each close, raises the first
-    failure, and releases in reverse acquisition order.
+    explicit multi-descriptor batch release goes through the one function that attempts each close, raises
+    the first failure, and releases in reverse acquisition order. A failed intermediate layout release
+    unwinds the retained set before propagating; heterogeneous `ExitStack` cleanup attempts every callback
+    in reverse order with standard exception chaining.
 12. Absent `anchored_traversal` or `advisory_project_lock` refuses; absent optional capabilities are
     reported; absent SQLite-WAL hostability refuses, certified across **two processes** through the §8.3
     choreography, with a child that exceeds its bounded timeout refusing as `CapabilityUnavailable` naming
