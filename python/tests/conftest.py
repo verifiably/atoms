@@ -6,7 +6,12 @@ from pathlib import Path
 import pytest
 
 from atoms.fs.linux import LinuxBackend
-from tests.fs_support import test_volume_or_skip_reason
+from atoms.fs.volume import StorageProfile
+from tests.fs_support import (
+    make_fdinfo_text,
+    make_mountinfo_text,
+    test_volume_or_skip_reason,
+)
 from tests.recovery_support import (
     make_classifier_plan,
     make_committed_halt_source,
@@ -203,3 +208,18 @@ def test_volume(tmp_path_factory):
 @pytest.fixture
 def linux_backend():
     return LinuxBackend()
+
+
+@pytest.fixture
+def mountinfo_text():
+    return make_mountinfo_text()
+
+
+@pytest.fixture
+def fdinfo_text():
+    return make_fdinfo_text()
+
+
+@pytest.fixture
+def test_storage_profile():
+    return StorageProfile(profile_id="atoms-test-profile")

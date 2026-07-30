@@ -7,6 +7,55 @@ from pathlib import Path
 
 SUPPORTED_FILESYSTEMS = frozenset({"ext4", "xfs", "btrfs"})
 
+_MOUNTINFO_CASES = {
+    "ext4_defaults": (
+        "25 30 259:1 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p1 rw\n"
+        "41 25 259:2 / /data rw,noatime shared:2 - ext4 /dev/nvme0n1p2 rw\n"
+    ),
+    "ext4_writeback": (
+        "41 25 259:2 / /data rw,noatime shared:2 - ext4 /dev/nvme0n1p2 "
+        "rw,data=writeback\n"
+    ),
+    "ext4_sync": (
+        "41 25 259:2 / /data rw,sync,dirsync shared:2 - ext4 /dev/nvme0n1p2 rw\n"
+    ),
+    # Every filesystem in the barrier table gets a defaults fixture and a
+    # super-options-only fixture. Shipping a table without both would ship an
+    # untested durability claim (design §11.1).
+    "xfs_defaults": (
+        "41 25 259:2 / /data rw,noatime shared:2 - xfs /dev/nvme0n1p2 "
+        "rw,attr2,inode64,logbufs=8,logbsize=32k,noquota\n"
+    ),
+    "xfs_wsync": (
+        "41 25 259:2 / /data rw,noatime shared:2 - xfs /dev/nvme0n1p2 "
+        "rw,wsync,attr2,inode64,noquota\n"
+    ),
+    "btrfs_defaults": (
+        "41 25 0:33 /@ /data rw,noatime shared:2 - btrfs /dev/nvme0n1p2 "
+        "rw,space_cache=v2,subvolid=256,subvol=/@\n"
+    ),
+    "btrfs_flushoncommit": (
+        "41 25 0:33 /@ /data rw,noatime shared:2 - btrfs /dev/nvme0n1p2 "
+        "rw,flushoncommit,commit=15,space_cache=v2,subvolid=256,subvol=/@\n"
+    ),
+    "escaped_space": (
+        "41 25 259:2 / /mnt/my\\040volume rw,noatime shared:2 - ext4 /dev/nvme0n1p2 rw\n"
+    ),
+    "optional_fields": (
+        "41 25 259:2 / /shared rw,noatime shared:2 master:7 propagate_from:3 "
+        "- ext4 /dev/nvme0n1p2 rw\n"
+    ),
+    "bind_same_device": (
+        "41 25 259:2 / /data rw,noatime shared:2 - ext4 /dev/nvme0n1p2 rw\n"
+        "43 25 259:2 /sub /data/bind rw,noatime shared:2 - ext4 /dev/nvme0n1p2 rw\n"
+    ),
+    "tmpfs": "22 25 0:21 / /tmp rw,nosuid,nodev - tmpfs tmpfs rw,inode64\n",
+}
+
+_FDINFO_CASES = {
+    "plain": "pos:\t0\nflags:\t02000000\nmnt_id:\t41\nino:\t131074\n",
+}
+
 
 def _filesystem_type_for(path: Path) -> str | None:
     """Return the filesystem type backing `path`, from /proc/self/mountinfo."""
@@ -46,3 +95,17 @@ def test_volume_or_skip_reason() -> tuple[Path | None, str]:
         f"no supported test volume: repository filesystem is {found!r}; "
         "set ATOMS_TEST_VOLUME to a directory on ext4, xfs, or btrfs"
     )
+
+
+def make_mountinfo_text():
+    def lookup(case: str) -> str:
+        return _MOUNTINFO_CASES[case]
+
+    return lookup
+
+
+def make_fdinfo_text():
+    def lookup(case: str) -> str:
+        return _FDINFO_CASES[case]
+
+    return lookup
