@@ -1,6 +1,8 @@
+import copy
 import dataclasses
 import errno
 import os
+import pickle
 import shutil
 import subprocess
 import sys
@@ -10,7 +12,7 @@ import pytest
 from atoms.core.capabilities import Capability
 from atoms.core.errors import CapabilityUnavailable, ProtocolError
 from atoms.fs.binding import ProjectBinding, VolumeEvidence, bind_project_volume
-from atoms.fs.bootstrap import close_layout
+from atoms.fs.bootstrap import close_layout, reclaim_probe_survivors
 from atoms.fs.lock import acquire_project_lock
 from atoms.fs.volume import CERTIFIED_ALLOWLIST, DurabilityAllowlist
 
@@ -308,6 +310,38 @@ def test_binding_refuses_dataclass_replacement(bound_volume):
         dataclasses.replace(binding)
 
 
+@pytest.mark.parametrize(
+    ("duplicate", "message"),
+    [
+        pytest.param(copy.copy, "ProjectBinding cannot be copied", id="copy"),
+        pytest.param(
+            copy.deepcopy, "ProjectBinding cannot be deep-copied", id="deepcopy"
+        ),
+        pytest.param(
+            lambda value: pickle.loads(pickle.dumps(value)),
+            "ProjectBinding cannot be pickled",
+            id="pickle-round-trip",
+        ),
+    ],
+)
+def test_binding_refuses_duplicate_ownership(bound_volume, duplicate, message):
+    # A duplicate would be a second active owner of the same descriptor integer.
+    # Refusal must leave the sole real owner active and its descriptor unchanged.
+    with bound_volume() as binding:
+        project_root_fd = binding.project_root_fd
+        project_root_identity = os.fstat(project_root_fd)
+
+        with pytest.raises(TypeError, match=message):
+            duplicate(binding)
+
+        assert binding.active is True
+        assert os.fstat(project_root_fd) == project_root_identity
+
+    with pytest.raises(OSError) as caught:
+        os.fstat(project_root_fd)
+    assert caught.value.errno == errno.EBADF
+
+
 def test_evidence_is_frozen(bound_volume):
     with bound_volume() as binding, pytest.raises(dataclasses.FrozenInstanceError):
         binding.evidence.mount_id = 1
@@ -367,3 +401,88 @@ def test_a_descriptor_release_failure_still_reclaims(
             assert os.listdir(probe_fd) == [], "reclamation must run despite the release failure"
         finally:
             os.close(probe_fd)
+
+
+def test_release_and_reclamation_failures_attempt_both_and_raise_first(
+    project_root,
+    metadata_root,
+    linux_backend,
+    test_allowlist,
+    test_storage_profile,
+    monkeypatch,
+):
+    events = []
+    reclaim_calls = 0
+
+    def no_certification(database_path, cleanup=False):
+        pass
+
+    def failing_release(retained):
+        events.append("release")
+        close_layout(retained)
+        raise OSError(errno.EIO, "injected release failure")
+
+    def failing_final_reclamation(lock):
+        nonlocal reclaim_calls
+        reclaim_calls += 1
+        reclaim_probe_survivors(lock)
+        if reclaim_calls == 2:
+            events.append("reclaim")
+            raise OSError(errno.EPERM, "injected reclamation failure")
+
+    monkeypatch.setattr("atoms.fs.binding.certify_sqlite_wal", no_certification)
+    monkeypatch.setattr("atoms.fs.binding.close_layout", failing_release)
+    monkeypatch.setattr(
+        "atoms.fs.binding.reclaim_probe_survivors", failing_final_reclamation
+    )
+    with acquire_project_lock(linux_backend, str(metadata_root)) as lock:
+        allowlist = test_allowlist(lock, project_root, test_storage_profile)
+        with pytest.raises(OSError) as caught:
+            bind_project_volume(
+                str(project_root), lock, allowlist=allowlist, storage=test_storage_profile
+            )
+
+    assert caught.value.errno == errno.EIO, "the first cleanup failure must surface"
+    assert events == ["release", "reclaim"], "both cleanup obligations must be attempted"
+
+
+def test_a_lone_reclamation_failure_surfaces_after_layout_release(
+    project_root,
+    metadata_root,
+    linux_backend,
+    test_allowlist,
+    test_storage_profile,
+    monkeypatch,
+):
+    events = []
+    reclaim_calls = 0
+
+    def no_certification(database_path, cleanup=False):
+        pass
+
+    def recording_release(retained):
+        events.append("release")
+        close_layout(retained)
+
+    def failing_final_reclamation(lock):
+        nonlocal reclaim_calls
+        reclaim_calls += 1
+        reclaim_probe_survivors(lock)
+        if reclaim_calls == 2:
+            events.append("reclaim")
+            raise OSError(errno.EPERM, "injected reclamation failure")
+
+    monkeypatch.setattr("atoms.fs.binding.certify_sqlite_wal", no_certification)
+    monkeypatch.setattr("atoms.fs.binding.close_layout", recording_release)
+    monkeypatch.setattr(
+        "atoms.fs.binding.reclaim_probe_survivors", failing_final_reclamation
+    )
+    with acquire_project_lock(linux_backend, str(metadata_root)) as lock:
+        allowlist = test_allowlist(lock, project_root, test_storage_profile)
+        with pytest.raises(OSError) as caught:
+            bind_project_volume(
+                str(project_root), lock, allowlist=allowlist, storage=test_storage_profile
+            )
+
+    assert caught.value.errno == errno.EPERM
+    assert events == ["release", "reclaim"]

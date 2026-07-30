@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Self
+from typing import Never, Self
 
 from atoms.core.capabilities import Capability
 from atoms.core.errors import CapabilityUnavailable, ProtocolError
@@ -94,6 +94,18 @@ class ProjectBinding:
         self._project_root_fd = kwargs["project_root_fd"]
         self._evidence = kwargs["evidence"]
         self._active = True
+
+    def __copy__(self) -> Never:
+        raise TypeError("ProjectBinding cannot be copied")
+
+    def __deepcopy__(self, memo: dict[int, object]) -> Never:
+        raise TypeError("ProjectBinding cannot be deep-copied")
+
+    def __reduce__(self) -> Never:
+        raise TypeError("ProjectBinding cannot be pickled")
+
+    def __reduce_ex__(self, protocol: int) -> Never:
+        raise TypeError("ProjectBinding cannot be pickled")
 
     def _require_active(self) -> None:
         if not self._active:
@@ -222,8 +234,13 @@ def bind_project_volume(
             # releases them in reverse opening order per design §9.3.
             try:
                 close_layout(retained)
-            finally:
-                reclaim_probe_survivors(lock)
+            except OSError as first:
+                try:
+                    reclaim_probe_survivors(lock)
+                except (OSError, ProtocolError):
+                    raise first
+                raise
+            reclaim_probe_survivors(lock)
 
         evidence = VolumeEvidence(
             configuration=configuration,
