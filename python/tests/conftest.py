@@ -6,10 +6,14 @@ from pathlib import Path
 import pytest
 
 from atoms.fs.linux import LinuxBackend
+from atoms.fs.lock import acquire_project_lock
 from atoms.fs.volume import StorageProfile
 from tests.fs_support import (
+    make_fake_backend,
     make_fdinfo_text,
+    make_metadata_root,
     make_mountinfo_text,
+    make_project_root,
     test_volume_or_skip_reason,
 )
 from tests.recovery_support import (
@@ -208,6 +212,29 @@ def test_volume(tmp_path_factory):
 @pytest.fixture
 def linux_backend():
     return LinuxBackend()
+
+
+@pytest.fixture
+def metadata_root(test_volume):
+    return make_metadata_root(test_volume)
+
+
+@pytest.fixture
+def project_root(test_volume):
+    return make_project_root(test_volume)
+
+
+@pytest.fixture
+def held_lock(linux_backend):
+    def acquire(metadata_root):
+        return acquire_project_lock(linux_backend, str(metadata_root))
+
+    return acquire
+
+
+@pytest.fixture
+def fake_backend():
+    return make_fake_backend()
 
 
 @pytest.fixture
