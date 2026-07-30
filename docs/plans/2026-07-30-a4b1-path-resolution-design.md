@@ -86,7 +86,7 @@ Two entries, #19 and #20, are added to the ledger in the same commit as this des
 | # | Admitted shape | Admitted by | First owner | Required behavior |
 | --- | --- | --- | --- | --- |
 | 19 | Resolve-and-close leaves a window: a directory's identity, `LookupProof`, and mount membership may change between approval and use | A4b-1 resolution contract | A5, A6, A7 | Re-resolve and compare all three against the approved topology before relying on it. Before durable transaction authority exists: refuse. After a durable transaction record exists: halt. Never silently reapprove or substitute the newly resolved topology. A5's obligation holds in either form: it may not use any resolved identity or `LookupProof` from `ProjectApprovedSpec` to authorize project-space access, and if its preparation creates the work root or scratch entries it re-resolves under the held lock first |
-| 20 | A4b-1 refuses by raising; nothing forces A4b-2 to surface those refusals rather than catching them | A4b-1/A4b-2 seam | A4b-2 | Every A4b-1 refusal class — `UNREPRODUCIBLE_CASEFOLD`, non-ext4 filesystem, non-linux backend, mount crossing, mount membership, metadata-root identity, `NAME_MAX`/`PATH_MAX`, and frontier drift — propagates uncaught through `approve_for_project`. Removed when A4b-2's propagation tests land |
+| 20 | A4b-1 refuses by raising; nothing forces A4b-2 to surface those refusals rather than catching them | A4b-1/A4b-2 seam | A4b-2 | **`approve_for_project` catches no exception raised by A4b-1.** The obligation is categorical rather than a list, because any enumeration drifts as §7 grows. Propagation tests cover every declared exception type in §7 — `ProjectApprovalRefused`, `PreconditionRefused`, `CapabilityUnavailable`, `ProtocolError`, and a bare `OSError` — and each load-bearing branch that produces one. Removed when those tests land |
 
 A fail-closed platform is **not** an admitted shape. Refusing XFS, Btrfs, and casefold directories
 admits nothing, so no ledger entry tracks them; §2.2 records them as non-scope instead.
@@ -259,7 +259,7 @@ Construction refuses anything that makes every path unapprovable, in this order:
    check, which is exactly why it must not be the first thing touched.
 3. `backend_id != "linux"` → `CapabilityUnavailable`.
 4. Root `DirectoryFacts`: `fstat` identity plus `read_lookup_constraints`.
-5. `VolumeLimits(path_max)` from `fpathconf(project_root_fd, "PC_PATH_MAX")`, read once. `PATH_MAX`
+5. A private `_path_max` from `fpathconf(project_root_fd, "PC_PATH_MAX")`, read once. `PATH_MAX`
    is exactly the longest relative pathname from the queried directory that does not cross a mount,
    and `RESOLVE_NO_XDEV` guarantees no crossing.
 6. Root proof is `UNREPRODUCIBLE_CASEFOLD` → `ProjectApprovalRefused`.
@@ -350,7 +350,7 @@ resolve(rel_path) -> ResolvedPrefix
           other        -> propagates unwrapped
       identity = FilesystemIdentity(fstat(child))
       identity == metadata root                    -> ProjectApprovalRefused
-      facts = memo[identity] or DirectoryFacts(identity, read_lookup_constraints(child, fs_type))
+      facts = memo.get(identity) or DirectoryFacts(identity, read_lookup_constraints(child, fs_type))
       facts.constraints.lookup_proof is UNREPRODUCIBLE_CASEFOLD -> ProjectApprovalRefused
       close(fd) unless fd is the borrowed root ; fd = child
 
@@ -427,9 +427,12 @@ variant can remove it.
 ### 6.5 Descriptor discipline
 
 Closing the parent immediately after the child opens bounds the resolver by a constant rather than by
-depth: **at most two resolver-opened descriptors exist at any instant, one in steady state, at any
-path depth.** The `O_PATH` observation coexists with its parent and never with a third. The borrowed
-project-root descriptor is never closed.
+depth: **at most three resolver-opened descriptors exist at any instant, one in steady state, at any
+path depth.** The peak occurs during a leaf observation, where the resolver-owned parent, the `O_PATH`
+descriptor, and the `/proc/self/fdinfo/<fd>` handle that `read_mount_id` opens internally all coexist.
+That third descriptor belongs to A4a's `read_mount_id` rather than to this module, which is exactly why
+the bound is stated as three: closing the parent early to reach a bound of two would hide a descriptor
+the resolver genuinely causes to exist. The borrowed project-root descriptor is never closed.
 
 Release is exception-safe on every path, using A4a's `close_all` and its first-failure-raised
 discipline. Cleanup order is reverse acquisition: child, then the resolver-owned parent, never the
@@ -438,13 +441,13 @@ borrowed root.
 The component name is checked against the **parent's** `name_max` before the child is opened, which is
 what makes the early parent close safe: the parent's facts are consumed before it is released.
 
-Closing is sound across the wider seam for a separate reason. A later stage re-resolving a path
-compares `FilesystemIdentity`, and identity is expected to determine the proof: ext4 refuses `+F` on a
-non-empty directory, so a directory's fold behavior cannot be switched on underneath a resolver that
-re-verifies identity. This design does **not** rest on that property — §3.2's first ledger entry
-requires re-resolution to compare `LookupProof` and mount membership as well as identity, so a
-violation is detected rather than assumed away. The property is the reason that comparison should
-never fire, and §9.4 pins it directly.
+Closing does not make a later re-resolution safe on its own, and this design claims no such thing.
+The `F` attribute **can be changed** — set or cleared — on an empty directory on a casefold-enabled
+filesystem, without changing its inode
+([`chattr(1)`](https://man7.org/linux/man-pages/man1/chattr.1.html)). A directory's identity can
+therefore remain equal while its `LookupProof` changes, so ledger #19's comparison can genuinely fire.
+Its three independent checks — identity, `LookupProof`, and mount membership — are the actual safety
+mechanism, and none of them is redundant.
 
 ### 6.6 `work_root_facts()`
 
@@ -453,12 +456,18 @@ resolved persistent parent, but `CreateDirectory` takes `ScratchRole.WORK`, whic
 `metadata_root/work` — and `CreateDirectory` is the only effect that takes it.
 
 ```
-work_root_facts()                                   # private, lazy, memoized after first call
-    fd = backend.open_child_directory(binding.metadata_root_fd, "work")   # guarded traversal
+work_root_facts()                        # private, lazy, memoized on success only
+    backend = binding.backend            # liveness FIRST, before the memo is consulted, so a
+    parent  = binding.metadata_root_fd   # cached result still fails after closure or lock release
+    if cached is not None: return cached
+
+    fd = backend.open_child_directory(parent, "work")          # guarded traversal
         ENOENT, ENOTDIR, ELOOP, EXDEV -> ProtocolError
         any other OSError             -> propagates unchanged
-    read_mount_id(fd) != evidence.mount_id -> ProtocolError
-    facts = DirectoryFacts(fstat(fd), read_lookup_constraints(fd, fs_type))
+    read_mount_id(fd) != evidence.mount_id                     -> ProtocolError
+    constraints = read_lookup_constraints(fd, fs_type)
+    constraints.lookup_proof is UNREPRODUCIBLE_CASEFOLD        -> ProjectApprovalRefused
+    cached = DirectoryFacts(fstat(fd), constraints)            # cached only on success
     close(fd)
 ```
 
@@ -466,6 +475,12 @@ Only the documented namespace contradictions become `ProtocolError`: `work/` is 
 by `ensure_metadata_layout` under the held lock at bind time, so its absence or malformation is a
 violated internal invariant. `EIO`, `EMFILE`, and similar system failures are not invariant violations
 and propagate unchanged, preserving §7's no-blanket rule.
+
+Liveness is read **before** the memo is consulted, so memoization cannot become a bypass: a resolver
+whose binding is closed after the first call must still fail on the second. Only a successful result
+is cached, so a refusal is never converted into a cached success on a later call. A casefolded `work/`
+raises `ProjectApprovalRefused` like any other unreproducible directory — `metadata_root` is
+engine-owned, but its lookup relation is no more reproducible than a project directory's.
 
 It is lazy so that an unapprovable `work/` cannot refuse a specification that contains no
 `CreateDirectory`.
@@ -484,9 +499,11 @@ here; the two are not in conflict.
 | `ProtocolError` | malformed input path, closed binding, released lock, `work/` namespace contradiction |
 | bare `OSError` | **everything else, unwrapped** |
 
-Exactly five errnos are interpreted as evidence: `ENOENT`, `ENOTDIR`, `ELOOP`, `EXDEV`,
-`ENAMETOOLONG`. There is no `except OSError` blanket anywhere in either module, and `ENAMETOOLONG`
-conversion is scoped around each pathname operation that can return it rather than around the walk.
+Exactly five **pathname** errnos are interpreted as evidence: `ENOENT`, `ENOTDIR`, `ELOOP`, `EXDEV`,
+`ENAMETOOLONG`. One further errno is interpreted outside the walk — `ENOTTY` from the flag ioctl in
+§5.3, meaning the filesystem does not implement it at all. Nothing else is interpreted anywhere: there
+is no `except OSError` blanket in either module, and `ENAMETOOLONG` conversion is scoped around each
+pathname operation that can return it rather than around the walk.
 
 `ENAMETOOLONG` stays a refusal rather than an assertion: reaching it means the kernel disagreed with
 `fpathconf`, and that is the filesystem's answer, not an engine defect.
@@ -512,7 +529,9 @@ Measured on the development volume: `PC_NAME_MAX` 255, `PC_PATH_MAX` 4096.
 
 ## 9. Verification
 
-Five layers. Only tier 4 requires privileges, and only tier 4 is ever skipped.
+Five layers. Tiers 1, 2, and 5 always run. Tier 3 skips without an ext4 volume, and its bind-mount
+cases skip additionally where user namespaces are unavailable. Tier 4 skips without the privileged
+setup of §9.4. Only tier 4 requires privileges.
 
 ### 9.1 Tier 1 — pure
 
@@ -529,8 +548,12 @@ spellings compare equal.
 - dispatch occurs before any ioctl — an `xfs`/`btrfs`/`ext2` type refuses without issuing one
 - `FS_CASEFOLD_FL` clear → `EXACT_BYTES`; set → `UNREPRODUCIBLE_CASEFOLD`
 - `ENOTTY` → `CapabilityUnavailable`, no fallback
-- `fpathconf` returning `-1`, `0`, or negative → `CapabilityUnavailable`
-- unexpected ioctl and `fpathconf` errors propagate unchanged
+- `PC_NAME_MAX` returning `-1`, `0`, or another negative value → `CapabilityUnavailable`
+- unexpected ioctl and `PC_NAME_MAX` errors propagate unchanged
+
+The same four `fpathconf` cases are covered independently for `PC_PATH_MAX` at construction — `-1`,
+`0`, another negative value, and an unexpected `OSError` — because the two limits are read by
+different code at different times, and testing only one leaves the other's handling unproven.
 
 Resolver-level tests then patch that function as the clean seam:
 
@@ -578,18 +601,21 @@ already proved works on this host:
 they equal `inherited_constraints` applied to its parent. Without this the §5.4 rule is only prose.
 
 **`work_root_facts()`**: lazy (not called during construction), memoized (one open across repeated
-calls), mount-checked, casefold-refusing, and closing its descriptor on every failure path. A4b-2
-later locks "called iff a `CreateDirectory` exists."
+calls), mount-checked, casefold-refusing, and closing its descriptor on every failure path. One test
+populates the memo, closes the binding, and calls again — it must raise `ProtocolError`, proving
+memoization is not a liveness bypass. Another proves a refusal is not cached: a failing call followed
+by a succeeding one must re-open. A4b-2 later locks "called iff a `CreateDirectory` exists."
 
 **Hard links**: two declared paths linked to one file resolve to equal leaf identities with distinct
 spelling and parent provenance. Whether topology merges them is an A4b-2 test, not this one.
 
-**Descriptor peak, measured deterministically.** Periodic sampling can miss the interval where parent
-and child coexist, so the real backend is wrapped to record `/proc/self/fd` immediately after
-`open_child_directory` returns, and the `O_PATH` observation is wrapped to record immediately after
-`os.open` returns. The maximum delta over baseline is compared for depth 2 and depth 512 and must be
-equal. `/proc/self/fd` rather than an `os.open` patch because `open_child_directory` issues raw
-`openat2` through `ctypes` and is invisible to such a patch.
+**Descriptor peak, measured deterministically.** Periodic sampling can miss the interval where
+descriptors coexist, so every acquisition point records `/proc/self/fd` immediately after it returns:
+the wrapped backend after `open_child_directory`, the wrapped leaf observation after `os.open`, and —
+critically — inside `read_mount_id` after it opens `/proc/self/fdinfo/<fd>`. Omitting that third hook
+is what would let a false bound of two pass. The maximum delta over baseline is compared for depth 2
+and depth 512, must be equal, and must equal three. `/proc/self/fd` rather than an `os.open` patch,
+because `open_child_directory` issues raw `openat2` through `ctypes` and is invisible to such a patch.
 
 ### 9.4 Tier 4 — real casefold volume
 
@@ -613,7 +639,10 @@ sudo mount -o loop "$IMG" "$MNT"            # privileged
 sudo chown "$USER" "$MNT"                   # privileged
 
 export ATOMS_CASEFOLD_VOLUME="$MNT"
+cd ~/d/atoms/python && uv run pytest
 ```
+
+The image lives outside the repository so no test artifact can land in `~/d/atoms/`.
 
 The suite creates `plain/` and `folded/`, sets `chattr +F folded/` while it is empty, and asserts:
 
@@ -622,9 +651,17 @@ The suite creates `plain/` and `folded/`, sets `chattr +F folded/` while it is e
 - a path through `folded/` raises `ProjectApprovalRefused`
 - a path through `plain/` resolves
 
-That is §13.3 surface 3's mixed-policy case, discharged as a **refusal** test. It still proves what
-the case exists to prove: the policy is per-directory, and one directory's answer is never applied to
-another.
+This is §13.3 surface 3's mixed-policy case exercised against the **resolution mechanism**. It does
+not discharge the surface — §3.1 records that A4b-1 discharges nothing, and the surface is a claim
+about approval. A4b-2's public refusal test through `approve_for_project` discharges it; this tier
+locks the mechanism that test will depend on. What it does prove directly is the reason the rule is
+per-directory rather than per-mount: the policy is decided per directory, and one directory's answer
+is never applied to another on the same filesystem.
+
+Created-directory inheritance is also exercised here, under `plain/`, not only on a filesystem that
+lacks the casefold feature entirely. That is the stronger case: it proves a directory created beneath
+a non-casefold parent on a **casefold-capable** filesystem inherits `EXACT_BYTES`, which is exactly
+what §5.4's rule asserts and what a feature-less volume cannot demonstrate.
 
 A separate test creates a directory, creates a child inside it, and asserts `chattr +F` then fails.
 That is a distinct claim from the fold test above — which sets the flag while the directory is still
@@ -672,14 +709,17 @@ support, and Btrfs support. All three are refused, and refusal admits nothing.
 8. A path equal to the metadata root and a path beneath it both refuse by identity.
 9. A bind mount at an ancestor and a bind mount at the declared leaf both refuse, the latter with
    equal `st_dev`.
-10. At most two resolver-opened descriptors exist at any instant, verified deterministically at depth
-    2 and depth 512.
-11. Exactly five errnos are interpreted; every other `OSError` propagates unwrapped, verified with the
-    backend call asserted to have occurred exactly once.
+10. At most three resolver-opened descriptors exist at any instant — resolver-owned parent, `O_PATH`
+    observation, and `read_mount_id`'s `fdinfo` handle — verified deterministically with all three
+    acquisition points instrumented, at depth 2 and depth 512.
+11. Exactly five pathname errnos are interpreted, plus `ENOTTY` in `read_lookup_constraints`; every
+    other `OSError` propagates unwrapped, verified with the backend call asserted to have occurred
+    exactly once with the valid parent descriptor and component.
 12. A closed binding or released lock fails every `resolve()` with `ProtocolError`, before any
     evidence-derived refusal.
-13. `work_root_facts()` is lazy, memoized, mount-checked, casefold-refusing, and releases its
-    descriptor on every failure path.
+13. `work_root_facts()` is lazy, mount-checked, casefold-refusing, releases its descriptor on every
+    failure path, caches only successes, and reads liveness before its memo — so a call after the
+    binding closes still raises `ProtocolError`.
 14. Observed constraints of a really-created directory equal `inherited_constraints` applied to its
     parent.
 15. `read_lookup_constraints` is tested directly, not only through the resolver.
