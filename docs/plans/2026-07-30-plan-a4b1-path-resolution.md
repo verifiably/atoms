@@ -22,8 +22,23 @@ Where this plan and either document disagree, the design wins over this plan and
 ## Global Constraints
 
 - Work from `~/d/atoms/python`. Gates are `uv run pytest`, `uv run ruff check`, `uv run pyright`.
-- Ruff config sets only `line-length = 120`, so default rules (E4/E7/E9/F) apply. F401, F811, and F821
-  are real gate failures.
+- **Ruff is pinned at 0.16.0 and its default rule set is much broader than `E4/E7/E9/F`** — measured on
+  this checkout it includes isort (`I001`), bugbear (`B017`, `B018`, …), flake8-simplify (`SIM117`),
+  bandit (`S`), and blind-except (`BLE001`), alongside `F401`/`F811`/`F821`. The code blocks below are
+  written to pass it as given. Run `uv run ruff check <file>` right after creating each file rather
+  than only at the task gate.
+- **One expected transient:** ruff's isort classifies a module as first-party by *path existence*, so a
+  test importing `atoms.fs.lookup` or `atoms.fs.resolve` before that module is created reports `I001`
+  and proposes an import order that becomes wrong once it exists. Between "write the failing test" and
+  "write the module" this is expected; do not reorder imports to satisfy it. It disappears at the step
+  that creates the module, which is where each task's ruff gate sits.
+- **pyright type-checks the tests** — `[tool.pyright]` sets no `include`. A `None` passed where a
+  union type is declared is a gate failure in a test just as in production code, and a union-typed
+  field must be narrowed with `isinstance` before a variant-only attribute is read.
+- **The two gates conflict on frozen-value tests.** pyright rejects `value.field = x` on a frozen
+  dataclass (`reportAttributeAccessIssue`); ruff's `B010` rejects `setattr(value, "field", x)` with a
+  *constant* name. Only a variable name passes both, so every such test takes its field through
+  `@pytest.mark.parametrize`.
 - **No `except OSError` blanket** in either new module. Exactly five pathname errnos are interpreted —
   `ENOENT`, `ENOTDIR`, `ELOOP`, `EXDEV`, `ENAMETOOLONG` — plus `ENOTTY` in `read_lookup_constraints`.
   Every other `OSError` propagates unwrapped.
@@ -48,7 +63,7 @@ Where this plan and either document disagree, the design wins over this plan and
 | `src/atoms/fs/resolve.py` | **Create.** `FilesystemIdentity`, `DirectoryFacts`, `EntryKind`, frontier types, `ResolvedHop`, `ResolvedPrefix`, `PathResolver`. |
 | `src/atoms/fs/bootstrap.py` | **Modify.** Add `WORK_DIRECTORY = "work"` beside `PROBE_DIRECTORY`. |
 | `tests/fs_support.py` | **Modify.** ext4 and casefold volume resolution, descriptor counting, namespace helper. |
-| `tests/conftest.py` | **Modify.** `ext4_volume`, `casefold_volume` fixtures. |
+| `tests/conftest.py` | **Modify.** Every new fixture lands here. The existing architecture guard registers fixtures **only** from `conftest.py`, so a module-local `@pytest.fixture` in any `test_fs_*.py` fails `test_fs_fixture_registry_covers_every_test_argument`. |
 | `tests/test_fs_lookup.py` | **Create.** Direct tests of `lookup.py` (tiers 1–2). |
 | `tests/test_fs_resolve_construction.py` | **Create.** `PathResolver.__init__` refusals and ordering. |
 | `tests/test_fs_resolve_walk.py` | **Create.** Observation, frontier matrix, memo, limits (tiers 2–3). |
@@ -67,6 +82,7 @@ Seven tasks. Each ends with a deliverable a reviewer could reject while approvin
 **Files:**
 - Modify: `src/atoms/core/errors.py`
 - Create: `src/atoms/fs/lookup.py`
+- Modify: `tests/conftest.py`
 - Create: `tests/test_fs_lookup.py`
 
 **Interfaces:**
@@ -75,9 +91,25 @@ Seven tasks. Each ends with a deliverable a reviewer could reject while approvin
   `DirectoryConstraints(lookup_proof: LookupProof, name_max: int)` frozen;
   `read_lookup_constraints(fd: int, filesystem_type: str) -> DirectoryConstraints`;
   `inherited_constraints(parent: DirectoryConstraints, filesystem_type: str) -> DirectoryConstraints`;
-  `ProjectApprovalRefused` in `atoms.core.errors`.
+  `ProjectApprovalRefused` in `atoms.core.errors`; the `directory_fd` fixture.
 
-- [ ] **Step 1: Write the failing tests**
+- [ ] **Step 1: Register the fixture in conftest**
+
+Append to `tests/conftest.py`. It goes here rather than in the test module because
+`test_fs_fixture_registry_covers_every_test_argument` reads fixture names from `conftest.py` alone
+and reports a module-local fixture as an unregistered test argument:
+
+```python
+@pytest.fixture
+def directory_fd(tmp_path):
+    fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    yield fd
+    os.close(fd)
+```
+
+Add `import os` to `tests/conftest.py`'s imports.
+
+- [ ] **Step 2: Write the failing tests**
 
 Create `tests/test_fs_lookup.py`:
 
@@ -86,6 +118,7 @@ Create `tests/test_fs_lookup.py`:
 
 from __future__ import annotations
 
+import dataclasses
 import errno
 import os
 
@@ -95,6 +128,7 @@ from atoms.core.errors import CapabilityUnavailable
 from atoms.fs.lookup import (
     EXT4_NAME_MAX,
     FS_CASEFOLD_FL,
+    FS_IOC_GETFLAGS,
     DirectoryConstraints,
     LookupProof,
     inherited_constraints,
@@ -102,13 +136,6 @@ from atoms.fs.lookup import (
 )
 
 NON_EXT4 = ("xfs", "btrfs", "ext2", "tmpfs", "")
-
-
-@pytest.fixture
-def directory_fd(tmp_path):
-    fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-    yield fd
-    os.close(fd)
 
 
 @pytest.mark.parametrize("filesystem_type", NON_EXT4)
@@ -159,16 +186,27 @@ def test_enotty_from_the_flag_ioctl_refuses_without_fallback(monkeypatch, direct
         read_lookup_constraints(directory_fd, "ext4")
 
 
-@pytest.mark.parametrize("code", [errno.EACCES, errno.EIO, errno.EPERM])
+@pytest.mark.parametrize("code", [errno.EACCES, errno.EIO, errno.EPERM, errno.EMFILE])
 def test_unexpected_ioctl_errors_propagate_unwrapped(monkeypatch, directory_fd, code):
-    def refuse(*args, **kwargs):
-        raise OSError(code, "injected")
+    """Assert on the injected object itself.
+
+    `not isinstance(caught, CapabilityUnavailable)` is satisfied by almost every OSError
+    and so proves nothing about wrapping. Identity with the raised object does, and the
+    call record proves the ioctl was actually reached rather than short-circuited
+    earlier — the exact blind spot A4a's review found in a propagation test.
+    """
+    injected = OSError(code, "injected")
+    calls = []
+
+    def refuse(fd, request, *args, **kwargs):
+        calls.append((fd, request))
+        raise injected
 
     monkeypatch.setattr("atoms.fs.lookup.fcntl.ioctl", refuse)
     with pytest.raises(OSError) as caught:
         read_lookup_constraints(directory_fd, "ext4")
-    assert type(caught.value) is OSError or not isinstance(caught.value, CapabilityUnavailable)
-    assert caught.value.errno == code
+    assert caught.value is injected
+    assert calls == [(directory_fd, FS_IOC_GETFLAGS)]
 
 
 @pytest.mark.parametrize("value", [-1, 0, -17])
@@ -180,17 +218,21 @@ def test_nonpositive_name_max_refuses(monkeypatch, directory_fd, value):
     assert "PC_NAME_MAX" in str(caught.value)
 
 
-@pytest.mark.parametrize("code", [errno.EACCES, errno.EIO])
+@pytest.mark.parametrize("code", [errno.EACCES, errno.EIO, errno.EPERM, errno.EMFILE])
 def test_unexpected_fpathconf_errors_propagate_unwrapped(monkeypatch, directory_fd, code):
     monkeypatch.setattr("atoms.fs.lookup._casefold_flag", lambda fd: False)
+    injected = OSError(code, "injected")
+    calls = []
 
     def refuse(fd, name):
-        raise OSError(code, "injected")
+        calls.append((fd, name))
+        raise injected
 
     monkeypatch.setattr("atoms.fs.lookup.os.fpathconf", refuse)
     with pytest.raises(OSError) as caught:
         read_lookup_constraints(directory_fd, "ext4")
-    assert caught.value.errno == code
+    assert caught.value is injected
+    assert calls == [(directory_fd, "PC_NAME_MAX")]
 
 
 def test_read_constraints_reports_the_real_name_max(directory_fd):
@@ -222,18 +264,29 @@ def test_inheritance_refuses_every_non_ext4_filesystem(filesystem_type):
         inherited_constraints(parent, filesystem_type)
 
 
-def test_constraints_are_frozen():
+@pytest.mark.parametrize("field", ["lookup_proof", "name_max"])
+def test_constraints_are_frozen(field):
+    """FrozenInstanceError specifically: `pytest.raises(Exception)` trips B017 and
+    would also pass against an unrelated AttributeError.
+
+    Parametrized on the field name, not written as a direct assignment, because the
+    two gates disagree: pyright rejects assigning to a frozen field, and ruff's B010
+    rejects `setattr` with a *constant* name. A variable name satisfies both, and
+    covering every field is better coverage than covering one.
+    """
     constraints = DirectoryConstraints(lookup_proof=LookupProof.EXACT_BYTES, name_max=255)
-    with pytest.raises(Exception):
-        constraints.name_max = 1
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        setattr(constraints, field, object())
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [ ] **Step 3: Run the tests to verify they fail**
 
 Run: `uv run pytest tests/test_fs_lookup.py -q`
 Expected: collection error, `ModuleNotFoundError: No module named 'atoms.fs.lookup'`.
+`uv run ruff check` reports `I001` here; that is the expected transient from Global Constraints and
+clears at Step 5.
 
-- [ ] **Step 3: Add the error type**
+- [ ] **Step 4: Add the error type**
 
 In `src/atoms/core/errors.py`, after `SpecValidationError`:
 
@@ -247,7 +300,7 @@ class ProjectApprovalRefused(AtomsError):
     """
 ```
 
-- [ ] **Step 4: Write `lookup.py`**
+- [ ] **Step 5: Write `lookup.py`**
 
 Create `src/atoms/fs/lookup.py`:
 
@@ -366,18 +419,18 @@ def inherited_constraints(
     )
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [ ] **Step 6: Run the tests to verify they pass**
 
 Run: `uv run pytest tests/test_fs_lookup.py -q`
 Expected: PASS.
 
 Run: `uv run ruff check && uv run pyright`
-Expected: clean.
+Expected: clean. The `I001` from Step 3 is gone now that `atoms/fs/lookup.py` exists.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add src/atoms/core/errors.py src/atoms/fs/lookup.py tests/test_fs_lookup.py
+git add src/atoms/core/errors.py src/atoms/fs/lookup.py tests/conftest.py tests/test_fs_lookup.py
 git commit -m "feat(fs): read per-directory lookup constraints"
 ```
 
@@ -387,19 +440,155 @@ git commit -m "feat(fs): read per-directory lookup constraints"
 
 **Files:**
 - Create: `src/atoms/fs/resolve.py`
+- Modify: `tests/fs_support.py`
+- Modify: `tests/conftest.py`
 - Create: `tests/test_fs_resolve_construction.py`
 
 **Interfaces:**
 - Consumes: Task 1's `LookupProof`, `DirectoryConstraints`, `read_lookup_constraints`;
   A4a's `ProjectBinding` (`backend`, `project_root_fd`, `metadata_root_fd`, `evidence`).
-- Produces: `FilesystemIdentity(device: int, inode: int)`;
+- Produces: `ext4_volume_or_skip_reason()` and `descriptor_count()` in `tests/fs_support.py`; the
+  `ext4_volume`, `ext4_project_root`, `ext4_metadata_root`, `ext4_bound_volume`,
+  `ext4_nested_bound_volume`, `resolver_on`, and `resolver_after_lock_release` fixtures;
+  `FilesystemIdentity(device: int, inode: int)`;
   `DirectoryFacts(identity: FilesystemIdentity, constraints: DirectoryConstraints)`;
   `EntryKind` (`DIRECTORY` | `REGULAR_FILE` | `SYMLINK` | `OTHER`); `AbsentFrontier()`;
   `PresentFrontier(identity, kind)`; `Frontier` union; `ResolvedHop(declared_component, facts)`;
   `ResolvedPrefix(root, hops, frontier_name, frontier, remainder)` with a
   `deepest_constraints` property; `PathResolver(binding)`.
 
-- [ ] **Step 1: Write the failing tests**
+- [ ] **Step 1: Add the ext4 volume helpers**
+
+A4a's `bound_volume` admits ext4, XFS, **and** Btrfs, so a resolver constructed on it raises
+`CapabilityUnavailable` from `read_lookup_constraints` on a non-ext4 host — every resolver test would
+fail rather than skip. The ext4-rooted fixtures therefore arrive with the first task that constructs a
+resolver, not with the conformance tier. Append to `tests/fs_support.py`:
+
+```python
+EXT4 = "ext4"
+
+
+def ext4_volume_or_skip_reason() -> tuple[Path | None, str]:
+    """A4b-1 approves only ext4, while A4a admits ext4, xfs, and btrfs.
+
+    A contributor on btrfs must be told why this suite skips, not merely that it does.
+    """
+    resolved = resolve_test_volume()
+    if resolved is None:
+        return None, "no test volume: set ATOMS_TEST_VOLUME to a directory on ext4"
+    probe = resolved if resolved.exists() else resolved.parent
+    found = _filesystem_type_for(probe)
+    if found != EXT4:
+        return None, (
+            f"A4b-1 approves only ext4; the test volume is {found!r}. "
+            "Set ATOMS_TEST_VOLUME to a directory on ext4."
+        )
+    return resolved, ""
+
+
+def descriptor_count() -> int:
+    """Open descriptors for this process.
+
+    The listing itself opens one descriptor, so this contributes a constant; only
+    deltas between counts measured this way are meaningful.
+    """
+    return len(os.listdir("/proc/self/fd"))
+```
+
+- [ ] **Step 2: Register the fixtures in conftest**
+
+Append to `tests/conftest.py`, and add `build_test_allowlist`, `descriptor_count`, and
+`ext4_volume_or_skip_reason` to the `tests.fs_support` import list:
+
+```python
+@pytest.fixture
+def ext4_volume():
+    base, reason = ext4_volume_or_skip_reason()
+    if base is None:
+        pytest.skip(reason)
+    base.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=base) as directory:
+        yield Path(directory)
+
+
+@pytest.fixture
+def ext4_project_root(ext4_volume):
+    return make_project_root(ext4_volume)
+
+
+@pytest.fixture
+def ext4_metadata_root(ext4_volume):
+    return make_metadata_root(ext4_volume)
+
+
+@pytest.fixture
+def ext4_bound_volume(ext4_project_root, ext4_metadata_root, test_storage_profile):
+    return make_bound_volume(
+        make_fake_backend(), ext4_project_root, ext4_metadata_root, test_storage_profile
+    )
+
+
+@pytest.fixture
+def ext4_nested_bound_volume(ext4_project_root, test_storage_profile):
+    """A binding whose metadata root sits INSIDE its project root.
+
+    The sibling layout of `project_root`/`metadata_root` makes every declared path's
+    relative spelling start with '..', which require_rel_path rejects, so a
+    metadata-root containment test written against it can only skip itself. This is
+    also the layout a real project uses.
+    """
+    return make_bound_volume(
+        make_fake_backend(),
+        ext4_project_root,
+        ext4_project_root / "metadata",
+        test_storage_profile,
+    )
+
+
+@pytest.fixture
+def resolver_on(ext4_bound_volume):
+    """A resolver and its live binding, on ext4."""
+    from atoms.fs.resolve import PathResolver
+
+    @contextlib.contextmanager
+    def build():
+        with ext4_bound_volume() as binding:
+            yield PathResolver(binding), binding
+
+    return build
+
+
+@pytest.fixture
+def resolver_after_lock_release(
+    linux_backend, ext4_project_root, ext4_metadata_root, test_storage_profile
+):
+    """A resolver whose binding is still active but whose lock has been released.
+
+    ProjectBinding._require_active checks its own flag AND lock.held, so this is a
+    distinct liveness failure from a closed binding — and it needs a binding that
+    outlives its lock, which no context-managed fixture produces.
+    """
+    from atoms.fs.binding import bind_project_volume
+    from atoms.fs.resolve import PathResolver
+
+    with acquire_project_lock(linux_backend, str(ext4_metadata_root)) as lock:
+        allowlist = build_test_allowlist(lock, ext4_project_root, test_storage_profile)
+        binding = bind_project_volume(
+            str(ext4_project_root),
+            lock,
+            allowlist=allowlist,
+            storage=test_storage_profile,
+        )
+        resolver = PathResolver(binding)
+    with binding:
+        assert binding.active and not lock.held
+        yield resolver
+```
+
+Add `import contextlib` to `tests/conftest.py`'s imports. `PathResolver` is imported inside the
+fixture bodies so `conftest.py` still imports cleanly before Step 4 creates the module.
+
+- [ ] **Step 3: Write the failing tests**
 
 Create `tests/test_fs_resolve_construction.py`:
 
@@ -409,6 +598,7 @@ Create `tests/test_fs_resolve_construction.py`:
 from __future__ import annotations
 
 import dataclasses
+import errno
 import os
 
 import pytest
@@ -422,35 +612,37 @@ from atoms.fs.lookup import DirectoryConstraints, LookupProof
 from atoms.fs.resolve import (
     AbsentFrontier,
     DirectoryFacts,
+    EntryKind,
     FilesystemIdentity,
     PathResolver,
+    PresentFrontier,
     ResolvedHop,
     ResolvedPrefix,
 )
 
 
-def test_construction_succeeds_on_a_plain_ext4_project_root(bound_volume):
-    with bound_volume() as binding:
+def test_construction_succeeds_on_a_plain_ext4_project_root(ext4_bound_volume):
+    with ext4_bound_volume() as binding:
         resolver = PathResolver(binding)
         assert resolver is not None
 
 
-def test_a_closed_binding_refuses_construction(bound_volume):
-    with bound_volume() as binding:
+def test_a_closed_binding_refuses_construction(ext4_bound_volume):
+    with ext4_bound_volume() as binding:
         pass
     with pytest.raises(ProtocolError):
         PathResolver(binding)
 
 
 def test_liveness_is_checked_before_any_detached_evidence_is_read(
-    monkeypatch, bound_volume
+    monkeypatch, ext4_bound_volume
 ):
     """A closed binding must fail on liveness, never on an evidence-derived refusal.
 
     `evidence` is a detached value whose property performs no liveness check, so
     reading it first would let a closed binding produce a CapabilityUnavailable.
     """
-    with bound_volume() as binding:
+    with ext4_bound_volume() as binding:
         pass
     monkeypatch.setattr(
         type(binding),
@@ -461,8 +653,8 @@ def test_liveness_is_checked_before_any_detached_evidence_is_read(
         PathResolver(binding)
 
 
-def test_a_non_linux_backend_id_refuses(monkeypatch, bound_volume):
-    with bound_volume() as binding:
+def test_a_non_linux_backend_id_refuses(monkeypatch, ext4_bound_volume):
+    with ext4_bound_volume() as binding:
         configuration = dataclasses.replace(
             binding.evidence.configuration, backend_id="darwin"
         )
@@ -474,8 +666,8 @@ def test_a_non_linux_backend_id_refuses(monkeypatch, bound_volume):
 
 
 @pytest.mark.parametrize("filesystem_type", ["xfs", "btrfs", "ext2"])
-def test_a_non_ext4_filesystem_refuses(monkeypatch, bound_volume, filesystem_type):
-    with bound_volume() as binding:
+def test_a_non_ext4_filesystem_refuses(monkeypatch, ext4_bound_volume, filesystem_type):
+    with ext4_bound_volume() as binding:
         configuration = dataclasses.replace(
             binding.evidence.configuration, filesystem_type=filesystem_type
         )
@@ -486,8 +678,8 @@ def test_a_non_ext4_filesystem_refuses(monkeypatch, bound_volume, filesystem_typ
         assert filesystem_type in str(caught.value)
 
 
-def test_a_casefold_project_root_refuses(monkeypatch, bound_volume):
-    with bound_volume() as binding:
+def test_a_casefold_project_root_refuses(monkeypatch, ext4_bound_volume):
+    with ext4_bound_volume() as binding:
         monkeypatch.setattr(
             "atoms.fs.resolve.read_lookup_constraints",
             lambda fd, filesystem_type: DirectoryConstraints(
@@ -500,9 +692,9 @@ def test_a_casefold_project_root_refuses(monkeypatch, bound_volume):
 
 
 def test_a_project_root_identical_to_the_metadata_root_refuses(
-    monkeypatch, bound_volume
+    monkeypatch, ext4_bound_volume
 ):
-    with bound_volume() as binding:
+    with ext4_bound_volume() as binding:
         info = os.fstat(binding.project_root_fd)
         evidence = _evidence_with(
             binding.evidence,
@@ -516,8 +708,8 @@ def test_a_project_root_identical_to_the_metadata_root_refuses(
 
 
 @pytest.mark.parametrize("value", [-1, 0, -17])
-def test_nonpositive_path_max_refuses(monkeypatch, bound_volume, value):
-    with bound_volume() as binding:
+def test_nonpositive_path_max_refuses(monkeypatch, ext4_bound_volume, value):
+    with ext4_bound_volume() as binding:
         monkeypatch.setattr(
             "atoms.fs.resolve.os.fpathconf",
             lambda fd, name: value if name == "PC_PATH_MAX" else 255,
@@ -527,24 +719,99 @@ def test_nonpositive_path_max_refuses(monkeypatch, bound_volume, value):
         assert "PC_PATH_MAX" in str(caught.value)
 
 
-@pytest.mark.parametrize("code", [1, 5])
-def test_unexpected_path_max_errors_propagate_unwrapped(monkeypatch, bound_volume, code):
-    with bound_volume() as binding:
+@pytest.mark.parametrize("code", [errno.EACCES, errno.EIO, errno.EPERM, errno.EMFILE])
+def test_unexpected_path_max_errors_propagate_unwrapped(
+    monkeypatch, ext4_bound_volume, code
+):
+    with ext4_bound_volume() as binding:
+        injected = OSError(code, "injected")
+        calls = []
 
         def refuse(fd, name):
-            raise OSError(code, "injected")
+            calls.append((fd, name))
+            raise injected
 
         monkeypatch.setattr("atoms.fs.resolve.os.fpathconf", refuse)
         with pytest.raises(OSError) as caught:
             PathResolver(binding)
-        assert caught.value.errno == code
-        assert not isinstance(caught.value, CapabilityUnavailable)
+        assert caught.value is injected
+        assert calls == [(binding.project_root_fd, "PC_PATH_MAX")]
 
 
 def test_identity_ignores_declared_spelling():
     left = FilesystemIdentity(device=1, inode=2)
     right = FilesystemIdentity(device=1, inode=2)
     assert left == right and hash(left) == hash(right)
+
+
+@pytest.mark.parametrize(
+    ("value", "field"),
+    [
+        (FilesystemIdentity(1, 2), "device"),
+        (
+            DirectoryFacts(
+                FilesystemIdentity(1, 2),
+                DirectoryConstraints(
+                    lookup_proof=LookupProof.EXACT_BYTES, name_max=255
+                ),
+            ),
+            "identity",
+        ),
+        (PresentFrontier(FilesystemIdentity(1, 2), EntryKind.DIRECTORY), "kind"),
+        (
+            ResolvedHop(
+                "a",
+                DirectoryFacts(
+                    FilesystemIdentity(1, 2),
+                    DirectoryConstraints(
+                        lookup_proof=LookupProof.EXACT_BYTES, name_max=255
+                    ),
+                ),
+            ),
+            "declared_component",
+        ),
+        (
+            ResolvedPrefix(
+                root=DirectoryFacts(
+                    FilesystemIdentity(1, 2),
+                    DirectoryConstraints(
+                        lookup_proof=LookupProof.EXACT_BYTES, name_max=255
+                    ),
+                ),
+                hops=(),
+                frontier_name="a",
+                frontier=AbsentFrontier(),
+                remainder=(),
+            ),
+            "frontier_name",
+        ),
+    ],
+)
+def test_every_declared_value_type_is_frozen(value, field):
+    """FrozenInstanceError specifically, per design §9.1.
+
+    `pytest.raises(Exception)` trips B017 and would also pass against an unrelated
+    AttributeError, which is what a frozen slots dataclass raises for a name that is
+    not a declared field. The field name comes through parametrize rather than being
+    a literal: pyright rejects a direct assignment to a frozen field, and ruff's B010
+    rejects `setattr` with a constant name, so only a variable satisfies both gates.
+    """
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        setattr(value, field, object())
+
+
+def test_the_absent_frontier_is_frozen_and_declares_no_field():
+    """Checked behaviourally, without an assignment.
+
+    A frozen slots dataclass raises TypeError, not FrozenInstanceError, for a name it
+    does not declare — and AbsentFrontier declares none — so an assignment-based test
+    would assert the wrong thing. Hashability is the substitute proof: @dataclass sets
+    __hash__ to None when eq=True and frozen=False, so a non-frozen version of this
+    type would raise TypeError here.
+    """
+    assert dataclasses.fields(AbsentFrontier) == ()
+    assert AbsentFrontier() == AbsentFrontier()
+    assert hash(AbsentFrontier()) == hash(AbsentFrontier())
 
 
 def test_deepest_constraints_falls_back_to_the_root_when_there_are_no_hops():
@@ -597,12 +864,12 @@ class _StandInEvidence:
     mount_id: int
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [ ] **Step 4: Run the tests to verify they fail**
 
 Run: `uv run pytest tests/test_fs_resolve_construction.py -q`
 Expected: collection error, `ModuleNotFoundError: No module named 'atoms.fs.resolve'`.
 
-- [ ] **Step 3: Write the value types and constructor**
+- [ ] **Step 5: Write the value types and constructor**
 
 Create `src/atoms/fs/resolve.py`:
 
@@ -732,7 +999,6 @@ class PathResolver:
         "_filesystem_type",
         "_metadata_identity",
         "_path_max",
-        "_root_facts",
         "_work_base",
     )
 
@@ -768,22 +1034,28 @@ class PathResolver:
                 "the project root is a casefold directory; its lookup relation "
                 "cannot be reproduced, so no path beneath it can be approved"
             )
-        self._root_facts = DirectoryFacts(identity, constraints)
+        # Seeds the memo rather than a dedicated field. resolve() re-observes the root
+        # through the same path as every other hop (§6.5), so a stored copy would only
+        # be a second, unchecked answer.
         self._facts_by_identity: dict[FilesystemIdentity, DirectoryFacts] = {
-            identity: self._root_facts
+            identity: DirectoryFacts(identity, constraints)
         }
         self._work_base: DirectoryFacts | None = None
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [ ] **Step 6: Run the tests to verify they pass**
 
 Run: `uv run pytest tests/test_fs_resolve_construction.py -q`
-Expected: PASS.
+Expected: PASS, or skipped with the ext4 reason on a non-ext4 host.
 
-- [ ] **Step 5: Commit**
+Run: `uv run ruff check && uv run pyright`
+Expected: clean.
+
+- [ ] **Step 7: Commit**
 
 ```bash
-git add src/atoms/fs/resolve.py tests/test_fs_resolve_construction.py
+git add src/atoms/fs/resolve.py tests/fs_support.py tests/conftest.py \
+  tests/test_fs_resolve_construction.py
 git commit -m "feat(fs): construct an approval-scoped path resolver"
 ```
 
@@ -815,38 +1087,22 @@ import os
 
 import pytest
 
-from atoms.core.errors import (
-    PreconditionRefused,
-    ProjectApprovalRefused,
-    ProtocolError,
-)
-from atoms.fs.resolve import AbsentFrontier, EntryKind, PathResolver, PresentFrontier
+from atoms.core.errors import ProjectApprovalRefused
+from atoms.fs.resolve import AbsentFrontier, EntryKind, PresentFrontier
+from tests.fs_support import descriptor_count
 
 
-@pytest.fixture
-def resolver_on(bound_volume):
-    """A resolver plus the project root path its fixtures should populate."""
-    import contextlib
-
-    @contextlib.contextmanager
-    def build():
-        with bound_volume() as binding:
-            yield PathResolver(binding), binding
-
-    return build
-
-
-def test_an_absent_entry_is_reported_absent(resolver_on, project_root):
+def test_an_absent_entry_is_reported_absent(resolver_on):
     with resolver_on() as (resolver, binding):
         frontier = resolver._observe(binding.project_root_fd, "missing", "missing")
         assert isinstance(frontier, AbsentFrontier)
 
 
-def test_a_regular_file_is_observed_with_its_identity(resolver_on, project_root):
-    (project_root / "plain").write_text("x")
+def test_a_regular_file_is_observed_with_its_identity(resolver_on, ext4_project_root):
+    (ext4_project_root / "plain").write_text("x")
     with resolver_on() as (resolver, binding):
         frontier = resolver._observe(binding.project_root_fd, "plain", "plain")
-        info = os.lstat(project_root / "plain")
+        info = os.lstat(ext4_project_root / "plain")
         assert isinstance(frontier, PresentFrontier)
         assert frontier.kind is EntryKind.REGULAR_FILE
         assert (frontier.identity.device, frontier.identity.inode) == (
@@ -855,37 +1111,39 @@ def test_a_regular_file_is_observed_with_its_identity(resolver_on, project_root)
         )
 
 
-def test_a_symlink_is_observed_rather_than_followed(resolver_on, project_root):
-    (project_root / "target").write_text("x")
-    os.symlink("target", project_root / "alias")
+def test_a_symlink_is_observed_rather_than_followed(resolver_on, ext4_project_root):
+    (ext4_project_root / "target").write_text("x")
+    os.symlink("target", ext4_project_root / "alias")
     with resolver_on() as (resolver, binding):
         frontier = resolver._observe(binding.project_root_fd, "alias", "alias")
         assert frontier.kind is EntryKind.SYMLINK
-        assert frontier.identity.inode == os.lstat(project_root / "alias").st_ino
+        assert frontier.identity.inode == os.lstat(ext4_project_root / "alias").st_ino
 
 
-def test_a_directory_leaf_is_observed_without_being_opened(resolver_on, project_root):
-    (project_root / "child").mkdir()
+def test_a_directory_leaf_is_observed_without_being_opened(
+    resolver_on, ext4_project_root
+):
+    (ext4_project_root / "child").mkdir()
     with resolver_on() as (resolver, binding):
         frontier = resolver._observe(binding.project_root_fd, "child", "child")
         assert frontier.kind is EntryKind.DIRECTORY
 
 
-def test_a_fifo_is_observed_as_other(resolver_on, project_root):
-    os.mkfifo(project_root / "pipe")
+def test_a_fifo_is_observed_as_other(resolver_on, ext4_project_root):
+    os.mkfifo(ext4_project_root / "pipe")
     with resolver_on() as (resolver, binding):
         frontier = resolver._observe(binding.project_root_fd, "pipe", "pipe")
         assert frontier.kind is EntryKind.OTHER
 
 
 def test_an_entry_whose_identity_is_the_metadata_root_refuses(
-    resolver_on, project_root
+    resolver_on, ext4_project_root
 ):
     """Identity, not spelling: an entry matching the metadata root must refuse."""
     from atoms.fs.resolve import FilesystemIdentity
 
-    (project_root / "sentinel").write_text("x")
-    info = os.lstat(project_root / "sentinel")
+    (ext4_project_root / "sentinel").write_text("x")
+    info = os.lstat(ext4_project_root / "sentinel")
     with resolver_on() as (resolver, binding):
         resolver._metadata_identity = FilesystemIdentity(
             device=info.st_dev, inode=info.st_ino
@@ -895,10 +1153,12 @@ def test_an_entry_whose_identity_is_the_metadata_root_refuses(
         assert "metadata root" in str(caught.value)
 
 
-def test_an_entry_on_a_different_mount_refuses(monkeypatch, resolver_on, project_root):
+def test_an_entry_on_a_different_mount_refuses(
+    monkeypatch, resolver_on, ext4_project_root
+):
     """A bind mount can share st_dev while carrying a distinct mount id, which is
     exactly why the observation goes through O_PATH and read_mount_id."""
-    (project_root / "plain").write_text("x")
+    (ext4_project_root / "plain").write_text("x")
     with resolver_on() as (resolver, binding):
         monkeypatch.setattr(
             "atoms.fs.resolve.read_mount_id", lambda fd: binding.evidence.mount_id + 1
@@ -909,47 +1169,84 @@ def test_an_entry_on_a_different_mount_refuses(monkeypatch, resolver_on, project
 
 
 def test_observation_releases_its_descriptor_on_the_success_path(
-    resolver_on, project_root
+    resolver_on, ext4_project_root
 ):
-    (project_root / "plain").write_text("x")
+    (ext4_project_root / "plain").write_text("x")
     with resolver_on() as (resolver, binding):
-        before = len(os.listdir("/proc/self/fd"))
+        before = descriptor_count()
         resolver._observe(binding.project_root_fd, "plain", "plain")
-        assert len(os.listdir("/proc/self/fd")) == before
+        assert descriptor_count() == before
 
 
 def test_observation_releases_its_descriptor_on_the_refusal_path(
-    monkeypatch, resolver_on, project_root
+    monkeypatch, resolver_on, ext4_project_root
 ):
-    (project_root / "plain").write_text("x")
+    (ext4_project_root / "plain").write_text("x")
     with resolver_on() as (resolver, binding):
         monkeypatch.setattr(
             "atoms.fs.resolve.read_mount_id", lambda fd: binding.evidence.mount_id + 1
         )
-        before = len(os.listdir("/proc/self/fd"))
+        before = descriptor_count()
         with pytest.raises(ProjectApprovalRefused):
             resolver._observe(binding.project_root_fd, "plain", "plain")
-        assert len(os.listdir("/proc/self/fd")) == before
+        assert descriptor_count() == before
 
 
-@pytest.mark.parametrize("code", [errno.EACCES, errno.EIO])
+def _failing_observation(monkeypatch, calls, injected):
+    """Fail only the O_PATH observation, passing every other os.open through.
+
+    `atoms.fs.resolve.os` IS the `os` module, so patching through that path replaces
+    os.open process-wide. An unconditional replacement breaks pytest's own teardown,
+    so the substitute has to recognise the call it is meant to fail.
+    """
+    real_open = os.open
+
+    def refuse(name, flags, *args, **kwargs):
+        if flags & os.O_PATH:
+            calls.append((name, flags, kwargs.get("dir_fd")))
+            raise injected
+        return real_open(name, flags, *args, **kwargs)
+
+    monkeypatch.setattr("atoms.fs.resolve.os.open", refuse)
+
+
+def test_an_enametoolong_leaf_observation_refuses(monkeypatch, resolver_on):
+    """Reachable only by injection: _require_name_fits refuses an over-long name
+    first, so the kernel disagreeing with fpathconf has no ordinary fixture."""
+    injected = OSError(errno.ENAMETOOLONG, "injected")
+    calls = []
+    with resolver_on() as (resolver, binding):
+        _failing_observation(monkeypatch, calls, injected)
+        with pytest.raises(ProjectApprovalRefused) as caught:
+            resolver._observe(binding.project_root_fd, "wide", "wide")
+        assert "name limit" in str(caught.value)
+        assert caught.value.__cause__ is injected
+        assert [name for name, _, _ in calls] == ["wide"]
+
+
+@pytest.mark.parametrize("code", [errno.EACCES, errno.EIO, errno.EPERM, errno.EMFILE])
 def test_unexpected_observation_errors_propagate_unwrapped(
     monkeypatch, resolver_on, code
 ):
+    injected = OSError(code, "injected")
+    calls = []
     with resolver_on() as (resolver, binding):
-        real_open = os.open
-
-        def refuse(name, flags, *args, **kwargs):
-            if flags & os.O_PATH:
-                raise OSError(code, "injected")
-            return real_open(name, flags, *args, **kwargs)
-
-        monkeypatch.setattr("atoms.fs.resolve.os.open", refuse)
+        _failing_observation(monkeypatch, calls, injected)
         with pytest.raises(OSError) as caught:
             resolver._observe(binding.project_root_fd, "anything", "anything")
-        assert caught.value.errno == code
-        assert not isinstance(caught.value, ProjectApprovalRefused)
+        assert caught.value is injected
+        assert calls == [
+            (
+                "anything",
+                os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC,
+                binding.project_root_fd,
+            )
+        ]
 ```
+
+This module imports only what it uses. Task 4 appends tests that need
+`PreconditionRefused` and `ProtocolError`, and its Step 1 replaces the import block
+accordingly — importing them now would leave Task 3 failing `F401`.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -958,19 +1255,16 @@ Expected: FAIL with `AttributeError: 'PathResolver' object has no attribute '_ob
 
 - [ ] **Step 3: Implement observation**
 
-**Replace** the `atoms.core.errors` import block in `src/atoms/fs/resolve.py` with the four-name
-version below, and add the two new imports and `import errno`:
+Add `import errno` to `src/atoms/fs/resolve.py`'s stdlib imports and these two lines after the
+`atoms.fs.lookup` import:
 
 ```python
-from atoms.core.errors import (
-    CapabilityUnavailable,
-    PreconditionRefused,
-    ProjectApprovalRefused,
-    ProtocolError,
-)
 from atoms.fs.lock import close_all
 from atoms.fs.volume import read_mount_id
 ```
+
+Leave the `atoms.core.errors` block at its two names. `_observe` raises neither `PreconditionRefused`
+nor `ProtocolError`; Task 4 introduces both, and importing them now is an `F401` gate failure.
 
 Add to `PathResolver`:
 
@@ -1014,12 +1308,13 @@ Add to `PathResolver`:
         return PresentFrontier(identity, _entry_kind(info.st_mode))
 ```
 
-Add `import errno` to the module imports.
-
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `uv run pytest tests/test_fs_resolve_walk.py -q`
 Expected: PASS.
+
+Run: `uv run ruff check && uv run pyright`
+Expected: clean. This task stands on its own; do not carry forward an import Task 4 will need.
 
 - [ ] **Step 5: Commit**
 
@@ -1043,14 +1338,25 @@ git commit -m "feat(fs): observe entries coherently through O_PATH"
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `tests/test_fs_resolve_walk.py`:
+First **replace** `tests/test_fs_resolve_walk.py`'s `atoms.core.errors` import with the three-name
+version — the appended tests need both new names, and Task 3 deliberately did not import them:
+
+```python
+from atoms.core.errors import (
+    PreconditionRefused,
+    ProjectApprovalRefused,
+    ProtocolError,
+)
+```
+
+Then append:
 
 ```python
 def test_a_fully_existing_chain_resolves_with_an_empty_remainder(
-    resolver_on, project_root
+    resolver_on, ext4_project_root
 ):
-    (project_root / "a" / "b").mkdir(parents=True)
-    (project_root / "a" / "b" / "leaf").write_text("x")
+    (ext4_project_root / "a" / "b").mkdir(parents=True)
+    (ext4_project_root / "a" / "b" / "leaf").write_text("x")
     with resolver_on() as (resolver, _):
         prefix = resolver.resolve("a/b/leaf")
         assert [hop.declared_component for hop in prefix.hops] == ["a", "b"]
@@ -1059,8 +1365,8 @@ def test_a_fully_existing_chain_resolves_with_an_empty_remainder(
         assert prefix.frontier.kind is EntryKind.REGULAR_FILE
 
 
-def test_an_absent_leaf_yields_an_absent_frontier(resolver_on, project_root):
-    (project_root / "a").mkdir()
+def test_an_absent_leaf_yields_an_absent_frontier(resolver_on, ext4_project_root):
+    (ext4_project_root / "a").mkdir()
     with resolver_on() as (resolver, _):
         prefix = resolver.resolve("a/missing")
         assert prefix.remainder == ()
@@ -1068,9 +1374,7 @@ def test_an_absent_leaf_yields_an_absent_frontier(resolver_on, project_root):
         assert isinstance(prefix.frontier, AbsentFrontier)
 
 
-def test_an_absent_ancestor_stops_the_walk_and_keeps_the_remainder(
-    resolver_on, project_root
-):
+def test_an_absent_ancestor_stops_the_walk_and_keeps_the_remainder(resolver_on):
     with resolver_on() as (resolver, _):
         prefix = resolver.resolve("a/b/leaf")
         assert prefix.hops == ()
@@ -1087,9 +1391,9 @@ def test_an_absent_ancestor_stops_the_walk_and_keeps_the_remainder(
     ],
 )
 def test_a_non_directory_ancestor_becomes_a_blocking_frontier(
-    resolver_on, project_root, maker, kind
+    resolver_on, ext4_project_root, maker, kind
 ):
-    maker(project_root / "a")
+    maker(ext4_project_root / "a")
     with resolver_on() as (resolver, _):
         prefix = resolver.resolve("a/b/leaf")
         assert prefix.hops == ()
@@ -1099,10 +1403,10 @@ def test_a_non_directory_ancestor_becomes_a_blocking_frontier(
 
 
 def test_a_symlink_ancestor_becomes_a_symlink_blocking_frontier(
-    resolver_on, project_root
+    resolver_on, ext4_project_root
 ):
-    (project_root / "real").mkdir()
-    os.symlink("real", project_root / "a")
+    (ext4_project_root / "real").mkdir()
+    os.symlink("real", ext4_project_root / "a")
     with resolver_on() as (resolver, _):
         prefix = resolver.resolve("a/b")
         assert prefix.frontier_name == "a"
@@ -1111,11 +1415,11 @@ def test_a_symlink_ancestor_becomes_a_symlink_blocking_frontier(
 
 
 def test_an_errno_the_observation_contradicts_is_reported_as_drift(
-    monkeypatch, resolver_on, project_root
+    monkeypatch, resolver_on, ext4_project_root
 ):
     """ENOTDIR with a directory actually present means the entry changed between
     the two calls; that is drift, not a frontier."""
-    (project_root / "a").mkdir()
+    (ext4_project_root / "a").mkdir()
     with resolver_on() as (resolver, binding):
         backend = binding.backend
         real_open_child = backend.open_child_directory
@@ -1131,16 +1435,77 @@ def test_an_errno_the_observation_contradicts_is_reported_as_drift(
         assert "changed" in str(caught.value) or "drift" in str(caught.value).lower()
 
 
+def test_exdev_from_the_traversal_refuses_as_a_mount_crossing(
+    monkeypatch, resolver_on, ext4_project_root
+):
+    """Injected because require_rel_path rejects every escape spelling first, so the
+    only real EXDEV is a mount crossing — which tier 3's bind-mount child exercises."""
+    (ext4_project_root / "a").mkdir()
+    injected = OSError(errno.EXDEV, "injected")
+    calls = []
+    with resolver_on() as (resolver, binding):
+        backend = binding.backend
+
+        def refuse(parent_fd, name):
+            calls.append((parent_fd, name))
+            raise injected
+
+        monkeypatch.setattr(type(backend), "open_child_directory", staticmethod(refuse))
+        with pytest.raises(ProjectApprovalRefused) as caught:
+            resolver.resolve("a/b")
+        assert "mount boundary" in str(caught.value)
+        assert caught.value.__cause__ is injected
+        assert calls == [(binding.project_root_fd, "a")]
+
+
+def test_enametoolong_from_the_traversal_refuses(monkeypatch, resolver_on):
+    """The kernel disagreeing with fpathconf is the filesystem's answer, not a defect,
+    so it stays a refusal. _require_name_fits refuses first for any name we can
+    construct, which is why this branch needs injection."""
+    injected = OSError(errno.ENAMETOOLONG, "injected")
+    calls = []
+    with resolver_on() as (resolver, binding):
+        backend = binding.backend
+
+        def refuse(parent_fd, name):
+            calls.append((parent_fd, name))
+            raise injected
+
+        monkeypatch.setattr(type(backend), "open_child_directory", staticmethod(refuse))
+        with pytest.raises(ProjectApprovalRefused) as caught:
+            resolver.resolve("a/b")
+        assert "name limit" in str(caught.value)
+        assert caught.value.__cause__ is injected
+        assert calls == [(binding.project_root_fd, "a")]
+
+
+@pytest.mark.parametrize("code", [errno.EACCES, errno.EIO, errno.EPERM, errno.EMFILE])
+def test_an_unexpected_traversal_errno_propagates_unwrapped(
+    monkeypatch, resolver_on, code
+):
+    injected = OSError(code, "injected")
+    calls = []
+    with resolver_on() as (resolver, binding):
+        backend = binding.backend
+
+        def refuse(parent_fd, name):
+            calls.append((parent_fd, name))
+            raise injected
+
+        monkeypatch.setattr(type(backend), "open_child_directory", staticmethod(refuse))
+        with pytest.raises(OSError) as caught:
+            resolver.resolve("a/b")
+        assert caught.value is injected
+        assert calls == [(binding.project_root_fd, "a")]
+
+
 @pytest.mark.parametrize("bad", ["/absolute", "a/../b", ".", "a/", "a//b", "a/\x00b"])
 def test_a_malformed_path_is_an_internal_contract_violation(resolver_on, bad):
-    with resolver_on() as (resolver, _):
-        with pytest.raises(ProtocolError):
-            resolver.resolve(bad)
+    with resolver_on() as (resolver, _), pytest.raises(ProtocolError):
+        resolver.resolve(bad)
 
 
-def test_a_malformed_path_is_rejected_before_any_syscall(
-    monkeypatch, resolver_on
-):
+def test_a_malformed_path_is_rejected_before_any_syscall(monkeypatch, resolver_on):
     """The EXDEV interpretation depends on no escape route reaching openat2."""
     with resolver_on() as (resolver, binding):
         calls = []
@@ -1162,6 +1527,39 @@ def test_a_component_over_name_max_refuses(resolver_on):
         assert "NAME_MAX" in str(caught.value) or "name limit" in str(caught.value)
 
 
+def test_name_max_is_taken_from_the_parent_that_performs_the_lookup(
+    monkeypatch, resolver_on, ext4_project_root
+):
+    """Injecting a narrow limit at one hop, not at the root.
+
+    Without this, an implementation that applied the root's name_max to every
+    component would pass every other limit test in this file.
+    """
+    from atoms.fs.lookup import DirectoryConstraints, LookupProof
+
+    (ext4_project_root / "a").mkdir()
+    with resolver_on() as (resolver, _):
+        import atoms.fs.resolve as module
+
+        real = module.read_lookup_constraints
+        target = os.stat(ext4_project_root / "a").st_ino
+
+        def narrow(fd, filesystem_type):
+            if os.fstat(fd).st_ino == target:
+                return DirectoryConstraints(
+                    lookup_proof=LookupProof.EXACT_BYTES, name_max=3
+                )
+            return real(fd, filesystem_type)
+
+        monkeypatch.setattr(module, "read_lookup_constraints", narrow)
+        # The root still admits the same name, so this is the hop's limit and not
+        # the volume's.
+        assert resolver.resolve("abcd").frontier_name == "abcd"
+        with pytest.raises(ProjectApprovalRefused) as caught:
+            resolver.resolve("a/abcd")
+        assert "NAME_MAX of 3" in str(caught.value)
+
+
 def test_a_path_over_path_max_refuses(resolver_on):
     with resolver_on() as (resolver, _):
         long_path = "/".join(["a" * 200] * 30)
@@ -1179,35 +1577,154 @@ def test_limits_are_measured_in_encoded_bytes_not_characters(resolver_on):
             resolver.resolve(name)
 
 
-def test_one_constraints_read_serves_every_path_through_a_directory(
-    monkeypatch, resolver_on, project_root
+def _counting_reader(monkeypatch, calls, replacement=None):
+    """Patch read_lookup_constraints, recording the inode of every read."""
+    import atoms.fs.resolve as module
+
+    real = module.read_lookup_constraints
+
+    def counted(fd, filesystem_type):
+        inode = os.fstat(fd).st_ino
+        calls.append(inode)
+        if replacement is not None:
+            substitute = replacement(inode, len(calls))
+            if substitute is not None:
+                return substitute
+        return real(fd, filesystem_type)
+
+    monkeypatch.setattr(module, "read_lookup_constraints", counted)
+
+
+def test_every_traversal_of_a_directory_re_reads_its_constraints(
+    monkeypatch, resolver_on, ext4_project_root
 ):
-    """The memo must be populated, not merely consulted."""
-    (project_root / "a" / "b").mkdir(parents=True)
-    (project_root / "a" / "c").mkdir()
+    """The memo interns; it must not suppress observation (design §6.5).
+
+    FS_CASEFOLD_FL can be set on an empty directory without changing its inode, so a
+    cache hit that skips the read can report stale semantics for a lookup that has
+    already happened under the new ones — inside a single approval, which is a window
+    ledger #19 does not cover.
+    """
+    (ext4_project_root / "a" / "b").mkdir(parents=True)
+    (ext4_project_root / "a" / "c").mkdir()
+    calls: list[int] = []
+    with resolver_on() as (resolver, _):
+        _counting_reader(monkeypatch, calls)
+        resolver.resolve("a/b/x")
+        resolver.resolve("a/c/y")
+        assert calls.count(os.stat(ext4_project_root / "a").st_ino) == 2
+
+
+def test_the_memo_interns_one_facts_value_per_identity(
+    resolver_on, ext4_project_root
+):
+    """Re-reading must not mean re-allocating: A4b-2 compares facts by object."""
+    (ext4_project_root / "a" / "b").mkdir(parents=True)
+    (ext4_project_root / "a" / "c").mkdir()
+    with resolver_on() as (resolver, _):
+        first = resolver.resolve("a/b/x")
+        second = resolver.resolve("a/c/y")
+        assert first.hops[0].facts is second.hops[0].facts
+        assert first.root is second.root
+
+
+def test_a_changed_name_max_between_two_resolutions_refuses(
+    monkeypatch, resolver_on, ext4_project_root
+):
+    from atoms.fs.lookup import DirectoryConstraints, LookupProof
+
+    (ext4_project_root / "a").mkdir()
+    target = os.stat(ext4_project_root / "a").st_ino
+    calls: list[int] = []
+    with resolver_on() as (resolver, _):
+        seen = []
+
+        def substitute(inode, _count):
+            if inode != target:
+                return None
+            seen.append(inode)
+            return DirectoryConstraints(
+                lookup_proof=LookupProof.EXACT_BYTES,
+                name_max=255 if len(seen) == 1 else 200,
+            )
+
+        _counting_reader(monkeypatch, calls, substitute)
+        resolver.resolve("a/x")
+        with pytest.raises(PreconditionRefused) as caught:
+            resolver.resolve("a/y")
+        assert "lookup constraints" in str(caught.value)
+
+
+def test_a_proof_that_turns_casefold_between_two_resolutions_refuses(
+    monkeypatch, resolver_on, ext4_project_root
+):
+    from atoms.fs.lookup import DirectoryConstraints, LookupProof
+
+    (ext4_project_root / "a").mkdir()
+    target = os.stat(ext4_project_root / "a").st_ino
+    calls: list[int] = []
+    with resolver_on() as (resolver, _):
+        seen = []
+
+        def substitute(inode, _count):
+            if inode != target:
+                return None
+            seen.append(inode)
+            if len(seen) == 1:
+                return None
+            return DirectoryConstraints(
+                lookup_proof=LookupProof.UNREPRODUCIBLE_CASEFOLD, name_max=255
+            )
+
+        _counting_reader(monkeypatch, calls, substitute)
+        resolver.resolve("a/x")
+        with pytest.raises(ProjectApprovalRefused) as caught:
+            resolver.resolve("a/y")
+        assert "casefold" in str(caught.value).lower()
+
+
+def test_the_project_root_is_re_read_on_every_resolution(
+    monkeypatch, resolver_on, ext4_project_root
+):
+    """Constraints read once at construction would otherwise be reported unchecked
+    for the resolver's whole life."""
+    calls: list[int] = []
+    with resolver_on() as (resolver, binding):
+        root_inode = os.fstat(binding.project_root_fd).st_ino
+        _counting_reader(monkeypatch, calls)
+        resolver.resolve("x")
+        resolver.resolve("y")
+        assert calls.count(root_inode) == 2
+
+
+def test_a_project_root_that_turns_casefold_after_construction_refuses(
+    monkeypatch, resolver_on
+):
+    from atoms.fs.lookup import DirectoryConstraints, LookupProof
+
     with resolver_on() as (resolver, _):
         import atoms.fs.resolve as module
 
-        real = module.read_lookup_constraints
-        calls = []
-
-        def counted(fd, filesystem_type):
-            calls.append(os.fstat(fd).st_ino)
-            return real(fd, filesystem_type)
-
-        monkeypatch.setattr(module, "read_lookup_constraints", counted)
-        resolver.resolve("a/b/x")
-        resolver.resolve("a/c/y")
-        assert len(calls) == len(set(calls))
-        assert calls.count(os.stat(project_root / "a").st_ino) == 1
+        monkeypatch.setattr(
+            module,
+            "read_lookup_constraints",
+            lambda fd, filesystem_type: DirectoryConstraints(
+                lookup_proof=LookupProof.UNREPRODUCIBLE_CASEFOLD, name_max=255
+            ),
+        )
+        with pytest.raises(ProjectApprovalRefused) as caught:
+            resolver.resolve("x")
+        assert "casefold" in str(caught.value).lower()
 
 
-def test_a_casefold_directory_mid_walk_refuses(monkeypatch, resolver_on, project_root):
+def test_a_casefold_directory_mid_walk_refuses(
+    monkeypatch, resolver_on, ext4_project_root
+):
     from atoms.fs.lookup import DirectoryConstraints, LookupProof
 
-    (project_root / "a").mkdir()
+    (ext4_project_root / "a").mkdir()
     with resolver_on() as (resolver, _):
-        target = os.stat(project_root / "a").st_ino
+        target = os.stat(ext4_project_root / "a").st_ino
         import atoms.fs.resolve as module
 
         real = module.read_lookup_constraints
@@ -1232,26 +1749,40 @@ def test_resolution_after_the_binding_closes_refuses(resolver_on):
         resolver.resolve("anything")
 
 
-def test_the_walk_leaks_no_descriptor_on_the_success_path(resolver_on, project_root):
-    (project_root / "a" / "b" / "c").mkdir(parents=True)
+def test_resolution_after_the_lock_is_released_refuses(resolver_after_lock_release):
+    """A distinct liveness failure from a closed binding: _require_active checks the
+    binding's own flag AND lock.held, and only the second has fired here."""
+    with pytest.raises(ProtocolError) as caught:
+        resolver_after_lock_release.resolve("anything")
+    assert "lock" in str(caught.value)
+
+
+def test_the_walk_leaks_no_descriptor_on_the_success_path(
+    resolver_on, ext4_project_root
+):
+    (ext4_project_root / "a" / "b" / "c").mkdir(parents=True)
     with resolver_on() as (resolver, _):
-        before = len(os.listdir("/proc/self/fd"))
+        before = descriptor_count()
         resolver.resolve("a/b/c/leaf")
-        assert len(os.listdir("/proc/self/fd")) == before
+        assert descriptor_count() == before
 
 
 def test_the_walk_leaks_no_descriptor_on_a_refusal_path(
-    monkeypatch, resolver_on, project_root
+    monkeypatch, resolver_on, ext4_project_root
 ):
-    (project_root / "a" / "b").mkdir(parents=True)
+    # The leaf must EXIST. _observe returns AbsentFrontier before it ever calls
+    # read_mount_id, so an absent leaf makes this walk succeed and the test assert
+    # descriptor hygiene about a path that never refused.
+    (ext4_project_root / "a" / "b").mkdir(parents=True)
+    (ext4_project_root / "a" / "b" / "leaf").write_text("x")
     with resolver_on() as (resolver, binding):
         monkeypatch.setattr(
             "atoms.fs.resolve.read_mount_id", lambda fd: binding.evidence.mount_id + 1
         )
-        before = len(os.listdir("/proc/self/fd"))
+        before = descriptor_count()
         with pytest.raises(ProjectApprovalRefused):
             resolver.resolve("a/b/leaf")
-        assert len(os.listdir("/proc/self/fd")) == before
+        assert descriptor_count() == before
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -1261,21 +1792,35 @@ Expected: FAIL with `AttributeError: 'PathResolver' object has no attribute 'res
 
 - [ ] **Step 3: Implement the walk**
 
-Add to `src/atoms/fs/resolve.py`:
+**Replace** `src/atoms/fs/resolve.py`'s `atoms.core.errors` import with the five-name version and add
+the `atoms.core.paths` import:
 
 ```python
+from atoms.core.errors import (
+    CapabilityUnavailable,
+    PreconditionRefused,
+    ProjectApprovalRefused,
+    ProtocolError,
+    SpecValidationError,
+)
 from atoms.core.paths import require_rel_path
-from atoms.core.errors import SpecValidationError
 ```
 
-and to `PathResolver`:
+Add this **module-level** constant immediately after the `EntryKind` enum — it names those members, so
+placing it beside `_LINUX` at the top of the module is an `F821`. It is not a class attribute: a
+mutable class attribute trips `RUF012`, and the table describes the errno vocabulary rather than
+resolver state:
 
 ```python
-    _BLOCKER_KINDS = {
-        errno.ENOTDIR: (EntryKind.REGULAR_FILE, EntryKind.OTHER),
-        errno.ELOOP: (EntryKind.SYMLINK,),
-    }
+_BLOCKER_KINDS = {
+    errno.ENOTDIR: (EntryKind.REGULAR_FILE, EntryKind.OTHER),
+    errno.ELOOP: (EntryKind.SYMLINK,),
+}
+```
 
+and add to `PathResolver`:
+
+```python
     def resolve(self, rel_path: str) -> ResolvedPrefix:
         """Observe the deepest existing directory prefix of one declared path.
 
@@ -1299,7 +1844,10 @@ and to `PathResolver`:
 
         components = rel_path.split("/")
         ancestors, leaf = components[:-1], components[-1]
-        facts = self._root_facts
+        # The root is re-observed per call, like every other hop. Constraints read once
+        # at construction would otherwise be reported unchecked for this object's life.
+        root_facts = self._facts_for(root_fd, rel_path)
+        facts = root_facts
         parent_fd = root_fd
         owned: int | None = None
         hops: list[ResolvedHop] = []
@@ -1310,7 +1858,7 @@ and to `PathResolver`:
                     child = backend.open_child_directory(parent_fd, component)
                 except OSError as caught:
                     return ResolvedPrefix(
-                        root=self._root_facts,
+                        root=root_facts,
                         hops=tuple(hops),
                         frontier_name=component,
                         frontier=self._frontier_from(
@@ -1328,7 +1876,7 @@ and to `PathResolver`:
 
             self._require_name_fits(leaf, facts, rel_path)
             return ResolvedPrefix(
-                root=self._root_facts,
+                root=root_facts,
                 hops=tuple(hops),
                 frontier_name=leaf,
                 frontier=self._observe(parent_fd, leaf, rel_path),
@@ -1351,6 +1899,10 @@ and to `PathResolver`:
     def _frontier_from(
         self, caught: OSError, parent_fd: int, component: str, rel_path: str
     ) -> Frontier:
+        if caught.errno is None:
+            # No errno is no evidence, so it is not one of the five interpreted codes.
+            # Also what keeps _BLOCKER_KINDS.get well-typed: OSError.errno is int|None.
+            raise caught
         if caught.errno == errno.ENOENT:
             return AbsentFrontier()
         if caught.errno == errno.EXDEV:
@@ -1364,7 +1916,7 @@ and to `PathResolver`:
             raise ProjectApprovalRefused(
                 f"component {component!r} of {rel_path!r} exceeds the filesystem name limit"
             ) from caught
-        admissible = self._BLOCKER_KINDS.get(caught.errno)
+        admissible = _BLOCKER_KINDS.get(caught.errno)
         if admissible is None:
             raise caught
         observed = self._observe(parent_fd, component, rel_path)
@@ -1377,23 +1929,40 @@ and to `PathResolver`:
         return observed
 
     def _facts_for(self, fd: int, rel_path: str) -> DirectoryFacts:
+        """Observe one traversed directory. The memo interns; it never skips the read.
+
+        FS_CASEFOLD_FL can be set on an empty directory without changing its inode, so
+        a cache hit that skipped read_lookup_constraints could report EXACT_BYTES for a
+        lookup that already happened under casefold semantics — a wrong answer produced
+        inside one approval, which is a window ledger #19 does not cover. The memo's
+        jobs are to hand back one DirectoryFacts object per identity, so A4b-2 can
+        compare by object, and to notice disagreement.
+        """
         identity = _identity(os.fstat(fd))
         if identity == self._metadata_identity:
             raise ProjectApprovalRefused(
                 f"{rel_path!r} traverses the metadata root by identity "
                 f"(device {identity.device}, inode {identity.inode})"
             )
-        facts = self._facts_by_identity.get(identity)
-        if facts is None:
-            constraints = read_lookup_constraints(fd, self._filesystem_type)
-            facts = DirectoryFacts(identity, constraints)
-            self._facts_by_identity[identity] = facts
-        if facts.constraints.lookup_proof is LookupProof.UNREPRODUCIBLE_CASEFOLD:
+        constraints = read_lookup_constraints(fd, self._filesystem_type)
+        if constraints.lookup_proof is LookupProof.UNREPRODUCIBLE_CASEFOLD:
             raise ProjectApprovalRefused(
                 f"{rel_path!r} traverses a casefold directory whose lookup relation "
                 "cannot be reproduced"
             )
-        return facts
+        cached = self._facts_by_identity.get(identity)
+        if cached is None:
+            facts = DirectoryFacts(identity, constraints)
+            self._facts_by_identity[identity] = facts
+            return facts
+        if cached.constraints != constraints:
+            raise PreconditionRefused(
+                f"the directory at device {identity.device}, inode {identity.inode} "
+                f"changed its lookup constraints during one approval: {cached.constraints} "
+                f"then {constraints}; the engine will not assemble one proof from two "
+                f"filesystem moments"
+            )
+        return cached
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
@@ -1434,7 +2003,6 @@ Create `tests/test_fs_resolve_work_base.py`:
 
 from __future__ import annotations
 
-import contextlib
 import errno
 import os
 
@@ -1442,21 +2010,12 @@ import pytest
 
 from atoms.core.errors import ProjectApprovalRefused, ProtocolError
 from atoms.fs.resolve import PathResolver
+from tests.fs_support import descriptor_count
 
 
-@pytest.fixture
-def resolver_on(bound_volume):
-    @contextlib.contextmanager
-    def build():
-        with bound_volume() as binding:
-            yield PathResolver(binding), binding
-
-    return build
-
-
-def test_construction_does_not_touch_the_work_base(monkeypatch, bound_volume):
+def test_construction_does_not_touch_the_work_base(monkeypatch, ext4_bound_volume):
     """Lazy: an unapprovable work/ must not refuse a spec with no CreateDirectory."""
-    with bound_volume() as binding:
+    with ext4_bound_volume() as binding:
         calls = []
         backend = binding.backend
         real = backend.open_child_directory
@@ -1471,10 +2030,10 @@ def test_construction_does_not_touch_the_work_base(monkeypatch, bound_volume):
         assert "work" not in calls
 
 
-def test_work_base_facts_reports_the_real_directory(resolver_on, metadata_root):
+def test_work_base_facts_reports_the_real_directory(resolver_on, ext4_metadata_root):
     with resolver_on() as (resolver, _):
         facts = resolver.work_base_facts()
-        info = os.stat(metadata_root / "work")
+        info = os.stat(ext4_metadata_root / "work")
         assert (facts.identity.device, facts.identity.inode) == (
             info.st_dev,
             info.st_ino,
@@ -1505,6 +2064,19 @@ def test_a_cached_result_still_fails_after_the_binding_closes(resolver_on):
         resolver.work_base_facts()
     with pytest.raises(ProtocolError):
         resolver.work_base_facts()
+
+
+def test_the_work_base_fails_after_the_lock_is_released(resolver_after_lock_release):
+    """The other half of the liveness gate.
+
+    _require_active checks the binding's own flag AND lock.held; only the second has
+    fired here. The memo is empty in this case — the populated-memo bypass is what the
+    closed-binding test above covers — so between them both gates are proved to sit
+    ahead of the memo.
+    """
+    with pytest.raises(ProtocolError) as caught:
+        resolver_after_lock_release.work_base_facts()
+    assert "lock" in str(caught.value)
 
 
 def test_a_failing_release_is_not_cached(monkeypatch, resolver_on):
@@ -1547,20 +2119,23 @@ def test_a_namespace_contradiction_is_an_internal_error(
         assert "work" in str(caught.value)
 
 
-@pytest.mark.parametrize("code", [errno.EIO, errno.EMFILE, errno.EACCES])
+@pytest.mark.parametrize("code", [errno.EIO, errno.EMFILE, errno.EACCES, errno.EPERM])
 def test_unrelated_system_failures_propagate_unchanged(monkeypatch, resolver_on, code):
     """EIO and EMFILE are not violated invariants and must not be relabelled."""
+    injected = OSError(code, "injected")
+    calls = []
     with resolver_on() as (resolver, binding):
         backend = binding.backend
 
         def refuse(parent_fd, name):
-            raise OSError(code, "injected")
+            calls.append((parent_fd, name))
+            raise injected
 
         monkeypatch.setattr(type(backend), "open_child_directory", staticmethod(refuse))
         with pytest.raises(OSError) as caught:
             resolver.work_base_facts()
-        assert caught.value.errno == code
-        assert not isinstance(caught.value, ProtocolError)
+        assert caught.value is injected
+        assert calls == [(binding.metadata_root_fd, "work")]
 
 
 def test_a_work_base_on_another_mount_is_an_internal_error(monkeypatch, resolver_on):
@@ -1591,10 +2166,10 @@ def test_every_failure_path_releases_the_descriptor(monkeypatch, resolver_on):
         monkeypatch.setattr(
             "atoms.fs.resolve.read_mount_id", lambda fd: binding.evidence.mount_id + 1
         )
-        before = len(os.listdir("/proc/self/fd"))
+        before = descriptor_count()
         with pytest.raises(ProtocolError):
             resolver.work_base_facts()
-        assert len(os.listdir("/proc/self/fd")) == before
+        assert descriptor_count() == before
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -1625,6 +2200,13 @@ Add `from atoms.fs.bootstrap import WORK_DIRECTORY` to `resolve.py`, then to `Pa
         NOT A3's logical WorkRoot: authority §7 places effect-time staging in
         work/<txid>/, which does not exist at approval time. A4b-2 derives that
         directory's constraints from these through inherited_constraints.
+
+        Unlike _facts_for, this memo DOES skip re-observation on a hit. work/ is
+        engine-owned space created by ensure_metadata_layout under the exclusive
+        project lock still held here; a project directory is not, and external
+        processes mutate project space as a matter of course. A flag change on work/
+        would be out-of-contract interference in engine space, which the errors below
+        already answer with ProtocolError rather than with defensive re-reading.
         """
         backend = self._binding.backend  # liveness BEFORE the memo, so a cached
         parent_fd = self._binding.metadata_root_fd  # result still fails after closure
@@ -1679,105 +2261,24 @@ git commit -m "feat(fs): observe the engine-owned work base"
 ## Task 6: Real-filesystem conformance
 
 **Files:**
-- Modify: `tests/fs_support.py`
 - Modify: `tests/conftest.py`
 - Create: `tests/test_fs_resolve_conformance.py`
 
 **Interfaces:**
-- Consumes: everything from Tasks 1–5.
-- Produces: `ext4_volume_or_skip_reason()`, `descriptor_count()`,
-  `user_namespaces_available()`, `run_in_bind_namespace(script)` in `tests/fs_support.py`;
-  the `ext4_volume` fixture in `tests/conftest.py`.
+- Consumes: everything from Tasks 1–5, including Task 2's `ext4_volume`,
+  `ext4_project_root`, `ext4_bound_volume`, `ext4_nested_bound_volume`, and `descriptor_count`.
+- Produces: the `ext4_probe_fd` fixture in `tests/conftest.py`.
 
-- [ ] **Step 1: Add the fixtures and helpers**
+- [ ] **Step 1: Register the probe fixture**
 
-Append to `tests/fs_support.py`:
-
-```python
-EXT4 = "ext4"
-
-
-def ext4_volume_or_skip_reason() -> tuple[Path | None, str]:
-    """A4b-1 approves only ext4, while A4a admits ext4, xfs, and btrfs.
-
-    A contributor on btrfs must be told why this suite skips, not merely that it does.
-    """
-    resolved = resolve_test_volume()
-    if resolved is None:
-        return None, (
-            "no test volume: set ATOMS_TEST_VOLUME to a directory on ext4"
-        )
-    found = _filesystem_type_for(resolved.parent if not resolved.exists() else resolved)
-    if found != EXT4:
-        return None, (
-            f"A4b-1 approves only ext4; the test volume is {found!r}. "
-            "Set ATOMS_TEST_VOLUME to a directory on ext4."
-        )
-    return resolved, ""
-
-
-def descriptor_count() -> int:
-    """Open descriptors for this process.
-
-    The listing itself opens one descriptor, so this contributes a constant; only
-    deltas between counts measured this way are meaningful.
-    """
-    return len(os.listdir("/proc/self/fd"))
-
-
-def user_namespaces_available() -> bool:
-    import subprocess
-
-    try:
-        completed = subprocess.run(
-            ["unshare", "--mount", "--map-root-user", "--", "true"],
-            capture_output=True,
-            timeout=30,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return completed.returncode == 0
-
-
-def run_in_bind_namespace(script: str, *args: str):
-    """Run `script` under `unshare --mount --map-root-user`.
-
-    A bind mount inside the namespace shares st_dev with its source while carrying a
-    distinct mount id, which is the pair no captured fixture can assert about.
-    """
-    import subprocess
-    import sys
-
-    return subprocess.run(
-        [
-            "unshare",
-            "--mount",
-            "--map-root-user",
-            "--",
-            sys.executable,
-            "-c",
-            script,
-            *args,
-        ],
-        capture_output=True,
-        text=True,
-        timeout=120,
-        check=False,
-    )
-```
-
-Append to `tests/conftest.py` (and extend the `tests.fs_support` import list):
+Append to `tests/conftest.py`:
 
 ```python
 @pytest.fixture
-def ext4_volume(tmp_path_factory):
-    base, reason = ext4_volume_or_skip_reason()
-    if base is None:
-        pytest.skip(reason)
-    base.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=base) as directory:
-        yield Path(directory)
+def ext4_probe_fd(ext4_volume):
+    fd = os.open(ext4_volume, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    yield fd
+    os.close(fd)
 ```
 
 - [ ] **Step 2: Write the conformance tests**
@@ -1789,26 +2290,149 @@ Create `tests/test_fs_resolve_conformance.py`:
 
 from __future__ import annotations
 
+import builtins
 import os
+import shutil
+import subprocess
+import sys
 import unicodedata
 
 import pytest
 
 from atoms.core.errors import ProjectApprovalRefused
 from atoms.fs.lookup import LookupProof, inherited_constraints, read_lookup_constraints
-from atoms.fs.resolve import EntryKind, PathResolver
-from tests.fs_support import (
-    descriptor_count,
-    run_in_bind_namespace,
-    user_namespaces_available,
+from atoms.fs.resolve import PathResolver, PresentFrontier
+from tests.fs_support import descriptor_count
+
+# Both children follow A4a's _BIND_MOUNT_CHILD convention: script text plus sys.argv,
+# exit 77 for "namespace or mount unavailable, skip". Each builds its own single-entry
+# allowlist inline, so it needs nothing from the `tests` package on its path. Both
+# construct a PathResolver and call resolve(): asserting the errno from
+# open_child_directory, or st_dev/mnt_id from two bare descriptors, would prove a
+# property of A4a and of the kernel while leaving A4b-1's translation of it untested.
+_BIND_PREAMBLE = r"""
+import os
+import subprocess
+import sys
+
+from atoms.core.errors import ProjectApprovalRefused
+from atoms.fs.binding import bind_project_volume
+from atoms.fs.linux import LinuxBackend
+from atoms.fs.lock import acquire_project_lock
+from atoms.fs.resolve import PathResolver
+from atoms.fs.volume import (
+    AllowlistEntry,
+    DurabilityAllowlist,
+    StorageProfile,
+    build_configuration,
+    kernel_identifier,
+    read_mountinfo,
+    resolve_mount_entry,
 )
 
+project, source, target, metadata_root, mount_program = sys.argv[1:]
+mounted = subprocess.run(
+    [mount_program, "--bind", source, target], capture_output=True, text=True
+)
+if mounted.returncode != 0:
+    print(mounted.stderr.strip(), file=sys.stderr)
+    sys.exit(77)
 
-@pytest.fixture
-def probe_fd(ext4_volume):
-    fd = os.open(ext4_volume, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-    yield fd
-    os.close(fd)
+storage = StorageProfile(profile_id="a4b1-bind-test")
+backend = LinuxBackend()
+
+
+def resolver_for(lock):
+    fd = backend.open_root(project)
+    try:
+        entry = resolve_mount_entry(fd, read_mountinfo())
+    finally:
+        os.close(fd)
+    allowlist = DurabilityAllowlist(
+        entries=frozenset(
+            {
+                AllowlistEntry(
+                    configuration=build_configuration(entry, kernel_identifier()),
+                    storage=storage,
+                    certification_ref="test-injected-not-crash-certified",
+                )
+            }
+        )
+    )
+    return bind_project_volume(project, lock, allowlist=allowlist, storage=storage)
+"""
+
+_ANCESTOR_BIND_CHILD = _BIND_PREAMBLE + r"""
+with acquire_project_lock(backend, metadata_root) as lock:
+    with resolver_for(lock) as binding:
+        resolver = PathResolver(binding)
+        try:
+            resolver.resolve("ancestor/leaf")
+        except ProjectApprovalRefused as caught:
+            if "mount boundary" not in str(caught):
+                print(f"wrong refusal: {caught}", file=sys.stderr)
+                sys.exit(10)
+        else:
+            print("resolve() admitted a bind-mounted ancestor", file=sys.stderr)
+            sys.exit(11)
+"""
+
+_LEAF_BIND_CHILD = _BIND_PREAMBLE + r"""
+if os.stat(source).st_dev != os.stat(target).st_dev:
+    print("the bind mount did not preserve st_dev", file=sys.stderr)
+    sys.exit(10)
+
+with acquire_project_lock(backend, metadata_root) as lock:
+    with resolver_for(lock) as binding:
+        resolver = PathResolver(binding)
+        try:
+            resolver.resolve("leaf")
+        except ProjectApprovalRefused as caught:
+            if "mount" not in str(caught):
+                print(f"wrong refusal: {caught}", file=sys.stderr)
+                sys.exit(11)
+        else:
+            print("resolve() admitted a bind-mounted leaf", file=sys.stderr)
+            sys.exit(12)
+"""
+
+
+def _run_bind_child(script, ext4_volume, target_name):
+    """Build project/metadata on the ext4 volume and run `script` in a namespace."""
+    unshare = shutil.which("unshare")
+    mount_program = shutil.which("mount")
+    if unshare is None or mount_program is None:
+        missing = "unshare" if unshare is None else "mount"
+        pytest.skip(f"the bind-mount tier requires the {missing!r} program")
+
+    project = ext4_volume / "project"
+    project.mkdir()
+    (project / "source").mkdir()
+    (project / target_name).mkdir()
+    finished = subprocess.run(
+        [
+            unshare,
+            "--mount",
+            "--map-root-user",
+            "--",
+            sys.executable,
+            "-c",
+            script,
+            str(project),
+            str(project / "source"),
+            str(project / target_name),
+            str(ext4_volume / "metadata"),
+            mount_program,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    if finished.returncode == 77:
+        reason = finished.stderr.strip() or "no diagnostic"
+        pytest.skip(f"isolated bind mount unavailable: {reason}")
+    assert finished.returncode == 0, finished.stderr
 
 
 @pytest.mark.parametrize(
@@ -1820,29 +2444,29 @@ def probe_fd(ext4_volume):
     ],
 )
 def test_a_plain_ext4_directory_compares_names_as_exact_bytes(
-    ext4_volume, probe_fd, made, sought
+    ext4_probe_fd, made, sought
 ):
     """EXACT_BYTES is a claim about the filesystem, so it is verified against one."""
-    fd = os.open(made, os.O_CREAT | os.O_WRONLY, 0o600, dir_fd=probe_fd)
+    fd = os.open(made, os.O_CREAT | os.O_WRONLY, 0o600, dir_fd=ext4_probe_fd)
     os.close(fd)
     try:
         with pytest.raises(FileNotFoundError):
-            os.stat(sought, dir_fd=probe_fd)
+            os.stat(sought, dir_fd=ext4_probe_fd)
     finally:
-        os.unlink(made, dir_fd=probe_fd)
+        os.unlink(made, dir_fd=ext4_probe_fd)
 
 
-def test_a_plain_ext4_directory_reports_exact_bytes(probe_fd):
-    assert read_lookup_constraints(probe_fd, "ext4").lookup_proof is (
+def test_a_plain_ext4_directory_reports_exact_bytes(ext4_probe_fd):
+    assert read_lookup_constraints(ext4_probe_fd, "ext4").lookup_proof is (
         LookupProof.EXACT_BYTES
     )
 
 
-def test_a_created_directory_matches_the_inheritance_rule(ext4_volume, probe_fd):
+def test_a_created_directory_matches_the_inheritance_rule(ext4_probe_fd):
     """Without this, §5.4's rule is only prose."""
-    parent = read_lookup_constraints(probe_fd, "ext4")
-    os.mkdir("child", mode=0o700, dir_fd=probe_fd)
-    child_fd = os.open("child", os.O_RDONLY | os.O_DIRECTORY, dir_fd=probe_fd)
+    parent = read_lookup_constraints(ext4_probe_fd, "ext4")
+    os.mkdir("child", mode=0o700, dir_fd=ext4_probe_fd)
+    child_fd = os.open("child", os.O_RDONLY | os.O_DIRECTORY, dir_fd=ext4_probe_fd)
     try:
         observed = read_lookup_constraints(child_fd, "ext4")
     finally:
@@ -1850,8 +2474,8 @@ def test_a_created_directory_matches_the_inheritance_rule(ext4_volume, probe_fd)
     assert observed == inherited_constraints(parent, "ext4")
 
 
-def test_a_255_byte_name_is_accepted_and_256_refuses(bound_volume, project_root):
-    with bound_volume() as binding:
+def test_a_255_byte_name_is_accepted_and_256_refuses(ext4_bound_volume):
+    with ext4_bound_volume() as binding:
         resolver = PathResolver(binding)
         assert resolver.resolve("a" * 255).frontier_name == "a" * 255
         with pytest.raises(ProjectApprovalRefused):
@@ -1859,60 +2483,68 @@ def test_a_255_byte_name_is_accepted_and_256_refuses(bound_volume, project_root)
 
 
 def test_two_hard_links_share_an_identity_with_distinct_provenance(
-    bound_volume, project_root
+    ext4_bound_volume, ext4_project_root
 ):
     """A4b-1 reports the shared identity; whether topology merges them is A4b-2's."""
-    (project_root / "left").write_text("x")
-    os.link(project_root / "left", project_root / "right")
-    with bound_volume() as binding:
+    (ext4_project_root / "left").write_text("x")
+    os.link(ext4_project_root / "left", ext4_project_root / "right")
+    with ext4_bound_volume() as binding:
         resolver = PathResolver(binding)
         left = resolver.resolve("left")
         right = resolver.resolve("right")
-    assert left.frontier.identity == right.frontier.identity
-    assert left.frontier_name != right.frontier_name
+        # Narrowed, not assumed: `frontier` is a union and pyright type-checks tests.
+        assert isinstance(left.frontier, PresentFrontier)
+        assert isinstance(right.frontier, PresentFrontier)
+        assert left.frontier.identity == right.frontier.identity
+        assert left.frontier_name != right.frontier_name
 
 
-def test_a_path_equal_to_the_metadata_root_refuses(bound_volume, metadata_root):
-    with bound_volume() as binding:
+def test_a_path_equal_to_the_metadata_root_refuses(ext4_nested_bound_volume):
+    """Needs a metadata root INSIDE the project root.
+
+    With A4a's sibling layout the metadata root's relative spelling starts with '..',
+    require_rel_path rejects that, and this assertion is unreachable.
+    """
+    with ext4_nested_bound_volume() as binding:
         resolver = PathResolver(binding)
-        relative = os.path.relpath(metadata_root, start=os.readlink(f"/proc/self/fd/{binding.project_root_fd}"))
-        if relative.startswith(".."):
-            pytest.skip("the metadata root is not inside the project root here")
         with pytest.raises(ProjectApprovalRefused) as caught:
-            resolver.resolve(relative)
+            resolver.resolve("metadata")
         assert "metadata root" in str(caught.value)
 
 
-def test_a_path_beneath_the_metadata_root_refuses(bound_volume, metadata_root):
-    with bound_volume() as binding:
+def test_a_path_beneath_the_metadata_root_refuses(ext4_nested_bound_volume):
+    with ext4_nested_bound_volume() as binding:
         resolver = PathResolver(binding)
-        root_path = os.readlink(f"/proc/self/fd/{binding.project_root_fd}")
-        relative = os.path.relpath(metadata_root, start=root_path)
-        if relative.startswith(".."):
-            pytest.skip("the metadata root is not inside the project root here")
         with pytest.raises(ProjectApprovalRefused) as caught:
-            resolver.resolve(f"{relative}/staging")
+            resolver.resolve("metadata/staging")
         assert "metadata root" in str(caught.value)
 
 
-def test_the_descriptor_peak_is_three_at_any_depth(monkeypatch, bound_volume, project_root):
+def test_the_descriptor_peak_is_three_at_any_depth(
+    monkeypatch, ext4_bound_volume, ext4_project_root
+):
     """Every acquisition point samples immediately after it returns.
 
     Omitting the read_mount_id hook is what would let a false bound of two pass:
     its /proc/self/fdinfo handle coexists with the parent and the O_PATH descriptor.
+
+    Both leaves must EXIST. _observe returns AbsentFrontier the moment os.open reports
+    ENOENT, so an absent leaf skips the O_PATH descriptor and read_mount_id entirely,
+    and the measured peak collapses to the walk's two — which is how a bound of three
+    would silently go unverified.
     """
     import atoms.fs.volume as volume_module
 
-    deep = project_root
+    deep = ext4_project_root
     for index in range(512):
         deep = deep / f"d{index}"
     deep.mkdir(parents=True)
-    shallow = project_root / "s0"
-    shallow.mkdir()
+    (deep / "leaf").write_text("x")
+    (ext4_project_root / "s0").mkdir()
+    (ext4_project_root / "s0" / "leaf").write_text("x")
 
     samples: list[int] = []
     real_open = os.open
-    real_builtin_open = volume_module.open
 
     def sampling_open(*args, **kwargs):
         fd = real_open(*args, **kwargs)
@@ -1920,11 +2552,17 @@ def test_the_descriptor_peak_is_three_at_any_depth(monkeypatch, bound_volume, pr
         return fd
 
     def sampling_builtin_open(*args, **kwargs):
-        handle = real_builtin_open(*args, **kwargs)
+        # builtins.open, not volume_module.open: volume.py declares no such global,
+        # so reading it raises AttributeError and the measurement never runs. Setting
+        # it as a module global shadows the builtin for that module alone, because
+        # module globals are consulted before builtins.
+        # SIM115 is suppressed because the caller owns the handle; this wrapper only
+        # samples the descriptor count while it is open.
+        handle = builtins.open(*args, **kwargs)  # noqa: SIM115
         samples.append(descriptor_count())
         return handle
 
-    with bound_volume() as binding:
+    with ext4_bound_volume() as binding:
         resolver = PathResolver(binding)
         backend = binding.backend
         real_child = backend.open_child_directory
@@ -1938,7 +2576,9 @@ def test_the_descriptor_peak_is_three_at_any_depth(monkeypatch, bound_volume, pr
             type(backend), "open_child_directory", staticmethod(sampling_child)
         )
         monkeypatch.setattr("atoms.fs.resolve.os.open", sampling_open)
-        monkeypatch.setattr(volume_module, "open", sampling_builtin_open)
+        monkeypatch.setattr(
+            volume_module, "open", sampling_builtin_open, raising=False
+        )
 
         baseline = descriptor_count()
         samples.clear()
@@ -1952,75 +2592,35 @@ def test_the_descriptor_peak_is_three_at_any_depth(monkeypatch, bound_volume, pr
     assert shallow_peak == deep_peak == 3
 
 
-@pytest.mark.skipif(
-    not user_namespaces_available(), reason="user namespaces are unavailable"
-)
-def test_a_bind_mount_at_an_ancestor_refuses():
-    script = """
-import os, subprocess, sys, tempfile
-sys.path.insert(0, os.environ["ATOMS_SRC"])
-from atoms.fs.linux import LinuxBackend
-base = tempfile.mkdtemp(dir=os.environ["ATOMS_VOLUME"])
-os.mkdir(f"{base}/source"); os.mkdir(f"{base}/ancestor")
-subprocess.run(["mount", "--bind", f"{base}/source", f"{base}/ancestor"], check=True)
-fd = LinuxBackend().open_root(base)
-try:
-    LinuxBackend().open_child_directory(fd, "ancestor")
-    print("NO_REFUSAL")
-except OSError as caught:
-    print(os.strerror(caught.errno), caught.errno)
-finally:
-    os.close(fd)
-"""
-    completed = run_in_bind_namespace(script)
-    assert "18" in completed.stdout, completed.stderr  # EXDEV
+def test_a_bind_mount_at_an_ancestor_makes_resolve_refuse(ext4_volume):
+    """EXDEV from RESOLVE_NO_XDEV, translated by the resolver into a refusal."""
+    _run_bind_child(_ANCESTOR_BIND_CHILD, ext4_volume, "ancestor")
 
 
-@pytest.mark.skipif(
-    not user_namespaces_available(), reason="user namespaces are unavailable"
-)
-def test_a_bind_mount_at_the_leaf_shares_st_dev_but_not_the_mount_id():
-    """The test that justifies O_PATH + read_mount_id over lstat."""
-    script = """
-import os, subprocess, sys, tempfile
-sys.path.insert(0, os.environ["ATOMS_SRC"])
-from atoms.fs.volume import read_mount_id
-base = tempfile.mkdtemp(dir=os.environ["ATOMS_VOLUME"])
-os.mkdir(f"{base}/source"); os.mkdir(f"{base}/leaf")
-subprocess.run(["mount", "--bind", f"{base}/source", f"{base}/leaf"], check=True)
-left = os.open(f"{base}/source", os.O_PATH | os.O_NOFOLLOW)
-right = os.open(f"{base}/leaf", os.O_PATH | os.O_NOFOLLOW)
-print(os.fstat(left).st_dev == os.fstat(right).st_dev,
-      read_mount_id(left) != read_mount_id(right))
-os.close(left); os.close(right)
-"""
-    completed = run_in_bind_namespace(script)
-    assert "True True" in completed.stdout, completed.stderr
+def test_a_bind_mount_at_the_leaf_makes_resolve_refuse(ext4_volume):
+    """The pair that justifies O_PATH + read_mount_id over lstat.
+
+    The child asserts st_dev is EQUAL across the boundary and that resolve() refuses
+    anyway. With lstat the refusal would never fire while the mount went unseen.
+    """
+    _run_bind_child(_LEAF_BIND_CHILD, ext4_volume, "leaf")
 ```
 
-- [ ] **Step 3: Wire the environment for the namespace children**
+The `..`-rejects-with-zero-`openat2`-calls case from design §9.3 is **not** repeated here: now that
+`resolver_on` binds an ext4 volume with a real `LinuxBackend`, the walk suite's
+`test_a_malformed_path_is_rejected_before_any_syscall` already runs against real ext4 and a real
+`openat2`.
 
-In `tests/fs_support.py`, extend `run_in_bind_namespace` to pass `ATOMS_SRC` and
-`ATOMS_VOLUME` through `env`:
-
-```python
-    environment = dict(os.environ)
-    environment["ATOMS_SRC"] = str(Path(__file__).parents[1] / "src")
-    environment["ATOMS_VOLUME"] = str(resolve_test_volume())
-```
-
-and pass `env=environment` to `subprocess.run`.
-
-- [ ] **Step 4: Run the suite**
+- [ ] **Step 3: Run the suite**
 
 Run: `uv run pytest tests/test_fs_resolve_conformance.py -q`
 Expected: PASS, with the two bind-mount tests running rather than skipping on a host with
-user namespaces.
+user namespaces. Then `uv run ruff check && uv run pyright`.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
-git add tests/fs_support.py tests/conftest.py tests/test_fs_resolve_conformance.py
+git add tests/conftest.py tests/test_fs_resolve_conformance.py
 git commit -m "test(fs): verify resolution against a real ext4 volume"
 ```
 
@@ -2038,8 +2638,9 @@ git commit -m "test(fs): verify resolution against a real ext4 volume"
 
 **Interfaces:**
 - Consumes: everything from Tasks 1–6.
-- Produces: `casefold_volume_or_reason()` in `tests/fs_support.py`; the `casefold_volume`
-  fixture; the tier-5 architecture assertions.
+- Produces: `casefold_volume_or_reason()` in `tests/fs_support.py`; the `casefold_volume`,
+  `casefold_project_root`, `casefold_bound_volume`, and `mixed_policy` fixtures; the tier-5
+  architecture assertions.
 
 - [ ] **Step 1: Add the casefold fixture**
 
@@ -2087,6 +2688,45 @@ def casefold_volume():
         pytest.skip(reason)
     with tempfile.TemporaryDirectory(dir=base) as directory:
         yield Path(directory)
+
+
+@pytest.fixture
+def casefold_project_root(casefold_volume):
+    return make_project_root(casefold_volume)
+
+
+@pytest.fixture
+def casefold_bound_volume(casefold_project_root, casefold_volume, test_storage_profile):
+    return make_bound_volume(
+        make_fake_backend(),
+        casefold_project_root,
+        make_metadata_root(casefold_volume),
+        test_storage_profile,
+    )
+
+
+@pytest.fixture
+def mixed_policy(casefold_project_root):
+    """A folded directory and a plain sibling inside one project root.
+
+    Both live under the project root rather than beside it, so a PathResolver bound to
+    that root can be asked about each — which is the assertion the tier exists for.
+    """
+    import subprocess
+
+    plain = casefold_project_root / "plain"
+    folded = casefold_project_root / "folded"
+    plain.mkdir()
+    folded.mkdir()
+    completed = subprocess.run(
+        ["chattr", "+F", str(folded)], capture_output=True, text=True, check=False
+    )
+    if completed.returncode != 0:
+        pytest.fail(
+            f"chattr +F failed on {folded}: {completed.stderr.strip()}. "
+            "The volume is probably not formatted with -O casefold."
+        )
+    return plain, folded
 ```
 
 - [ ] **Step 2: Write the casefold tests**
@@ -2106,25 +2746,9 @@ import subprocess
 
 import pytest
 
+from atoms.core.errors import ProjectApprovalRefused
 from atoms.fs.lookup import LookupProof, inherited_constraints, read_lookup_constraints
-
-
-@pytest.fixture
-def mixed_policy(casefold_volume):
-    """A folded directory and a plain sibling on one filesystem."""
-    plain = casefold_volume / "plain"
-    folded = casefold_volume / "folded"
-    plain.mkdir()
-    folded.mkdir()
-    completed = subprocess.run(
-        ["chattr", "+F", str(folded)], capture_output=True, text=True, check=False
-    )
-    if completed.returncode != 0:
-        pytest.fail(
-            f"chattr +F failed on {folded}: {completed.stderr.strip()}. "
-            "The volume is probably not formatted with -O casefold."
-        )
-    return plain, folded
+from atoms.fs.resolve import PathResolver
 
 
 def test_the_folded_directory_really_folds(mixed_policy):
@@ -2166,9 +2790,39 @@ def test_a_directory_created_under_the_plain_sibling_inherits_exact_bytes(mixed_
         os.close(child_fd)
 
 
-def test_the_casefold_flag_cannot_be_set_on_a_non_empty_directory(casefold_volume):
-    """Backs §6.5: this is a distinct claim from the fold test, which sets +F while
-    the directory is still empty."""
+def test_a_path_through_the_folded_directory_refuses(
+    mixed_policy, casefold_bound_volume
+):
+    """The point of the tier, and the reason the pair sits on one filesystem.
+
+    Reading the flag proves read_lookup_constraints sees it. Only this proves the
+    policy is decided per directory rather than per mount.
+    """
+    with casefold_bound_volume() as binding:
+        resolver = PathResolver(binding)
+        with pytest.raises(ProjectApprovalRefused) as caught:
+            resolver.resolve("folded/leaf")
+        assert "casefold" in str(caught.value).lower()
+
+
+def test_a_path_through_the_plain_sibling_resolves(
+    mixed_policy, casefold_bound_volume
+):
+    with casefold_bound_volume() as binding:
+        resolver = PathResolver(binding)
+        prefix = resolver.resolve("plain/leaf")
+        assert [hop.declared_component for hop in prefix.hops] == ["plain"]
+        assert prefix.frontier_name == "leaf"
+
+
+def test_the_casefold_flag_cannot_be_changed_on_a_non_empty_directory(casefold_volume):
+    """An ext4 behavior record. It backs no safety claim.
+
+    chattr(1) says the attribute can only be *changed* — set or cleared — on an empty
+    directory, so this says nothing about the case §6.5 turns on: an empty directory
+    whose proof flips while its inode stays equal. Re-reading constraints on every
+    traversal is what covers that; this is not a second mechanism.
+    """
     occupied = casefold_volume / "occupied"
     occupied.mkdir()
     (occupied / "child").write_text("x")
@@ -2236,7 +2890,42 @@ def test_the_backend_protocol_gained_no_method():
 
     assert BACKEND_REVISION == "linux-1"
     assert not hasattr(Backend, "read_lookup_constraints")
+
+
+def test_the_memo_never_shortcuts_the_constraints_read():
+    """A structural guard on §6.5's rule.
+
+    The behavioural tests in the walk suite can only fail once someone reintroduces
+    the shortcut; this one names the shape, so the reason survives a refactor. The
+    memo lookup must not gate the read_lookup_constraints call.
+    """
+    source = (SOURCE_ROOT / "fs" / "resolve.py").read_text()
+    tree = ast.parse(source)
+    facts_for = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_facts_for"
+    )
+    reads = [
+        node
+        for node in ast.walk(facts_for)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "read_lookup_constraints"
+    ]
+    assert len(reads) == 1
+    guarded = [
+        node
+        for branch in ast.walk(facts_for)
+        if isinstance(branch, (ast.If, ast.IfExp))
+        for node in ast.walk(branch)
+        if node in reads
+    ]
+    assert guarded == [], "read_lookup_constraints must not sit behind a memo branch"
 ```
+
+The existing `test_fs_fixture_registry_covers_every_test_argument` needs no change and must keep
+passing: every fixture this plan adds lives in `conftest.py`, which is the only file it scans.
 
 - [ ] **Step 4: Amend the authority design**
 
@@ -2279,16 +2968,28 @@ git commit -m "test(fs): lock the casefold correspondence and the a4b-1 boundary
 
 **Design coverage.** §5.2 dispatch → Task 1. §5.3 reader → Task 1. §5.4 inheritance → Task 1, locked
 against reality in Tasks 6 and 7. §6.1 construction → Task 2. §6.2 types → Task 2. §6.3 walk → Task 4.
-§6.4 observation → Task 3. §6.5 descriptor discipline → Task 4 (implementation), Task 6 (peak of
-three). §6.6 work base → Task 5. §7 error contract → Tasks 1–5, guarded in Task 7. §8 limits → Task 4.
-§9.1–§9.5 → Tasks 1–7. §10 authority amendment → Task 7.
+§6.4 observation → Task 3. §6.5 descriptor discipline and the interning memo → Task 4
+(implementation), Tasks 4 and 6 (behaviour), Task 7 (structural guard). §6.6 work base → Task 5. §7
+error contract → Tasks 1–5, guarded in Task 7. §8 limits → Task 4. §9.1–§9.5 → Tasks 1–7. §10
+authority amendment → Task 7.
 
-**Acceptance criteria.** 1–3 Task 4; 4 Tasks 1–2; 5 Tasks 2 and 4; 6 Task 6; 7 Tasks 4 and 6; 8 Task
-6; 9 Task 6; 10 Task 6; 11 Tasks 1, 3, 4, 5, 7; 12 Tasks 2 and 4; 13 Task 5; 14 Tasks 6 and 7; 15 Task
-1; 16 Task 4; 17 Task 7.
+**Acceptance criteria.** 1–3 Task 4; 4 Tasks 1–2; 5 Tasks 2, 4, and 7; 6 Task 6; 7 Tasks 4 and 6; 8
+Task 6; 9 Task 6; 10 Task 6; 11 Tasks 1, 3, 4, 5, 7; 12 Tasks 2, 4, and 5; 13 Task 5; 14 Tasks 6 and
+7; 15 Task 1; 16 Tasks 4 and 7; 17 Task 7; 18 Task 7.
 
 **Ledger.** Entries #19 and #20 stay open — both name later stages as owners. No entry is discharged
-by this plan, matching design §3.1.
+by this plan, matching design §3.1. Note that the §6.5 memo rule is **not** a partial discharge of
+#19: it closes a window *inside* one approval, while #19 is about the window between approval and use.
+
+**Every fixture lands in `conftest.py`.** `test_fs_fixture_registry_covers_every_test_argument` reads
+fixture names from `conftest.py` alone, so a module-local `@pytest.fixture` in a `test_fs_*.py` file
+is reported as an unregistered test argument and fails Task 7's gate. That is why Tasks 1, 2, 6, and 7
+each open with a conftest step.
+
+**Every resolver test binds ext4, never A4a's `bound_volume`.** A4a admits ext4, XFS, and Btrfs; a
+resolver constructed on a Btrfs or XFS binding raises `CapabilityUnavailable` from
+`read_lookup_constraints`, so the suite would fail rather than skip. The ext4 fixtures therefore
+arrive in Task 2, with the first resolver, rather than in the conformance tier.
 
 **Two deliberate readings of the design, flagged for the reviewer.** Design §6.1 says construction
 reads `binding.backend` and `binding.project_root_fd` before `evidence`; the implementation reads
@@ -2297,6 +2998,12 @@ read would be a bare expression with no effect. The gate the design asks for —
 detached evidence — holds. Second, `_path_max` lives in `resolve.py` while `_name_max` lives in
 `lookup.py`, because `PATH_MAX` is volume-scoped and read once at construction while `NAME_MAX` is
 per-directory and belongs with the constraints it accompanies.
+
+**One judgment call the review did not name.** `work_base_facts()` keeps a memo that *does* skip
+re-observation, while `_facts_for` no longer may. Design §6.6 now states the reason — `work/` is
+engine-owned space held under the exclusive project lock, and interference there is a `ProtocolError`
+case rather than something to defend against by re-reading — but a reviewer who disagrees would want
+the same rule applied to both, at the cost of one `openat2` per `CreateDirectory` effect.
 
 ---
 
