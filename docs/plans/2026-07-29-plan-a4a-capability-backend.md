@@ -24,7 +24,8 @@ embedding a resource.
 refines [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md)
 §§5.4, 5.5, 6, 7, and 13.2. Where they disagree, the authority design wins.
 
-**Status:** Draft for owner review. No A4a production code may land until this plan is approved.
+**Status:** Implemented on 2026-07-29. A4b and A5–A8 remain unimplemented; no code in this
+repository mutates a project path.
 
 ## Global Constraints
 
@@ -4684,9 +4685,8 @@ def test_each_effective_unsupported_errno_removes_exactly_its_capability(
 ):
     # This is the licensed half: the probe owns valid operands under the lock.
     backend = fake_backend(supplied=set(Capability), **{f"{operation}_errno": code})
-    with held_lock(metadata_root) as lock:
-        with probe_directory(lock) as probe_fd:
-            supplied = probe_backend(backend, probe_fd, lock)
+    with held_lock(metadata_root) as lock, probe_directory(lock) as probe_fd:
+        supplied = probe_backend(backend, probe_fd, lock)
     assert supplied == frozenset(
         set(Capability) - {_OPERATION_CAPABILITY[operation]}
     )
@@ -4713,26 +4713,28 @@ def test_each_bootstrap_unsupported_errno_refuses_before_probing(
         acquire_project_lock(backend, str(metadata_root))
 
 
-def _invoke_with_invalid_descriptor(backend, operation):
+def _invoke_with_invalid_descriptor(backend, operation, invalid_fd):
     # Non-empty components are load-bearing: an empty pathname produces ENOENT
     # before the kernel consults the invalid descriptor. These calls exercise the
     # real Linux backend outside probe_backend's licensed precondition.
     if operation == "exchange":
-        return backend.exchange(-1, "left", "right")
+        return backend.exchange(invalid_fd, "left", "right")
     if operation == "transfer_noclobber":
-        return backend.transfer_noclobber(-1, "source", -1, "destination")
+        return backend.transfer_noclobber(
+            invalid_fd, "source", invalid_fd, "destination"
+        )
     if operation == "link_anchor":
-        return backend.link_anchor(-1, "source", -1, "anchor")
+        return backend.link_anchor(invalid_fd, "source", invalid_fd, "anchor")
     if operation == "flush":
-        return backend.flush_file(-1)
+        return backend.flush_file(invalid_fd)
     if operation == "open_regular_nofollow":
-        return backend.open_regular_nofollow(-1, "entry")
+        return backend.open_regular_nofollow(invalid_fd, "entry")
     if operation == "symlink_fingerprint":
-        return backend.symlink_fingerprint(-1, "entry")
+        return backend.symlink_fingerprint(invalid_fd, "entry")
     if operation == "lock":
-        return backend.try_lock_exclusive(-1)
+        return backend.try_lock_exclusive(invalid_fd)
     if operation == "traversal":
-        return backend.open_child_directory(-1, "entry")
+        return backend.open_child_directory(invalid_fd, "entry")
     raise AssertionError(f"unmapped operation: {operation}")
 
 
@@ -4745,7 +4747,11 @@ def test_linux_backend_propagates_ebadf_outside_probe_precondition(
     # evidence, so every operation must expose it unchanged.
     assert all(errno.EBADF not in codes for codes in UNSUPPORTED_ERRNO.values())
     with pytest.raises(OSError) as caught:
-        _invoke_with_invalid_descriptor(linux_backend, operation)
+        # A closed positive descriptor reaches every real syscall. CPython rejects
+        # a negative descriptor before fsync/flock with ValueError.
+        invalid_fd = os.open(__file__, os.O_RDONLY | os.O_CLOEXEC)
+        os.close(invalid_fd)
+        _invoke_with_invalid_descriptor(linux_backend, operation, invalid_fd)
     assert caught.value.errno == errno.EBADF
 ```
 

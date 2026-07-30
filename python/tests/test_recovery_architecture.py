@@ -11,29 +11,9 @@ import pytest
 from atoms.core import recovery
 from atoms.core.compiler import CompiledSpec
 from atoms.core.spec import TransactionSpec
+from tests.architecture_support import fixture_names, unregistered_test_arguments
 
 _CLASSIFIER_MODULE = "atoms.core.recovery.classifier"
-_PYTEST_BUILTINS = {
-    "cache",
-    "capfd",
-    "capfdbinary",
-    "caplog",
-    "capsys",
-    "capsysbinary",
-    "capteesys",
-    "doctest_namespace",
-    "monkeypatch",
-    "pytestconfig",
-    "record_property",
-    "record_testsuite_property",
-    "record_xml_attribute",
-    "recwarn",
-    "request",
-    "tmp_path",
-    "tmp_path_factory",
-    "tmpdir",
-    "tmpdir_factory",
-}
 
 
 def _resolved_import_targets(
@@ -70,131 +50,6 @@ def _imports_classifier(source: str, *, package: str) -> bool:
         or target.startswith(f"{_CLASSIFIER_MODULE}.")
         for target in _resolved_import_targets(source, package=package)
     )
-
-
-def _decorator_name(decorator: ast.expr) -> str | None:
-    target = decorator.func if isinstance(decorator, ast.Call) else decorator
-    if isinstance(target, ast.Name):
-        return target.id
-    if isinstance(target, ast.Attribute):
-        return target.attr
-    return None
-
-
-def _fixture_names(conftest_path: Path) -> set[str]:
-    tree = ast.parse(conftest_path.read_text(encoding="utf-8"))
-    return {
-        node.name
-        for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and any(
-            _decorator_name(decorator) == "fixture"
-            for decorator in node.decorator_list
-        )
-    }
-
-
-def _parametrize_names(
-    test: ast.FunctionDef | ast.AsyncFunctionDef,
-) -> set[str]:
-    names: set[str] = set()
-    for decorator in test.decorator_list:
-        if (
-            not isinstance(decorator, ast.Call)
-            or _decorator_name(decorator) != "parametrize"
-            or not decorator.args
-        ):
-            continue
-        raw_names = decorator.args[0]
-        if isinstance(raw_names, ast.Constant) and isinstance(
-            raw_names.value,
-            str,
-        ):
-            names.update(
-                name.strip()
-                for name in raw_names.value.split(",")
-                if name.strip()
-            )
-            continue
-        if isinstance(raw_names, (ast.Tuple, ast.List)):
-            literal_names: list[str] = []
-            for item in raw_names.elts:
-                if not (
-                    isinstance(item, ast.Constant)
-                    and isinstance(item.value, str)
-                ):
-                    break
-                literal_names.append(item.value)
-            else:
-                names.update(literal_names)
-                continue
-        if isinstance(raw_names, (ast.Tuple, ast.List)):
-            raise TypeError(
-                f"{test.name} has a non-literal parametrize signature"
-            )
-        raise TypeError(
-            f"{test.name} has a non-literal parametrize signature"
-        )
-    return names
-
-
-def _collected_test_functions(
-    tree: ast.Module,
-) -> list[
-    tuple[ast.FunctionDef | ast.AsyncFunctionDef, set[str]]
-]:
-    collected: list[
-        tuple[ast.FunctionDef | ast.AsyncFunctionDef, set[str]]
-    ] = []
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if node.name.startswith("test_"):
-                collected.append((node, set()))
-            continue
-        if not isinstance(node, ast.ClassDef) or not node.name.startswith(
-            "Test"
-        ):
-            continue
-        for method in node.body:
-            if not isinstance(
-                method,
-                (ast.FunctionDef, ast.AsyncFunctionDef),
-            ) or not method.name.startswith("test_"):
-                continue
-            positional = (*method.args.posonlyargs, *method.args.args)
-            receivers = (
-                {positional[0].arg}
-                if positional and positional[0].arg in {"self", "cls"}
-                else set()
-            )
-            collected.append((method, receivers))
-    return collected
-
-
-def _unregistered_test_arguments(
-    tests_root: Path,
-    registered: set[str],
-) -> set[str]:
-    missing: set[str] = set()
-    for test_path in tests_root.glob("test_recovery_*.py"):
-        tree = ast.parse(test_path.read_text(encoding="utf-8"))
-        for node, receivers in _collected_test_functions(tree):
-            arguments = {
-                argument.arg
-                for argument in (
-                    *node.args.posonlyargs,
-                    *node.args.args,
-                    *node.args.kwonlyargs,
-                )
-            }
-            missing.update(
-                arguments
-                - _parametrize_names(node)
-                - registered
-                - _PYTEST_BUILTINS
-                - receivers
-            )
-    return missing
 
 
 def test_public_surface_has_exactly_five_operations():
@@ -326,8 +181,10 @@ import atoms.core.recovery
 
 def test_recovery_fixture_registry_covers_every_test_argument():
     tests_root = Path(__file__).parent
-    registered = _fixture_names(tests_root / "conftest.py")
-    assert _unregistered_test_arguments(tests_root, registered) == set()
+    registered = fixture_names(tests_root / "conftest.py")
+    assert unregistered_test_arguments(
+        tests_root, registered, "test_recovery_*.py"
+    ) == set()
 
 
 def test_recovery_fixture_registry_scans_test_class_methods(tmp_path):
@@ -338,6 +195,8 @@ def test_recovery_fixture_registry_scans_test_class_methods(tmp_path):
         encoding="utf-8",
     )
 
-    assert _unregistered_test_arguments(tmp_path, set()) == {
+    assert unregistered_test_arguments(
+        tmp_path, set(), "test_recovery_*.py"
+    ) == {
         "missing_fixture"
     }

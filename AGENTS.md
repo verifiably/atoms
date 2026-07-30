@@ -20,19 +20,20 @@ Plan B is written only after Plan A's interfaces settle.
 - **A3 — executable recovery reference model: implemented.** The pure production authority exposes
   `build_recovery_snapshot`, `classify_recovery`, `authorize_recovery_step`,
   `reduce_recovery_plan_prefix`, and `apply_recovery_plan` with the closed recovery model, fresh-step
-  authorization, and abstract reducer. A4–A8 remain unimplemented, and no filesystem mutation code
+  authorization, and abstract reducer. A4b and A5–A8 remain unimplemented, and no project mutation code
   has landed.
-- **A4 is split into A4a and A4b.** §14 item 2 bundles the platform capability backend with rooted
-  project approval, but the second is defined in terms of the first, so each gets its own design and
-  plan. **A4a — capability backend and project volume binding: designed, not implemented**
-  ([design](docs/plans/2026-07-29-a4a-capability-backend-design.md)) delivers the impure `atoms/fs/`
-  package, the `Backend` protocol and its Linux implementation, durability-configuration resolution,
-  the §5.5 bootstrap, and the capability probe. **A4b — rooted project approval** then owns
-  `approve_for_project`, `ProjectApprovedSpec`, and ledger entries #2, #3 (its part), #4, #5, #6, #9,
-  #10, and #11.
+- **A4a — capability backend and project volume binding: implemented.** `python/src/atoms/fs/`
+  holds the `Backend` protocol and its Linux implementation, `ctypes` bindings for `openat2` and
+  `renameat2`, mount-identity and durability-configuration resolution, the §5.5 bootstrap under an
+  explicit `HeldProjectLock`, the empirical capability probe, and `bind_project_volume`.
+  `CERTIFIED_ALLOWLIST` ships empty, so production binding refuses every volume until A8
+  crash-certifies a configuration tuple. **A4b — rooted project approval** remains unimplemented and
+  owns `approve_for_project`, `ProjectApprovedSpec`, and ledger entries #2, #3 (its part), #4, #5,
+  #6, #9, #10, #11, and #16.
 
 Work lives under `python/` (`uv run pytest`, `uv run ruff check`, `uv run pyright`, all from
-`python/`). No code in this repository mutates a filesystem path yet; that begins at A4a.
+`python/`). A4a is the first layer that touches a filesystem; it writes only inside the
+engine-owned `metadata_root`, never a project path.
 
 ## Authority order
 

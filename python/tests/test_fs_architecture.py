@@ -1,14 +1,18 @@
 import ast
 import ctypes
 import importlib
+import inspect
 import sys
 from importlib.util import resolve_name
 from pathlib import Path
 
 import pytest
 
+import atoms.fs
 from atoms.core.errors import CapabilityUnavailable
 from atoms.fs import platform as fs_platform
+from atoms.fs.volume import CERTIFIED_ALLOWLIST, DurabilityAllowlist
+from tests.architecture_support import fixture_names, unregistered_test_arguments
 
 _CORE_IMPORT_ALLOWLIST = {
     "__future__",
@@ -136,3 +140,90 @@ def test_non_linux_platform_refusal_does_not_load_linux_syscalls(monkeypatch):
 
     with pytest.raises(CapabilityUnavailable, match="platform"):
         reloaded_platform.select_backend()
+
+
+def test_bind_requires_a_keyword_only_allowlist_with_no_default():
+    signature = inspect.signature(atoms.fs.bind_project_volume)
+    parameter = signature.parameters["allowlist"]
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is inspect.Parameter.empty
+    storage = signature.parameters["storage"]
+    assert storage.kind is inspect.Parameter.KEYWORD_ONLY
+    assert storage.default is inspect.Parameter.empty
+
+
+def test_certified_allowlist_is_empty_so_population_is_deliberate():
+    assert CERTIFIED_ALLOWLIST == DurabilityAllowlist(entries=frozenset())
+
+
+def test_no_production_caller_of_bind_exists_yet():
+    # A4a has no production composition root, so it cannot assert which allowlist
+    # is passed. That call-site assertion is ledger entry #18, owned by A5.
+    source_root = Path(__file__).parents[1] / "src"
+    callers = [
+        path
+        for path in source_root.rglob("*.py")
+        if "bind_project_volume(" in path.read_text(encoding="utf-8")
+        and path.name != "binding.py"
+        and path.name != "__init__.py"
+    ]
+    assert callers == []
+
+
+def test_verified_child_path_is_not_exported():
+    assert not hasattr(atoms.fs, "verified_child_path")
+
+
+def test_public_surface_is_exactly_the_documented_names():
+    assert sorted(atoms.fs.__all__) == [
+        "AllowlistEntry",
+        "Backend",
+        "CERTIFIED_ALLOWLIST",
+        "Capability",
+        "DurabilityAllowlist",
+        "HeldProjectLock",
+        "ProjectBinding",
+        "StorageProfile",
+        "VolumeConfiguration",
+        "VolumeEvidence",
+        "acquire_project_lock",
+        "bind_project_volume",
+        "reclaim_probe_survivors",
+        "select_backend",
+    ]
+
+
+def test_fs_fixture_registry_covers_every_test_argument():
+    tests_root = Path(__file__).parent
+    registered = fixture_names(tests_root / "conftest.py")
+    assert unregistered_test_arguments(tests_root, registered, "test_fs_*.py") == set()
+
+
+def test_fs_fixture_registry_subtracts_parametrized_arguments(tmp_path):
+    # The A4a suite parametrizes on 'absent', 'operation', 'code', and 'expected'.
+    # A scanner that treated every argument as a fixture would reject all four, so
+    # this pins the behavior that makes reusing A3's scanner worth the extraction.
+    (tmp_path / "test_fs_parametrized.py").write_text(
+        "import pytest\n"
+        "@pytest.mark.parametrize(('operation', 'code'), [('exchange', 22)])\n"
+        "def test_uses_parametrized_values(operation, code):\n"
+        "    pass\n"
+        "@pytest.mark.parametrize('absent', [1])\n"
+        "def test_uses_one_parametrized_value(absent):\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+
+    assert unregistered_test_arguments(tmp_path, set(), "test_fs_*.py") == set()
+
+
+def test_fs_fixture_registry_still_catches_a_genuine_omission(tmp_path):
+    # The converse, so the test above cannot pass by the scanner finding nothing.
+    (tmp_path / "test_fs_missing.py").write_text(
+        "def test_uses_unregistered(nonexistent_fixture):\n    pass\n",
+        encoding="utf-8",
+    )
+
+    assert unregistered_test_arguments(tmp_path, set(), "test_fs_*.py") == {
+        "nonexistent_fixture"
+    }

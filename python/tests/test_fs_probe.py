@@ -7,6 +7,8 @@ import pytest
 
 from atoms.core.capabilities import Capability
 from atoms.core.errors import CapabilityUnavailable
+from atoms.fs.backend import UNSUPPORTED_ERRNO
+from atoms.fs.lock import acquire_project_lock
 from atoms.fs.probe import ChildExit, certify_sqlite_wal, probe_backend
 from tests.fs_support import probe_database_path, probe_directory
 
@@ -391,3 +393,115 @@ def test_each_child_verdict_refuses_with_its_own_reason(
         pytest.raises(CapabilityUnavailable, match=expected),
     ):
         certify_sqlite_wal(database)
+
+
+_OPERATION_CAPABILITY = {
+    "exchange": Capability.ATOMIC_EXCHANGE,
+    "transfer_noclobber": Capability.NOCLOBBER_TRANSFER,
+    "link_anchor": Capability.IDENTITY_ANCHOR,
+    "flush": Capability.DURABLE_PUBLISH,
+    "open_regular_nofollow": Capability.NOFOLLOW_COHERENT_READ,
+    "symlink_fingerprint": Capability.SYMLINK_FINGERPRINT,
+    "lock": Capability.ADVISORY_PROJECT_LOCK,
+    "traversal": Capability.ANCHORED_TRAVERSAL,
+}
+
+# Generated from production, with ENOTSUP/EOPNOTSUPP deduplicated by numeric value
+# on Linux. A copied list could silently miss a newly admitted table entry.
+_EFFECTIVE_UNSUPPORTED_PAIRS = tuple(
+    (operation, code)
+    for operation, codes in UNSUPPORTED_ERRNO.items()
+    for code in sorted(codes)
+)
+
+_BOOTSTRAP_OPERATIONS = frozenset({"lock", "traversal"})
+
+
+def test_operational_enosys_cases_are_in_the_generated_matrix():
+    # A current kernel will not naturally return these, so the fake must keep the
+    # openat2 and both renameat2 operational-absence paths reachable.
+    for operation in ("traversal", "exchange", "transfer_noclobber"):
+        assert (operation, errno.ENOSYS) in _EFFECTIVE_UNSUPPORTED_PAIRS
+
+
+@pytest.mark.parametrize(
+    ("operation", "code"),
+    [
+        pair
+        for pair in _EFFECTIVE_UNSUPPORTED_PAIRS
+        if pair[0] not in _BOOTSTRAP_OPERATIONS
+    ],
+)
+def test_each_effective_unsupported_errno_removes_exactly_its_capability(
+    held_lock, metadata_root, fake_backend, operation, code
+):
+    # This is the licensed half: the probe owns valid operands under the lock.
+    backend = fake_backend(supplied=set(Capability), **{f"{operation}_errno": code})
+    with held_lock(metadata_root) as lock, probe_directory(lock) as probe_fd:
+        supplied = probe_backend(backend, probe_fd, lock)
+    assert supplied == frozenset(
+        set(Capability) - {_OPERATION_CAPABILITY[operation]}
+    )
+
+
+@pytest.mark.parametrize(
+    ("operation", "code"),
+    [
+        pair
+        for pair in _EFFECTIVE_UNSUPPORTED_PAIRS
+        if pair[0] in _BOOTSTRAP_OPERATIONS
+    ],
+)
+def test_each_bootstrap_unsupported_errno_refuses_before_probing(
+    metadata_root, fake_backend, operation, code
+):
+    backend = fake_backend(supplied=set(Capability), **{f"{operation}_errno": code})
+    expected = (
+        "anchored_traversal"
+        if operation == "traversal"
+        else "advisory_project_lock"
+    )
+    with pytest.raises(CapabilityUnavailable, match=expected):
+        acquire_project_lock(backend, str(metadata_root))
+
+
+def _invoke_with_invalid_descriptor(backend, operation, invalid_fd):
+    # Non-empty components are load-bearing: an empty pathname produces ENOENT
+    # before the kernel consults the invalid descriptor. These calls exercise the
+    # real Linux backend outside probe_backend's licensed precondition.
+    if operation == "exchange":
+        return backend.exchange(invalid_fd, "left", "right")
+    if operation == "transfer_noclobber":
+        return backend.transfer_noclobber(
+            invalid_fd, "source", invalid_fd, "destination"
+        )
+    if operation == "link_anchor":
+        return backend.link_anchor(invalid_fd, "source", invalid_fd, "anchor")
+    if operation == "flush":
+        return backend.flush_file(invalid_fd)
+    if operation == "open_regular_nofollow":
+        return backend.open_regular_nofollow(invalid_fd, "entry")
+    if operation == "symlink_fingerprint":
+        return backend.symlink_fingerprint(invalid_fd, "entry")
+    if operation == "lock":
+        return backend.try_lock_exclusive(invalid_fd)
+    if operation == "traversal":
+        return backend.open_child_directory(invalid_fd, "entry")
+    raise AssertionError(f"unmapped operation: {operation}")
+
+
+@pytest.mark.parametrize("operation", tuple(_OPERATION_CAPABILITY))
+def test_linux_backend_propagates_ebadf_outside_probe_precondition(
+    linux_backend, operation
+):
+    # This half observes the real backend; dictating an errno through RestrictedBackend
+    # would only prove that the test double can raise. EBADF is never availability
+    # evidence, so every operation must expose it unchanged.
+    assert all(errno.EBADF not in codes for codes in UNSUPPORTED_ERRNO.values())
+    with pytest.raises(OSError) as caught:
+        # A closed positive descriptor reaches every real syscall. CPython rejects
+        # a negative descriptor before fsync/flock with ValueError.
+        invalid_fd = os.open(__file__, os.O_RDONLY | os.O_CLOEXEC)
+        os.close(invalid_fd)
+        _invoke_with_invalid_descriptor(linux_backend, operation, invalid_fd)
+    assert caught.value.errno == errno.EBADF

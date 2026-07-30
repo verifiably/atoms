@@ -974,8 +974,10 @@ Two consequences bind the plan.
    removes exactly its capability while a bootstrap prerequisite refuses with its named
    `CapabilityUnavailable` before probing.
 3. A separate matrix calls the real `LinuxBackend` once per operation outside `probe_backend`, using
-   `fd=-1` and non-empty components. It observes — never injects — exact `EBADF`, asserts that `EBADF`
-   belongs to no unsupported set, and requires the raw `OSError` to reach the caller.
+   a freshly closed positive descriptor and non-empty components. A negative descriptor is not used:
+   CPython may reject it before `fsync` or `flock` reaches Linux. The matrix observes — never injects —
+   exact `EBADF`, asserts that `EBADF` belongs to no unsupported set, and requires the raw `OSError` to
+   reach the caller.
 
 The tests deliberately separate those claims. A fake that raises a requested errno before delegating can
 prove the probe's classification table, but it cannot prove anything about ordinary backend propagation.
