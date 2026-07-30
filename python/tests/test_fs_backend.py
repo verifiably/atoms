@@ -78,6 +78,56 @@ def test_open_root_uses_cloexec(test_volume, linux_backend):
         os.close(fd)
 
 
+@pytest.mark.parametrize(
+    "invoke",
+    [
+        pytest.param(
+            lambda backend: backend.open_root("root\x00shadow"),
+            id="nul-root",
+        ),
+        pytest.param(
+            lambda backend: backend.open_child_directory(7, "child\x00shadow"),
+            id="nul-child",
+        ),
+        pytest.param(
+            lambda backend: backend.exchange(7, "left\x00shadow", "right"),
+            id="nul-exchange-left",
+        ),
+        pytest.param(
+            lambda backend: backend.exchange(7, "left", "right\x00shadow"),
+            id="nul-exchange-right",
+        ),
+        pytest.param(
+            lambda backend: backend.transfer_noclobber(
+                7, "source\x00shadow", 8, "destination"
+            ),
+            id="nul-transfer-source",
+        ),
+        pytest.param(
+            lambda backend: backend.transfer_noclobber(
+                7, "source", 8, "destination\x00shadow"
+            ),
+            id="nul-transfer-destination",
+        ),
+    ],
+)
+def test_linux_backend_refuses_nul_before_calling_raw_path_wrappers(
+    monkeypatch, linux_backend, invoke
+):
+    calls = []
+
+    def recording_wrapper(*args, **kwargs):
+        calls.append((args, kwargs))
+
+    monkeypatch.setattr("atoms.fs.linux.sys_linux.openat2", recording_wrapper)
+    monkeypatch.setattr("atoms.fs.linux.sys_linux.renameat2", recording_wrapper)
+
+    with pytest.raises(ValueError, match="embedded null byte"):
+        invoke(linux_backend)
+
+    assert calls == [], "the string adapter must reject before the raw wrapper"
+
+
 def test_open_child_directory_refuses_a_symlink(test_volume, linux_backend):
     (test_volume / "real").mkdir()
     (test_volume / "link").symlink_to("real")

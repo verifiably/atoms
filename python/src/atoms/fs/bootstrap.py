@@ -150,7 +150,13 @@ def verified_child_path(
     verify-then-open the authority requires, performed at the moment of use rather
     than trusted from bootstrap. Both the SQLite probe and A5 go through it.
     """
-    if not name or name in (".", "..") or "/" in name or os.sep in name:
+    if (
+        not name
+        or name in (".", "..")
+        or "/" in name
+        or os.sep in name
+        or "\x00" in name
+    ):
         raise ProtocolError(f"not a single path component: {name!r}")
     info = os.fstat(metadata_root_fd)
     if (info.st_dev, info.st_ino) != (expected_device, expected_inode):

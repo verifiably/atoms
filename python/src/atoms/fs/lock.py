@@ -82,6 +82,10 @@ def establish_root(backend: Backend, path: str, create: bool) -> tuple[int, str,
     no component is a symlink, and only then can collapsing '..' not change which
     entry the path names.
     """
+    if not path:
+        raise ProtocolError("root spelling must not be empty")
+    if "\x00" in path:
+        raise ProtocolError(f"root spelling contains a NUL byte: {path!r}")
     spelled = _guarded_spelling(path)
     try:
         fd = _guarded_open(backend, spelled)

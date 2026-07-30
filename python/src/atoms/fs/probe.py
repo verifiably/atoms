@@ -16,7 +16,8 @@ import sqlite3
 import stat
 import subprocess
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from typing import TypeVar
 
 from atoms.core.capabilities import Capability
 from atoms.core.errors import CapabilityUnavailable
@@ -388,6 +389,7 @@ sys.exit({ChildExit.OK})
 
 
 _CHILD_TIMEOUT_SECONDS = 60
+_Result = TypeVar("_Result")
 
 
 def _run_child(
@@ -420,39 +422,69 @@ def _run_child(
         ) from caught
 
 
-def certify_sqlite_wal(database_path: str, cleanup: bool = False) -> None:
-    """Certify the volume can host the SQLite-WAL metadata store (design §8.3).
-
-    Opening a database and selecting WAL mode is insufficient: WAL can operate
-    without shared memory when SQLite runs in exclusive locking mode. The second
-    reader must be a separate PROCESS, because a same-process connection exercises
-    WAL but not SQLite's cross-process POSIX locking contract, and the shared-memory
-    WAL index exists precisely to coordinate readers across processes.
-
-    The choreography runs as TWO child invocations. The parent must release its write
-    lock between the contending read (steps 4-5) and the child write (step 7), and a
-    single blocking child cannot express that: the parent would block waiting for a
-    child that is blocked waiting for the parent's commit, and the sequence would
-    resolve only by one side timing out. Splitting at the release point makes the
-    ordering explicit and the outcome deterministic.
-    """
-    parent = sqlite3.connect(database_path, isolation_level=None)
+def _parent_sqlite_operation(
+    phase: str, operation: Callable[[], _Result]
+) -> _Result:
+    """Run one parent SQLite phase under the certification refusal contract."""
     try:
-        mode = parent.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+        return operation()
+    except sqlite3.OperationalError as caught:
+        raise CapabilityUnavailable(
+            f"the SQLite-WAL parent {phase} failed, so hostability is unproven"
+        ) from caught
+
+
+def _cleanup_sqlite_files(database_path: str) -> None:
+    """Attempt every requested SQLite pathname and raise the first cleanup failure."""
+    first: OSError | None = None
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            os.unlink(database_path + suffix)
+        except FileNotFoundError:
+            pass
+        except OSError as caught:
+            if first is None:
+                first = caught
+    if first is not None:
+        raise first
+
+
+def _certify_sqlite_wal(database_path: str) -> None:
+    parent = _parent_sqlite_operation(
+        "connection",
+        lambda: sqlite3.connect(database_path, isolation_level=None),
+    )
+    try:
+        mode = _parent_sqlite_operation(
+            "WAL selection",
+            lambda: parent.execute("PRAGMA journal_mode=WAL").fetchone()[0],
+        )
         if str(mode).lower() != "wal":
             raise CapabilityUnavailable(
                 f"volume cannot host SQLite in WAL mode (journal_mode={mode!r})"
             )
-        parent.execute("PRAGMA synchronous=FULL")
-        parent.execute("PRAGMA user_version=1")
+        _parent_sqlite_operation(
+            "synchronous configuration",
+            lambda: parent.execute("PRAGMA synchronous=FULL"),
+        )
+        _parent_sqlite_operation(
+            "initial transaction",
+            lambda: parent.execute("PRAGMA user_version=1"),
+        )
 
-        parent.execute("BEGIN IMMEDIATE")
+        _parent_sqlite_operation(
+            "transaction begin",
+            lambda: parent.execute("BEGIN IMMEDIATE"),
+        )
         try:
             contended = _run_child(_CHILD_CONTENDER, database_path, "contention")
         finally:
             # Release before inspecting the verdict, so no refusal path can leave the
             # write lock held while the second child needs it.
-            parent.execute("COMMIT")
+            _parent_sqlite_operation(
+                "transaction commit",
+                lambda: parent.execute("COMMIT"),
+            )
         if contended.returncode == ChildExit.STALE_READ:
             raise CapabilityUnavailable(
                 "a second process could not read the committed WAL state while a "
@@ -483,16 +515,44 @@ def certify_sqlite_wal(database_path: str, cleanup: bool = False) -> None:
                 f"a second process could not write once the lock was released: "
                 f"{wrote.stderr!r}"
             )
-        observed = parent.execute("PRAGMA user_version").fetchone()[0]
+        observed = _parent_sqlite_operation(
+            "final verification",
+            lambda: parent.execute("PRAGMA user_version").fetchone()[0],
+        )
         if observed != 2:
             raise CapabilityUnavailable(
                 f"the child's committed write was not observed (user_version={observed})"
             )
     finally:
         parent.close()
-    if cleanup:
-        for suffix in ("", "-wal", "-shm"):
+
+
+def certify_sqlite_wal(database_path: str, cleanup: bool = False) -> None:
+    """Certify the volume can host the SQLite-WAL metadata store (design §8.3).
+
+    Opening a database and selecting WAL mode is insufficient: WAL can operate
+    without shared memory when SQLite runs in exclusive locking mode. The second
+    reader must be a separate PROCESS, because a same-process connection exercises
+    WAL but not SQLite's cross-process POSIX locking contract, and the shared-memory
+    WAL index exists precisely to coordinate readers across processes.
+
+    The choreography runs as TWO child invocations. The parent must release its write
+    lock between the contending read (steps 4-5) and the child write (step 7), and a
+    single blocking child cannot express that: the parent would block waiting for a
+    child that is blocked waiting for the parent's commit, and the sequence would
+    resolve only by one side timing out. Splitting at the release point makes the
+    ordering explicit and the outcome deterministic.
+    """
+    try:
+        _certify_sqlite_wal(database_path)
+    except BaseException as failure:
+        if cleanup:
             try:
-                os.unlink(database_path + suffix)
-            except FileNotFoundError:
-                pass
+                _cleanup_sqlite_files(database_path)
+            except OSError as cleanup_failure:
+                failure.add_note(
+                    f"SQLite cleanup also failed and was suppressed: {cleanup_failure!r}"
+                )
+        raise
+    if cleanup:
+        _cleanup_sqlite_files(database_path)

@@ -5101,6 +5101,33 @@ git commit -m "test(fs): lock the errno contract and the a4a boundary"
 
 ---
 
+## Consolidated final-review corrections (2026-07-30)
+
+These corrections supersede the earlier task code excerpts where they differ; the implemented status and
+open ledger obligations are unchanged.
+
+- Empty and NUL-containing logical root spellings refuse with `ProtocolError` before guarded spelling or
+  traversal. `verified_child_path` and `ProjectBinding.verified_metadata_path` likewise refuse a
+  NUL-containing component before identity syscalls.
+- `LinuxBackend` rejects NUL after filesystem encoding, and the raw `openat2` and `renameat2` wrappers
+  independently reject NUL in every operand with `ValueError` before either libc route. Tests cover the
+  reproduced prefix-truncation case and both rename operands/routes without a syscall or mutation.
+- `mountinfo` and `fdinfo` parsing validates required fields, separators, field counts, unsigned-decimal
+  grammar, unique mount IDs, and exactly one one-token `mnt_id:` record. Proc reads use
+  `errors="surrogateescape"`. Mount fields decode only `\040`, `\011`, `\012`, and `\134`, once; malformed
+  records refuse through contextual `CapabilityUnavailable`.
+- Parent `sqlite3.OperationalError` at connection, WAL selection, synchronous setup, initial transaction,
+  `BEGIN`, `COMMIT`, and final verification becomes phase-specific `CapabilityUnavailable` with the
+  original error as `__cause__`; programming faults are not caught. `certify_sqlite_wal(cleanup=True)`
+  attempts database/WAL/SHM cleanup on success, refusal, and timeout, attempts all three names, and
+  preserves an in-flight certification failure if cleanup also fails. Binding's anchored outer
+  reclamation remains authoritative.
+- The non-Linux reload test restores the `atoms.fs.platform` package attribute; both filesystem-volume
+  fixtures yield from guaranteed temporary-directory teardown; the early-lock-release binding is closed
+  in `finally`; every public `__all__` name is required to exist; the actual child script is driven with a
+  non-`SQLITE_BUSY` operational failure; and `select_backend() -> Backend` imports only the protocol
+  eagerly, leaving Linux/syscall loading lazy on unsupported hosts.
+
 ## Self-review checklist
 
 Run before declaring A4a complete.

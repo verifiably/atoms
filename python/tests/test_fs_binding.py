@@ -262,15 +262,21 @@ def test_accessors_refuse_once_the_lock_is_released(
     # Without this, metadata_root_fd could hand back a descriptor the lock already
     # closed — an out-of-order exit surfacing as EBADF somewhere far away.
     lock = held_lock(metadata_root)
-    binding = bind_project_volume(
-        str(project_root),
-        lock,
-        allowlist=test_allowlist(lock, project_root, test_storage_profile),
-        storage=test_storage_profile,
-    )
-    lock.__exit__(None, None, None)
-    with pytest.raises(ProtocolError):
-        _ = binding.metadata_root_fd
+    binding = None
+    try:
+        binding = bind_project_volume(
+            str(project_root),
+            lock,
+            allowlist=test_allowlist(lock, project_root, test_storage_profile),
+            storage=test_storage_profile,
+        )
+        lock.__exit__(None, None, None)
+        with pytest.raises(ProtocolError):
+            _ = binding.metadata_root_fd
+    finally:
+        if binding is not None:
+            binding.__exit__(None, None, None)
+        lock.__exit__(None, None, None)
 
 
 def test_verified_metadata_path_delegates_to_the_shared_verifier(bound_volume, metadata_root):
@@ -279,6 +285,11 @@ def test_verified_metadata_path_delegates_to_the_shared_verifier(bound_volume, m
         assert resolved.endswith("/atoms.db")
         with pytest.raises(ProtocolError):
             binding.verified_metadata_path("nested/child")
+
+
+def test_verified_metadata_path_refuses_a_nul_component(bound_volume):
+    with bound_volume() as binding, pytest.raises(ProtocolError, match="component"):
+        binding.verified_metadata_path("atoms.db\x00shadow")
 
 
 def test_guarded_types_refuse_ordinary_construction(bound_volume):

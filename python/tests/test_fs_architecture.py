@@ -3,6 +3,7 @@ import ctypes
 import importlib
 import inspect
 import sys
+import typing
 from importlib.util import resolve_name
 from pathlib import Path
 
@@ -130,6 +131,9 @@ def test_non_linux_platform_refusal_does_not_load_linux_syscalls(monkeypatch):
     class LibcWithoutSyscall:
         pass
 
+    # Importing the temporary module below replaces this package attribute, while
+    # restoring only sys.modules would leave later tests holding the temporary one.
+    monkeypatch.setattr(atoms.fs, "platform", fs_platform)
     monkeypatch.setattr(sys, "platform", "darwin")
     monkeypatch.setattr(ctypes, "CDLL", lambda *args, **kwargs: LibcWithoutSyscall())
     monkeypatch.delitem(sys.modules, "atoms.fs.platform")
@@ -140,6 +144,14 @@ def test_non_linux_platform_refusal_does_not_load_linux_syscalls(monkeypatch):
 
     with pytest.raises(CapabilityUnavailable, match="platform"):
         reloaded_platform.select_backend()
+
+
+def test_non_linux_reload_restores_the_package_platform_attribute():
+    assert vars(atoms.fs)["platform"] is fs_platform
+
+
+def test_select_backend_is_typed_to_the_backend_protocol():
+    assert typing.get_type_hints(fs_platform.select_backend)["return"] is atoms.fs.Backend
 
 
 def test_bind_requires_a_keyword_only_allowlist_with_no_default():
@@ -401,6 +413,8 @@ def test_public_surface_is_exactly_the_documented_names():
         "reclaim_probe_survivors",
         "select_backend",
     ]
+    for name in atoms.fs.__all__:
+        assert hasattr(atoms.fs, name), name
 
 
 def test_fs_fixture_registry_covers_every_test_argument():

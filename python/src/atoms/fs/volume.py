@@ -9,7 +9,16 @@ from dataclasses import dataclass, field
 from atoms.core.errors import CapabilityUnavailable
 from atoms.fs.platform import BACKEND_REVISION
 
-_OCTAL_ESCAPE = re.compile(r"\\([0-7]{3})")
+_DECIMAL = re.compile(r"[0-9]+")
+_DEVICE = re.compile(r"[0-9]+:[0-9]+")
+_KERNEL_ESCAPE = re.compile(r"\\(?:040|011|012|134)")
+_INVALID_KERNEL_ESCAPE = re.compile(r"\\(?!040|011|012|134)")
+_KERNEL_ESCAPE_VALUES = {
+    r"\040": " ",
+    r"\011": "\t",
+    r"\012": "\n",
+    r"\134": "\\",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,39 +110,118 @@ _BARRIER_OPTIONS: dict[str, tuple[tuple[str, str, str], ...]] = {
 
 
 def _unescape(value: str) -> str:
-    return _OCTAL_ESCAPE.sub(lambda found: chr(int(found.group(1), 8)), value)
+    invalid = _INVALID_KERNEL_ESCAPE.search(value)
+    if invalid is not None:
+        raise ValueError(f"unsupported kernel escape at offset {invalid.start()}")
+    return _KERNEL_ESCAPE.sub(
+        lambda found: _KERNEL_ESCAPE_VALUES[found.group(0)],
+        value,
+    )
+
+
+def _mountinfo_error(line_number: int, reason: str) -> CapabilityUnavailable:
+    return CapabilityUnavailable(f"malformed mountinfo line {line_number}: {reason}")
+
+
+def _decimal_field(token: str, name: str, line_number: int) -> int:
+    if _DECIMAL.fullmatch(token) is None:
+        raise _mountinfo_error(line_number, f"{name} is not an unsigned decimal token")
+    return int(token)
+
+
+def _option_field(token: str, name: str, line_number: int) -> tuple[str, ...]:
+    options = tuple(token.split(","))
+    if any(not option for option in options):
+        raise _mountinfo_error(line_number, f"{name} contains an empty option")
+    return options
 
 
 def parse_mountinfo(text: str) -> tuple[MountEntry, ...]:
-    entries = []
-    for line in text.splitlines():
+    entries: list[MountEntry] = []
+    mount_ids: set[int] = set()
+    for line_number, line in enumerate(text.splitlines(), start=1):
         if not line.strip():
             continue
         fields = line.split()
+        if fields.count("-") != 1:
+            raise _mountinfo_error(
+                line_number, "expected exactly one field separator"
+            )
         separator = fields.index("-")
+        if separator < 6:
+            raise _mountinfo_error(
+                line_number, "record is missing required pre-separator fields"
+            )
+        if len(fields) != separator + 4:
+            raise _mountinfo_error(
+                line_number, "record must carry exactly three post-separator fields"
+            )
+        mount_id = _decimal_field(fields[0], "mount id", line_number)
+        _decimal_field(fields[1], "parent mount id", line_number)
+        if _DEVICE.fullmatch(fields[2]) is None:
+            raise _mountinfo_error(
+                line_number, "device is not an unsigned major:minor pair"
+            )
+        if mount_id in mount_ids:
+            raise _mountinfo_error(line_number, f"duplicate mount id {mount_id}")
+        mount_ids.add(mount_id)
+        try:
+            _unescape(fields[3])
+            mount_point = _unescape(fields[4])
+            _unescape(fields[separator + 2])
+        except ValueError as caught:
+            raise _mountinfo_error(line_number, str(caught)) from caught
         entries.append(
             MountEntry(
-                mount_id=int(fields[0]),
+                mount_id=mount_id,
                 device=fields[2],
-                mount_point=_unescape(fields[4]),
-                mount_options=tuple(fields[5].split(",")),
+                mount_point=mount_point,
+                mount_options=_option_field(
+                    fields[5], "mount options", line_number
+                ),
                 filesystem_type=fields[separator + 1],
-                super_options=tuple(fields[separator + 3].split(",")),
+                super_options=_option_field(
+                    fields[separator + 3], "super options", line_number
+                ),
             )
         )
     return tuple(entries)
 
 
 def parse_mount_id(fdinfo_text: str) -> int:
-    for line in fdinfo_text.splitlines():
+    found: int | None = None
+    for line_number, line in enumerate(fdinfo_text.splitlines(), start=1):
         if line.startswith("mnt_id:"):
-            return int(line.split()[1])
-    raise CapabilityUnavailable("fdinfo carries no mnt_id field")
+            fields = line.split()
+            if (
+                len(fields) != 2
+                or fields[0] != "mnt_id:"
+                or _DECIMAL.fullmatch(fields[1]) is None
+            ):
+                raise CapabilityUnavailable(
+                    f"malformed fdinfo mnt_id record at line {line_number}: "
+                    "expected exactly one unsigned decimal token"
+                )
+            if found is not None:
+                raise CapabilityUnavailable(
+                    f"duplicate fdinfo mnt_id record at line {line_number}"
+                )
+            found = int(fields[1])
+    if found is None:
+        raise CapabilityUnavailable("fdinfo carries no mnt_id field")
+    return found
 
 
 def read_mount_id(fd: int) -> int:
-    with open(f"/proc/self/fdinfo/{fd}", encoding="utf-8") as handle:
-        return parse_mount_id(handle.read())
+    path = f"/proc/self/fdinfo/{fd}"
+    with open(path, encoding="utf-8", errors="surrogateescape") as handle:
+        text = handle.read()
+    try:
+        return parse_mount_id(text)
+    except CapabilityUnavailable as caught:
+        raise CapabilityUnavailable(
+            f"cannot resolve mount id from {path}: {caught}"
+        ) from caught
 
 
 def resolve_mount_entry(fd: int, mountinfo_text: str) -> MountEntry:
@@ -143,7 +231,13 @@ def resolve_mount_entry(fd: int, mountinfo_text: str) -> MountEntry:
     carrying distinct per-mount options, so device-keying is ambiguous.
     """
     wanted = read_mount_id(fd)
-    for entry in parse_mountinfo(mountinfo_text):
+    try:
+        entries = parse_mountinfo(mountinfo_text)
+    except CapabilityUnavailable as caught:
+        raise CapabilityUnavailable(
+            f"cannot resolve mountinfo for descriptor {fd}: {caught}"
+        ) from caught
+    for entry in entries:
         if entry.mount_id == wanted:
             return entry
     raise CapabilityUnavailable(f"no mount entry for mount id {wanted}")
@@ -182,7 +276,11 @@ def build_configuration(entry: MountEntry, kernel_identifier: str) -> VolumeConf
 
 
 def read_mountinfo() -> str:
-    with open("/proc/self/mountinfo", encoding="utf-8") as handle:
+    with open(
+        "/proc/self/mountinfo",
+        encoding="utf-8",
+        errors="surrogateescape",
+    ) as handle:
         return handle.read()
 
 

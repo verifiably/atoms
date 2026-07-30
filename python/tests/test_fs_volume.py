@@ -1,7 +1,9 @@
 import dataclasses
+import io
 
 import pytest
 
+import atoms.fs.volume as volume_module
 from atoms.core.errors import CapabilityUnavailable
 from atoms.fs.volume import (
     _BARRIER_OPTIONS,
@@ -61,6 +63,75 @@ def test_parse_mountinfo_unescapes_octal_mount_points(mountinfo_text):
     assert any(entry.mount_point == "/mnt/my volume" for entry in entries)
 
 
+def test_parse_mountinfo_decodes_only_the_four_kernel_escapes_once():
+    text = (
+        r"41 25 259:2 / /mnt/space\040tab\011line\012slash\134040 "
+        "rw,noatime - ext4 /dev/nvme0n1p2 rw"
+    )
+
+    entry = parse_mountinfo(text)[0]
+
+    assert entry.mount_point == "/mnt/space tab\tline\nslash\\040"
+
+
+def test_parse_mountinfo_refuses_an_impossible_kernel_escape():
+    text = (
+        r"41 25 259:2 / /mnt/impossible\777escape "
+        "rw,noatime - ext4 /dev/nvme0n1p2 rw"
+    )
+
+    with pytest.raises(CapabilityUnavailable, match="mountinfo line 1"):
+        parse_mountinfo(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param(
+            "41 25 259:2 / /data rw,noatime",
+            id="missing-separator",
+        ),
+        pytest.param(
+            "41 25 259:2 / /data rw,noatime - ext4 /dev/x rw - trailing",
+            id="duplicate-separator",
+        ),
+        pytest.param(
+            "41 25 259:2 / /data rw,noatime - ext4 /dev/x",
+            id="truncated-post-separator",
+        ),
+        pytest.param(
+            "41 25 259:2 / /data rw,noatime - ext4 /dev/x rw trailing",
+            id="trailing-token",
+        ),
+        pytest.param(
+            "+41 25 259:2 / /data rw,noatime - ext4 /dev/x rw",
+            id="signed-mount-id",
+        ),
+        pytest.param(
+            "41 parent 259:2 / /data rw,noatime - ext4 /dev/x rw",
+            id="nondecimal-parent-id",
+        ),
+        pytest.param(
+            "41 25 259:minor / /data rw,noatime - ext4 /dev/x rw",
+            id="nonnumeric-device",
+        ),
+    ],
+)
+def test_parse_mountinfo_refuses_malformed_records(text):
+    with pytest.raises(CapabilityUnavailable, match="mountinfo line 1"):
+        parse_mountinfo(text)
+
+
+def test_parse_mountinfo_refuses_duplicate_mount_ids():
+    text = (
+        "41 25 259:2 / /data rw - ext4 /dev/x rw\n"
+        "41 25 259:3 / /other rw - ext4 /dev/y rw\n"
+    )
+
+    with pytest.raises(CapabilityUnavailable, match="duplicate mount id 41"):
+        parse_mountinfo(text)
+
+
 def test_parse_mountinfo_handles_variable_optional_fields(mountinfo_text):
     entries = parse_mountinfo(mountinfo_text("optional_fields"))
     shared = next(item for item in entries if item.mount_point == "/shared")
@@ -79,6 +150,37 @@ def test_parse_mount_id_reads_the_fdinfo_field(fdinfo_text):
     assert parse_mount_id(fdinfo_text("plain")) == 41
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("mnt_id:\n", id="truncated"),
+        pytest.param("mnt_id:\t41 trailing\n", id="trailing-token"),
+        pytest.param("mnt_id:\t+41\n", id="signed"),
+        pytest.param("mnt_id:\tnot-decimal\n", id="nonnumeric"),
+        pytest.param("mnt_id:\t41\nmnt_id:\t42\n", id="duplicate"),
+    ],
+)
+def test_parse_mount_id_requires_exactly_one_decimal_token(text):
+    with pytest.raises(CapabilityUnavailable, match="mnt_id"):
+        parse_mount_id(text)
+
+
+def test_read_mount_id_adds_the_descriptor_path_to_malformed_fdinfo(
+    monkeypatch
+):
+    monkeypatch.setattr(
+        volume_module,
+        "open",
+        lambda *args, **kwargs: io.StringIO("mnt_id:\tbad\n"),
+        raising=False,
+    )
+
+    with pytest.raises(CapabilityUnavailable, match="/proc/self/fdinfo/7") as caught:
+        volume_module.read_mount_id(7)
+
+    assert isinstance(caught.value.__cause__, CapabilityUnavailable)
+
+
 def test_resolve_mount_entry_matches_on_mount_id_not_device(monkeypatch, mountinfo_text):
     # st_dev alone is ambiguous: bind mounts share a device but differ in mount ID.
     monkeypatch.setattr("atoms.fs.volume.read_mount_id", lambda fd: 43)
@@ -91,6 +193,44 @@ def test_resolve_mount_entry_refuses_an_unresolvable_mount(monkeypatch, mountinf
     monkeypatch.setattr("atoms.fs.volume.read_mount_id", lambda fd: 9999)
     with pytest.raises(CapabilityUnavailable, match="mount"):
         resolve_mount_entry(7, mountinfo_text("bind_same_device"))
+
+
+def test_resolve_mount_entry_contextualizes_malformed_mountinfo(monkeypatch):
+    monkeypatch.setattr("atoms.fs.volume.read_mount_id", lambda fd: 41)
+
+    with pytest.raises(CapabilityUnavailable, match="mountinfo.*descriptor 7") as caught:
+        resolve_mount_entry(7, "41 25 truncated")
+
+    assert isinstance(caught.value.__cause__, CapabilityUnavailable)
+
+
+def test_read_mountinfo_preserves_unrelated_non_utf8_mountpoints_for_matching(
+    monkeypatch
+):
+    payload = (
+        b"41 25 259:2 / /unrelated-\xff rw - ext4 /dev/x rw\n"
+        b"42 25 259:3 / /data rw - ext4 /dev/y rw\n"
+    )
+
+    def open_mountinfo(path, *, encoding, errors):
+        assert path == "/proc/self/mountinfo"
+        assert encoding == "utf-8"
+        assert errors == "surrogateescape"
+        return io.TextIOWrapper(
+            io.BytesIO(payload),
+            encoding=encoding,
+            errors=errors,
+        )
+
+    monkeypatch.setattr(volume_module, "open", open_mountinfo, raising=False)
+    monkeypatch.setattr(volume_module, "read_mount_id", lambda fd: 42)
+
+    text = volume_module.read_mountinfo()
+    entry = resolve_mount_entry(7, text)
+
+    assert "\udcff" in parse_mountinfo(text)[0].mount_point
+    assert entry.mount_id == 42
+    assert entry.mount_point == "/data"
 
 
 def test_build_configuration_normalizes_absent_ext4_options(mountinfo_text):

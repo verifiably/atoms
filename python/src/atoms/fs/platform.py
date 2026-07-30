@@ -7,6 +7,7 @@ import platform
 import sys
 
 from atoms.core.errors import CapabilityUnavailable
+from atoms.fs.backend import Backend
 
 BACKEND_REVISION = "linux-1"
 """Atoms backend contract revision (design §6.2).
@@ -17,7 +18,7 @@ a crash test certifies a volume configuration *and* the backend code that issued
 """
 
 
-def select_backend():
+def select_backend() -> Backend:
     """Return a Backend for this host, or refuse. Performs no I/O."""
     if sys.platform != "linux":
         raise CapabilityUnavailable(

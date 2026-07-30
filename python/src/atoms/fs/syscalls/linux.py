@@ -47,8 +47,14 @@ def _raise_errno() -> None:
     raise OSError(code, os.strerror(code))
 
 
+def _require_c_string(path: bytes) -> None:
+    if b"\x00" in path:
+        raise ValueError("embedded null byte")
+
+
 def openat2(dirfd: int, path: bytes, flags: int, mode: int, resolve: int) -> int:
     """openat2(2). No glibc wrapper exists, so this always goes through syscall()."""
+    _require_c_string(path)
     how = OpenHow(flags=flags, mode=mode, resolve=resolve)
     ctypes.set_errno(0)
     result = _syscall(
@@ -89,6 +95,8 @@ def renameat2(
     newpath: bytes,
     flags: int,
 ) -> None:
+    _require_c_string(oldpath)
+    _require_c_string(newpath)
     ctypes.set_errno(0)
     if _renameat2_symbol is not None:
         result = _renameat2_symbol(olddirfd, oldpath, newdirfd, newpath, flags)

@@ -2,15 +2,25 @@ import errno
 import os
 import sqlite3
 import subprocess
+import sys
 
 import pytest
 
+import atoms.fs.probe as fs_probe
 from atoms.core.capabilities import Capability
 from atoms.core.errors import CapabilityUnavailable
 from atoms.fs.backend import UNSUPPORTED_ERRNO
 from atoms.fs.lock import acquire_project_lock
 from atoms.fs.probe import ChildExit, certify_sqlite_wal, probe_backend
 from tests.fs_support import probe_database_path, probe_directory
+
+
+class _Cursor:
+    def __init__(self, row):
+        self._row = row
+
+    def fetchone(self):
+        return self._row
 
 
 def test_real_volume_supplies_every_capability(held_lock, metadata_root):
@@ -240,6 +250,94 @@ def test_sqlite_wal_certification_succeeds_on_the_test_volume(held_lock, metadat
         certify_sqlite_wal(database)
 
 
+@pytest.mark.parametrize(
+    ("failure_target", "phase"),
+    [
+        pytest.param("connect", "connection", id="connect"),
+        pytest.param(
+            "PRAGMA journal_mode=WAL",
+            "WAL selection",
+            id="wal-selection",
+        ),
+        pytest.param(
+            "PRAGMA synchronous=FULL",
+            "synchronous configuration",
+            id="synchronous",
+        ),
+        pytest.param(
+            "PRAGMA user_version=1",
+            "initial transaction",
+            id="initial-transaction",
+        ),
+        pytest.param("BEGIN IMMEDIATE", "transaction begin", id="begin"),
+        pytest.param("COMMIT", "transaction commit", id="commit"),
+        pytest.param(
+            "PRAGMA user_version",
+            "final verification",
+            id="final-read",
+        ),
+    ],
+)
+def test_parent_operational_errors_refuse_with_the_exact_phase_and_cause(
+    tmp_path, monkeypatch, failure_target, phase
+):
+    failure = sqlite3.OperationalError(f"injected {failure_target} failure")
+
+    class Connection:
+        def execute(self, statement, *args):
+            if statement == failure_target:
+                raise failure
+            if statement == "PRAGMA journal_mode=WAL":
+                return _Cursor(("wal",))
+            if statement == "PRAGMA user_version":
+                return _Cursor((2,))
+            return _Cursor((None,))
+
+        def close(self):
+            pass
+
+    if failure_target == "connect":
+        def fail_connect(*args, **kwargs):
+            raise failure
+
+        monkeypatch.setattr("atoms.fs.probe.sqlite3.connect", fail_connect)
+    else:
+        monkeypatch.setattr(
+            "atoms.fs.probe.sqlite3.connect", lambda *args, **kwargs: Connection()
+        )
+    monkeypatch.setattr(
+        "atoms.fs.probe._run_child",
+        lambda *args, **kwargs: subprocess.CompletedProcess([], ChildExit.OK, b"", b""),
+    )
+
+    with pytest.raises(CapabilityUnavailable, match=phase) as caught:
+        certify_sqlite_wal(str(tmp_path / "phase.db"))
+
+    assert caught.value.__cause__ is failure
+
+
+def test_parent_programming_fault_is_not_converted_to_capability_unavailable(
+    tmp_path, monkeypatch
+):
+    failure = RuntimeError("injected programming fault")
+
+    class Connection:
+        def execute(self, statement, *args):
+            raise failure
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "atoms.fs.probe.sqlite3.connect", lambda *args, **kwargs: Connection()
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        certify_sqlite_wal(str(tmp_path / "programming.db"))
+
+    assert caught.value is failure
+
+
 def test_sqlite_certification_observes_the_commit_across_processes(
     held_lock, metadata_root
 ):
@@ -330,7 +428,8 @@ def test_a_certification_child_that_times_out_refuses(
         probe_database_path(lock) as database,
         pytest.raises(CapabilityUnavailable, match=phase),
     ):
-        certify_sqlite_wal(database)
+        certify_sqlite_wal(database, cleanup=True)
+    assert os.listdir(os.path.dirname(database)) == []
 
 
 def test_sqlite_certification_removes_its_files(held_lock, metadata_root):
@@ -342,30 +441,77 @@ def test_sqlite_certification_removes_its_files(held_lock, metadata_root):
 
 
 def test_sqlite_certification_refuses_when_wal_is_unavailable(tmp_path, monkeypatch):
-    class Cursor:
-        def __init__(self, rows):
-            self._rows = rows
-
-        def fetchone(self):
-            return self._rows[0] if self._rows else None
-
     class RefusingConnection:
         def execute(self, statement, *args):
             # Production calls .fetchone() on what execute returns, so the fake must
             # be cursor-shaped. Returning a bare list raises AttributeError and the
             # test would pass for the wrong reason.
             if "journal_mode" in statement:
-                return Cursor([("delete",)])
-            return Cursor([])
+                return _Cursor(("delete",))
+            return _Cursor(None)
 
         def close(self):
             pass
 
+    database = str(tmp_path / "x.db")
+    for suffix in ("", "-wal", "-shm"):
+        (tmp_path / f"x.db{suffix}").write_bytes(b"survivor")
     monkeypatch.setattr(
         "atoms.fs.probe.sqlite3.connect", lambda *a, **k: RefusingConnection()
     )
     with pytest.raises(CapabilityUnavailable, match="WAL"):
-        certify_sqlite_wal(str(tmp_path / "x.db"))
+        certify_sqlite_wal(database, cleanup=True)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_certification_failure_survives_cleanup_failure_and_all_names_are_attempted(
+    tmp_path, monkeypatch
+):
+    database = str(tmp_path / "x.db")
+    failure = sqlite3.OperationalError("injected connect failure")
+    attempted = []
+
+    def fail_connect(*args, **kwargs):
+        raise failure
+
+    def fail_cleanup(path):
+        attempted.append(path)
+        raise OSError(errno.EIO, f"injected cleanup failure for {path}")
+
+    monkeypatch.setattr("atoms.fs.probe.sqlite3.connect", fail_connect)
+    monkeypatch.setattr("atoms.fs.probe.os.unlink", fail_cleanup)
+
+    with pytest.raises(CapabilityUnavailable, match="connection") as caught:
+        certify_sqlite_wal(database, cleanup=True)
+
+    assert caught.value.__cause__ is failure
+    assert attempted == [database, f"{database}-wal", f"{database}-shm"]
+
+
+def test_contender_child_rejects_a_non_busy_operational_error(monkeypatch):
+    failure = sqlite3.OperationalError("injected readonly failure")
+    failure.sqlite_errorcode = sqlite3.SQLITE_READONLY
+
+    class Connection:
+        def execute(self, statement, *args):
+            if statement == "PRAGMA user_version":
+                return _Cursor((1,))
+            if statement == "BEGIN IMMEDIATE":
+                raise failure
+            raise AssertionError(f"unexpected statement: {statement}")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(sqlite3, "connect", lambda *args, **kwargs: Connection())
+    monkeypatch.setattr(sys, "argv", ["sqlite-contender", "controlled.db"])
+
+    with pytest.raises(SystemExit) as caught:
+        # Execute the fixed production child script against the controlled sqlite
+        # module state; no untrusted string reaches exec in this test.
+        exec(fs_probe._CHILD_CONTENDER, {})  # noqa: S102
+
+    assert caught.value.code == ChildExit.WRONG_REFUSAL
 
 
 @pytest.mark.parametrize(

@@ -89,7 +89,11 @@ def _filesystem_type_for(path: Path) -> str | None:
     """Return the filesystem type backing `path`, from /proc/self/mountinfo."""
     target = os.stat(path)
     device = f"{os.major(target.st_dev)}:{os.minor(target.st_dev)}"
-    with open("/proc/self/mountinfo", encoding="utf-8") as handle:
+    with open(
+        "/proc/self/mountinfo",
+        encoding="utf-8",
+        errors="surrogateescape",
+    ) as handle:
         for line in handle:
             fields = line.split()
             separator = fields.index("-")

@@ -39,6 +39,47 @@ def test_metadata_root_path_is_normalized_and_absolute(linux_backend, metadata_r
         assert lock.metadata_root_path == os.path.abspath(str(metadata_root))
 
 
+def test_acquire_refuses_an_empty_root_without_mutating_cwd(
+    linux_backend, tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+
+    with (
+        pytest.raises(ProtocolError, match="root"),
+        acquire_project_lock(linux_backend, ""),
+    ):
+        pass
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_acquire_refuses_a_nul_root_without_mutating_an_existing_prefix(
+    linux_backend, tmp_path
+):
+    prefix = tmp_path / "existing"
+    prefix.mkdir()
+    (prefix / "sentinel").write_text("unchanged")
+
+    with (
+        pytest.raises(ProtocolError, match="NUL"),
+        acquire_project_lock(linux_backend, f"{prefix}\x00/missing"),
+    ):
+        pass
+
+    assert sorted(path.name for path in prefix.iterdir()) == ["sentinel"]
+
+
+def test_acquire_refuses_a_nul_root_without_creating_a_missing_prefix(
+    linux_backend, tmp_path
+):
+    prefix = tmp_path / "missing"
+
+    with pytest.raises(ProtocolError, match="NUL"):
+        acquire_project_lock(linux_backend, f"{prefix}\x00shadow")
+
+    assert not prefix.exists()
+
+
 def test_establish_root_normalizes_only_after_the_guarded_walk(linux_backend, test_volume):
     # os.path.abspath calls normpath, which collapses 'aliased/..' lexically to
     # test_volume — a real directory that exists — so a normalize-first

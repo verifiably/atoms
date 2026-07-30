@@ -287,7 +287,7 @@ def test_verified_child_path_joins_after_confirming_identity(held_lock, metadata
 def test_verified_child_path_refuses_a_non_component(held_lock, metadata_root):
     with held_lock(metadata_root) as lock:
         info = os.fstat(lock.metadata_root_fd)
-        for name in ("../escape", "nested/child", "", "."):
+        for name in ("../escape", "nested/child", "", ".", "atoms.db\x00shadow"):
             with pytest.raises(ProtocolError):
                 verified_child_path(
                     lock.metadata_root_fd,
@@ -296,6 +296,26 @@ def test_verified_child_path_refuses_a_non_component(held_lock, metadata_root):
                     info.st_ino,
                     name,
                 )
+
+
+def test_verified_child_path_refuses_nul_before_identity_syscalls(
+    held_lock, metadata_root, monkeypatch
+):
+    with held_lock(metadata_root) as lock:
+        info = os.fstat(lock.metadata_root_fd)
+
+        def reached_fstat(fd):
+            raise AssertionError(f"NUL component reached fstat for descriptor {fd}")
+
+        monkeypatch.setattr("atoms.fs.bootstrap.os.fstat", reached_fstat)
+        with pytest.raises(ProtocolError, match="component"):
+            verified_child_path(
+                lock.metadata_root_fd,
+                lock.metadata_root_path,
+                info.st_dev,
+                info.st_ino,
+                "atoms.db\x00shadow",
+            )
 
 
 def test_verified_child_path_refuses_an_identity_mismatch(held_lock, metadata_root):

@@ -209,7 +209,8 @@ def test_volume(tmp_path_factory):
     if base is None:
         pytest.skip(reason)
     base.mkdir(parents=True, exist_ok=True)
-    return Path(tempfile.mkdtemp(dir=base))
+    with tempfile.TemporaryDirectory(dir=base) as directory:
+        yield Path(directory)
 
 
 @pytest.fixture
@@ -272,4 +273,5 @@ def distinct_volume(test_volume):
     found = find_distinct_mount(test_volume)
     if found is None:
         pytest.skip("no writable mount with a distinct mount id is available")
-    return Path(tempfile.mkdtemp(dir=found))
+    with tempfile.TemporaryDirectory(dir=found) as directory:
+        yield Path(directory)

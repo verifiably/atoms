@@ -238,7 +238,9 @@ unavailable, which refuses binding under §7.1; a kernel without `renameat2` sur
 `atomic_exchange` and `noclobber_transfer` absent, which is reported and not refused.
 
 Every wrapper raises `OSError` with the true `errno` and performs no policy, no retries, and no
-translation. Triage happens at the probe boundary (§10).
+translation. Triage happens at the probe boundary (§10). Embedded NUL is the input-boundary exception:
+the `LinuxBackend` string adapter and each raw `ctypes` pathname operand reject it with `ValueError`
+*before* `openat2`, either `renameat2` route, or any other libc entry can observe a truncated C string.
 
 ### 5.3 Platform selection
 
@@ -269,6 +271,10 @@ can change which entry a path names under any symlink arrangement. Every `..` re
 refuses it exactly when an earlier component is a symlink and resolves it normally otherwise. Only once
 the walk has proved the path contains no symlink is the returned pathname normalized, and at that point
 collapsing is sound by construction rather than by assumption.
+
+An empty logical root spelling and any root spelling containing NUL refuse with `ProtocolError` before
+this guarded spelling is built. In particular, an empty string can never become the current working
+directory, and a NUL suffix can never bind the pathname prefix.
 
 **Missing `metadata_root`.** Only the final leaf is created, and only relative to a descriptor:
 
@@ -305,7 +311,13 @@ onto the same volume as every effect path, because that is what lets blob promot
 publication reach live targets by atomic hard-link and rename. A4a proves it for the two roots it holds;
 A4b proves it for effect paths, which `anchored_traversal` already confines by refusing mount crossings.
 
-Failure to resolve a mount ID, or a mismatch between the roots, refuses with `CapabilityUnavailable`.
+Failure to resolve a mount ID, malformed proc records, or a mismatch between the roots refuses with
+`CapabilityUnavailable`. The `mountinfo` parser requires the complete field grammar and exactly one
+separator, three post-separator fields, unsigned-decimal IDs, an unsigned `major:minor` device, and unique
+mount IDs. The `fdinfo` parser requires exactly one `mnt_id:` record containing exactly one unsigned
+decimal token. Proc text is decoded with `surrogateescape`, so an unrelated non-UTF-8 mountpoint cannot
+prevent descriptor-bound matching. Only the four escapes the kernel emits (`\040`, `\011`, `\012`,
+`\134`) are decoded, in one pass; any other backslash escape refuses as malformed.
 
 ### 6.2 `VolumeConfiguration`
 
@@ -703,6 +715,14 @@ contention or write — did not finish, because a `TimeoutExpired` reaching the 
 certification outside the §10 contract, where every other certification failure already lands. Afterwards
 the database, `-wal`, and `-shm` names are removed through anchored probe cleanup.
 
+Parent-side `sqlite3.OperationalError` is likewise a certification refusal. Connection, WAL selection,
+synchronous configuration, initial transaction, `BEGIN`, `COMMIT`, and final verification are converted
+separately to phase-specific `CapabilityUnavailable`, preserving the operational error as `__cause__`.
+Other exception types still propagate. When the standalone helper is called with `cleanup=True`, it
+attempts database, WAL, and SHM removal after success, refusal, or timeout; all three removals are
+attempted, and a cleanup failure never replaces the original certification failure. Production binding's
+descriptor-anchored outer reclamation remains the authoritative cleanup boundary.
+
 The second reader must be a subprocess, not a second connection in this process. A same-process
 connection exercises WAL but not SQLite's cross-process POSIX locking contract, and the shared-memory
 WAL index exists precisely to coordinate readers across processes — which is the property §5.5 requires
@@ -873,7 +893,8 @@ def verified_metadata_path(self, name: str) -> str:
     """Return `<verified metadata_root>/<name>`, re-confirming the root's identity first."""
 ```
 
-The operation requires an active binding, rejects any `name` that is not a single path component, and
+The operation requires an active binding, rejects any `name` that is not a single path component
+(including any embedded NUL), and
 before returning **re-confirms** that the retained metadata-root descriptor still reports the recorded
 `st_dev`/`st_ino`, raising `ProtocolError` on a mismatch. That is the verify-then-open the authority
 requires, performed at the moment of use rather than trusted from bootstrap.
@@ -915,9 +936,12 @@ the barrier-option table; an unresolvable mount identity; a mount-identity or `s
 the roots; a configuration and profile pair absent from the supplied allowlist; unavailable
 `anchored_traversal` or `advisory_project_lock`; and a volume that cannot host SQLite-WAL — including a
 certification child that exceeds its bounded timeout, which is a volume that failed to demonstrate
-cross-process WAL coordination rather than an error escaping the contract.
+cross-process WAL coordination rather than an error escaping the contract. Malformed `mountinfo` or
+`fdinfo` and parent-side SQLite operational failures are instances of those same two refusal classes;
+their public boundary errors name the proc source or SQLite phase and preserve the parser/SQLite cause.
 
-`ProtocolError` is raised for internal contract violations — using a spent binding or a released lock, a
+`ProtocolError` is raised for internal contract violations — using a spent binding or a released lock, an
+empty or NUL-containing logical root spelling, a
 `verified_child_path` component or identity check that fails, `lock` or a layout name occupied by
 something that is not the expected file type, and a `probe/` that reclamation cannot open as a directory.
 The last three concern *external* state, but `metadata_root` is engine-owned space held under the project
@@ -1139,7 +1163,8 @@ production-allowlist call-site assertion, owned by A5.
 1. `atoms/fs/` exists with the §4.1 layout; the §4.2 import **allowlist** guard covers all of
    `atoms/core` by `rglob` and passes.
 2. `select_backend` refuses unsupported platforms and architectures without performing I/O.
-3. `openat2` and `renameat2` are bound per §5.2, with `ENOSYS` detected operationally.
+3. `openat2` and `renameat2` are bound per §5.2, with `ENOSYS` detected operationally and every NUL
+   pathname rejected before either libc route.
 4. The `Backend` protocol carries exactly one operation set per §5.5 capability and no
    `supplied_capabilities` method. Every method is exercised: the eight capability operations by the
    runtime probe that reports them, and `open_root` by the bootstrap plus its §5.4 ancestor-symlink test.
@@ -1147,8 +1172,11 @@ production-allowlist call-site assertion, owned by A5.
    the caller's component spelling reaches the kernel un-collapsed, so a symlink followed by `..` refuses
    rather than being normalized away, and the pathname is normalized only after the walk succeeds; a
    missing `metadata_root` leaf is created relative to a guarded parent descriptor and reverified; a
-   missing parent refuses, as does a leaf of `..`.
-6. Mount identity is proved from held descriptors' mount IDs plus `st_dev`, and the roots must agree. A
+   missing parent refuses, as does a leaf of `..`; empty and NUL-containing root spellings refuse before
+   traversal and cannot alias or mutate a pathname prefix.
+6. Mount identity is proved from held descriptors' mount IDs plus `st_dev`, and the roots must agree.
+   Malformed, duplicate, truncated, or trailing-token proc records refuse contextually; proc decoding
+   preserves non-UTF-8 bytes, and only the four kernel mount escapes are decoded once. A
    real isolated bind mount proves equal-`st_dev`/different-mount-ID roots refuse, with only the explicit
    §11.3 namespace-unavailable skip.
 7. An unlisted filesystem type refuses. `ext4`, `xfs`, and `btrfs` options normalize per the §6.2 table,
@@ -1180,13 +1208,16 @@ production-allowlist call-site assertion, owned by A5.
 12. Absent `anchored_traversal` or `advisory_project_lock` refuses; absent optional capabilities are
     reported; absent SQLite-WAL hostability refuses, certified across **two processes** through the §8.3
     choreography, with a child that exceeds its bounded timeout refusing as `CapabilityUnavailable` naming
-    the phase. `transfer_noclobber` and `link_anchor` are probed across distinct parent directories.
+    the phase. Parent operational errors name their exact certification phase and preserve their cause;
+    requested helper cleanup runs on every outcome without replacing a certification failure.
+    `transfer_noclobber` and `link_anchor` are probed across distinct parent directories.
 13. `VolumeEvidence` and `HeldProjectLock` are factory-guarded, as is `ProjectBinding`. All three expose
     the §7.1/§9.3 surfaces: no public descriptor attributes, borrowed descriptors, `O_CLOEXEC`, idempotent
     exit, and `ProtocolError` from every accessor once spent or once the lock is released — **except**
     `evidence` and `active` on the binding and `held` on the lock, which are deliberately readable
     afterwards so a diagnostic can inspect a released resource.
-14. One shared `verified_child_path` in `bootstrap.py` implements component validation and
+14. One shared `verified_child_path` in `bootstrap.py` implements component validation, including NUL
+    refusal before identity syscalls, and
     `st_dev`/`st_ino` re-confirmation. The §8.3 probe calls it directly, since no binding exists at step
     7; `ProjectBinding.verified_metadata_path` delegates to it; no provisional binding is constructed; and
     the helper is not exported. A5 uses only the public method.

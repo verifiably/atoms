@@ -11,6 +11,13 @@ from atoms.fs.syscalls import linux as sys_linux
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
 
 
+def _c_string_path(value: str) -> bytes:
+    encoded = os.fsencode(value)
+    if b"\x00" in encoded:
+        raise ValueError("embedded null byte")
+    return encoded
+
+
 class LinuxBackend:
     def open_root(self, path: str) -> int:
         # RESOLVE_NO_SYMLINKS over the complete path: O_NOFOLLOW would guard only
@@ -19,7 +26,7 @@ class LinuxBackend:
         # a crossing here would refuse a root that simply lives on its own mount.
         return sys_linux.openat2(
             -100,  # AT_FDCWD
-            os.fsencode(path),
+            _c_string_path(path),
             _DIR_FLAGS,
             0,
             sys_linux.RESOLVE_NO_SYMLINKS,
@@ -28,7 +35,7 @@ class LinuxBackend:
     def open_child_directory(self, parent_fd: int, name: str) -> int:
         return sys_linux.openat2(
             parent_fd,
-            os.fsencode(name),
+            _c_string_path(name),
             _DIR_FLAGS,
             0,
             sys_linux.RESOLVE_BENEATH
@@ -39,18 +46,18 @@ class LinuxBackend:
     def exchange(self, parent_fd: int, left: str, right: str) -> None:
         sys_linux.renameat2(
             parent_fd,
-            os.fsencode(left),
+            _c_string_path(left),
             parent_fd,
-            os.fsencode(right),
+            _c_string_path(right),
             sys_linux.RENAME_EXCHANGE,
         )
 
     def transfer_noclobber(self, src_fd: int, src: str, dst_fd: int, dst: str) -> None:
         sys_linux.renameat2(
             src_fd,
-            os.fsencode(src),
+            _c_string_path(src),
             dst_fd,
-            os.fsencode(dst),
+            _c_string_path(dst),
             sys_linux.RENAME_NOREPLACE,
         )
 
