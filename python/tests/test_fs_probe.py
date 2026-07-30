@@ -46,6 +46,29 @@ def test_each_optional_capability_can_be_absent(held_lock, metadata_root, fake_b
     assert supplied == frozenset(set(Capability) - {absent})
 
 
+def test_transfer_reports_absence_when_only_empty_destination_call_is_unsupported(
+    held_lock, metadata_root, fake_backend
+):
+    backend = fake_backend(supplied=set(Capability))
+    real_transfer = backend.transfer_noclobber
+    calls = 0
+
+    def call_sensitive_transfer(src_fd, src, dst_fd, dst):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError(errno.EOPNOTSUPP, "empty-destination transfer unsupported")
+        return real_transfer(src_fd, src, dst_fd, dst)
+
+    backend.transfer_noclobber = call_sensitive_transfer
+    with held_lock(metadata_root) as lock, probe_directory(lock) as probe_fd:
+        supplied = probe_backend(backend, probe_fd, lock)
+    assert calls == 2
+    assert supplied == frozenset(
+        set(Capability) - {Capability.NOCLOBBER_TRANSFER}
+    )
+
+
 def test_unexpected_errno_propagates_rather_than_reporting_absence(
     held_lock, metadata_root, fake_backend
 ):
@@ -147,6 +170,69 @@ def test_outer_cleanup_reclaims_a_survivor_after_inner_cleanup_fails_once(
         assert os.listdir(probe_fd) == []
 
 
+def test_initial_cleanup_failure_is_retried_by_the_outer_cleanup(
+    held_lock, metadata_root, fake_backend, monkeypatch
+):
+    backend = fake_backend(supplied=set(Capability))
+    real_unlink = os.unlink
+    failed_once = False
+
+    def fail_initial_release(name, *, dir_fd):
+        nonlocal failed_once
+        if name == "stale" and not failed_once:
+            failed_once = True
+            raise OSError(errno.EIO, "injected initial cleanup failure")
+        return real_unlink(name, dir_fd=dir_fd)
+
+    with held_lock(metadata_root) as lock, probe_directory(lock) as probe_fd:
+        stale_fd = os.open(
+            "stale",
+            os.O_CREAT | os.O_WRONLY | os.O_EXCL | os.O_CLOEXEC,
+            0o600,
+            dir_fd=probe_fd,
+        )
+        os.close(stale_fd)
+        monkeypatch.setattr("atoms.fs.probe.os.unlink", fail_initial_release)
+        with pytest.raises(OSError) as caught:
+            probe_backend(backend, probe_fd, lock)
+        assert caught.value.errno == errno.EIO
+        assert failed_once
+        assert os.listdir(probe_fd) == []
+
+
+@pytest.mark.parametrize(
+    ("target", "failure_occurrence"),
+    [pytest.param("payload", 2, id="transfer"), pytest.param("anchor", 1, id="link")],
+)
+def test_nested_pair_cleanup_failure_preserves_original_error_and_reclaims_root(
+    held_lock,
+    metadata_root,
+    fake_backend,
+    monkeypatch,
+    target,
+    failure_occurrence,
+):
+    backend = fake_backend(supplied=set(Capability))
+    real_unlink = os.unlink
+    target_unlinks = 0
+
+    def fail_nested_release_once(name, *, dir_fd):
+        nonlocal target_unlinks
+        if name == target:
+            target_unlinks += 1
+            if target_unlinks == failure_occurrence:
+                raise OSError(errno.EIO, f"injected {target} cleanup failure")
+        return real_unlink(name, dir_fd=dir_fd)
+
+    monkeypatch.setattr("atoms.fs.probe.os.unlink", fail_nested_release_once)
+    with held_lock(metadata_root) as lock, probe_directory(lock) as probe_fd:
+        with pytest.raises(OSError) as caught:
+            probe_backend(backend, probe_fd, lock)
+        assert caught.value.errno == errno.EIO
+        assert target_unlinks >= failure_occurrence
+        assert os.listdir(probe_fd) == []
+
+
 def test_sqlite_wal_certification_succeeds_on_the_test_volume(held_lock, metadata_root):
     with held_lock(metadata_root) as lock, probe_database_path(lock) as database:
         certify_sqlite_wal(database)
@@ -163,6 +249,35 @@ def test_sqlite_certification_observes_the_commit_across_processes(
             assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
         finally:
             connection.close()
+
+
+def test_sqlite_writer_refuses_a_wrong_committed_predecessor(
+    held_lock, metadata_root, monkeypatch
+):
+    real_run = subprocess.run
+    calls = 0
+
+    def replace_predecessor_before_writer(argv, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            connection = sqlite3.connect(argv[3], isolation_level=None)
+            try:
+                connection.execute("PRAGMA user_version=9")
+            finally:
+                connection.close()
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(
+        "atoms.fs.probe.subprocess.run", replace_predecessor_before_writer
+    )
+    with (
+        held_lock(metadata_root) as lock,
+        probe_database_path(lock) as database,
+        pytest.raises(CapabilityUnavailable, match="predecessor"),
+    ):
+        certify_sqlite_wal(database)
+    assert calls == 2
 
 
 def test_certification_uses_two_children_so_the_parent_can_release_between_them(

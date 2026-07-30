@@ -21,6 +21,7 @@ from collections.abc import Iterator
 from atoms.core.capabilities import Capability
 from atoms.core.errors import CapabilityUnavailable
 from atoms.fs.backend import UNSUPPORTED_ERRNO, Backend
+from atoms.fs.bootstrap import reclaim_probe_survivors
 from atoms.fs.lock import HeldProjectLock
 
 
@@ -36,6 +37,7 @@ class ChildExit:
     STALE_READ = 3
     ACQUIRED_WHILE_HELD = 4
     WRONG_REFUSAL = 5
+    WRONG_PREDECESSOR = 6
 
 
 def _supported(operation: str, probe) -> bool:
@@ -127,9 +129,13 @@ def _child_pair(backend: Backend, probe_fd: int) -> Iterator[tuple[int, int]]:
     Both descriptors are acquired *inside* the stack, so failing to open the second
     still closes the first — the leak a `src_fd = ...; dst_fd = ...; try:` prologue
     quietly takes on. ExitStack unwinds in reverse registration order, so each
-    directory is emptied before its own descriptor closes and `probe/` is emptied
-    last, once `src` and `dst` are empty enough to remove. It also keeps unwinding
+    directory is emptied before its own descriptor closes. It also keeps unwinding
     after a callback raises, so one failing release cannot strand the others.
+
+    `src` and `dst` are removed only after the descriptor stack exits successfully.
+    If an inner cleanup fails, removing a nonempty child would replace the causal
+    error with ENOTEMPTY. The outer recursive reclamation in `probe_backend` owns
+    that retry instead and preserves the original error when reclamation succeeds.
 
     This is heterogeneous cleanup, not a `close_all` batch: ExitStack preserves its
     standard chained-exception behavior if more than one clear/close callback fails.
@@ -137,7 +143,6 @@ def _child_pair(backend: Backend, probe_fd: int) -> Iterator[tuple[int, int]]:
     batch passed to `close_all`.
     """
     with contextlib.ExitStack() as stack:
-        stack.callback(_clear, probe_fd)
         os.mkdir("src", mode=0o700, dir_fd=probe_fd)
         os.mkdir("dst", mode=0o700, dir_fd=probe_fd)
         src_fd = backend.open_child_directory(probe_fd, "src")
@@ -147,6 +152,7 @@ def _child_pair(backend: Backend, probe_fd: int) -> Iterator[tuple[int, int]]:
         stack.callback(os.close, dst_fd)
         stack.callback(_clear, dst_fd)
         yield src_fd, dst_fd
+    _clear(probe_fd)
 
 
 def _probe_traversal(backend: Backend, probe_fd: int) -> bool:
@@ -223,7 +229,13 @@ def _probe_transfer(backend: Backend, probe_fd: int) -> bool:
         if not blocked:
             return False
         os.unlink("payload", dir_fd=dst_fd)
-        backend.transfer_noclobber(src_fd, "payload", dst_fd, "payload")
+        if not _supported(
+            "transfer_noclobber",
+            lambda: backend.transfer_noclobber(
+                src_fd, "payload", dst_fd, "payload"
+            ),
+        ):
+            return False
         return _read(dst_fd, "payload") == b"P"
 
 
@@ -311,9 +323,9 @@ def probe_backend(
     backend: Backend, probe_root_fd: int, lock: HeldProjectLock
 ) -> frozenset[Capability]:
     """Return exactly the capabilities this volume supplies. The sole producer."""
-    _clear(probe_root_fd)
     supplied: set[Capability] = set()
     try:
+        reclaim_probe_survivors(lock)
         if _probe_traversal(backend, probe_root_fd):
             supplied.add(Capability.ANCHORED_TRAVERSAL)
         if _probe_lock(backend, lock):
@@ -332,7 +344,7 @@ def probe_backend(
             supplied.add(Capability.SYMLINK_FINGERPRINT)
         return frozenset(supplied)
     finally:
-        _clear(probe_root_fd)
+        reclaim_probe_survivors(lock)
 
 
 # Design §8.3 steps 4-5: read the parent's committed state concurrently with the
@@ -364,6 +376,10 @@ _CHILD_WRITER = f"""
 import sqlite3, sys
 connection = sqlite3.connect(sys.argv[1], timeout=30, isolation_level=None)
 connection.execute("BEGIN IMMEDIATE")
+if connection.execute("PRAGMA user_version").fetchone()[0] != 1:
+    connection.execute("ROLLBACK")
+    connection.close()
+    sys.exit({ChildExit.WRONG_PREDECESSOR})
 connection.execute("PRAGMA user_version=2")
 connection.execute("COMMIT")
 connection.close()
@@ -457,6 +473,11 @@ def certify_sqlite_wal(database_path: str, cleanup: bool = False) -> None:
             )
 
         wrote = _run_child(_CHILD_WRITER, database_path, "write")
+        if wrote.returncode == ChildExit.WRONG_PREDECESSOR:
+            raise CapabilityUnavailable(
+                "the SQLite-WAL write child did not observe the committed predecessor "
+                "user_version=1"
+            )
         if wrote.returncode != ChildExit.OK:
             raise CapabilityUnavailable(
                 f"a second process could not write once the lock was released: "
