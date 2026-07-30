@@ -468,11 +468,13 @@ still-empty `a`, leaving its inode unchanged; resolve `a/y`. The `y` lookup happ
 semantics while the returned `ResolvedPrefix` reports the cached `EXACT_BYTES` — a wrong answer
 produced entirely inside the window ledger #19 does not cover. Every hop therefore re-reads its
 constraints on every traversal, and the memo's only jobs are to intern one `DirectoryFacts` value per
-identity, so A4b-2 can compare by object, and to detect disagreement: a cached value that differs from
-a fresh read is drift within one approval and raises `PreconditionRefused`, the same refusal the
-errno-versus-kind rule uses and for the same reason. The project root is re-observed at the top of
-every `resolve()` for the same reason; constraints read once at construction would otherwise be
-reported unchecked for the resolver's whole life.
+identity, so A4b-2 can compare by object, and to detect disagreement. A fresh
+`UNREPRODUCIBLE_CASEFOLD` proof takes rooted-proof precedence and raises
+`ProjectApprovalRefused`, whether or not the identity was cached; any other cached-versus-fresh
+constraint disagreement currently means a changed `name_max` and raises `PreconditionRefused`, the
+same refusal the errno-versus-kind rule uses and for the same reason. The project root is re-observed
+at the top of every `resolve()` for the same reason; constraints read once at construction would
+otherwise be reported unchecked for the resolver's whole life.
 
 The cost is one `ioctl` and one `fpathconf` per hop per call, against a defect class that produces a
 confidently wrong approval.
@@ -531,11 +533,13 @@ raises `ProjectApprovalRefused` like any other unreproducible directory — `met
 engine-owned, but its lookup relation is no more reproducible than a project directory's.
 
 Unlike the per-directory memo in §6.5, this one **does** skip re-observation on a hit, and the
-asymmetry is deliberate. `metadata_root/work` is engine-owned space created by `ensure_metadata_layout`
-under the exclusive project lock the resolver still holds; a project directory is not, and external
-processes mutate project space as a matter of course. A `+F` flip on `work/` would be out-of-contract
-interference in engine space, which §7 already answers with `ProtocolError` rather than with defensive
-re-reading. If that ever stops being true, this memo takes §6.5's rule.
+asymmetry is deliberate. `metadata_root/work` is engine-owned space created by
+`ensure_metadata_layout` under the exclusive project lock the resolver still holds; no cooperating
+process mutates it during the lease. The authority §3.2 explicitly places a noncooperating writer
+inside the engine's metadata tree outside the guarantee, so this memo does **not** claim to detect a
+post-cache `+F` flip or relabel it as `ProtocolError`. Ledger #19 still requires A5 to re-resolve the
+work namespace before relying on approved facts when preparation creates it. If the trust boundary
+ever expands to cover concurrent metadata-tree mutation during approval, this memo takes §6.5's rule.
 
 The cache is populated **after** the descriptor is released, not before. Assigning it earlier would
 mean a failing `close` propagates its error while leaving the observation cached, so the next call
@@ -554,7 +558,7 @@ physical constraints through the chain above; the two are not in conflict.
 | Raised | For |
 | --- | --- |
 | `ProjectApprovalRefused` *(new)* | mount crossing, mount membership, metadata-root identity, `NAME_MAX`/`PATH_MAX`, `UNREPRODUCIBLE_CASEFOLD` |
-| `PreconditionRefused` | two observations of one entry disagreeing within a single approval: errno ↔ observed kind at the frontier, and cached ↔ freshly read `DirectoryConstraints` at a hop |
+| `PreconditionRefused` | two observations disagree within one approval: errno ↔ observed kind at the frontier, or cached ↔ fresh `name_max` for one directory; a fresh casefold proof instead takes `ProjectApprovalRefused` precedence |
 | `CapabilityUnavailable` | non-`linux` backend, non-ext4 filesystem, `ENOTTY` from the flag read, nonpositive `fpathconf` |
 | `ProtocolError` | malformed input path, closed binding, released lock, `work/` namespace contradiction |
 | bare `OSError` | **everything else, unwrapped** |

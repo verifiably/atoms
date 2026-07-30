@@ -801,15 +801,15 @@ def test_every_declared_value_type_is_frozen(value, field):
 
 
 def test_the_absent_frontier_is_frozen_and_declares_no_field():
-    """Checked behaviourally, without an assignment.
+    """Checked directly and behaviourally, without an assignment.
 
     A frozen slots dataclass raises TypeError, not FrozenInstanceError, for a name it
     does not declare — and AbsentFrontier declares none — so an assignment-based test
-    would assert the wrong thing. Hashability is the substitute proof: @dataclass sets
-    __hash__ to None when eq=True and frozen=False, so a non-frozen version of this
-    type would raise TypeError here.
+    would assert the wrong thing. The dataclass parameter is the exact frozen-contract
+    assertion; equality and hashability lock the resulting value behaviour too.
     """
     assert dataclasses.fields(AbsentFrontier) == ()
+    assert vars(AbsentFrontier)["__dataclass_params__"].frozen
     assert AbsentFrontier() == AbsentFrontier()
     assert hash(AbsentFrontier()) == hash(AbsentFrontier())
 
@@ -1697,6 +1697,41 @@ def test_the_project_root_is_re_read_on_every_resolution(
         assert calls.count(root_inode) == 2
 
 
+def test_a_changed_project_root_name_max_between_resolutions_refuses(
+    monkeypatch, resolver_on
+):
+    """The root gets the same disagreement check as an intermediate directory.
+
+    Both leaves are absent, so the root is the only directory whose constraints are
+    read after the patch. The first read agrees with construction; the second changes
+    only name_max and must refuse rather than returning the interned root facts.
+    """
+    from atoms.fs.lookup import DirectoryConstraints
+
+    with resolver_on() as (resolver, _):
+        import atoms.fs.resolve as module
+
+        real = module.read_lookup_constraints
+        reads: list[DirectoryConstraints] = []
+
+        def changed(fd, filesystem_type):
+            constraints = real(fd, filesystem_type)
+            reads.append(constraints)
+            if len(reads) == 1:
+                return constraints
+            return DirectoryConstraints(
+                lookup_proof=constraints.lookup_proof,
+                name_max=constraints.name_max - 1,
+            )
+
+        monkeypatch.setattr(module, "read_lookup_constraints", changed)
+        resolver.resolve("x")
+        with pytest.raises(PreconditionRefused) as caught:
+            resolver.resolve("y")
+        assert "lookup constraints" in str(caught.value)
+        assert len(reads) == 2
+
+
 def test_a_project_root_that_turns_casefold_after_construction_refuses(
     monkeypatch, resolver_on
 ):
@@ -2203,10 +2238,10 @@ Add `from atoms.fs.bootstrap import WORK_DIRECTORY` to `resolve.py`, then to `Pa
 
         Unlike _facts_for, this memo DOES skip re-observation on a hit. work/ is
         engine-owned space created by ensure_metadata_layout under the exclusive
-        project lock still held here; a project directory is not, and external
-        processes mutate project space as a matter of course. A flag change on work/
-        would be out-of-contract interference in engine space, which the errors below
-        already answer with ProtocolError rather than with defensive re-reading.
+        project lock still held here; no cooperating process mutates it during the
+        lease. Authority §3.2 places a noncooperating writer inside the metadata tree
+        outside the guarantee, so this method does not claim to detect a post-cache
+        flag change. A5 still re-resolves before relying on the approved facts.
         """
         backend = self._binding.backend  # liveness BEFORE the memo, so a cached
         parent_fd = self._binding.metadata_root_fd  # result still fails after closure
@@ -2868,7 +2903,7 @@ def test_resolution_internals_are_not_exported(name):
 
 @pytest.mark.parametrize("module_name", ["resolve", "lookup"])
 def test_no_blanket_oserror_handler(module_name):
-    """§7: exactly five pathname errnos plus ENOTTY are interpreted, nothing else."""
+    """Every OSError handler either discriminates or delegates to the discriminator."""
     source = (SOURCE_ROOT / "fs" / f"{module_name}.py").read_text()
     for node in ast.walk(ast.parse(source)):
         if not isinstance(node, ast.ExceptHandler) or node.type is None:
@@ -2878,9 +2913,25 @@ def test_no_blanket_oserror_handler(module_name):
         )
         for entry in names:
             if isinstance(entry, ast.Name) and entry.id == "OSError":
-                body = ast.dump(ast.Module(body=node.body, type_ignores=[]))
-                assert "errno" in body, (
-                    f"{module_name}.py catches OSError without discriminating on errno"
+                handler = ast.Module(body=node.body, type_ignores=[])
+                body = ast.dump(handler)
+                delegates = (
+                    node.name is not None
+                    and any(
+                        isinstance(call, ast.Call)
+                        and isinstance(call.func, ast.Attribute)
+                        and call.func.attr == "_frontier_from"
+                        and any(
+                            isinstance(argument, ast.Name)
+                            and argument.id == node.name
+                            for argument in call.args
+                        )
+                        for call in ast.walk(handler)
+                    )
+                )
+                assert "errno" in body or delegates, (
+                    f"{module_name}.py catches OSError without discriminating on errno "
+                    "or passing the caught object to _frontier_from"
                 )
 
 
@@ -2999,11 +3050,13 @@ detached evidence — holds. Second, `_path_max` lives in `resolve.py` while `_n
 `lookup.py`, because `PATH_MAX` is volume-scoped and read once at construction while `NAME_MAX` is
 per-directory and belongs with the constraints it accompanies.
 
-**One judgment call the review did not name.** `work_base_facts()` keeps a memo that *does* skip
-re-observation, while `_facts_for` no longer may. Design §6.6 now states the reason — `work/` is
-engine-owned space held under the exclusive project lock, and interference there is a `ProtocolError`
-case rather than something to defend against by re-reading — but a reviewer who disagrees would want
-the same rule applied to both, at the cost of one `openat2` per `CreateDirectory` effect.
+**One deliberate trust-boundary reading.** `work_base_facts()` keeps a memo that *does* skip
+re-observation, while `_facts_for` no longer may. Design §6.6 now states the exact limit: `work/` is
+engine-owned space under the exclusive project lock, so no cooperating process mutates it during the
+lease; a noncooperating writer inside the metadata tree is the authority §3.2 exception and is not
+promised to surface as `ProtocolError`. Ledger #19 still makes A5 re-resolve before use. Expanding the
+trust boundary would require giving this memo §6.5's rule, at the cost of one `openat2` per repeated
+call.
 
 ---
 
