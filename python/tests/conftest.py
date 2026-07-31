@@ -369,6 +369,57 @@ def injected_lookup(monkeypatch):
 
 
 @pytest.fixture
+def injected_equivalence(monkeypatch):
+    """Install a chosen name-equivalence double on the modules that consume it.
+
+    Patched by consuming-module path, like injected_lookup patches
+    atoms.fs.resolve.read_lookup_constraints, because both modules bind the name at
+    import time.
+
+    A factory rather than a fixed double, because the two behaviours under test need
+    different relations. Case folding merges directories (`A` and `a`), which A2 admits
+    because its phase 4 key is the whole path and `A` differs from `a/x`. Case folding
+    can NOT exercise endpoint distinctness: two leaves fold in one parent only when their
+    whole paths fold too, and A2 phase 4 already refuses that pair before approval sees
+    it. Endpoint tests therefore use a truncating relation — a real filesystem
+    equivalence class that A2's key does not subsume.
+
+    `install` returns the list of names the double was asked about, in call order. That
+    is the positive half of the bypass check: a call site that decides a name without the
+    helper contributes nothing to the list, whatever shape the bypass takes. Under an
+    identity key the *behaviour* is unchanged, so only the recording distinguishes the
+    two. The AST guard in test_fs_architecture.py is the negative half and catches the
+    specific shapes it names; neither alone is a proof, and the pair is what the design
+    asks for.
+
+    This is a double either way. It proves the call sites route through the function and
+    merge whatever it merges; it proves nothing about any real relation, all of which
+    stay unreproducible and refused.
+    """
+
+    def install(key):
+        calls: list[str] = []
+
+        def recording(constraints, name):
+            calls.append(name)
+            return key(name)
+
+        for module in _EQUIVALENCE_CONSUMERS:
+            monkeypatch.setattr(f"{module}.lookup_equivalence_key", recording)
+        return calls
+
+    return install
+
+
+_EQUIVALENCE_CONSUMERS = ("atoms.fs.topology",)
+
+
+def truncate_to_eight(name: str) -> str:
+    """A truncating name equivalence, in conftest so the registry guard sees it."""
+    return name[:8]
+
+
+@pytest.fixture
 def injected_resolver_on(bound_volume, injected_lookup):
     """A resolver whose lookup proof is injected; valid on every A4a test volume."""
     from atoms.fs.resolve import PathResolver

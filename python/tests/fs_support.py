@@ -4,14 +4,39 @@ from __future__ import annotations
 
 import contextlib
 import errno as _errno
+import hashlib
+import itertools
 import os
 import shutil
+import zlib
 from pathlib import Path
 
 from atoms.core.capabilities import Capability
+from atoms.core.compiler import CompiledSpec, compile_spec
+from atoms.core.effects import (
+    CreateDirectory,
+    CreateFileNoClobber,
+    DeletePath,
+    Effect,
+    MoveNoClobber,
+    ReplaceFile,
+    occurrences,
+)
+from atoms.core.errors import SpecValidationError
+from atoms.core.fingerprint import DirectoryState, FileState, PathState
+from atoms.core.spec import TransactionSpec, build_spec
 from atoms.fs.bootstrap import close_layout, ensure_metadata_layout, verified_child_path
 from atoms.fs.linux import LinuxBackend
 from atoms.fs.lock import acquire_project_lock
+from atoms.fs.lookup import DirectoryConstraints, LookupProof
+from atoms.fs.resolve import (
+    AbsentFrontier,
+    DirectoryFacts,
+    FilesystemIdentity,
+    Frontier,
+    ResolvedHop,
+    ResolvedPrefix,
+)
 from atoms.fs.volume import (
     AllowlistEntry,
     DurabilityAllowlist,
@@ -23,6 +48,11 @@ from atoms.fs.volume import (
 
 SUPPORTED_FILESYSTEMS = frozenset({"ext4", "xfs", "btrfs"})
 EXT4 = "ext4"
+
+WORK_CONSTRAINTS = DirectoryConstraints(
+    lookup_proof=LookupProof.EXACT_BYTES, name_max=255
+)
+EMPTY_DIGEST = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 _MOUNTINFO_CASES = {
     "ext4_defaults": (
@@ -490,3 +520,186 @@ def casefold_volume_or_reason() -> tuple[Path | None, str, bool]:
     if shutil.which("chattr") is None:
         return None, "chattr is not installed; the casefold tier cannot run", True
     return base, "", False
+
+
+def file_state(mode: int = 0o644) -> FileState:
+    return FileState(content_hash=EMPTY_DIGEST, mode=mode, byte_len=0)
+
+
+def nonempty_state(content: bytes, mode: int = 0o644) -> FileState:
+    """A2 refuses a FileState whose byte_len is non-zero under the empty-content hash and
+    vice versa, so ReplaceFile's two distinct states need real digests."""
+    digest = hashlib.sha256(content).hexdigest()
+    return FileState(
+        content_hash=f"sha256:{digest}", mode=mode, byte_len=len(content)
+    )
+
+
+def compiled_for(*effects: Effect) -> CompiledSpec:
+    """Compile a spec whose surfaces are derived from the effects, so every test states
+    only what it is about."""
+    return compile_spec(_spec_for(effects))
+
+
+def _spec_for(effects: tuple[Effect, ...]) -> TransactionSpec:
+    initial: dict[str, PathState] = {}
+    final: dict[str, PathState] = {}
+    for effect in effects:
+        for occurrence in occurrences(effect):
+            initial.setdefault(occurrence.path, occurrence.pre)
+            final[occurrence.path] = occurrence.post
+    return build_spec(
+        consumer_tag="test",
+        intent_digest=EMPTY_DIGEST,
+        initial_surface=initial,
+        final_surface=final,
+        effects=effects,
+    )
+
+
+def directory_facts(inode: int, *, name_max: int = 255, device: int = 41) -> DirectoryFacts:
+    """A synthetic existing directory. Distinct inodes give distinct identities."""
+    return DirectoryFacts(
+        identity=FilesystemIdentity(device=device, inode=inode),
+        constraints=DirectoryConstraints(
+            lookup_proof=LookupProof.EXACT_BYTES, name_max=name_max
+        ),
+    )
+
+
+def resolved_prefix(
+    path: str,
+    *,
+    existing_depth: int,
+    frontier: Frontier | None = None,
+    root_inode: int = 2,
+    name_max: int = 255,
+) -> ResolvedPrefix:
+    """Build the ResolvedPrefix a real walk of ``path`` would produce.
+
+    ``existing_depth`` is how many ancestor components resolved to directories. The
+    frontier is the next component; everything after it is the remainder. Inodes are
+    derived from the prefix string so two paths sharing an ancestor share its identity,
+    which is what the topology's identity keying depends on.
+    """
+    components = path.split("/")
+    hops = tuple(
+        ResolvedHop(
+            declared_component=components[index],
+            facts=directory_facts(
+                _synthetic_inode("/".join(components[: index + 1])), name_max=name_max
+            ),
+        )
+        for index in range(existing_depth)
+    )
+    return ResolvedPrefix(
+        root=directory_facts(root_inode, name_max=name_max),
+        hops=hops,
+        frontier_name=components[existing_depth],
+        frontier=AbsentFrontier() if frontier is None else frontier,
+        remainder=tuple(components[existing_depth + 1 :]),
+    )
+
+
+def _synthetic_inode(prefix: str) -> int:
+    """Stable per prefix string, and never the root's inode.
+
+    `crc32` rather than `hash`, whose string salt is randomized per process — a test that
+    passes only within one interpreter run is not a test.
+    """
+    return 1000 + zlib.crc32(prefix.encode("utf-8"))
+
+
+def prefixes_for(compiled: CompiledSpec) -> dict[str, ResolvedPrefix]:
+    """The resolution table a walk produces when every ancestor exists except the ones
+    this transaction creates.
+
+    The created check compares whole prefix strings, not `startswith`: `d/newer` starts
+    with `d/new` and is not beneath it.
+    """
+    created = {
+        effect.path
+        for effect in compiled.spec.effects
+        if isinstance(effect, CreateDirectory)
+    }
+    table: dict[str, ResolvedPrefix] = {}
+    for timeline in compiled.timelines:
+        components = timeline.path.split("/")
+        depth = len(components) - 1
+        for index in range(len(components) - 1):
+            if "/".join(components[: index + 1]) in created:
+                depth = index
+                break
+        table[timeline.path] = resolved_prefix(timeline.path, existing_depth=depth)
+    return table
+
+
+GENERATOR_PATHS = ("a", "a/b", "d/one", "d/two", "p")
+GENERATOR_MOVES = (("d/one", "d/two"), ("a", "p"), ("d/one", "a/b"))
+GENERATED_SPECIFICATION_COUNT = 4841
+"""How many of the 12719 candidate sequences A2 admits, measured on this checkout.
+
+Asserted exactly by the §7.4 property test, so a generator that silently narrows fails
+rather than passing on a smaller matrix. Change it only alongside a pool change."""
+
+
+def _generated_effect(tag: str, argument, index: int) -> Effect:
+    effect_id = f"e{index}"
+    if tag == "cf":
+        return CreateFileNoClobber(effect_id, argument, file_state())
+    if tag == "mk":
+        return CreateDirectory(effect_id, argument, DirectoryState(mode=0o755))
+    if tag == "rm":
+        return DeletePath(effect_id, argument, file_state())
+    if tag == "rp":
+        return ReplaceFile(
+            effect_id, argument, nonempty_state(b"old"), nonempty_state(b"new")
+        )
+    return MoveNoClobber(effect_id, argument[0], argument[1], file_state())
+
+
+def generated_specifications():
+    """Yield `(label, effects)` for every effect sequence A2 admits, over a fixed pool.
+
+    All ordered sequences of length 1-3 over 23 candidate effects: each of the four
+    single-path variants against each of five paths, plus three moves. Sequences A2
+    refuses are skipped rather than reported -- an input that does not compile is not an
+    input to this layer.
+
+    `product`, not `permutations`: a candidate may repeat. `permutations` draws without
+    replacement and so silently omits every sequence that uses one candidate twice -- the
+    multi-touch timelines, where a path is created, deleted, and created again, or appears
+    as a move endpoint between two direct touches. That is 16 sequences: 10 cf/rm
+    alternations and 6 involving a move. None contains a CreateDirectory, because a
+    repeated `mk` on one path does not compile, so this recovers longer per-path timelines
+    rather than new ancestor shapes.
+    """
+    pool = [
+        (tag, path)
+        for path in GENERATOR_PATHS
+        for tag in ("cf", "mk", "rm", "rp")
+    ]
+    pool += [("mv", pair) for pair in GENERATOR_MOVES]
+    for size in (1, 2, 3):
+        for combination in itertools.product(pool, repeat=size):
+            effects = tuple(
+                _generated_effect(tag, argument, index)
+                for index, (tag, argument) in enumerate(combination)
+            )
+            try:
+                compile_spec(_spec_for(effects))
+            except SpecValidationError:
+                continue
+            yield "|".join(f"{tag}:{argument}" for tag, argument in combination), effects
+
+
+def work_for(compiled: CompiledSpec) -> DirectoryConstraints | None:
+    """The work-root constraints approval derives, present exactly when a CreateDirectory
+    is, which is what A3's WorkRoot rule requires."""
+    return (
+        WORK_CONSTRAINTS
+        if any(
+            isinstance(effect, CreateDirectory) for effect in compiled.spec.effects
+        )
+        else None
+    )
