@@ -678,10 +678,17 @@ traversal nor visible to the in-process interposer (§13.5). They are handled as
   contract. The engine therefore does **not** name a fixed three-file allowlist; it **bounds** the
   surface with a pinned SQL/configuration profile and treats whatever files that profile can produce
   under the verified `metadata_root` as the excluded SQLite surface (§13.5). The profile pins the SQLite
-  capabilities the engine relies on, sets `temp_store=MEMORY` and a `metadata_root`-local temp directory
-  so no temp file escapes the store, and forbids `ATTACH` and `VACUUM`; the one transient on-disk journal
-  — the rollback journal SQLite writes while first switching the database into WAL mode — is created and
-  consumed inside bootstrap (§5.5), before any effect runs. The interposer does not audit SQLite's
+  capabilities the engine relies on, sets `temp_store=MEMORY`, and forbids `ATTACH` and `VACUUM`.
+  `temp_store=MEMORY` governs temp tables, indices, and materializations; it does not govern rollback,
+  super-, or statement journals, and **no per-connection temp-directory redirect is available** — the
+  `SQLITE_TMPDIR` environment variable is process-global and hostile in a library, and
+  `temp_store_directory` is deprecated. The engine therefore minimizes transients rather than claiming
+  every SQLite transient is `metadata_root`-local: SQLite documents that a statement journal may use a
+  randomized path outside the database directory, and reserves the right to change its temporary-file
+  behavior — which is the same disclaimer this paragraph opens with. The one transient the engine can
+  place is the rollback journal SQLite writes while first switching the database into WAL mode; that
+  transition belongs to **A5a**, which creates and opens `atoms.db` (§5.5's bootstrap switches only
+  `probe/certify.db`), and it is consumed before any effect runs. The interposer does not audit SQLite's
   internal C-level I/O — exactly as the persistence-cut model does not re-verify SQLite's WAL atomicity
   (§13.2); the engine trusts the library on a certified volume. Its obligation is to prove no *effect*
   mutation targets the store, not to enumerate the library's own writes.
@@ -727,15 +734,20 @@ each `COMMIT` flushes the WAL to true stable storage (plain fsync is not power-l
 §5.5). **A `COMMIT` is the engine's durability barrier**, replacing the numbered-generation-file fsyncs
 of the earlier design. Table shapes (informative):
 
-- `transaction(txid PRIMARY KEY, schema_version, spec_json, state, committed, rollback_result,
+- `transaction(txid PRIMARY KEY, spec_json, state, committed, rollback_result,
   halt_diagnostic, …)` — one row per transaction; `state` is the §8.1 machine; `committed` is the
   separate durable commit decision retained through `HALTED`; `halt_diagnostic` is A3's token-free
   stable diagnostic shape, not a serialization of snapshot-local identity tokens; `spec_json` is the
-  immutable canonical `TransactionSpec`, written once.
+  immutable canonical `TransactionSpec`, written once. A5a names the table `transaction_record`,
+  since `transaction` is a SQL keyword. The store's DDL version lives in `PRAGMA user_version`; a
+  per-row `schema_version` is migration scaffolding and is not carried until a second version needs
+  per-record provenance.
 - `effect(txid, effect_id, variant, journal_state, …, PRIMARY KEY(txid, effect_id))` — per-effect
   forward/reverse journal state (§8.2–§8.3).
-- `blob(digest PRIMARY KEY, byte_len, refcount)` — the content-addressed blob index; the bytes live
-  under `blobs/sha256/`.
+- `blob(digest PRIMARY KEY, byte_len)` — the content-addressed blob index; the bytes live
+  under `blobs/sha256/`. No refcount: its only consumer is the garbage collection §7.5 excludes from
+  transaction correctness, a blob is referenced iff a live transaction record names it, and a
+  maintained counter that reaches zero early deletes a blob a live transaction still references.
 - `active(singleton INTEGER PRIMARY KEY CHECK(singleton = 0), txid)` — at most one row, enforcing a
   single active transaction and naming it.
 
@@ -1253,6 +1265,13 @@ staging swap during rollback cannot be laundered into a false restoration.
   project mutation.
 - **`TransactionHalted`** — the journal, live state, or rollback survivor is unattributable. The engine
   preserves the active record and evidence.
+- **`MetadataStoreInvalid`** — the durable metadata store cannot be safely interpreted: a failed
+  integrity or foreign-key check, a schema that does not match its recorded version, a foreign
+  database, a non-canonical `spec_json`, a blob whose bytes do not match its digest, or a store
+  version this build does not know. Corruption and forward incompatibility share one type because
+  they share one correct response — stop and preserve evidence — and the message distinguishes them.
+  Raised by the store layer, never as a substitute for `ProtocolError`, which tells a caller to fix
+  its call.
 - **`ProtocolError`** — an internal contract was violated. Attempt rollback if mutation may have begun;
   retain the record if a complete rollback cannot be proved.
 

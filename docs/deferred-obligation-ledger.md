@@ -30,6 +30,14 @@ a stated required behavior.
 | 19 | A4b-1 resolves a path and closes every descriptor it opened, so a directory's identity, `LookupProof`, and mount membership may change between approval and use | A4b-1 resolution contract | A5, A6, A7 | Re-resolve and compare all three against the approved topology before relying on it. Before durable transaction authority exists: refuse. After a durable transaction record exists: halt. Never silently reapprove or substitute the newly resolved topology. A5's obligation holds in either form: it may not use any resolved identity or `LookupProof` from `ProjectApprovedSpec` to authorize project-space access, and if its preparation creates the work root or scratch entries it re-resolves under the held lock first | §5.4, §13.3 |
 | 21 | `ProjectApprovedSpec` binds to one caller-supplied txid, and nothing in A4b-2 prevents a consumer from executing it under a different one | A4b-2 approval contract | A5 | A5 refuses to execute when the txid it holds differs from the proof's. Regenerating a txid under #7 voids the approval: A5 calls `approve_for_project` again and uses the fresh proof. Never substitute regenerated scratch names into an existing proof, and never treat an approved scratch leaf as valid for a txid the proof was not issued for | §5.4, §13.3 |
 
+| 22 | `promote_staging` returns only after the promoted blobs are durable, but nothing binds that call to the `COMMIT` that references the digests | A5a store contract | A5b | Enforce §7.3's cross-substrate rule — every blob a record references is durable on the filesystem before the COMMIT that references it — and prove it by a fresh-process test that a committed record never names a missing blob | §7.3, §13.4 |
+
+A shape no sub-plan will ever own is not an admitted shape either. A5a opens the database by verified
+path rather than by held descriptor, leaving an ancestor substituted between verification and SQLite's
+open undefended; the authority states that as its cooperating-process assumption (§7) and names the
+optional hardened VFS as the remedy, so the A5a design records it as a threat-model limitation rather
+than an entry with a fictional owner.
+
 A fail-closed platform is not an admitted shape. A4b-1's refusal of XFS, Btrfs, and ext4 casefold
 directories admits nothing and therefore has no entry here; the A4b-1 design records those as
 non-scope.
