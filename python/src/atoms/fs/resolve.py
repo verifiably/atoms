@@ -146,11 +146,9 @@ class PathResolver:
     )
 
     def __init__(self, binding: ProjectBinding) -> None:
-        # Liveness gate. project_root_fd routes through ProjectBinding._require_active,
-        # which checks the binding's own flag AND lock.held. It is read before
-        # `evidence`, a detached value whose property performs no such check. One
-        # checked property is sufficient here; resolve() and work_base_facts() each
-        # read the properties they need behind the same gate.
+        # Both live resources precede `evidence`, a detached value whose property
+        # performs no liveness check (design §6.1).
+        _backend = binding.backend
         root_fd = binding.project_root_fd
         evidence = binding.evidence
         configuration = evidence.configuration
@@ -164,18 +162,18 @@ class PathResolver:
         self._metadata_identity = FilesystemIdentity(
             device=evidence.metadata_root_device, inode=evidence.metadata_root_inode
         )
-        self._path_max = _path_max(root_fd)
         identity = _identity(os.fstat(root_fd))
-        if identity == self._metadata_identity:
-            raise ProjectApprovalRefused(
-                "the project root and the metadata root are the same directory; "
-                "no declared path could avoid the metadata namespace"
-            )
         constraints = read_lookup_constraints(root_fd, self._filesystem_type)
+        self._path_max = _path_max(root_fd)
         if constraints.lookup_proof is LookupProof.UNREPRODUCIBLE_CASEFOLD:
             raise ProjectApprovalRefused(
                 "the project root is a casefold directory; its lookup relation "
                 "cannot be reproduced, so no path beneath it can be approved"
+            )
+        if identity == self._metadata_identity:
+            raise ProjectApprovalRefused(
+                "the project root and the metadata root are the same directory; "
+                "no declared path could avoid the metadata namespace"
             )
         # Seeds the memo rather than a dedicated field. resolve() re-observes the root
         # through the same path as every other hop (§6.5), so a stored copy would only
@@ -397,17 +395,17 @@ class PathResolver:
         try:
             info = os.fstat(fd)
             identity = _identity(info)
-            if identity == self._metadata_identity:
-                raise ProjectApprovalRefused(
-                    f"{rel_path!r} resolves to the metadata root by identity "
-                    f"(device {identity.device}, inode {identity.inode})"
-                )
             mount = read_mount_id(fd)
             expected = self._binding.evidence.mount_id
             if mount != expected:
                 raise ProjectApprovalRefused(
                     f"component {name!r} of {rel_path!r} is on mount {mount}, "
                     f"not the bound volume's mount {expected}"
+                )
+            if identity == self._metadata_identity:
+                raise ProjectApprovalRefused(
+                    f"{rel_path!r} resolves to the metadata root by identity "
+                    f"(device {identity.device}, inode {identity.inode})"
                 )
         finally:
             close_all((fd,))

@@ -26,28 +26,35 @@ from atoms.fs.resolve import (
 )
 
 
-def test_construction_succeeds_on_a_plain_ext4_project_root(ext4_bound_volume):
-    with ext4_bound_volume() as binding:
+def test_injected_lookup_runs_resolver_contracts_with_non_ext4_evidence(
+    monkeypatch, bound_volume, injected_lookup
+):
+    with bound_volume() as binding:
+        configuration = dataclasses.replace(
+            binding.evidence.configuration, filesystem_type="xfs"
+        )
+        evidence = _evidence_with(binding.evidence, configuration=configuration)
+        monkeypatch.setattr(type(binding), "evidence", property(lambda self: evidence))
         resolver = PathResolver(binding)
-        assert resolver is not None
+        assert resolver.resolve("missing").root.constraints is injected_lookup
 
 
-def test_a_closed_binding_refuses_construction(ext4_bound_volume):
-    with ext4_bound_volume() as binding:
+def test_a_closed_binding_refuses_construction(bound_volume, injected_lookup):
+    with bound_volume() as binding:
         pass
     with pytest.raises(ProtocolError):
         PathResolver(binding)
 
 
 def test_liveness_is_checked_before_any_detached_evidence_is_read(
-    monkeypatch, ext4_bound_volume
+    monkeypatch, bound_volume, injected_lookup
 ):
     """A closed binding must fail on liveness, never on an evidence-derived refusal.
 
     `evidence` is a detached value whose property performs no liveness check, so
     reading it first would let a closed binding produce a CapabilityUnavailable.
     """
-    with ext4_bound_volume() as binding:
+    with bound_volume() as binding:
         pass
     monkeypatch.setattr(
         type(binding),
@@ -58,8 +65,36 @@ def test_liveness_is_checked_before_any_detached_evidence_is_read(
         PathResolver(binding)
 
 
-def test_a_non_linux_backend_id_refuses(monkeypatch, ext4_bound_volume):
-    with ext4_bound_volume() as binding:
+def test_live_resources_are_read_before_detached_evidence(
+    monkeypatch, bound_volume, injected_lookup
+):
+    """Both liveness-bearing properties precede the detached evidence value."""
+    with bound_volume() as binding:
+        backend = binding.backend
+        root_fd = binding.project_root_fd
+        evidence = binding.evidence
+        reads = []
+        monkeypatch.setattr(
+            type(binding),
+            "backend",
+            property(lambda self: reads.append("backend") or backend),
+        )
+        monkeypatch.setattr(
+            type(binding),
+            "project_root_fd",
+            property(lambda self: reads.append("project_root_fd") or root_fd),
+        )
+
+        def detached(self):
+            assert reads == ["backend", "project_root_fd"]
+            return evidence
+
+        monkeypatch.setattr(type(binding), "evidence", property(detached))
+        PathResolver(binding)
+
+
+def test_a_non_linux_backend_id_refuses(monkeypatch, bound_volume):
+    with bound_volume() as binding:
         configuration = dataclasses.replace(
             binding.evidence.configuration, backend_id="darwin"
         )
@@ -71,8 +106,8 @@ def test_a_non_linux_backend_id_refuses(monkeypatch, ext4_bound_volume):
 
 
 @pytest.mark.parametrize("filesystem_type", ["xfs", "btrfs", "ext2"])
-def test_a_non_ext4_filesystem_refuses(monkeypatch, ext4_bound_volume, filesystem_type):
-    with ext4_bound_volume() as binding:
+def test_a_non_ext4_filesystem_refuses(monkeypatch, bound_volume, filesystem_type):
+    with bound_volume() as binding:
         configuration = dataclasses.replace(
             binding.evidence.configuration, filesystem_type=filesystem_type
         )
@@ -83,8 +118,8 @@ def test_a_non_ext4_filesystem_refuses(monkeypatch, ext4_bound_volume, filesyste
         assert filesystem_type in str(caught.value)
 
 
-def test_a_casefold_project_root_refuses(monkeypatch, ext4_bound_volume):
-    with ext4_bound_volume() as binding:
+def test_a_casefold_project_root_refuses(monkeypatch, bound_volume):
+    with bound_volume() as binding:
         monkeypatch.setattr(
             "atoms.fs.resolve.read_lookup_constraints",
             lambda fd, filesystem_type: DirectoryConstraints(
@@ -97,9 +132,9 @@ def test_a_casefold_project_root_refuses(monkeypatch, ext4_bound_volume):
 
 
 def test_a_project_root_identical_to_the_metadata_root_refuses(
-    monkeypatch, ext4_bound_volume
+    monkeypatch, bound_volume, injected_lookup
 ):
-    with ext4_bound_volume() as binding:
+    with bound_volume() as binding:
         info = os.fstat(binding.project_root_fd)
         evidence = _evidence_with(
             binding.evidence,
@@ -112,9 +147,67 @@ def test_a_project_root_identical_to_the_metadata_root_refuses(
         assert "metadata root" in str(caught.value)
 
 
+def test_lookup_unavailability_precedes_path_limit_and_root_identity(
+    monkeypatch, bound_volume
+):
+    """Root facts are observed before PATH_MAX and metadata exclusion (§6.1)."""
+    with bound_volume() as binding:
+        info = os.fstat(binding.project_root_fd)
+        configuration = dataclasses.replace(
+            binding.evidence.configuration, filesystem_type="xfs"
+        )
+        evidence = _evidence_with(
+            binding.evidence,
+            configuration=configuration,
+            metadata_root_device=info.st_dev,
+            metadata_root_inode=info.st_ino,
+        )
+        monkeypatch.setattr(type(binding), "evidence", property(lambda self: evidence))
+        monkeypatch.setattr(
+            "atoms.fs.resolve.os.fpathconf",
+            lambda fd, name: pytest.fail("PATH_MAX read before root lookup constraints"),
+        )
+        with pytest.raises(CapabilityUnavailable) as caught:
+            PathResolver(binding)
+        assert "xfs" in str(caught.value)
+
+
+def test_unexpected_lookup_error_precedes_path_limit_and_root_identity(
+    monkeypatch, bound_volume
+):
+    injected = OSError(errno.EIO, "injected lookup failure")
+    calls = []
+    with bound_volume() as binding:
+        info = os.fstat(binding.project_root_fd)
+        evidence = _evidence_with(
+            binding.evidence,
+            metadata_root_device=info.st_dev,
+            metadata_root_inode=info.st_ino,
+        )
+        monkeypatch.setattr(type(binding), "evidence", property(lambda self: evidence))
+
+        def refuse(fd, filesystem_type):
+            calls.append((fd, filesystem_type))
+            raise injected
+
+        monkeypatch.setattr("atoms.fs.resolve.read_lookup_constraints", refuse)
+        monkeypatch.setattr(
+            "atoms.fs.resolve.os.fpathconf",
+            lambda fd, name: pytest.fail("PATH_MAX read before root lookup constraints"),
+        )
+        with pytest.raises(OSError) as caught:
+            PathResolver(binding)
+        assert caught.value is injected
+        assert calls == [
+            (binding.project_root_fd, binding.evidence.configuration.filesystem_type)
+        ]
+
+
 @pytest.mark.parametrize("value", [-1, 0, -17])
-def test_nonpositive_path_max_refuses(monkeypatch, ext4_bound_volume, value):
-    with ext4_bound_volume() as binding:
+def test_nonpositive_path_max_refuses(
+    monkeypatch, bound_volume, injected_lookup, value
+):
+    with bound_volume() as binding:
         monkeypatch.setattr(
             "atoms.fs.resolve.os.fpathconf",
             lambda fd, name: value if name == "PC_PATH_MAX" else 255,
@@ -126,9 +219,9 @@ def test_nonpositive_path_max_refuses(monkeypatch, ext4_bound_volume, value):
 
 @pytest.mark.parametrize("code", [errno.EACCES, errno.EIO, errno.EPERM, errno.EMFILE])
 def test_unexpected_path_max_errors_propagate_unwrapped(
-    monkeypatch, ext4_bound_volume, code
+    monkeypatch, bound_volume, injected_lookup, code
 ):
-    with ext4_bound_volume() as binding:
+    with bound_volume() as binding:
         injected = OSError(code, "injected")
         calls = []
 

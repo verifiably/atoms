@@ -12,9 +12,11 @@ from atoms.fs.resolve import PathResolver
 from tests.fs_support import descriptor_count
 
 
-def test_construction_does_not_touch_the_work_base(monkeypatch, ext4_bound_volume):
+def test_construction_does_not_touch_the_work_base(
+    monkeypatch, bound_volume, injected_lookup
+):
     """Lazy: an unapprovable work/ must not refuse a spec with no CreateDirectory."""
-    with ext4_bound_volume() as binding:
+    with bound_volume() as binding:
         calls = []
         backend = binding.backend
         real = backend.open_child_directory
@@ -39,8 +41,8 @@ def test_work_base_facts_reports_the_real_directory(resolver_on, ext4_metadata_r
         )
 
 
-def test_repeated_calls_open_the_directory_once(monkeypatch, resolver_on):
-    with resolver_on() as (resolver, binding):
+def test_repeated_calls_open_the_directory_once(monkeypatch, injected_resolver_on):
+    with injected_resolver_on() as (resolver, binding):
         calls = []
         backend = binding.backend
         real = backend.open_child_directory
@@ -57,15 +59,17 @@ def test_repeated_calls_open_the_directory_once(monkeypatch, resolver_on):
         assert calls.count("work") == 1
 
 
-def test_a_cached_result_still_fails_after_the_binding_closes(resolver_on):
+def test_a_cached_result_still_fails_after_the_binding_closes(injected_resolver_on):
     """Liveness is read before the memo, so memoization is not a bypass."""
-    with resolver_on() as (resolver, _):
+    with injected_resolver_on() as (resolver, _):
         resolver.work_base_facts()
     with pytest.raises(ProtocolError):
         resolver.work_base_facts()
 
 
-def test_the_work_base_fails_after_the_lock_is_released(resolver_after_lock_release):
+def test_the_work_base_fails_after_the_lock_is_released(
+    injected_resolver_after_lock_release,
+):
     """The other half of the liveness gate.
 
     _require_active checks the binding's own flag AND lock.held; only the second has
@@ -74,13 +78,13 @@ def test_the_work_base_fails_after_the_lock_is_released(resolver_after_lock_rele
     ahead of the memo.
     """
     with pytest.raises(ProtocolError) as caught:
-        resolver_after_lock_release.work_base_facts()
+        injected_resolver_after_lock_release.work_base_facts()
     assert "lock" in str(caught.value)
 
 
-def test_a_failing_release_is_not_cached(monkeypatch, resolver_on):
+def test_a_failing_release_is_not_cached(monkeypatch, injected_resolver_on):
     """The cache is populated only after the descriptor is released."""
-    with resolver_on() as (resolver, _):
+    with injected_resolver_on() as (resolver, _):
         import atoms.fs.resolve as module
 
         real_close_all = module.close_all
@@ -104,9 +108,9 @@ def test_a_failing_release_is_not_cached(monkeypatch, resolver_on):
     "code", [errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.EXDEV]
 )
 def test_a_namespace_contradiction_is_an_internal_error(
-    monkeypatch, resolver_on, code
+    monkeypatch, injected_resolver_on, code
 ):
-    with resolver_on() as (resolver, binding):
+    with injected_resolver_on() as (resolver, binding):
         backend = binding.backend
 
         def refuse(parent_fd, name):
@@ -119,11 +123,13 @@ def test_a_namespace_contradiction_is_an_internal_error(
 
 
 @pytest.mark.parametrize("code", [errno.EIO, errno.EMFILE, errno.EACCES, errno.EPERM])
-def test_unrelated_system_failures_propagate_unchanged(monkeypatch, resolver_on, code):
+def test_unrelated_system_failures_propagate_unchanged(
+    monkeypatch, injected_resolver_on, code
+):
     """EIO and EMFILE are not violated invariants and must not be relabelled."""
     injected = OSError(code, "injected")
     calls = []
-    with resolver_on() as (resolver, binding):
+    with injected_resolver_on() as (resolver, binding):
         backend = binding.backend
 
         def refuse(parent_fd, name):
@@ -137,8 +143,10 @@ def test_unrelated_system_failures_propagate_unchanged(monkeypatch, resolver_on,
         assert calls == [(binding.metadata_root_fd, "work")]
 
 
-def test_a_work_base_on_another_mount_is_an_internal_error(monkeypatch, resolver_on):
-    with resolver_on() as (resolver, binding):
+def test_a_work_base_on_another_mount_is_an_internal_error(
+    monkeypatch, injected_resolver_on
+):
+    with injected_resolver_on() as (resolver, binding):
         monkeypatch.setattr(
             "atoms.fs.resolve.read_mount_id", lambda fd: binding.evidence.mount_id + 1
         )
@@ -146,10 +154,29 @@ def test_a_work_base_on_another_mount_is_an_internal_error(monkeypatch, resolver
             resolver.work_base_facts()
 
 
-def test_a_casefold_work_base_refuses(monkeypatch, resolver_on):
+def test_work_base_mount_refusal_precedes_directory_facts(
+    monkeypatch, injected_resolver_on
+):
+    """The mount observation is the first check after opening work/ (design §6.6)."""
+    with injected_resolver_on() as (resolver, binding):
+        monkeypatch.setattr(
+            "atoms.fs.resolve.read_mount_id", lambda fd: binding.evidence.mount_id + 1
+        )
+        monkeypatch.setattr(
+            "atoms.fs.resolve.read_lookup_constraints",
+            lambda fd, filesystem_type: pytest.fail(
+                "directory facts read before mount membership"
+            ),
+        )
+        with pytest.raises(ProtocolError) as caught:
+            resolver.work_base_facts()
+        assert "mount" in str(caught.value)
+
+
+def test_a_casefold_work_base_refuses(monkeypatch, injected_resolver_on):
     from atoms.fs.lookup import DirectoryConstraints, LookupProof
 
-    with resolver_on() as (resolver, _):
+    with injected_resolver_on() as (resolver, _):
         monkeypatch.setattr(
             "atoms.fs.resolve.read_lookup_constraints",
             lambda fd, filesystem_type: DirectoryConstraints(
@@ -160,8 +187,10 @@ def test_a_casefold_work_base_refuses(monkeypatch, resolver_on):
             resolver.work_base_facts()
 
 
-def test_every_failure_path_releases_the_descriptor(monkeypatch, resolver_on):
-    with resolver_on() as (resolver, binding):
+def test_every_failure_path_releases_the_descriptor(
+    monkeypatch, injected_resolver_on
+):
+    with injected_resolver_on() as (resolver, binding):
         monkeypatch.setattr(
             "atoms.fs.resolve.read_mount_id", lambda fd: binding.evidence.mount_id + 1
         )

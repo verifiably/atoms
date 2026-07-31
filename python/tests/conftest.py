@@ -354,8 +354,36 @@ def resolver_on(ext4_bound_volume):
 
 
 @pytest.fixture
-def resolver_after_lock_release(
-    linux_backend, ext4_project_root, ext4_metadata_root, test_storage_profile
+def injected_lookup(monkeypatch):
+    """Make resolver contract tests independent of the volume's lookup mechanism."""
+    from atoms.fs.lookup import DirectoryConstraints, LookupProof
+
+    constraints = DirectoryConstraints(
+        lookup_proof=LookupProof.EXACT_BYTES, name_max=255
+    )
+    monkeypatch.setattr(
+        "atoms.fs.resolve.read_lookup_constraints",
+        lambda fd, filesystem_type: constraints,
+    )
+    return constraints
+
+
+@pytest.fixture
+def injected_resolver_on(bound_volume, injected_lookup):
+    """A resolver whose lookup proof is injected; valid on every A4a test volume."""
+    from atoms.fs.resolve import PathResolver
+
+    @contextlib.contextmanager
+    def build():
+        with bound_volume() as binding:
+            yield PathResolver(binding), binding
+
+    return build
+
+
+@pytest.fixture
+def injected_resolver_after_lock_release(
+    injected_lookup, linux_backend, project_root, metadata_root, test_storage_profile
 ):
     """A resolver whose binding is still active but whose lock has been released.
 
@@ -366,10 +394,10 @@ def resolver_after_lock_release(
     from atoms.fs.binding import bind_project_volume
     from atoms.fs.resolve import PathResolver
 
-    with acquire_project_lock(linux_backend, str(ext4_metadata_root)) as lock:
-        allowlist = build_test_allowlist(lock, ext4_project_root, test_storage_profile)
+    with acquire_project_lock(linux_backend, str(metadata_root)) as lock:
+        allowlist = build_test_allowlist(lock, project_root, test_storage_profile)
         binding = bind_project_volume(
-            str(ext4_project_root),
+            str(project_root),
             lock,
             allowlist=allowlist,
             storage=test_storage_profile,

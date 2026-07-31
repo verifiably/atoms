@@ -1,5 +1,9 @@
 # A4b-1 Path Resolution Implementation Plan
 
+**Status:** Implemented 2026-07-30; final-review fixes applied 2026-07-31. A4b-2 and
+A5–A8 remain unimplemented. Per the approved design §9, injected Tier 2 uses the
+generic A4a binding; ext4-only fixtures are reserved for Tier 3 and Tier 4.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build the anchored path-resolution mechanism A4b-2's rooted project proof runs on — a
@@ -3230,18 +3234,17 @@ fixture names from `conftest.py` alone, so a module-local `@pytest.fixture` in a
 is reported as an unregistered test argument and fails Task 7's gate. That is why Tasks 1, 2, 6, and 7
 each open with a conftest step.
 
-**Every resolver test binds ext4, never A4a's `bound_volume`.** A4a admits ext4, XFS, and Btrfs; a
-resolver constructed on a Btrfs or XFS binding raises `CapabilityUnavailable` from
-`read_lookup_constraints`, so the suite would fail rather than skip. The ext4 fixtures therefore
-arrive in Task 2, with the first resolver, rather than in the conformance tier.
+**Tier 2 injects lookup constraints over A4a's generic `bound_volume`; Tiers 3–4 use physical
+fixtures.** The narrow injection keeps constructor, errno, liveness, and memo contracts running on
+ext4, XFS, and Btrfs without pretending that a non-ext4 filesystem supplies an approvable lookup
+proof. Real lookup, frontier, limit, and descriptor observations remain on ext4, and the casefold tier
+keeps its explicit opt-in fixture.
 
-**Two deliberate readings of the design, flagged for the reviewer.** Design §6.1 says construction
-reads `binding.backend` and `binding.project_root_fd` before `evidence`; the implementation reads
-`project_root_fd` alone, because that property already routes through `_require_active()` and a second
-read would be a bare expression with no effect. The gate the design asks for — liveness before
-detached evidence — holds. Second, `_path_max` lives in `resolve.py` while `_name_max` lives in
-`lookup.py`, because `PATH_MAX` is volume-scoped and read once at construction while `NAME_MAX` is
-per-directory and belongs with the constraints it accompanies.
+**Construction follows the design's observation order exactly.** Both `binding.backend` and
+`binding.project_root_fd` are read before detached `evidence`; root identity and lookup constraints
+precede `PATH_MAX`, casefold refusal, and metadata-root exclusion. `_path_max` lives in `resolve.py`
+while `_name_max` lives in `lookup.py`, because `PATH_MAX` is volume-scoped and read once at
+construction while `NAME_MAX` is per-directory and belongs with the constraints it accompanies.
 
 **One deliberate trust-boundary reading.** `work_base_facts()` keeps a memo that *does* skip
 re-observation, while `_facts_for` no longer may. Design §6.6 now states the exact limit: `work/` is

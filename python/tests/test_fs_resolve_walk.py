@@ -61,14 +61,14 @@ def test_a_fifo_is_observed_as_other(resolver_on, ext4_project_root):
 
 
 def test_an_entry_whose_identity_is_the_metadata_root_refuses(
-    resolver_on, ext4_project_root
+    injected_resolver_on, project_root
 ):
     """Identity, not spelling: an entry matching the metadata root must refuse."""
     from atoms.fs.resolve import FilesystemIdentity
 
-    (ext4_project_root / "sentinel").write_text("x")
-    info = os.lstat(ext4_project_root / "sentinel")
-    with resolver_on() as (resolver, binding):
+    (project_root / "sentinel").write_text("x")
+    info = os.lstat(project_root / "sentinel")
+    with injected_resolver_on() as (resolver, binding):
         resolver._metadata_identity = FilesystemIdentity(
             device=info.st_dev, inode=info.st_ino
         )
@@ -77,13 +77,33 @@ def test_an_entry_whose_identity_is_the_metadata_root_refuses(
         assert "metadata root" in str(caught.value)
 
 
+def test_mount_refusal_precedes_metadata_identity_refusal(
+    monkeypatch, injected_resolver_on, project_root
+):
+    """Mount membership is observed before metadata exclusion (design §6.4)."""
+    from atoms.fs.resolve import FilesystemIdentity
+
+    (project_root / "sentinel").write_text("x")
+    info = os.lstat(project_root / "sentinel")
+    with injected_resolver_on() as (resolver, binding):
+        resolver._metadata_identity = FilesystemIdentity(
+            device=info.st_dev, inode=info.st_ino
+        )
+        monkeypatch.setattr(
+            "atoms.fs.resolve.read_mount_id", lambda fd: binding.evidence.mount_id + 1
+        )
+        with pytest.raises(ProjectApprovalRefused) as caught:
+            resolver._observe(binding.project_root_fd, "sentinel", "sentinel")
+        assert "mount" in str(caught.value)
+
+
 def test_an_entry_on_a_different_mount_refuses(
-    monkeypatch, resolver_on, ext4_project_root
+    monkeypatch, injected_resolver_on, project_root
 ):
     """A bind mount can share st_dev while carrying a distinct mount id, which is
     exactly why the observation goes through O_PATH and read_mount_id."""
-    (ext4_project_root / "plain").write_text("x")
-    with resolver_on() as (resolver, binding):
+    (project_root / "plain").write_text("x")
+    with injected_resolver_on() as (resolver, binding):
         monkeypatch.setattr(
             "atoms.fs.resolve.read_mount_id", lambda fd: binding.evidence.mount_id + 1
         )
@@ -134,12 +154,14 @@ def _failing_observation(monkeypatch, calls, injected):
     monkeypatch.setattr("atoms.fs.resolve.os.open", refuse)
 
 
-def test_an_enametoolong_leaf_observation_refuses(monkeypatch, resolver_on):
+def test_an_enametoolong_leaf_observation_refuses(
+    monkeypatch, injected_resolver_on
+):
     """Reachable only by injection: _require_name_fits refuses an over-long name
     first, so the kernel disagreeing with fpathconf has no ordinary fixture."""
     injected = OSError(errno.ENAMETOOLONG, "injected")
     calls = []
-    with resolver_on() as (resolver, binding):
+    with injected_resolver_on() as (resolver, binding):
         _failing_observation(monkeypatch, calls, injected)
         with pytest.raises(ProjectApprovalRefused) as caught:
             resolver._observe(binding.project_root_fd, "wide", "wide")
@@ -150,11 +172,11 @@ def test_an_enametoolong_leaf_observation_refuses(monkeypatch, resolver_on):
 
 @pytest.mark.parametrize("code", [errno.EACCES, errno.EIO, errno.EPERM, errno.EMFILE])
 def test_unexpected_observation_errors_propagate_unwrapped(
-    monkeypatch, resolver_on, code
+    monkeypatch, injected_resolver_on, code
 ):
     injected = OSError(code, "injected")
     calls = []
-    with resolver_on() as (resolver, binding):
+    with injected_resolver_on() as (resolver, binding):
         _failing_observation(monkeypatch, calls, injected)
         with pytest.raises(OSError) as caught:
             resolver._observe(binding.project_root_fd, "anything", "anything")
@@ -231,12 +253,12 @@ def test_a_symlink_ancestor_becomes_a_symlink_blocking_frontier(
 
 
 def test_an_errno_the_observation_contradicts_is_reported_as_drift(
-    monkeypatch, resolver_on, ext4_project_root
+    monkeypatch, injected_resolver_on, project_root
 ):
     """ENOTDIR with a directory actually present means the entry changed between
     the two calls; that is drift, not a frontier."""
-    (ext4_project_root / "a").mkdir()
-    with resolver_on() as (resolver, binding):
+    (project_root / "a").mkdir()
+    with injected_resolver_on() as (resolver, binding):
         backend = binding.backend
         real_open_child = backend.open_child_directory
 
@@ -252,14 +274,14 @@ def test_an_errno_the_observation_contradicts_is_reported_as_drift(
 
 
 def test_exdev_from_the_traversal_refuses_as_a_mount_crossing(
-    monkeypatch, resolver_on, ext4_project_root
+    monkeypatch, injected_resolver_on, project_root
 ):
     """Injected because require_rel_path rejects every escape spelling first, so the
     only real EXDEV is a mount crossing — which tier 3's bind-mount child exercises."""
-    (ext4_project_root / "a").mkdir()
+    (project_root / "a").mkdir()
     injected = OSError(errno.EXDEV, "injected")
     calls = []
-    with resolver_on() as (resolver, binding):
+    with injected_resolver_on() as (resolver, binding):
         backend = binding.backend
 
         def refuse(parent_fd, name):
@@ -274,13 +296,15 @@ def test_exdev_from_the_traversal_refuses_as_a_mount_crossing(
         assert calls == [(binding.project_root_fd, "a")]
 
 
-def test_enametoolong_from_the_traversal_refuses(monkeypatch, resolver_on):
+def test_enametoolong_from_the_traversal_refuses(
+    monkeypatch, injected_resolver_on
+):
     """The kernel disagreeing with fpathconf is the filesystem's answer, not a defect,
     so it stays a refusal. _require_name_fits refuses first for any name we can
     construct, which is why this branch needs injection."""
     injected = OSError(errno.ENAMETOOLONG, "injected")
     calls = []
-    with resolver_on() as (resolver, binding):
+    with injected_resolver_on() as (resolver, binding):
         backend = binding.backend
 
         def refuse(parent_fd, name):
@@ -297,11 +321,11 @@ def test_enametoolong_from_the_traversal_refuses(monkeypatch, resolver_on):
 
 @pytest.mark.parametrize("code", [errno.EACCES, errno.EIO, errno.EPERM, errno.EMFILE])
 def test_an_unexpected_traversal_errno_propagates_unwrapped(
-    monkeypatch, resolver_on, code
+    monkeypatch, injected_resolver_on, code
 ):
     injected = OSError(code, "injected")
     calls = []
-    with resolver_on() as (resolver, binding):
+    with injected_resolver_on() as (resolver, binding):
         backend = binding.backend
 
         def refuse(parent_fd, name):
@@ -316,14 +340,18 @@ def test_an_unexpected_traversal_errno_propagates_unwrapped(
 
 
 @pytest.mark.parametrize("bad", ["/absolute", "a/../b", ".", "a/", "a//b", "a/\x00b"])
-def test_a_malformed_path_is_an_internal_contract_violation(resolver_on, bad):
-    with resolver_on() as (resolver, _), pytest.raises(ProtocolError):
+def test_a_malformed_path_is_an_internal_contract_violation(
+    injected_resolver_on, bad
+):
+    with injected_resolver_on() as (resolver, _), pytest.raises(ProtocolError):
         resolver.resolve(bad)
 
 
-def test_a_malformed_path_is_rejected_before_any_syscall(monkeypatch, resolver_on):
+def test_a_malformed_path_is_rejected_before_any_syscall(
+    monkeypatch, injected_resolver_on
+):
     """The EXDEV interpretation depends on no escape route reaching openat2."""
-    with resolver_on() as (resolver, binding):
+    with injected_resolver_on() as (resolver, binding):
         calls = []
         backend = binding.backend
         monkeypatch.setattr(
@@ -336,15 +364,15 @@ def test_a_malformed_path_is_rejected_before_any_syscall(monkeypatch, resolver_o
         assert calls == []
 
 
-def test_a_component_over_name_max_refuses(resolver_on):
-    with resolver_on() as (resolver, _):
+def test_a_component_over_name_max_refuses(injected_resolver_on):
+    with injected_resolver_on() as (resolver, _):
         with pytest.raises(ProjectApprovalRefused) as caught:
             resolver.resolve("a" * 256)
         assert "NAME_MAX" in str(caught.value) or "name limit" in str(caught.value)
 
 
 def test_name_max_is_taken_from_the_parent_that_performs_the_lookup(
-    monkeypatch, resolver_on, ext4_project_root
+    monkeypatch, injected_resolver_on, project_root
 ):
     """Injecting a narrow limit at one hop, not at the root.
 
@@ -353,12 +381,12 @@ def test_name_max_is_taken_from_the_parent_that_performs_the_lookup(
     """
     from atoms.fs.lookup import DirectoryConstraints, LookupProof
 
-    (ext4_project_root / "a").mkdir()
-    with resolver_on() as (resolver, _):
+    (project_root / "a").mkdir()
+    with injected_resolver_on() as (resolver, _):
         import atoms.fs.resolve as module
 
         real = module.read_lookup_constraints
-        target = os.stat(ext4_project_root / "a").st_ino
+        target = os.stat(project_root / "a").st_ino
 
         def narrow(fd, filesystem_type):
             if os.fstat(fd).st_ino == target:
@@ -384,9 +412,9 @@ def test_a_path_over_path_max_refuses(resolver_on):
         assert "PATH_MAX" in str(caught.value)
 
 
-def test_limits_are_measured_in_encoded_bytes_not_characters(resolver_on):
+def test_limits_are_measured_in_encoded_bytes_not_characters(injected_resolver_on):
     """A 200-character UTF-8 name can exceed a 255-byte bound."""
-    with resolver_on() as (resolver, _):
+    with injected_resolver_on() as (resolver, _):
         name = "é" * 200  # 400 bytes when encoded
         assert len(name) < 255 < len(os.fsencode(name))
         with pytest.raises(ProjectApprovalRefused):
@@ -412,7 +440,7 @@ def _counting_reader(monkeypatch, calls, replacement=None):
 
 
 def test_every_traversal_of_a_directory_re_reads_its_constraints(
-    monkeypatch, resolver_on, ext4_project_root
+    monkeypatch, injected_resolver_on, project_root
 ):
     """The memo interns; it must not suppress observation (design §6.5).
 
@@ -421,23 +449,23 @@ def test_every_traversal_of_a_directory_re_reads_its_constraints(
     already happened under the new ones — inside a single approval, which is a window
     ledger #19 does not cover.
     """
-    (ext4_project_root / "a" / "b").mkdir(parents=True)
-    (ext4_project_root / "a" / "c").mkdir()
+    (project_root / "a" / "b").mkdir(parents=True)
+    (project_root / "a" / "c").mkdir()
     calls: list[int] = []
-    with resolver_on() as (resolver, _):
+    with injected_resolver_on() as (resolver, _):
         _counting_reader(monkeypatch, calls)
         resolver.resolve("a/b/x")
         resolver.resolve("a/c/y")
-        assert calls.count(os.stat(ext4_project_root / "a").st_ino) == 2
+        assert calls.count(os.stat(project_root / "a").st_ino) == 2
 
 
 def test_the_memo_interns_one_facts_value_per_identity(
-    resolver_on, ext4_project_root
+    injected_resolver_on, project_root
 ):
     """Re-reading must not mean re-allocating: A4b-2 compares facts by object."""
-    (ext4_project_root / "a" / "b").mkdir(parents=True)
-    (ext4_project_root / "a" / "c").mkdir()
-    with resolver_on() as (resolver, _):
+    (project_root / "a" / "b").mkdir(parents=True)
+    (project_root / "a" / "c").mkdir()
+    with injected_resolver_on() as (resolver, _):
         first = resolver.resolve("a/b/x")
         second = resolver.resolve("a/c/y")
         assert first.hops[0].facts is second.hops[0].facts
@@ -445,14 +473,14 @@ def test_the_memo_interns_one_facts_value_per_identity(
 
 
 def test_a_changed_name_max_between_two_resolutions_refuses(
-    monkeypatch, resolver_on, ext4_project_root
+    monkeypatch, injected_resolver_on, project_root
 ):
     from atoms.fs.lookup import DirectoryConstraints, LookupProof
 
-    (ext4_project_root / "a").mkdir()
-    target = os.stat(ext4_project_root / "a").st_ino
+    (project_root / "a").mkdir()
+    target = os.stat(project_root / "a").st_ino
     calls: list[int] = []
-    with resolver_on() as (resolver, _):
+    with injected_resolver_on() as (resolver, _):
         seen = []
 
         def substitute(inode, _count):
@@ -472,14 +500,14 @@ def test_a_changed_name_max_between_two_resolutions_refuses(
 
 
 def test_a_proof_that_turns_casefold_between_two_resolutions_refuses(
-    monkeypatch, resolver_on, ext4_project_root
+    monkeypatch, injected_resolver_on, project_root
 ):
     from atoms.fs.lookup import DirectoryConstraints, LookupProof
 
-    (ext4_project_root / "a").mkdir()
-    target = os.stat(ext4_project_root / "a").st_ino
+    (project_root / "a").mkdir()
+    target = os.stat(project_root / "a").st_ino
     calls: list[int] = []
-    with resolver_on() as (resolver, _):
+    with injected_resolver_on() as (resolver, _):
         seen = []
 
         def substitute(inode, _count):
@@ -500,12 +528,12 @@ def test_a_proof_that_turns_casefold_between_two_resolutions_refuses(
 
 
 def test_the_project_root_is_re_read_on_every_resolution(
-    monkeypatch, resolver_on, ext4_project_root
+    monkeypatch, injected_resolver_on
 ):
     """Constraints read once at construction would otherwise be reported unchecked
     for the resolver's whole life."""
     calls: list[int] = []
-    with resolver_on() as (resolver, binding):
+    with injected_resolver_on() as (resolver, binding):
         root_inode = os.fstat(binding.project_root_fd).st_ino
         _counting_reader(monkeypatch, calls)
         resolver.resolve("x")
@@ -514,7 +542,7 @@ def test_the_project_root_is_re_read_on_every_resolution(
 
 
 def test_a_changed_project_root_name_max_between_resolutions_refuses(
-    monkeypatch, resolver_on
+    monkeypatch, injected_resolver_on
 ):
     """The root gets the same disagreement check as an intermediate directory.
 
@@ -524,7 +552,7 @@ def test_a_changed_project_root_name_max_between_resolutions_refuses(
     """
     from atoms.fs.lookup import DirectoryConstraints
 
-    with resolver_on() as (resolver, _):
+    with injected_resolver_on() as (resolver, _):
         import atoms.fs.resolve as module
 
         real = module.read_lookup_constraints
@@ -549,11 +577,11 @@ def test_a_changed_project_root_name_max_between_resolutions_refuses(
 
 
 def test_a_project_root_that_turns_casefold_after_construction_refuses(
-    monkeypatch, resolver_on
+    monkeypatch, injected_resolver_on
 ):
     from atoms.fs.lookup import DirectoryConstraints, LookupProof
 
-    with resolver_on() as (resolver, _):
+    with injected_resolver_on() as (resolver, _):
         import atoms.fs.resolve as module
 
         monkeypatch.setattr(
@@ -569,13 +597,13 @@ def test_a_project_root_that_turns_casefold_after_construction_refuses(
 
 
 def test_a_casefold_directory_mid_walk_refuses(
-    monkeypatch, resolver_on, ext4_project_root
+    monkeypatch, injected_resolver_on, project_root
 ):
     from atoms.fs.lookup import DirectoryConstraints, LookupProof
 
-    (ext4_project_root / "a").mkdir()
-    with resolver_on() as (resolver, _):
-        target = os.stat(ext4_project_root / "a").st_ino
+    (project_root / "a").mkdir()
+    with injected_resolver_on() as (resolver, _):
+        target = os.stat(project_root / "a").st_ino
         import atoms.fs.resolve as module
 
         real = module.read_lookup_constraints
@@ -593,18 +621,20 @@ def test_a_casefold_directory_mid_walk_refuses(
         assert "casefold" in str(caught.value).lower()
 
 
-def test_resolution_after_the_binding_closes_refuses(resolver_on):
-    with resolver_on() as (resolver, _):
+def test_resolution_after_the_binding_closes_refuses(injected_resolver_on):
+    with injected_resolver_on() as (resolver, _):
         pass
     with pytest.raises(ProtocolError):
         resolver.resolve("anything")
 
 
-def test_resolution_after_the_lock_is_released_refuses(resolver_after_lock_release):
+def test_resolution_after_the_lock_is_released_refuses(
+    injected_resolver_after_lock_release,
+):
     """A distinct liveness failure from a closed binding: _require_active checks the
     binding's own flag AND lock.held, and only the second has fired here."""
     with pytest.raises(ProtocolError) as caught:
-        resolver_after_lock_release.resolve("anything")
+        injected_resolver_after_lock_release.resolve("anything")
     assert "lock" in str(caught.value)
 
 
