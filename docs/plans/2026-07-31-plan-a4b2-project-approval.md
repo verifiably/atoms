@@ -3014,6 +3014,33 @@ Append to `tests/test_fs_architecture.py`:
 ```python
 APPROVAL_MODULES = ("approval", "judgment", "topology")
 PURE_MODULES = ("judgment", "topology")
+PURE_IMPORT_PREFIXES = ("__future__", "atoms.core", "collections", "dataclasses")
+PURE_FS_IMPORTS = {
+    "judgment": frozenset(
+        {
+            "atoms.fs.lookup",
+            "atoms.fs.lookup.lookup_equivalence_key",
+            "atoms.fs.resolve",
+            "atoms.fs.resolve.EntryKind",
+            "atoms.fs.resolve.PresentFrontier",
+            "atoms.fs.resolve.ResolvedPrefix",
+            "atoms.fs.topology",
+            "atoms.fs.topology.ApprovedScratch",
+            "atoms.fs.topology.ResolvedTopology",
+        }
+    ),
+    "topology": frozenset(
+        {
+            "atoms.fs.lookup",
+            "atoms.fs.lookup.DirectoryConstraints",
+            "atoms.fs.lookup.inherited_constraints",
+            "atoms.fs.lookup.lookup_equivalence_key",
+            "atoms.fs.resolve",
+            "atoms.fs.resolve.FilesystemIdentity",
+            "atoms.fs.resolve.ResolvedPrefix",
+        }
+    ),
+}
 
 
 def test_the_resolution_guard_still_names_exactly_the_two_mechanism_modules():
@@ -3045,11 +3072,88 @@ def test_approval_modules_may_judge_a_specification(module_name):
     assert ast.parse(source) is not None
 
 
+def _forbidden_pure_imports(module_name, tree):
+    imported = _resolved_imports(tree, package="atoms.fs")
+    forbidden = {
+        name
+        for name in imported
+        if not any(
+            name == prefix or name.startswith(f"{prefix}.")
+            for prefix in PURE_IMPORT_PREFIXES
+        )
+        and name not in PURE_FS_IMPORTS[module_name]
+    }
+    if any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "open"
+        for node in ast.walk(tree)
+    ):
+        forbidden.add("builtins.open")
+    return forbidden
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import os",
+        "from atoms.fs.resolve import PathResolver",
+        "from atoms.fs.syscalls import linux",
+        "import atoms.corex",
+        'open("path")',
+    ],
+)
+def test_the_pure_import_guard_detects_direct_and_indirect_io(source):
+    """The converse keeps the allowlist from becoming another vacuous denylist."""
+    assert _forbidden_pure_imports("topology", ast.parse(source))
+
+
 @pytest.mark.parametrize("module_name", PURE_MODULES)
-def test_the_pure_modules_issue_no_syscall(module_name):
+def test_the_pure_modules_import_only_pure_dependencies(module_name):
     source = (SOURCE_ROOT / "fs" / f"{module_name}.py").read_text(encoding="utf-8")
-    imported = _resolved_imports(ast.parse(source), package="atoms.fs")
-    assert not any(name.split(".")[0] in {"os", "fcntl", "ctypes"} for name in imported)
+    forbidden = _forbidden_pure_imports(module_name, ast.parse(source))
+    assert not forbidden, f"{module_name}.py imports I/O authority: {sorted(forbidden)}"
+
+
+def test_the_approved_proof_retains_only_the_authorized_schema():
+    """Criterion 21 is a negative schema contract, not an identity assertion.
+
+    Exact field sets make a copied frontier or mount identifier fail even if it is added
+    with a default. The live binding deliberately retains its own VolumeEvidence; this
+    guard covers the fields A4b-2 copies into its proof and approved fact values.
+    """
+    from atoms.fs.approval import ProjectApprovedSpec
+    from atoms.fs.topology import (
+        ApprovedExistingDirectory,
+        ApprovedPath,
+        ApprovedPlannedDirectory,
+        ApprovedScratch,
+        ApprovedWorkBase,
+    )
+
+    expected = {
+        ProjectApprovedSpec: frozenset(
+            {
+                "compiled",
+                "binding",
+                "txid",
+                "topology",
+                "directories",
+                "paths",
+                "scratch",
+                "work_base",
+            }
+        ),
+        ApprovedExistingDirectory: frozenset({"node", "identity", "constraints"}),
+        ApprovedPlannedDirectory: frozenset({"node", "constraints"}),
+        ApprovedPath: frozenset({"path", "parent_node", "leaf"}),
+        ApprovedScratch: frozenset({"effect_id", "role", "parent_node", "leaf"}),
+        ApprovedWorkBase: frozenset({"identity", "constraints"}),
+    }
+    assert {
+        value_type: frozenset(typing.get_type_hints(value_type))
+        for value_type in expected
+    } == expected
 
 
 RAW_COMPONENT_ATTRS = frozenset({"leaf", "declared_component"})
@@ -3415,8 +3519,9 @@ need real digests, since A2 refuses a non-zero `byte_len` under the empty-conten
 each state a claim the plan asserted a *proxy* for. Criterion 1 says the exact `CompiledSpec`; the plan
 checked only `proof.binding is binding`. Criterion 7 says `work_base_facts()` is *called* iff a
 `CreateDirectory` is present; the plan checked `proof.work_base is None`, which an implementation that
-observed the work base and discarded the result would also satisfy — and that call is not free, since it
-opens `metadata_root/work`, which A5 has not created at this point. Criterion 24 says no write to
+observed the work base and discarded the result would also satisfy — and that call can refuse an
+otherwise approvable specification with no stake in the work namespace. (`metadata_root/work`
+exists from A4a binding; A5 later creates `work/<txid>`.) Criterion 24 says no write to
 project space and had no test at all. All three are now asserted directly: identity, a call counter on
 `PathResolver.work_base_facts` patched at the class because approval builds its own resolver, and a
 recursive before/after tree snapshot carrying inode and mtime so a same-size rewrite is visible.
