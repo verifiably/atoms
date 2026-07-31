@@ -668,8 +668,11 @@ traversal nor visible to the in-process interposer (§13.5). They are handled as
   the database or a sidecar, so — unlike an effect path pinned to a held parent descriptor — no descriptor
   participates and the §3.2 held-directory reasoning does not carry over. The stdlib baseline therefore
   makes an explicit cooperating-process assumption, broader than §3.2's relocation case: **mutating or
-  replacing `metadata_root` or any of its ancestors while a lease is active voids the recovery
-  guarantee.** The project lock serializes cooperating processes, for which this never arises; defending
+  replacing `metadata_root`, any of its ancestors, or any of the `atoms.db{,-wal,-shm,-journal}`
+  entries while a lease is active voids the recovery guarantee.** The database entries are named
+  alongside the directory because verifying them is a time-of-check operation like any other: A5a
+  refuses a symlink or non-regular file at each before SQLite opens it, which proves what was there,
+  not what will be. The project lock serializes cooperating processes, for which this never arises; defending
   against an adversary who substitutes the store's path mid-lease requires the optional hardened VFS
   below, which opens the database through `openat`-anchored, `O_NOFOLLOW` descriptors.
 - *Bounded SQLite surface under a pinned profile, not per-syscall audit.* SQLite may touch more than
@@ -685,10 +688,12 @@ traversal nor visible to the in-process interposer (§13.5). They are handled as
   `temp_store_directory` is deprecated. The engine therefore minimizes transients rather than claiming
   every SQLite transient is `metadata_root`-local: SQLite documents that a statement journal may use a
   randomized path outside the database directory, and reserves the right to change its temporary-file
-  behavior — which is the same disclaimer this paragraph opens with. The one transient the engine can
-  place is the rollback journal SQLite writes while first switching the database into WAL mode; that
-  transition belongs to **A5a**, which creates and opens `atoms.db` (§5.5's bootstrap switches only
-  `probe/certify.db`), and it is consumed before any effect runs. The interposer does not audit SQLite's
+  behavior — which is the same disclaimer this paragraph opens with. One transient is placed
+  definitely: the rollback journal SQLite writes while first switching the database into WAL mode is
+  colocated with `atoms.db` as `atoms.db-journal`, and is consumed before any effect runs. That
+  transition belongs to **A5a**, which creates and opens `atoms.db`; §5.5's bootstrap switches only
+  `probe/certify.db`. It is not the *only* file SQLite places — the WAL and shared-memory files are
+  persistent companions, and a statement journal may appear elsewhere. The interposer does not audit SQLite's
   internal C-level I/O — exactly as the persistence-cut model does not re-verify SQLite's WAL atomicity
   (§13.2); the engine trusts the library on a certified volume. Its obligation is to prove no *effect*
   mutation targets the store, not to enumerate the library's own writes.
