@@ -142,8 +142,8 @@ capability and path resolution, and is already fourteen modules.
 | Module | Responsibility |
 | --- | --- |
 | `schema.py` | DDL text, `SCHEMA_VERSION`, `APPLICATION_ID`, the enum-derived CHECK clauses, and the expected `(type, name, tbl_name, sql)` catalog (§5.2). Pure — no I/O, no `sqlite3` connection. |
-| `connection.py` | Creation, reopen, the pinned profile and its verification, the authorizer, liveness, and transaction ownership — `StoreTransaction` and its spent/active rules (§7). |
-| `records.py` | Typed row read/write, §7.4's coherence predicate — used by both the loader and the pre-COMMIT check — and the private `HaltDiagnostic` codec. |
+| `connection.py` | Creation, reopen, the pinned profile and its verification, the authorizer, liveness, and transaction ownership — `_StoreTransaction` and its spent/active rules (§7). |
+| `records.py` | Typed row read/write, §7.5's coherence predicate — used by both the loader and the pre-COMMIT check — and the private `HaltDiagnostic` codec. |
 | `blobs.py` | The digest-to-leaf mapping, promotion, pre-existing-blob verification, the flush sequence. |
 | `workspace.py` | The `Workspace` value, `staging/<txid>/` and `work/<txid>/` creation and durable removal, and §5.5's name validation. |
 
@@ -527,14 +527,14 @@ no implicit `BEGIN`, so a bare `INSERT` would autocommit and a caller intending 
 several. A5a will not let that happen silently.
 
 **Holding the transaction object is not holding a transaction, so the object must check.** Putting the
-writes on `StoreTransaction` makes a write hard to reach by accident; it does not make one
+writes on `_StoreTransaction` makes a write hard to reach by accident; it does not make one
 *unreachable*. Nothing stops a caller from retaining `txn` past the `with` block, and under
 `isolation_level=None` a retained object's write autocommits: measured, an `INSERT` issued after context
 exit landed durably with `connection.in_transaction == False` — one statement, its own barrier, exactly
 the failure the explicit-boundary rule exists to prevent. It is not an exotic misuse either; storing the
 yielded object on `self` is an ordinary thing to write.
 
-So every `StoreTransaction` method begins by asserting that **this object is the store's current active
+So every `_StoreTransaction` method begins by asserting that **this object is the store's current active
 transaction**, and raises `ProtocolError` otherwise. Two conditions, because one is not enough:
 
 - The object is **spent** — set on *both* exit paths, commit and rollback alike. A rolled-back
@@ -556,16 +556,17 @@ __all__ = ("Store", "StoredRecord", "StagedBlob", "Workspace", "open_store")
 def open_store(binding: ProjectBinding) -> Store: ...
 
 class Store:                                   # context manager
-    def transaction(self) -> AbstractContextManager[StoreTransaction]: ...
+    def transaction(self) -> AbstractContextManager[_StoreTransaction]: ...
     def read_record(self, txid: str) -> StoredRecord | None: ...
     def read_active(self) -> StoredRecord | None: ...
+    def open_blob(self, digest: str) -> int: ...
     def create_workspace(self, txid: str) -> Workspace: ...
     def remove_workspace(self, workspace: Workspace) -> None: ...
     def promote_staging(self, workspace: Workspace,
                         manifest: tuple[StagedBlob, ...]) -> None: ...
     def close(self) -> None: ...
 
-class StoreTransaction:                        # yielded by Store.transaction()
+class _StoreTransaction:                       # yielded by Store.transaction()
     def insert_record(self, txid: str, spec: TransactionSpec) -> None: ...
     def set_transaction_state(self, txid: str, state: TransactionState) -> None: ...
     def set_commit_decision(self, txid: str, decision: CommitDecision) -> None: ...
@@ -583,32 +584,93 @@ class StagedBlob:
     byte_len: int
 ```
 
-Record *writes* live on `StoreTransaction`, not on `Store`. That placement makes a write hard to reach
+Record *writes* live on `_StoreTransaction`, not on `Store`. That placement makes a write hard to reach
 without a transaction; the checks above make it *impossible*. `Store` keeps what is genuinely
-transaction-free — open, close, reads, workspaces, and promotion, which is filesystem work with its own
-barrier (§8.1).
+transaction-free — open, close, reads, blob access, workspaces, and promotion, which is filesystem work
+with its own barrier (§8.1).
+
+**`_StoreTransaction` is private and stays private.** It is absent from `__all__` because no caller
+constructs one or annotates against one — it is obtained only by entering `Store.transaction()`, used
+inside that block, and dead after (§7). The underscore says so at the point of use; a public-looking
+name absent from a documented-exact `__all__` would read as an oversight, and §11.6 asserts the surface
+against `__all__` exactly. `Store`, `StoredRecord`, `StagedBlob`, and `Workspace` are all named by
+callers and are exported.
+
+**`StagedBlob` is an ordinary dataclass, deliberately unguarded.** A6 builds manifests — that is the
+whole point of the type — so a construction token would block the intended caller and protect nothing:
+the values are validated on arrival at `promote_staging` and `insert_blobs` (§8.1), which is where a
+forged one would have to do its damage. It is the opposite case from `Workspace` (§8.3), which A5a
+issues because it carries descriptors A5a owns.
 
 `insert_record` takes **no `variants` argument**. Every effect's variant is already in the spec:
-`TransactionSpec.effects` is a `tuple[Effect, ...]` and `atoms.core.effects` exposes `effect_id_of` and
-`variant_name` (`effects.py:102`, `:106`). A separate mapping would be a second copy of a fact the first
-argument already carries, and §7.3 has to *check* that the `effect` rows agree with `spec_json` anyway —
-so the argument's only reachable effect is to disagree with the spec and be rejected. The rule is the
-one §7.3 applies to row order: where `spec_json` is the authority, A5a derives rather than accepts.
+`TransactionSpec.effects` is a `tuple[Effect, ...]`, so a separate mapping would be a second copy of a
+fact the first argument already carries — and §7.5 has to *check* that the `effect` rows agree with
+`spec_json` anyway, so the argument's only reachable effect is to disagree with the spec and be
+rejected. The rule is the one §7.4 applies to row order: where `spec_json` is the authority, A5a derives
+rather than accepts.
+
+**Deriving it takes an explicit mapping, not `variant_name`.** That helper returns
+`type(effect).__name__` (`effects.py:106`) — `"ReplaceFile"` — while the `effect.variant` column accepts
+`EffectVariant`'s values, `"replace_file"` (`recovery/plan.py:37`). Measured for all five. The two
+spellings are near enough to read as the same thing and are not; and while a `CHECK` violation on the
+first `INSERT` would at least fail loudly, the tempting repair — deriving one spelling from the other by
+case transformation — is what must be avoided, because it makes the schema value depend on a class name
+that no longer has any reason to keep matching.
+
+So `schema.py` carries a literal, total mapping, in the same module that generates the `CHECK` lists
+from the enum, so both facts about a variant live together:
+
+```python
+EFFECT_VARIANTS: Mapping[type[Effect], EffectVariant] = {
+    ReplaceFile:         EffectVariant.REPLACE_FILE,
+    CreateFileNoClobber: EffectVariant.CREATE_FILE_NO_CLOBBER,
+    DeletePath:          EffectVariant.DELETE_PATH,
+    MoveNoClobber:       EffectVariant.MOVE_NO_CLOBBER,
+    CreateDirectory:     EffectVariant.CREATE_DIRECTORY,
+}
+```
+
+Lookup is by `type(effect)`, exact — not `isinstance`, which would accept a subclass and record it as
+its base. A missing key raises `ProtocolError`. §11.1 asserts **totality in both directions**: every
+member of the `Effect` union (`effects.py:56`) is a key, and every `EffectVariant` member is a value,
+each exactly once. A sixth variant then breaks the build rather than the store — the same property §6.2
+gives the `CHECK` lists, which is why the two belong in one module.
 
 `StoredRecord` is a frozen value carrying the decoded `TransactionSpec`, the txid, `state`,
 `committed`, `rollback_result | None`, `halt_diagnostic | None`, and the journal vector as a
-`tuple[EffectJournalState, ...]` in `spec_json` order (§7.3). It is a plain value, not a live cursor.
+`tuple[EffectJournalState, ...]` in `spec_json` order (§7.4). It is a plain value, not a live cursor.
 
 **Descriptor ownership.** `Store` owns the connection and closes it in `close()`; `Store.__exit__`
 calls `close()`. `Workspace` owns the directory descriptors it opened and closes them on its own exit.
-Neither owns anything belonging to the binding — the `metadata_root` descriptor stays A4a's, and A5a
-only ever borrows it, exactly as `ProjectBinding.__exit__` closes only what it opened.
+`open_blob` returns a descriptor the **caller** owns and must close — the one place A5a hands out
+ownership, marked as such in the signature's docstring because it is the exception. Nothing here owns
+anything belonging to the binding: the `metadata_root` descriptor stays A4a's, and A5a only ever
+borrows it, exactly as `ProjectBinding.__exit__` closes only what it opened.
 
-### 7.2 Reads take one snapshot
+### 7.2 Reading a blob
+
+A5a owns the blob substrate — it decides the leaf name, performs promotion, and verifies digests — so
+it is the only layer that can open a blob without re-deriving a mapping that is private to it (§8.1).
+Authority §10 requires A6/A7 to compute "a file prefix relation ... by comparing that object with the
+planned blob," which is a read of blob bytes during recovery. Without an operation here, the caller's
+only route is to rebuild `blobs/sha256/<hex>` itself, and then the mapping is no longer private and a
+second copy of it can drift.
+
+`open_blob(digest) -> int` is the whole surface: validate the digest against §5.5, open the leaf from
+the retained `blobs/sha256/` descriptor with `O_RDONLY | O_NOFOLLOW | O_CLOEXEC`, require a regular
+file, and return the descriptor. A missing blob raises `MetadataStoreInvalid` — a record's digest
+naming no file is durable state that cannot be interpreted, not a caller error.
+
+It deliberately does **not** verify the content. `open_blob` is on the hot path of a comparison that is
+itself streaming the bytes, and re-hashing every open would double that work to answer a question the
+caller is already answering. §8.2's verification exists where the decision to trust a pre-existing blob
+is actually made. A5a returns the descriptor and states the limit rather than implying a guarantee.
+
+### 7.3 Reads take one snapshot
 
 `read_record` and `read_active` each issue **several** queries — the record row, its `effect` rows, the
 `blob` rows for its digests, and for `read_active` the `active` row first. Without a transaction those
-are separate snapshots, and §7.4's cross-row rules would then be checked against a state that never
+are separate snapshots, and §7.5's cross-row rules would then be checked against a state that never
 existed as a whole.
 
 The window is real, not theoretical. Two `Store` objects may share one live `ProjectBinding` — nothing
@@ -622,11 +684,28 @@ them a single WAL snapshot. The same interleaving under a read transaction retur
 values for both queries, measured. `BEGIN` deferred rather than `IMMEDIATE`: a reader takes no write
 lock and must not block A5b's writer.
 
+**Every exit from a read closes its transaction, including the failing ones.** A read's most likely
+ending is not `COMMIT`: it is a decode failure or a §7.5 refusal, both raised from Python after the
+queries have run. Leaving on that path without a `ROLLBACK` leaves `in_transaction` true, and the next
+`BEGIN IMMEDIATE` then fails with `cannot start a transaction within a transaction` — measured. The
+damage is displaced twice over: the store still holds valid data, A5b's *next write* is what fails, and
+it fails as an `OperationalError` naming nesting, which is a true statement about a state some earlier
+read created. So the read transaction lives in a `try/finally`, and any failure rolls back before the
+exception leaves.
+
+**Liveness is gated again before the record is returned** (§5.4). A load runs several queries plus
+`compile_spec` and the full §7.5 predicate; the lock can be released during that work, and a
+`StoredRecord` handed back afterwards is evidence from a volume this process no longer holds. A5b's
+whole purpose is to *act* on what it reads, so the second gate is placed where the value crosses the
+boundary — the same reasoning as §7.6's gate before COMMIT, and the same shape: gate, work, gate,
+release. A failure raises `ProtocolError` after the rollback.
+
 This does not make `read_record` a *write* path, and the transaction it opens is A5a's own, not one
 A5b may nest into — `transaction()` still refuses to nest (§5.4). A read issued while this store's own
-write transaction is open reuses that transaction's snapshot instead of opening a second one.
+write transaction is open reuses that transaction's snapshot instead of opening a second one, and
+therefore neither begins nor ends a transaction it does not own.
 
-### 7.3 Effect order is reconstructed, never queried
+### 7.4 Effect order is reconstructed, never queried
 
 The journal vector must be in `spec_json` order, and **the schema cannot express that order**. Its
 primary key is `(txid, effect_id)`, so SQLite answers `SELECT ... WHERE txid = ?` through the covering
@@ -641,15 +720,15 @@ both directions — no effect id in `spec_json` missing a row, no row naming an 
 does not contain — and then emits the journal vector by walking `spec_json`'s effects in order. Row
 order becomes irrelevant rather than trusted.
 
-### 7.4 Cross-row validation
+### 7.5 Cross-row validation
 
 A single well-typed row is not evidence the record is coherent. These rules define what a coherent
 record *is*, and they are checked on **both** sides of the store — before returning a `StoredRecord`,
-and before every COMMIT (§7.5). The list is written once because it is one predicate:
+and before every COMMIT (§7.6). The list is written once because it is one predicate:
 
 - `spec_json` decodes, re-encodes to exactly the stored text (§6.3), and **passes `compile_spec`** —
   a stored spec that A2 would refuse was never one this engine wrote;
-- `effect` rows cover the `spec_json` effect ids exactly, in both directions (§7.3);
+- `effect` rows cover the `spec_json` effect ids exactly, in both directions (§7.4);
 - each `effect.variant` matches that effect's variant in `spec_json`;
 - every digest the record references has a `blob` row, and that row's `byte_len` equals the
   `FileState.byte_len` of every reference to it;
@@ -661,14 +740,19 @@ and before every COMMIT (§7.5). The list is written once because it is one pred
 - the diagnostic encoding is well-formed: a malformed payload, a missing or extra field, an unknown
   enum member, or a duplicate key all refuse.
 
-Each failure raises `MetadataStoreInvalid` (§9).
+**The predicate returns a finding; the caller chooses the exception.** It is one function used from two
+sides, and the two sides mean different things. On a load, a violation is durable state that cannot be
+interpreted: `MetadataStoreInvalid`. On a write (§7.6), the same violation is a caller assembling an
+incoherent record, caught before anything is durable: `ProtocolError`. So the shared code returns a
+structured finding — the rule that failed and the values — and each site raises its own type from it,
+rather than the predicate raising and the write path catching and relabelling.
 
 These are all checks for **malformed persisted input**, not transition judgments — the line §6.2 draws.
 A journal vector that is legal SQL and legal encoding but describes an impossible history, or a commit
 decision that conflicts with the transaction state, is left for A3 to classify: those are recovery
 inputs, and pre-empting them here would put a second classifier in the store.
 
-### 7.5 The same predicate runs before COMMIT
+### 7.6 The same predicate runs before COMMIT
 
 A5a's own typed write API can otherwise produce a record its own loader rejects. The setters in §7.1
 are independent by design — A5b advances one column at a time — so nothing in the surface stops a
@@ -682,10 +766,25 @@ refuses it later — reporting the defect to whichever process reopens the datab
 caused it long gone, as `MetadataStoreInvalid`, the exception that tells a caller to stop and preserve
 evidence. A5a would have manufactured the corruption it reports.
 
-So `StoreTransaction.__exit__` runs §7.4's predicate over **every txid the transaction touched**, inside
-the still-open transaction and immediately after §5.4's late liveness gate. A failure **rolls back** and
-raises `MetadataStoreInvalid`; nothing partial reaches the WAL. The set of touched txids is accumulated
-by the setters themselves, so the cost is proportional to what was written rather than to the store.
+So `_StoreTransaction.__exit__` runs §7.5's predicate over **every txid the transaction touched**, inside
+the still-open transaction. A failure **rolls back** and raises; nothing partial reaches the WAL. The set
+of touched txids is accumulated by the setters themselves, so the cost is proportional to what was
+written rather than to the store.
+
+**The exit sequence is gate → validate → gate → COMMIT**, and the second gate is adjacent to the COMMIT
+with nothing between them. Validation runs `compile_spec` over every touched spec and re-reads rows; on
+a large transaction that is unbounded work, and a single gate *before* it would prove the lock was held
+when the exit began rather than when the barrier ran — reopening the exact window §5.4 added the late
+gate to close, just wider than the original. The first gate is still worth running: it refuses before
+doing the work, rather than after.
+
+**A refused write raises `ProtocolError`, not `MetadataStoreInvalid`.** The transaction rolled back, so
+the durable store is exactly as valid as it was — nothing about it "cannot be safely interpreted," and
+the correct response is for the caller to fix its call, not to stop and preserve evidence. Authority §11
+settles it: `MetadataStoreInvalid` is "raised by the store layer, never as a substitute for
+`ProtocolError`, which tells a caller to fix its call." Raising it here would have been the substitution
+that sentence forbids, and would have sent A5b into evidence preservation over a store with nothing
+wrong with it. The predicate is shared; the verdict is not (§7.5).
 
 Two consequences worth stating, because they are the point rather than a limitation:
 
@@ -699,6 +798,35 @@ Two consequences worth stating, because they are the point rather than a limitat
 §11.2 tests each write-side refusal independently, and asserts that after a refused COMMIT the database
 still holds the pre-transaction record.
 
+### 7.7 The store's own lifecycle
+
+`Store` is a resource, and every resource in this repo states what happens after it is released. Left
+unstated, the answer would come from pysqlite rather than from A5a: a use-after-close raises
+`sqlite3.ProgrammingError("Cannot operate on a closed database.")`, measured — a `DatabaseError`
+subclass carrying **no `sqlite_errorcode` attribute at all**, so §9.1's translation shape would hit an
+`AttributeError` inside its own handler while trying to classify it. A5a's own misuse must not arrive
+dressed as a database condition.
+
+- **`close()` is idempotent.** Calling it twice is not an error, matching `sqlite3.Connection.close`
+  and letting `__exit__` run after an explicit close.
+- **`close()` rolls back any transaction it finds open, then spends it.** SQLite already discards an
+  open write transaction on close — the uncommitted row was gone after `close()`, measured — but it
+  does so silently, so A5a issues the `ROLLBACK` explicitly and marks the `_StoreTransaction` spent.
+  Silent discard and explicit rollback have the same durable result and different diagnostics, and the
+  spend is what stops a retained object from being used against the next store.
+- **Every operation after close raises `ProtocolError`**, checked before the connection is touched.
+  This is caller misuse in exactly authority §11's sense, and it must never surface as
+  `sqlite3.ProgrammingError`, which a caller would have to know pysqlite's hierarchy to interpret.
+- **`close()` does not gate on liveness.** It is a release, so it is exempt for §5.4's reason: a store
+  whose binding died must still be closable, or a dead session strands its connection.
+- **Closing does not close the binding.** `metadata_root` is borrowed, and `ProjectBinding.__exit__`
+  closes only what it opened (`binding.py:81`). `close()` closes the connection A5a opened and any
+  `Workspace` descriptors still outstanding, and nothing else.
+
+§11.2 covers the sequence directly: double close; close with an open write transaction, asserting the
+rollback and that the retained object is spent; and each public method after close raising
+`ProtocolError` rather than any `sqlite3` exception.
+
 ## 8. Blobs and workspaces
 
 ### 8.1 Promotion
@@ -710,13 +838,28 @@ cannot remove the directory it promised to remove.
 `promote_staging(workspace, manifest)` where the manifest names every file in the workspace's staging
 directory with its digest and byte length:
 
-1. For each entry, no-clobber rename `staging/<txid>/<name>` → `blobs/sha256/<hex>`. `EEXIST` is
+1. **Preflight the whole manifest before the first rename.** Promotion is one batch and has no undo:
+   once entry *k* has been renamed, discovering that entry *k+1* is malformed leaves the workspace
+   half-promoted, with some blobs published, some files still staged, and a `staging/<txid>/` that step
+   3 can no longer remove. Every rejection must therefore happen while nothing has moved.
+
+   The manifest must be exactly `tuple`, each element exactly `StagedBlob`, and for every element:
+   `name` and `digest` pass §5.5, and `byte_len` is exactly `int` — not `bool`, which is an `int`
+   subclass — and non-negative. Across elements, **source names are unique**: two entries naming the
+   same file would rename it once and then fail `ENOENT` on the second, mid-batch. Duplicate *digests*
+   under different names are allowed and resolve through §8.2, since that is ordinary content
+   addressing rather than a malformed manifest.
+
+   Each failure raises `ProtocolError` — the manifest is the caller's argument, not durable state.
+   `insert_blobs` validates each `StagedBlob` by the same rules for the same reason: its values become
+   a `digest` primary key and a `byte_len` that §7.5 later compares against every reference.
+2. For each entry, no-clobber rename `staging/<txid>/<name>` → `blobs/sha256/<hex>`. `EEXIST` is
    handled in §8.2.
-2. `backend.flush_directory` on `blobs/sha256/` **and** `staging/<txid>/`. Flushing only the blob
+3. `backend.flush_directory` on `blobs/sha256/` **and** `staging/<txid>/`. Flushing only the blob
    directory could leave both the blob and its staging source name durable after power loss,
    resurrecting preparation-only staging — authority §7.3's stated reason.
-3. Require `staging/<txid>/` to be empty, then `rmdir` it.
-4. `backend.flush_directory` on `staging/`.
+4. Require `staging/<txid>/` to be empty, then `rmdir` it.
+5. `backend.flush_directory` on `staging/`.
 
 **The database key and the filesystem leaf are not the same string.** The key stored in `blob.digest`
 and carried by `StagedBlob.digest` is the full `sha256:<64 hex>` — it is self-describing, so a second
@@ -730,13 +873,13 @@ Every flush is `backend.flush_file` / `backend.flush_directory`, never a raw `os
 step 3's reason: the backend is where `F_FULLFSYNC` lives on macOS, and a raw `os.fsync` here would make
 the blob durability claim exactly as weak as §5.3 says plain fsync is on that platform.
 
-The call returns only after step 4, so a caller cannot get the sequence wrong. Step 3's emptiness
+The call returns only after step 5, so a caller cannot get the sequence wrong. Step 4's emptiness
 requirement is what makes "complete manifest" *enforced*: an uncovered file raises instead of leaving a
 directory that cannot be removed.
 
 ### 8.2 A pre-existing blob is verified, not assumed
 
-`EEXIST` on step 1 is **not success by construction**. The digest names the content the engine intends,
+`EEXIST` on step 2 is **not success by construction**. The digest names the content the engine intends,
 not the content on disk: a pre-existing blob may be truncated by a previous crash, corrupted, or
 externally substituted.
 
@@ -752,25 +895,43 @@ after a corrupt blob would discard the only recovery material.
 retained `metadata_root` descriptor, never by absolute path. Removal is durable: `rmdir`, then
 `backend.flush_directory` on the parent.
 
-A workspace is the pair, and its shape and lifetime are exact:
+A workspace is the pair, and its shape and lifetime are exact. **It is a resource, not a value, so it
+is not frozen** — the distinction `ProjectBinding` already draws in the same words: "Not frozen, because
+it owns descriptors and a spent flag. `VolumeEvidence` is a value; this is a resource"
+(`binding.py:81`). A `Workspace` owns two descriptors and has at least two mutable states, so freezing
+it would have forced the spent flags out through `object.__setattr__` — writing to a frozen object to
+record that it changed.
 
 ```python
-@dataclass(frozen=True, slots=True)
 class Workspace:
-    txid: str                  # validated by §5.5 before either mkdirat
-    store: Store               # the issuing store — identity, checked on every use
-    staging_fd: int            # owned; closed by close()
-    work_fd: int               # owned; closed by close()
+    """A live resource: two directory descriptors and their spent flags.
+
+    Created only by Store.create_workspace. Every descriptor it holds is OWNED;
+    the metadata_root descriptor it was opened from is borrowed and stays A4a's.
+    """
+
+    __slots__ = ("_staging_fd", "_store", "_txid", "_work_fd")
+
+    def __init__(self, *, _construction_token: object | None = None, **kwargs) -> None: ...
+
+    @property
+    def txid(self) -> str: ...            # validated by §5.5 before either mkdirat
 
     def close(self) -> None: ...          # idempotent; closes both descriptors
     def __enter__(self) -> Workspace: ...
     def __exit__(self, *exc: object) -> None: ...   # calls close()
 ```
 
+**The descriptors are private.** A5a needs them; no caller does — the operations that use them are
+`promote_staging`, `remove_workspace`, and A6's writes through paths A5a hands out. Exposing
+`staging_fd` publicly would put a descriptor A5a closes into a caller's hands, which is the mistake
+`ProjectBinding`'s "every descriptor it exposes is BORROWED — a consumer must never close one" warns
+about, in the harder direction. `_store` is likewise private and used only for the identity check
+below. The token guard follows `ProjectBinding.__init__` (`binding.py:90`), along with its refusals of
+copy, deepcopy, and pickle: a copied workspace would duplicate descriptor ownership.
+
 - **`create_workspace(txid)`** validates the txid (§5.5), creates both directories, opens both
-  descriptors, and returns the `Workspace`. It is the only constructor; the dataclass is
-  factory-token-guarded exactly as `ProjectApprovedSpec` is (`approval.py:69`), so an ordinary
-  construction and `dataclasses.replace` both refuse.
+  descriptors, and returns the `Workspace`. It is the only constructor.
 - **`remove_workspace(workspace)`** removes both directories and flushes both parents, then closes the
   workspace. This is the method §8.3 promised and §7.1 did not have; without it "removes it when asked"
   was unimplementable through the public surface, and a caller would have had to reach past A5a to the
@@ -778,13 +939,23 @@ class Workspace:
   `remove_workspace` tolerates that directory being gone and requires `work/<txid>/` to be empty —
   refusing rather than recursing, since A5a does not know what a non-empty work directory means.
 - **Both operations verify the workspace before touching the filesystem**: it must be exactly
-  `Workspace`, not closed, and `workspace.store is self`. Two stores may share one binding (§7.2), so a
+  `Workspace`, not closed, and `workspace._store is self`. Two stores may share one binding (§7.3), so a
   workspace from another store carries descriptors into the wrong lifetime — its issuer may close them
   underneath. A forged or closed workspace raises `ProtocolError`; a foreign one does too, since all
   three are caller misuse rather than durable-state corruption.
-- **After promotion the workspace remains usable** for `work/<txid>/` alone. Its `staging_fd` refers to
-  a removed directory, and A5a does not reuse it — creating entries under an unlinked directory would
-  produce files nothing can ever reach.
+- **Promotion spends the staging half.** On success `promote_staging` closes `_staging_fd` and marks it
+  spent, because §8.1 step 4 removed the directory it refers to. An open descriptor to an unlinked
+  directory is the dangerous kind of still-valid: `openat` from it succeeds and produces files no path
+  can ever name, and `mkdirat` from it fails `ENOENT` for a reason that reads like a bug elsewhere. The
+  workspace stays usable for `work/<txid>/` alone.
+- **A second `promote_staging` on the same workspace raises `ProtocolError`**, which is the spent flag
+  doing its job. It is a plausible call — a retry after a failure that was not promotion's — and
+  without the check it would operate inside the removed directory rather than refusing.
+
+  The flag is set only on **success**. A promotion that raised left the staging directory in place by
+  §8.2's rule, and the retry that the caller then makes must be allowed to work.
+- **`close()` and `remove_workspace` are idempotent and never gate on liveness**, for §7.7's reason:
+  they release, and a workspace whose binding died must still be closable.
 
 A5a creates a workspace when asked and removes it when asked. **When** either happens is A5b's, and the
 re-resolution ledger #19 requires before creating scratch is A5b's.
@@ -796,19 +967,26 @@ Reuses `atoms.core.errors` unchanged except for one addition.
 | Raised | When |
 | --- | --- |
 | `CapabilityUnavailable` | SQLite < 3.37; `TEMP_STORE=0`; a pinned pragma that would not take. |
-| `ProtocolError` | Caller misuse: a wrong exact type, a name failing §5.5, a record operation outside an explicit transaction, a spent or foreign `StoreTransaction` or `Workspace`, a closed binding or released lock. |
-| `MetadataStoreInvalid` | **New.** The durable store cannot be safely interpreted — or a write would have made it so (§7.5). |
+| `ProtocolError` | Caller misuse: a wrong exact type, a name or manifest failing §5.5 or §8.1, a record operation outside an explicit transaction, a spent or foreign `_StoreTransaction` or `Workspace`, a use after `close`, a rejected pre-COMMIT record (§7.6), a closed binding or released lock. |
+| `MetadataStoreInvalid` | **New.** The durable store cannot be safely interpreted. |
 | `OSError` | Propagated. No blanket handler; §11.6 extends the existing guard to the new package. |
 | `sqlite3.Error` | Narrowly translated where it means corruption; otherwise propagated (§9.1). |
 
 `MetadataStoreInvalid(AtomsError)` covers both corruption and incompatibility, with the message
 distinguishing them: a failed `quick_check`, a schema that does not match its version, a foreign
-database, a non-canonical `spec_json`, a blob whose bytes do not match its digest, a sidecar surviving
-without its database (§5.1), a refused pre-COMMIT coherence check (§7.5), and *an unknown future
+database, a non-canonical `spec_json`, a blob whose bytes do not match its digest, a record digest
+naming no blob (§7.2), a sidecar surviving without its database (§5.1), and *an unknown future
 `user_version`*. A newer store is not corrupt — it is unreadable by this build — but both mean
 "stop; do not interpret this," which is one caller response and therefore one exception. Folding either
 into `ProtocolError` would tell a consumer to fix its call when the correct action is to preserve
 evidence.
+
+**The converse holds just as strictly**, and authority §11 states it: `MetadataStoreInvalid` is "raised
+by the store layer, never as a substitute for `ProtocolError`." Every entry above is a fact about
+durable state that already exists. A caller error caught *before* anything becomes durable is not one,
+however similar the check that catches it — which is why §7.6's pre-COMMIT rejection raises
+`ProtocolError` even though it runs §7.5's predicate, the same predicate whose failures on a load raise
+`MetadataStoreInvalid`. The rule is the state, not the check.
 
 Authority §11 is amended to add it (§3.3).
 
@@ -840,10 +1018,18 @@ shape, at each of the three sites named in the table above:
 try:
     ...                                     # one narrow operation, not a whole protocol
 except sqlite3.DatabaseError as caught:
-    if (caught.sqlite_errorcode & 0xFF) in (SQLITE_CORRUPT, SQLITE_NOTADB):
+    code = getattr(caught, "sqlite_errorcode", None)
+    if code is not None and (code & 0xFF) in (SQLITE_CORRUPT, SQLITE_NOTADB):
         raise MetadataStoreInvalid(...) from caught
     raise                                   # bare: original traceback, unchanged class
 ```
+
+The `getattr` is not defensive padding — `sqlite3.ProgrammingError` is a `DatabaseError` that carries
+**no `sqlite_errorcode` attribute at all**, measured, because it reports a pysqlite-level misuse rather
+than an SQLite result. Reading the attribute directly would raise `AttributeError` from inside the
+handler, replacing a clear "Cannot operate on a closed database" with a failure in the error path. It
+takes the `raise` branch instead, which is correct: it is not corruption. §7.7 keeps that case from
+arising through A5a's own surface by refusing use-after-close with `ProtocolError` first.
 
 Three properties carry the weight. The `except` encloses **one narrow operation**, not a protocol, so
 the codes it can plausibly see are bounded. The default is `raise`, bare — not `raise X from caught` —
@@ -902,7 +1088,10 @@ prove no *effect* mutation targets the store.
 ### 11.1 Tier 1 — pure
 
 No I/O, no connection. Generated DDL `CHECK` lists equal the A1/A3 enum members exactly, so a new
-member breaks the build rather than the store. The digest-to-leaf mapping in both directions (§8.1),
+member breaks the build rather than the store. `EFFECT_VARIANTS` is total in both directions (§7.1):
+every member of the `Effect` union is a key and every `EffectVariant` member is a value, each exactly
+once — and each of the five maps to the enum value the `CHECK` list accepts, not to a class name.
+The digest-to-leaf mapping in both directions (§8.1),
 including that the leaf is bare hex and never carries the `sha256:` prefix. The §5.5 name rules — a
 txid, manifest leaf, or digest that is empty, `.`, `..`, multi-component, NUL-bearing, or off the digest
 grammar, each refused **with `ProtocolError` specifically**, plus `3`, `None`, `b"tx"`, and a `str`
@@ -910,7 +1099,7 @@ subclass, which are the inputs that reach a raw `TypeError` without the exact-ty
 policy table of §5.2 as a pure decision function, including the `delete`-mode zero state, which is
 resumable and must not be refused for its journal mode.
 `HaltDiagnostic` round-trip equality over generated diagnostics, the assertion that no encoded field
-derives from `EntryIdentity`, and the four malformed-encoding refusals of §7.4 — missing field, extra
+derives from `EntryIdentity`, and the four malformed-encoding refusals of §7.5 — missing field, extra
 field, unknown enum member, duplicate key.
 
 ### 11.2 Tier 2 — real SQLite, temporary directory
@@ -922,6 +1111,11 @@ Profile read-back, including a connection whose `journal_mode` did not take and 
 pass for the wrong reason. The `spec_json` trigger refusing an `UPDATE`. A record operation attempted
 outside an explicit transaction, and a nested `transaction()` refused.
 
+**The pre-COMMIT gate ordering** (§7.6): with the lock released *during* validation — after the first
+gate has passed and before COMMIT — the transaction rolls back and raises `ProtocolError`. A single
+gate at the start of exit passes this test only by accident of timing, so the test holds the lock
+through the first gate and releases it inside the predicate.
+
 **The retained transaction object**, which is the case a type alone does not cover (§7). Three tests: a
 `txn` kept past a clean exit, a `txn` kept past a rollback, and a stale `txn` from an earlier
 transaction used while a *later* one is open. Each must raise `ProtocolError`, and each asserts the
@@ -929,19 +1123,31 @@ database is unchanged afterwards — the failure being prevented is a write that
 has to be about the row, not only about the exception. The rollback case is tested explicitly because it
 is the one a caller retrying after an exception still holds.
 
-**One-snapshot reads** (§7.2): a reader whose multi-query load is interleaved with a committing writer
+**One-snapshot reads** (§7.3): a reader whose multi-query load is interleaved with a committing writer
 on a second connection over the same database returns a coherent record. Run against the interleaving
 that tore without a read transaction — `state` read before a commit, journal state after it.
 
-Every cross-row validation of §7.4, failed one at a time **on both sides**: a `spec_json` that
+Every cross-row validation of §7.5, failed one at a time **on both sides**: a `spec_json` that
 `compile_spec` refuses; a missing `effect` row and an extra one; a mismatched variant; a `blob.byte_len`
 disagreeing with the referenced `FileState`; `rollback_result` present without `ROLLED_BACK` and absent
 with it; `halt_diagnostic` present without `HALTED` and absent with it; a diagnostic whose commit
-decision or journal vector disagrees with the row. Read-side by planting the row and loading it;
-write-side (§7.5) by issuing the setters and reaching the transaction's exit, asserting
-`MetadataStoreInvalid`, that the transaction rolled back, and that the pre-transaction record is intact.
-Plus the write-side case with no read-side counterpart: a transaction that touches two txids where only
-the second is incoherent must roll back **both**.
+decision or journal vector disagrees with the row. Read-side by planting the row and loading it,
+asserting **`MetadataStoreInvalid`**; write-side (§7.6) by issuing the setters and reaching the
+transaction's exit, asserting **`ProtocolError`** — the exception types are asserted, not just that
+something raised, since one predicate serving two verdicts is exactly where they could collapse into
+one. The write-side cases also assert the transaction rolled back and the pre-transaction record is
+intact. Plus the write-side case with no read-side counterpart: a transaction that touches two txids
+where only the second is incoherent must roll back **both**.
+
+**A failed read leaves no transaction open** (§7.3): after a load that raises — a planted non-canonical
+`spec_json`, then a planted §7.5 violation — assert `in_transaction` is false and that a following
+`BEGIN IMMEDIATE` succeeds. Without the rollback the follow-up write fails with `cannot start a
+transaction within a transaction`, which is the symptom that would otherwise surface far from its cause.
+
+**Store lifecycle** (§7.7): `close()` twice; `close()` with an open write transaction, asserting the
+row did not persist and the retained object is spent; and every public method after `close()` raising
+`ProtocolError` rather than `sqlite3.ProgrammingError`. The last is asserted on the exception type
+specifically, since pysqlite's own message is plausible enough to pass a laxer check.
 
 Effect order specifically: rows inserted `z, a, m` are proved to come back in `spec_json` order, since
 the raw query returns `a, m, z`.
@@ -949,7 +1155,9 @@ the raw query returns `a, m, z`.
 Error translation, by behavior rather than by grep (§9.1): a database truncated to garbage raising
 `MetadataStoreInvalid` — the `SQLITE_NOTADB` case, which arrives as `sqlite3.DatabaseError` itself with
 primary code 26 — and a `SQLITE_BUSY` or `SQLITE_READONLY` propagating **unchanged**, asserted on the
-exception's class *and* its `sqlite_errorcode`, not merely on "something raised."
+exception's class *and* its `sqlite_errorcode`, not merely on "something raised." And a
+`sqlite3.ProgrammingError`, which carries no `sqlite_errorcode`, reaching the translation site
+propagates rather than raising `AttributeError` from inside the handler.
 
 ### 11.3 Tier 3 — creation and reopen
 
@@ -988,18 +1196,36 @@ the emptiness requirement. `EEXIST` with matching bytes, and `EEXIST` with misma
 both the raise **and** that the staged source survives. A txid or manifest leaf containing `..` or `/`,
 refused before any `mkdirat` — asserted by the absence of the entry, not only by the exception.
 
+Manifest preflight (§8.1 step 1), each case asserting **nothing moved** — the staging directory still
+holds every file and `blobs/sha256/` is unchanged: a manifest that is a `list` rather than a `tuple`; an
+element that is not exactly `StagedBlob`; a bad name; a bad digest; a `byte_len` that is negative, a
+`bool`, or a `float`; and two entries naming the same source file. Each is placed **last** in an
+otherwise valid multi-entry manifest, since an invalid first entry would pass even without a preflight.
+
 Workspaces (§8.3): creation, then `remove_workspace` removing both directories durably; removal after
 promotion, where `staging/<txid>/` is already gone; removal refused when `work/<txid>/` is non-empty; a
 closed workspace and a workspace belonging to a *different* `Store` over the same binding, each raising
 `ProtocolError` from both `remove_workspace` and `promote_staging`; and a forged `Workspace` refused by
-the construction token.
+the construction token, plus refusals of copy, deepcopy, and pickle.
+
+Promotion's effect on the workspace: a second `promote_staging` on a promoted workspace raises
+`ProtocolError`; the staging descriptor is closed rather than left open on a removed directory; and
+after a promotion that *failed* under §8.2 the workspace is **not** spent, so the retry the caller makes
+next succeeds once the mismatch is resolved.
+
+Blob reading (§7.2): `open_blob` returns a readable descriptor whose bytes hash to the digest, refuses a
+digest failing §5.5 with `ProtocolError`, refuses a symlink at the leaf, and raises
+`MetadataStoreInvalid` for a digest with no blob. The caller closes the descriptor; the test asserts
+`Store.close()` does not close it, since ownership transfers (§7.1).
 
 Liveness: store operations after the binding is closed and after the lock is released, each raising
 `ProtocolError` — including `read_record` and `read_active`, since reads gate too (§5.4); and the case
 the per-operation gate misses — the lock released **between the last write and the transaction's
 exit**, asserting that `ProtocolError` escapes, that the transaction was rolled back rather than
-committed, and that `close()` still succeeds afterwards. The exemptions are asserted positively:
-`ROLLBACK` and `close()` both succeed on a dead binding.
+committed, and that `close()` still succeeds afterwards. The same shape on the read path: the lock
+released **during a load**, after the queries and before the record is returned, asserting that no
+`StoredRecord` reaches the caller and that the read transaction was rolled back (§7.3). The exemptions
+are asserted positively: `ROLLBACK`, `close()`, and `remove_workspace` all succeed on a dead binding.
 
 ### 11.5 Tier 5 — fresh process
 
@@ -1083,53 +1309,70 @@ table shapes, and §11 refusal vocabulary (§3.3).
     in the package.
 13. **Every** operation gates on `binding.backend`, reads included, and the gate runs again
     immediately before COMMIT; a lock released between the last write and the transaction's exit rolls
-    back and raises `ProtocolError`. `ROLLBACK` and `close` are the only exemptions and are asserted
-    to succeed after the binding or lock dies.
-14. `Store` exposes no `sqlite3.Connection`; record writes exist only on the object `transaction()`
-    yields, **and that object refuses use unless it is the store's current active transaction** —
-    a retained object raises `ProtocolError` after both a commit and a rollback, and a stale object
-    cannot write into a later transaction. A nested `transaction()` raises `ProtocolError`.
+    back and raises `ProtocolError`. The only exemptions are the operations that *release* — `ROLLBACK`,
+    `Store.close`, `Workspace.close`, and `remove_workspace` — each asserted to succeed after the
+    binding or lock dies.
+14. `Store` exposes no `sqlite3.Connection`; record writes exist only on the private
+    `_StoreTransaction` that `transaction()` yields, **and that object refuses use unless it is the
+    store's current active transaction** — a retained object raises `ProtocolError` after both a commit
+    and a rollback, and a stale object cannot write into a later transaction. A nested `transaction()`
+    raises `ProtocolError`. The exported surface is exactly `__all__`.
 15. Every read takes one SQLite snapshot, proved against a writer committing between the queries of a
-    single load.
-16. Every `CHECK` enumeration is generated from its enum, asserted equal to the enum members.
-17. All tables are `STRICT`, tested with values SQLite cannot losslessly coerce.
-18. `spec_json` is written from `canonical_json`, and a read that does not re-encode to the stored text
+    single load; every failing read rolls back before raising, leaving no open transaction, and gates
+    liveness again before returning a record.
+16. `Store.close()` is idempotent, rolls back and spends any open transaction, and every operation
+    after it raises `ProtocolError` rather than any `sqlite3` exception.
+17. Every `CHECK` enumeration is generated from its enum, asserted equal to the enum members.
+18. All tables are `STRICT`, tested with values SQLite cannot losslessly coerce.
+19. `spec_json` is written from `canonical_json`, and a read that does not re-encode to the stored text
     exactly raises `MetadataStoreInvalid`.
-19. An `UPDATE` of `spec_json` is refused by the database trigger, not only by lint, and the source
+20. An `UPDATE` of `spec_json` is refused by the database trigger, not only by lint, and the source
     guard targets issued DML while excluding the `CREATE TRIGGER` text that implements it.
-20. `HaltDiagnostic` round-trips exactly, and its encoded form contains no field derived from
+21. `HaltDiagnostic` round-trips exactly, and its encoded form contains no field derived from
     `EntryIdentity`.
-21. The journal vector is reconstructed by walking `spec_json`, never by relying on row order, with
+22. The journal vector is reconstructed by walking `spec_json`, never by relying on row order, with
     exact two-way coverage proved; the schema carries no ordinal column, and `insert_record` takes no
-    `variants` argument — every variant is derived from the spec.
-22. §7.4's predicate covers `compile_spec` acceptance, effect coverage, variant consistency, blob
+    `variants` argument — every variant is derived from the spec through `EFFECT_VARIANTS`, a literal
+    total mapping asserted exhaustive in both directions and never `variant_name`, whose class-name
+    spelling the `CHECK` list rejects.
+23. §7.5's predicate covers `compile_spec` acceptance, effect coverage, variant consistency, blob
     `byte_len` agreement, `rollback_result` exactly for `ROLLED_BACK`, `halt_diagnostic` exactly for
     `HALTED`, diagnostic agreement with the durable row, active-record existence, and the four
     malformed-encoding cases — each failing independently.
-23. That same predicate runs over every touched txid **before every COMMIT**; a transaction that would
-    persist an incoherent record rolls back with `MetadataStoreInvalid` and leaves the prior record
-    intact. A5a cannot commit a record its own loader would reject.
-24. `promote_staging` takes a complete manifest, and a manifest omitting a file raises at the emptiness
-    requirement rather than leaving an unremovable directory.
-25. Promotion returns only after `blobs/sha256/` and `staging/<txid>/` are flushed, the staging
+24. That same predicate runs over every touched txid **before every COMMIT**, in the order
+    gate → validate → gate → COMMIT with the second gate adjacent to the barrier. A transaction that
+    would persist an incoherent record rolls back and leaves the prior record intact, raising
+    **`ProtocolError`** — never `MetadataStoreInvalid`, which authority §11 reserves for durable state
+    that cannot be interpreted. A5a cannot commit a record its own loader would reject.
+25. `promote_staging` validates the entire manifest — element types, names, digests, exact
+    non-negative `int` lengths, and unique source names — **before the first rename**, so a rejected
+    manifest moves nothing; `insert_blobs` applies the same value rules. A manifest omitting a file
+    raises at the emptiness requirement rather than leaving an unremovable directory.
+26. Promotion returns only after `blobs/sha256/` and `staging/<txid>/` are flushed, the staging
     directory is removed, and `staging/` is flushed.
-26. A pre-existing blob is verified by kind, length, and streamed SHA-256 before the staged source is
+27. A pre-existing blob is verified by kind, length, and streamed SHA-256 before the staged source is
     unlinked; on mismatch the staged source survives and `MetadataStoreInvalid` is raised.
-27. The `blob.digest` key is `sha256:<hex>` while the `blobs/sha256/` leaf is the bare 64-character
+28. The `blob.digest` key is `sha256:<hex>` while the `blobs/sha256/` leaf is the bare 64-character
     hex, with the mapping tested in both directions.
-28. Workspace directories are created and removed through guarded traversal from the retained
+29. Workspace directories are created and removed through guarded traversal from the retained
     descriptor, never by absolute path; removal is durable and reachable through
     `Store.remove_workspace`. A closed, forged, or foreign-store `Workspace` is refused by both
     `remove_workspace` and `promote_staging`.
-29. `atoms.fs` and `atoms.core` import nothing from `atoms.store`.
-30. A record committed in one process is read back identically in a fresh process.
-31. No `ProjectApprovedSpec` is accepted anywhere in `atoms.store`, so ledger #9's enforcement cannot
+30. `Workspace` is a token-guarded resource with private descriptors, not a frozen value. A successful
+    `promote_staging` closes and spends the staging half, a second promotion raises `ProtocolError`,
+    and a *failed* promotion leaves the workspace usable for the retry.
+31. `open_blob` is the only way to read a blob's bytes, so no later layer re-derives the digest-to-leaf
+    mapping; it validates the digest, refuses a symlink or non-regular leaf, raises
+    `MetadataStoreInvalid` for a missing blob, and transfers descriptor ownership to the caller.
+32. `atoms.fs` and `atoms.core` import nothing from `atoms.store`.
+33. A record committed in one process is read back identically in a fresh process.
+34. No `ProjectApprovedSpec` is accepted anywhere in `atoms.store`, so ledger #9's enforcement cannot
     be satisfied at this layer by accident.
-32. No consumer of `atoms.store` exists yet, asserted rather than assumed.
-33. Every caller-supplied pathname component — txid, manifest leaf, digest — is validated against
+35. No consumer of `atoms.store` exists yet, asserted rather than assumed.
+36. Every caller-supplied pathname component — txid, manifest leaf, digest — is validated against
     §5.5 before any filesystem mutation, with exact types required and **`ProtocolError` raised**,
     never a bare `TypeError` or `SpecValidationError`.
-34. `SQLITE_CORRUPT` and `SQLITE_NOTADB` translate to `MetadataStoreInvalid` with the original as
+37. `SQLITE_CORRUPT` and `SQLITE_NOTADB` translate to `MetadataStoreInvalid` with the original as
     `__cause__`; every other `sqlite3.Error` propagates with its original class and code, asserted at
     runtime. The static guard bans `except sqlite3.Error` and bare `except:`, permits
     `except sqlite3.DatabaseError` because §9.1 requires it, and requires every such handler to
