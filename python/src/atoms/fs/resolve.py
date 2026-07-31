@@ -21,6 +21,7 @@ from atoms.core.errors import (
 )
 from atoms.core.paths import require_rel_path
 from atoms.fs.binding import ProjectBinding
+from atoms.fs.bootstrap import WORK_DIRECTORY
 from atoms.fs.lock import close_all
 from atoms.fs.lookup import DirectoryConstraints, LookupProof, read_lookup_constraints
 from atoms.fs.volume import read_mount_id
@@ -140,6 +141,9 @@ class PathResolver:
     )
 
     _OBSERVE_FLAGS = os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC
+    _NAMESPACE_CONTRADICTIONS = frozenset(
+        {errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.EXDEV}
+    )
 
     def __init__(self, binding: ProjectBinding) -> None:
         # Liveness gate. project_root_fd routes through ProjectBinding._require_active,
@@ -180,6 +184,55 @@ class PathResolver:
             identity: DirectoryFacts(identity, constraints)
         }
         self._work_base: DirectoryFacts | None = None
+
+    def work_base_facts(self) -> DirectoryFacts:
+        """Facts for the existing metadata_root/work base.
+
+        NOT A3's logical WorkRoot: authority §7 places effect-time staging in
+        work/<txid>/, which does not exist at approval time. A4b-2 derives that
+        directory's constraints from these through inherited_constraints.
+
+        Unlike _facts_for, this memo DOES skip re-observation on a hit. work/ is
+        engine-owned space created by ensure_metadata_layout under the exclusive
+        project lock still held here; no cooperating process mutates it during the
+        lease. Authority §3.2 places a noncooperating writer inside the metadata tree
+        outside the guarantee, so this method does not claim to detect a post-cache
+        flag change. A5 still re-resolves before relying on the approved facts.
+        """
+        backend = self._binding.backend  # liveness BEFORE the memo, so a cached
+        parent_fd = self._binding.metadata_root_fd  # result still fails after closure
+        if self._work_base is not None:
+            return self._work_base
+        try:
+            fd = backend.open_child_directory(parent_fd, WORK_DIRECTORY)
+        except OSError as caught:
+            if caught.errno in self._NAMESPACE_CONTRADICTIONS:
+                raise ProtocolError(
+                    f"engine-owned metadata_root/{WORK_DIRECTORY} is missing or "
+                    f"malformed: {caught}"
+                ) from caught
+            raise
+        try:
+            mount = read_mount_id(fd)
+            expected = self._binding.evidence.mount_id
+            if mount != expected:
+                raise ProtocolError(
+                    f"engine-owned metadata_root/{WORK_DIRECTORY} is on mount {mount}, "
+                    f"not the bound volume's mount {expected}"
+                )
+            constraints = read_lookup_constraints(fd, self._filesystem_type)
+            if constraints.lookup_proof is LookupProof.UNREPRODUCIBLE_CASEFOLD:
+                raise ProjectApprovalRefused(
+                    f"metadata_root/{WORK_DIRECTORY} is a casefold directory; its "
+                    "lookup relation cannot be reproduced"
+                )
+            facts = DirectoryFacts(_identity(os.fstat(fd)), constraints)
+        except BaseException:
+            close_all((fd,))
+            raise
+        close_all((fd,))  # may raise; nothing is cached if it does
+        self._work_base = facts
+        return facts
 
     def resolve(self, rel_path: str) -> ResolvedPrefix:
         """Observe the deepest existing directory prefix of one declared path.

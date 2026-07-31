@@ -10,6 +10,7 @@ from atoms.fs.lock import HeldProjectLock, close_all
 
 METADATA_LAYOUT = ("probe", "staging", "work", "blobs/sha256")
 PROBE_DIRECTORY = "probe"
+WORK_DIRECTORY = "work"
 
 
 def _open_or_create_child(backend, parent_fd: int, name: str) -> int:
