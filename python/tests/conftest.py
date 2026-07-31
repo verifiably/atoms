@@ -300,6 +300,13 @@ def ext4_volume():
 
 
 @pytest.fixture
+def ext4_probe_fd(ext4_volume):
+    fd = os.open(ext4_volume, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    yield fd
+    os.close(fd)
+
+
+@pytest.fixture
 def ext4_project_root(ext4_volume):
     return make_project_root(ext4_volume)
 
