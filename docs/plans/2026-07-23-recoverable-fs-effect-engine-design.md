@@ -1233,9 +1233,12 @@ staging swap during rollback cannot be laundered into a false restoration.
 
 ## 11. Refusal and failure semantics
 
-- **`PreconditionRefused`** — concurrent drift was detected either at capture or by validating an
-  atomically displaced entry. The executor returns this refusal only after the current effect and every
-  earlier effect have been restored; inability to prove that restoration becomes `TransactionHalted`.
+- **`PreconditionRefused`** — concurrent drift was detected: during approval, when two observations of
+  one directory or entry disagree within a single approval; at capture; or by validating an atomically
+  displaced entry. Approval holds no transaction record and has mutated nothing, so it refuses
+  directly. Once mutation may have begun, the executor returns this refusal only after the current
+  effect and every earlier effect have been restored; inability to prove that restoration becomes
+  `TransactionHalted`.
 - **`SpecValidationError`** — a `TransactionSpec` failed A2's pure lexical/model proof. Raised by
   `compile_spec` before any project context exists.
 - **`ProjectApprovalRefused`** — the rooted project proof failed. Raised during approval, before any

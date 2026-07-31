@@ -20,8 +20,9 @@ pure, so every obligation except the two that are definitionally about real limi
 speed against synthetic resolution tables.
 
 Its public result is a frozen, factory-issued `ProjectApprovedSpec` composing the exact `CompiledSpec`
-it approved, the live `ProjectBinding` it approved against, A3's production `RecoveryTopology`, and a
-node-keyed table of the resolved facts a later stage must re-observe and compare.
+it approved, the live `ProjectBinding` it approved against, A3's production `RecoveryTopology`, and the
+approved baselines a later stage must re-observe and compare against — per-node directory facts and the
+observed `metadata_root/work` facts.
 
 ## 2. Scope and non-scope
 
@@ -38,7 +39,10 @@ node-keyed table of the resolved facts a later stage must re-observe and compare
 - Required-capability adjudication against the bound volume's supplied set (ledger #6).
 - Construction of A3's production `RecoveryTopology` and the re-run of surface consistency and
   created-directory ordering over its resolved nodes (ledger #10).
-- Retention of the live binding in the proof (ledger #16).
+- Retention of the live binding in the proof (ledger #16), and of the approved baselines a later stage
+  compares against: per-node directory facts and the observed `metadata_root/work` facts.
+- `lookup_equivalence_key`, the pure per-policy name-equivalence function both endpoint distinctness
+  and planned-node assignment use. It is added to A4b-1's `lookup.py`, which judges no specification.
 - Categorical refusal propagation from A4b-1 (ledger #20).
 
 ### 2.2 Not in scope
@@ -111,9 +115,15 @@ and Btrfs; that admits nothing and §2.2 records it as non-scope.
 
 ### 3.3 Delivery obligations that are not ledger entries
 
-- **No authority amendment is required.** §11 already declares every exception A4b-2 raises, and §5.4
-  explicitly assigns `ProjectContext`'s concrete fields to A4's reviewed plan. A4b-1 needed a §11
-  amendment; this design needs none.
+- **Authority §11 gains approval-time drift as a `PreconditionRefused` case.** A4b-1 raises that
+  exception when two observations of one directory or entry disagree within a single approval, and
+  A4b-2 propagates it under #20. §11 as written defines it only for drift detected "at capture or by
+  validating an atomically displaced entry", and conditions its return on the current effect and every
+  earlier one having been restored — none of which describes approval, which holds no transaction
+  record and has mutated nothing. The exception *name* was already declared, which is why A4b-1's
+  review did not catch this; its *meaning* did not cover the case. The amendment lands in the same
+  commit as this design.
+- `ProjectContext`'s concrete fields need no amendment: §5.4 already assigns them to A4's reviewed plan.
 - `AGENTS.md`'s A4b status line changes from "A4b-1 implemented, A4b-2 unimplemented" when the
   implementation lands. A4a's `test_a4a_status_is_synchronized_across_authority_documents` establishes
   the pattern for keeping that line honest.
@@ -129,6 +139,11 @@ Three new modules under `~/d/atoms/python/src/atoms/fs/`:
 | `approval.py` | `ProjectContext`, `ProjectApprovedSpec`, the construction token, `approve_for_project` | Yes — phase B only |
 | `topology.py` | Node assignment, edge construction, the re-run of surface and ordering rules | No |
 | `judgment.py` | Ancestor legality, endpoint distinctness, scratch instantiation and distinctness | No |
+
+One addition to an existing module: `lookup_equivalence_key` joins `lookup.py`, beside
+`read_lookup_constraints` and `inherited_constraints`. It belongs with the other per-policy functions
+rather than in `judgment.py`, and it introduces no specification dependency, so §2.3's seam guard is
+unaffected.
 
 `topology.py` and `judgment.py` are pure: they consume a resolution table and produce values or raise.
 Neither imports `atoms.fs.resolve` for anything but its types. This is what makes §11.1 the largest
@@ -206,14 +221,35 @@ Four phases, ordered so the cheapest refusal comes first.
 
 ### 6.1 Phase A — context, no path I/O
 
-1. `type(compiled) is CompiledSpec` → `ProtocolError` otherwise, following A3's `_require_exact`
-   convention in `snapshot.py`. A subclass would pass an `isinstance` gate and then break a later phase.
-2. `require_valid_identifier("txid", context.txid)`, translated to `ProtocolError` per §5.1.
-3. Capability adjudication (ledger #6):
+1. **Exact-type gates**, each raising `ProtocolError`, following A3's `_require_exact` convention in
+   `snapshot.py`: `type(compiled) is CompiledSpec`, `type(context) is ProjectContext`,
+   `type(context.binding) is ProjectBinding`, and `type(context.txid) is str`.
+2. **Liveness**, before any other field of the context is read: `context.binding.backend`, whose
+   property routes through `_require_active()` and issues no I/O.
+3. `require_valid_identifier("txid", context.txid)`, translated to `ProtocolError` per §5.1.
+4. Capability adjudication (ledger #6):
    `compiled.spec.required_capabilities() - context.binding.evidence.supplied_capabilities` must be
    empty, else `CapabilityUnavailable` naming the sorted missing capability values.
-4. `PathResolver(context.binding)`, which refuses a non-Linux backend, a casefold project root, and a
+5. `PathResolver(context.binding)`, which refuses a non-Linux backend, a casefold project root, and a
    project root that *is* the metadata root.
+
+**Why every type is gated exactly, not just `compiled`.** `ProjectContext` is freely constructible by
+design (§5.1), so the only thing standing between a duck-typed binding and proof issuance is this
+gate. A delegating object exposing `backend`, `project_root_fd`, and `evidence` would satisfy every
+attribute access in `PathResolver` and reach phase D, producing a proof that retains something which
+is not a live `ProjectBinding` — precisely what ledger #16 forbids, and an architecture test asserting
+"the retained binding is present" would not catch it. The `str` gate on the txid is load-bearing for a
+different reason: `require_valid_identifier` calls `re.Pattern.fullmatch`, which raises `TypeError` on
+a non-string, so without this gate a non-string txid would escape as `TypeError` rather than the
+`ProtocolError` §5.1 promises.
+
+**Why liveness precedes evidence.** `ProjectBinding.evidence` is a detached value and its property
+performs no liveness check — deliberately, and A4b-1 §6.1 records that as the reason evidence must not
+be the first thing touched. Adjudicating capabilities against a closed binding's evidence would
+therefore report `CapabilityUnavailable` for a specification whose real problem is that the lease is
+gone, and would report it *successfully* for a specification that needs nothing missing. Reading
+`backend` first makes the closed binding fail as `ProtocolError` regardless of what the capability sets
+happen to contain.
 
 Capability adjudication precedes every traversal deliberately. An unsupported capability makes each
 subsequent path check pointless work, and the refusal is more actionable than the first path refusal
@@ -223,14 +259,15 @@ durability allowlist, so no `ProjectBinding` exists for an unlisted volume.
 
 ### 6.2 Phase B — resolution, the only I/O
 
-5. Resolve every path in `compiled.timelines`, in sorted order, into
+6. Resolve every path in `compiled.timelines`, in sorted order, into
    `dict[str, ResolvedPrefix]`. A2 phase 10 already proves that path set equals the declared surface
    exactly, so using `timelines` needs no separate coverage argument and matches the key A3's
    `_validate_persistent_coverage` uses.
-6. If any effect is a `CreateDirectory`, call `resolver.work_base_facts()`, check the concrete `<txid>`
-   component against `work.name_max`, and derive `work/<txid>/`'s constraints through
-   `inherited_constraints`. Skipped entirely otherwise, matching A4b-1's reason for making that method
-   lazy: a specification with no `CreateDirectory` must not be refused by an unapprovable `work/`.
+7. If any effect is a `CreateDirectory`, call `resolver.work_base_facts()`, retain the result as
+   `work_base`, check the concrete `<txid>` component against `work.name_max`, and derive
+   `work/<txid>/`'s constraints through `inherited_constraints`. Skipped entirely otherwise, matching
+   A4b-1's reason for making that method lazy: a specification with no `CreateDirectory` must not be
+   refused by an unapprovable `work/`.
 
 This phase discharges #4 and #5 by construction — every limit, containment, metadata-root, and
 mount-membership rule is enforced inside `resolve()` — and produces the table every later phase reads.
@@ -270,9 +307,24 @@ about `openat2` behavior rather than about this module.
 
 #### 6.3.2 Endpoint distinctness
 
-Two declared paths name one entry iff they resolve to the same parent node and their leaf bytes are
-equal under that parent's actual lookup policy. Under `EXACT_BYTES` — the only policy A4b-1 approves —
-that reduces to exact byte equality of the leaves.
+Both this check and §7.1's planned-node assignment need one shared notion of "these two names reach the
+same entry in this parent." A single pure function supplies it, added to `lookup.py` — which judges no
+specification, so the seam guard in §2.3 still holds:
+
+```python
+def lookup_equivalence_key(constraints: DirectoryConstraints, name: str) -> str
+```
+
+For `EXACT_BYTES` it returns `name` unchanged. It raises `CapabilityUnavailable` for any other
+`LookupProof`, matching `inherited_constraints`' treatment of an unapproved filesystem: a policy whose
+relation the engine cannot reproduce has no equivalence key either, and inventing one would be the
+silent fallback this engine refuses. When the floor widens, the new policy's key lands here and every
+caller inherits it.
+
+Two declared paths name one entry iff they resolve to the same parent node and their leaves share a
+`lookup_equivalence_key` under that parent's constraints. Under `EXACT_BYTES` that reduces to exact
+byte equality, which is why the check is currently equivalent to comparing leaf bytes and is
+nonetheless not written that way.
 
 The check runs over all declared paths including those declared `ABSENT`, where identity comparison
 does not apply and is therefore not what is being compared. Authority §5.4 gives the reason a
@@ -325,9 +377,17 @@ node for the same directory would break it.
 
 `node_id` values are assigned in first-encounter order over lexically sorted declared paths, so the
 topology is reproducible across runs. The assignment *key* is the `FilesystemIdentity` for an existing
-directory and (parent node, exact leaf bytes) for a planned one. Keying by identity is a no-op under
-today's floor, where no two spellings can reach one directory; it is written that way so that widening
-the floor changes the floor and not this code.
+directory, and for a planned one it is
+`(parent node, lookup_equivalence_key(parent.constraints, leaf))` — the same function §6.3.2 uses for
+endpoint distinctness.
+
+Keying planned directories by exact bytes would break the floor-agnosticism this scheme claims.
+`CreateDirectory("A")` alongside an effect on `a/x` compiles under A2, whose phase 4 refuses only
+whole-path aliases — `portability_equivalence_key` maps `A` to `a` but `A` and `a/x` to different keys,
+so both survive. Under an insensitive parent those are one directory, which is exactly authority
+§5.4's motivating example; an exact-bytes key would emit two nodes for it. Both halves of the key are
+therefore policy-derived, and both are no-ops under today's `EXACT_BYTES`-only floor: widening the
+floor changes `lookup_equivalence_key` and nothing here.
 
 ### 7.2 Edges
 
@@ -381,12 +441,24 @@ The chain is A4b-1 §6.6's, executed here:
 
 ```
 metadata_root/work facts                       (A4b-1, observed)
+  -> retained verbatim as ProjectApprovedSpec.work_base
   -> validate the concrete <txid> component against work.name_max
   -> inherited_constraints(work.constraints, "ext4")
   -> constraints of physical work/<txid>
   -> WorkRoot's ApprovedPlannedDirectory entry
   -> bounds every WORK scratch leaf name
 ```
+
+**The observed work-base facts are retained, not consumed.** `WorkRoot`'s planned entry carries only
+the *derived* constraints of `work/<txid>/`; the observed identity and constraints of physical
+`metadata_root/work` appear nowhere in it. Ledger #19 requires A5 to re-resolve that namespace under
+the held lock before creating `work/<txid>/`, and a re-resolution with no approved baseline is not a
+comparison — it is a fresh observation authorizing itself, which is the failure mode #19 exists to
+prevent. So the proof retains `work_base` as its own field.
+
+This is the one place where the §8 rule about consuming observations does not apply, and the
+distinction is exactly the one that rule draws: `metadata_root/work` is a *directory* whose facts A5
+must compare, not a leaf whose state A6 must capture.
 
 ## 8. The proof
 
@@ -402,6 +474,8 @@ ApprovedDirectory = ApprovedExistingDirectory | ApprovedPlannedDirectory
 ApprovedPath(path: str, parent_node: TopologyNode, leaf: str)
 ApprovedScratch(effect_id: str, role: ScratchRole, parent_node: TopologyNode, leaf: str)
 
+ApprovedWorkBase(identity: FilesystemIdentity, constraints: DirectoryConstraints)
+
 ProjectApprovedSpec(
     compiled: CompiledSpec,
     binding: ProjectBinding,
@@ -410,8 +484,17 @@ ProjectApprovedSpec(
     directories: tuple[ApprovedDirectory, ...],
     paths: tuple[ApprovedPath, ...],
     scratch: tuple[ApprovedScratch, ...],
+    work_base: ApprovedWorkBase | None,
 )
 ```
+
+`work_base` is present exactly when the specification contains a `CreateDirectory`, because
+`work_base_facts()` is lazy for the reason A4b-1 §6.6 gives. An `X | None` here rather than a
+two-variant union is deliberate and not in tension with the `ApprovedDirectory` union below: this
+`None` encodes *applicability* — the work namespace is irrelevant to this transaction — while the
+directory union encodes a *fact* about a directory that certainly matters. A3 draws the same line, with
+`rollback_result` and `halt_diagnostic` as `X | None` validated present-exactly-when-required, and
+§13's criteria state that rule for `work_base`.
 
 A two-variant union rather than `identity: FilesystemIdentity | None`, because "this transaction
 creates the directory" is a different fact from "I could not observe it", and every consumer branches
@@ -426,8 +509,10 @@ Authority §5.4 is clear this is a conventional API boundary and not a claim of 
 both read the frontier, and it is real evidence for those judgments. But A6's capture must observe each
 leaf again against a coherent descriptor regardless, so a retained leaf observation would be the one
 field in the proof that a consumer could mistake for authority while it silently went stale. Per-node
-directory facts *are* retained, because those are exactly what ledger #19 requires a later stage to
-re-resolve and compare against.
+directory facts *are* retained, and so is `work_base` (§7.5), because those are exactly what ledger #19
+requires a later stage to re-resolve and compare against. The line is drawn between a directory whose
+facts a later stage compares and a leaf whose state a later stage captures — not between cheap and
+expensive observations.
 
 Mount membership is likewise not stored. `open_child_directory` passes `RESOLVE_NO_XDEV`, so every hop
 is proved on the bound mount at resolution time and re-proved on re-resolution; there is no comparison
@@ -438,11 +523,13 @@ for a stored value to serve.
 | Raised | For |
 | --- | --- |
 | `ProjectApprovalRefused` | endpoint collision, illegal ancestor (missing, `OTHER`, or unconverted), scratch-leaf collision, resolved-topology surface or ordering violation — and everything A4b-1 raises, passing through untouched |
-| `CapabilityUnavailable` | required ⊄ supplied |
-| `ProtocolError` | malformed txid, a `compiled` that is not exactly a `CompiledSpec`, closed binding or released lock via A4b-1 |
+| `PreconditionRefused` | raised only by A4b-1 and propagated: two observations of one directory or entry disagreeing within a single approval. A4b-2 never raises it directly |
+| `CapabilityUnavailable` | required ⊄ supplied, and `lookup_equivalence_key` on an unapproved `LookupProof` |
+| `ProtocolError` | a `compiled`, `context`, `binding`, or `txid` of the wrong exact type; a malformed txid; a closed binding or released lock |
 | bare `OSError` | everything else, unwrapped |
 
-A4b-2 introduces no new exception type; authority §11 already declares each of these.
+A4b-2 introduces no new exception *type*. It does require one amendment to what an existing type
+means: authority §11's `PreconditionRefused` did not cover approval-time drift, per §3.3.
 
 **Ledger #20 is structural.** `approve_for_project` contains no `except` clause enclosing any resolver
 call — not a discriminating one, not a re-raising one. The correct count is zero, which is a stronger
@@ -473,11 +560,27 @@ correctly converted; the same ancestor left unconverted; an `OTHER` ancestor; an
 and `A` versus `a/x` merging under a hypothetical insensitive parent, which no real approved volume can
 produce.
 
+`lookup_equivalence_key` gets its own cases: identity on `EXACT_BYTES`, and `CapabilityUnavailable` on
+every other `LookupProof` member, parametrized over the enum so a future member fails the suite until
+someone decides what its key is.
+
+Phase A's gates are pure and tested here rather than against a volume: each of `compiled`, `context`,
+`context.binding`, and `context.txid` given a wrong exact type raises `ProtocolError`; a subclass of
+each is refused, not accepted; a duck-typed object exposing `backend`, `project_root_fd`, and
+`evidence` is refused before it can reach proof issuance; a non-string txid raises `ProtocolError`
+rather than the `TypeError` `re.Pattern.fullmatch` would produce; and a closed binding whose evidence
+lacks a required capability raises `ProtocolError`, not `CapabilityUnavailable` — the assertion that
+pins the §6.1 ordering, since both exceptions are reachable and only the order distinguishes them.
+
 ### 11.2 Tier 2 — topology construction
 
 Node assignment, edge construction, the `ApprovedExistingDirectory`/`ApprovedPlannedDirectory`
 partition of §7.3, `node_id` reproducibility across runs, and `WorkRoot` present exactly when a
 `CreateDirectory` exists.
+
+Planned-node keying gets a dedicated case, because it is the half of §7.1's key that is easy to get
+wrong: `CreateDirectory("A")` alongside an effect on `a/x`, under a synthetic insensitive parent, must
+yield **one** node. An exact-bytes key passes every other test in this tier and fails only this one.
 
 ### 11.3 Tier 3 — A3 acceptance
 
@@ -495,6 +598,10 @@ against a restatement of this document.
 - a genuine `FILE → ABSENT → DIRECTORY` ancestor conversion on disk;
 - a `PATH_MAX` and a per-directory `NAME_MAX` refusal;
 - the nested-metadata-root refusal, reached through `approve_for_project` rather than the resolver;
+- `work_base` retained with the identity and constraints of the real `metadata_root/work` — asserted
+  equal to an independent `fstat` and `read_lookup_constraints` on that directory, so the retained
+  baseline is checked against the filesystem rather than against the same call that produced it;
+- `work_base is None` for a specification with no `CreateDirectory`, and non-`None` with one;
 - the A2-agreement property: for every compiled specification, the §7.4 re-run reaches A2's verdict.
 
 The last is a property test rather than a case: under today's floor the two cannot disagree, so a
@@ -534,39 +641,51 @@ tier lands.
 **Ledger entries untouched:** #1 (A6); #7, #12, #17, #18 (A5); #8 (A3, A7); #13 (A6, A7); #14 (A7);
 #15 (A8); #19 (A5, A6, A7).
 
-**Not a ledger entry:** the `AGENTS.md` status line, and the absence of any authority amendment.
+**Not a ledger entry:** the `AGENTS.md` status line, and authority §11's `PreconditionRefused`
+amendment covering approval-time drift (§3.3).
 
 ## 13. Acceptance criteria
 
 1. `approve_for_project(compiled, context)` returns a frozen `ProjectApprovedSpec` composing the exact
-   `CompiledSpec` object passed in, the live `ProjectBinding`, the txid, the topology, and the three
-   fact tables.
+   `CompiledSpec` object passed in, the live `ProjectBinding`, the txid, the topology, the three fact
+   tables, and `work_base`.
 2. Ordinary construction of `ProjectApprovedSpec` and `dataclasses.replace` on one both raise.
-3. A `compiled` that is not exactly a `CompiledSpec` raises `ProtocolError`; a malformed txid raises
-   `ProtocolError` with the `SpecValidationError` as `__cause__`.
-4. A required capability the bound volume does not supply raises `CapabilityUnavailable`, before any
+3. A wrong exact type for any of `compiled`, `context`, `context.binding`, or `context.txid` raises
+   `ProtocolError`, subclasses included; a malformed `str` txid raises `ProtocolError` with the
+   `SpecValidationError` as `__cause__`; a non-`str` txid raises `ProtocolError`, never `TypeError`.
+4. A closed binding or released lock raises `ProtocolError` before any capability is compared, even
+   when a required capability is also missing.
+5. A required capability the bound volume does not supply raises `CapabilityUnavailable`, before any
    `openat2` is issued.
-5. Every path in `compiled.timelines` is resolved exactly once, in sorted order.
-6. `work_base_facts()` is called iff the specification contains a `CreateDirectory`.
-7. A declared path whose missing ancestor no `CreateDirectory` creates raises
+6. Every path in `compiled.timelines` is resolved exactly once, in sorted order.
+7. `work_base_facts()` is called iff the specification contains a `CreateDirectory`, and `work_base` is
+   non-`None` on exactly those approvals, carrying the observed identity and constraints of physical
+   `metadata_root/work`.
+8. A declared path whose missing ancestor no `CreateDirectory` creates raises
    `ProjectApprovalRefused`; one whose `CreateDirectory` is ordered after a descendant effect does too.
-8. A `REGULAR_FILE` or `SYMLINK` ancestor converted by the timeline is admitted; the same ancestor left
+9. A `REGULAR_FILE` or `SYMLINK` ancestor converted by the timeline is admitted; the same ancestor left
    unconverted, and any `OTHER` ancestor, raise `ProjectApprovalRefused`.
-9. Two declared paths resolving to the same parent node with equal leaf bytes raise
-   `ProjectApprovalRefused` naming both spellings.
-10. The complete scratch set is instantiated, bound to concrete parents per §6.3.3, proved pairwise
+10. Two declared paths resolving to the same parent node whose leaves share a
+    `lookup_equivalence_key` under that parent's constraints raise `ProjectApprovalRefused` naming both
+    spellings.
+11. `lookup_equivalence_key` is the identity on `EXACT_BYTES` and raises `CapabilityUnavailable` on
+    every other `LookupProof` member.
+12. The complete scratch set is instantiated, bound to concrete parents per §6.3.3, proved pairwise
     distinct, and each leaf is within its parent's `name_max`.
-11. The produced `RecoveryTopology` validates through `build_recovery_snapshot` for every specification
+13. The produced `RecoveryTopology` validates through `build_recovery_snapshot` for every specification
     the suite approves.
-12. `ApprovedExistingDirectory` covers exactly `ProjectRoot` and the `TopologyDirectory`s;
+14. `ApprovedExistingDirectory` covers exactly `ProjectRoot` and the `TopologyDirectory`s;
     `ApprovedPlannedDirectory` covers exactly `WorkRoot` and the parent `PersistentNode`s.
-13. `node_id` assignment is identical across repeated approvals of one specification.
-14. The §7.4 re-run reaches A2's verdict on every compiled input.
-15. Every exception A4b-1 raises reaches the caller as the same object, for every declared type and
+15. Planned directories are keyed by `lookup_equivalence_key`, so `CreateDirectory("A")` and an effect
+    on `a/x` yield one node under an insensitive parent and two under `EXACT_BYTES`.
+16. `node_id` assignment is identical across repeated approvals of one specification.
+17. The §7.4 re-run reaches A2's verdict on every compiled input.
+18. Every exception A4b-1 raises reaches the caller as the same object, for every declared type and
     every load-bearing branch.
-16. `approval.py` contains no `except` clause enclosing a resolver call.
-17. No leaf frontier observation and no mount identifier appears in the retained proof.
-18. `resolve.py` and `lookup.py` import none of `atoms.core.compiler`, `atoms.core.spec`, or
+19. `approval.py` contains no `except` clause enclosing a resolver call.
+20. No leaf frontier observation and no mount identifier appears in the retained proof; `work_base` is
+    the only observation retained beyond the per-node directory facts.
+21. `resolve.py` and `lookup.py` import none of `atoms.core.compiler`, `atoms.core.spec`, or
     `atoms.core.recovery`, and the guard covering them names exactly those two modules.
-19. No production consumer of `ProjectApprovedSpec` exists, asserted rather than assumed.
-20. Approval issues no write of any kind to project space.
+22. No production consumer of `ProjectApprovedSpec` exists, asserted rather than assumed.
+23. Approval issues no write of any kind to project space.
