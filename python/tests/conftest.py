@@ -1,5 +1,6 @@
 """Explicit recovery-model fixture registry."""
 
+import os
 import tempfile
 from pathlib import Path
 
@@ -275,3 +276,10 @@ def distinct_volume(test_volume):
         pytest.skip("no writable mount with a distinct mount id is available")
     with tempfile.TemporaryDirectory(dir=found) as directory:
         yield Path(directory)
+
+
+@pytest.fixture
+def directory_fd(tmp_path):
+    fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    yield fd
+    os.close(fd)

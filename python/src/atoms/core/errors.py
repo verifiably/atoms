@@ -13,6 +13,15 @@ class SpecValidationError(AtomsError):
     """A TransactionSpec failed compilation validation (design §5.4)."""
 
 
+class ProjectApprovalRefused(AtomsError):
+    """The rooted project proof failed (design §5.4).
+
+    Distinct from SpecValidationError because the two proof stages are deliberately
+    non-substitutable: a caller must not be able to catch one type and treat a
+    project/root refusal as a compilation refusal.
+    """
+
+
 class PreconditionRefused(AtomsError):
     """Concurrent drift was detected; the transaction refuses cleanly."""
 
