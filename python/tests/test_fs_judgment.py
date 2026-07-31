@@ -66,6 +66,25 @@ def test_a_created_ancestor_ordered_before_its_descendant_is_admitted():
     require_ancestors_legal(compiled, prefixes, resolved)
 
 
+def test_a_planned_ancestor_over_its_parents_name_max_is_refused():
+    wide = "x" * 256
+    compiled = compiled_for(
+        CreateDirectory("outer", "a", DirectoryState(mode=0o755)),
+        CreateDirectory("inner", f"a/{wide}", DirectoryState(mode=0o755)),
+        CreateFileNoClobber("put", f"a/{wide}/leaf", file_state()),
+    )
+    prefixes = {
+        timeline.path: resolved_prefix(timeline.path, existing_depth=0)
+        for timeline in compiled.timelines
+    }
+    resolved = build_topology(compiled, prefixes, EXT4, WORK_CONSTRAINTS)
+
+    with pytest.raises(ProjectApprovalRefused) as caught:
+        require_ancestors_legal(compiled, prefixes, resolved)
+
+    assert "NAME_MAX" in str(caught.value)
+
+
 def test_a_folding_ancestor_created_first_is_admitted(injected_equivalence):
     """Design §5.4's case, end to end through the two phases that decide it. A2 admits
     the pair — its phase 4 key is the whole path, and `A` differs from `a/x` — so the
@@ -134,6 +153,22 @@ def test_a_regular_file_ancestor_the_timeline_converts_is_admitted():
         "p/q": resolved_prefix("p/q", existing_depth=0, frontier=BLOCKING_FILE),
     }
     resolved = build_topology(compiled, prefixes, EXT4, WORK_CONSTRAINTS)
+    require_ancestors_legal(compiled, prefixes, resolved)
+
+
+def test_a_move_source_can_be_converted_from_a_file_to_a_directory():
+    compiled = compiled_for(
+        MoveNoClobber("mv", "p", "moved", file_state()),
+        CreateDirectory("mk", "p", DirectoryState(mode=0o755)),
+        CreateFileNoClobber("put", "p/q", file_state()),
+    )
+    prefixes = {
+        "moved": resolved_prefix("moved", existing_depth=0),
+        "p": resolved_prefix("p", existing_depth=0, frontier=BLOCKING_FILE),
+        "p/q": resolved_prefix("p/q", existing_depth=0, frontier=BLOCKING_FILE),
+    }
+    resolved = build_topology(compiled, prefixes, EXT4, WORK_CONSTRAINTS)
+
     require_ancestors_legal(compiled, prefixes, resolved)
 
 
@@ -259,6 +294,24 @@ def test_distinct_leaves_in_one_parent_are_admitted():
         "d/two": resolved_prefix("d/two", existing_depth=1),
     }
     require_endpoints_distinct(build_topology(compiled, prefixes, EXT4, None))
+
+
+def test_a_planned_leaf_over_its_parents_name_max_is_refused():
+    wide = "x" * 256
+    compiled = compiled_for(
+        CreateDirectory("mk", "a", DirectoryState(mode=0o755)),
+        CreateFileNoClobber("put", f"a/{wide}", file_state()),
+    )
+    prefixes = {
+        timeline.path: resolved_prefix(timeline.path, existing_depth=0)
+        for timeline in compiled.timelines
+    }
+    resolved = build_topology(compiled, prefixes, EXT4, WORK_CONSTRAINTS)
+
+    with pytest.raises(ProjectApprovalRefused) as caught:
+        require_endpoints_distinct(resolved)
+
+    assert "NAME_MAX" in str(caught.value)
 
 
 def test_two_paths_colliding_in_one_parent_are_refused(injected_equivalence):

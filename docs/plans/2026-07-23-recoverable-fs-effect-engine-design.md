@@ -384,7 +384,12 @@ blob write:
 - no persistent effect path resolves at or below the metadata root — checked by **filesystem identity,
   not spelling**: each effect path's resolved leaf and ancestors are compared against the held metadata
   root descriptor's `st_dev`/`st_ino`;
-- every path and component fits the actual filesystem's `NAME_MAX` / `PATH_MAX` constraints;
+- every path and component — including every unwalked component after resolution stops at the first
+  missing or blocking ancestor — fits the actual or inherited parent directory's `NAME_MAX` and the
+  volume's `PATH_MAX` constraints;
+- repeated observations of one lexical directory prefix agree on directory identity or compatible
+  frontier state; disagreement is approval-time drift, never a later observation silently replacing
+  an earlier one;
 - each required semantic capability (§5.5), plus the always-required `anchored_traversal`,
   `durable_publish`, and `advisory_project_lock`, is supplied by the selected backend for the
   project-root volume and the resolved configuration tuple is on the durability allowlist;
@@ -545,8 +550,9 @@ Descendant effects therefore mutate relative to a descriptor the engine itself c
 re-resolving the ancestor chain from the root.
 
 A second case reaches the same place by a different route: the ancestor **exists but is not a
-directory**. A transaction may declare an ancestor as a file or symlink initially, delete it, and create
-a directory in its place, then act on a path beneath it — `DeletePath("p")`, `CreateDirectory("p")`,
+directory**. A transaction may declare an ancestor as a file or symlink initially, remove it with
+`DeletePath` (or, for a regular file, as the source of `MoveNoClobber`), and create a directory in its
+place, then act on a path beneath it — for example `DeletePath("p")`, `CreateDirectory("p")`,
 `CreateFileNoClobber("p/q")`. Compilation admits this: `p`'s timeline is continuous
 (`FILE → ABSENT → DIRECTORY`), and the surface rule requiring a declared descendant of a non-directory to
 be declared absent is satisfied, since `p/q` is absent precisely *because* `p` is a file. The

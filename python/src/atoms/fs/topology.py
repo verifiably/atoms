@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 from atoms.core.compiler import CompiledSpec
 from atoms.core.effects import CreateDirectory, MoveNoClobber, occurrences
-from atoms.core.errors import ProjectApprovalRefused, ProtocolError
+from atoms.core.errors import PreconditionRefused, ProjectApprovalRefused, ProtocolError
 from atoms.core.fingerprint import AbsentState, DirectoryState
 from atoms.core.recovery import (
     PersistentNode,
@@ -31,7 +31,14 @@ from atoms.fs.lookup import (
     inherited_constraints,
     lookup_equivalence_key,
 )
-from atoms.fs.resolve import FilesystemIdentity, ResolvedPrefix
+from atoms.fs.resolve import (
+    DirectoryFacts,
+    EntryKind,
+    FilesystemIdentity,
+    Frontier,
+    PresentFrontier,
+    ResolvedPrefix,
+)
 
 ROOT_PREFIX = ""
 
@@ -166,7 +173,7 @@ def build_topology(
     ordered.extend(_scratch_edges(compiled, paths))
 
     parents = {edge.parent for edge in ordered}
-    directories = _directory_entries(facts, keys, nodes, parents)
+    directories = _directory_entries(facts, keys, nodes, parents, created)
     if work_constraints is not None:
         directories = (
             *directories,
@@ -203,15 +210,21 @@ def _facts_by_prefix(
     created by this transaction and inherits its parent's constraints.
     """
     facts: dict[str, tuple[FilesystemIdentity | None, DirectoryConstraints]] = {}
+    observations: dict[str, DirectoryFacts | Frontier] = {}
     for path in sorted(prefixes):
         prefix = prefixes[path]
-        facts[ROOT_PREFIX] = (prefix.root.identity, prefix.root.constraints)
+        _record_observation(observations, ROOT_PREFIX, prefix.root)
+        facts.setdefault(ROOT_PREFIX, (prefix.root.identity, prefix.root.constraints))
         components = path.split("/")
         for index, hop in enumerate(prefix.hops):
-            facts["/".join(components[: index + 1])] = (
+            candidate = "/".join(components[: index + 1])
+            _record_observation(observations, candidate, hop.facts)
+            facts.setdefault(candidate, (
                 hop.facts.identity,
                 hop.facts.constraints,
-            )
+            ))
+        frontier = "/".join(components[: len(prefix.hops) + 1])
+        _record_observation(observations, frontier, prefix.frontier)
 
     candidates: set[str] = set()
     for path in prefixes:
@@ -226,15 +239,46 @@ def _facts_by_prefix(
         )
 
     for candidate in sorted(candidates, key=_depth_then_name):
-        if candidate in facts:
-            continue
         parent = "/".join(candidate.split("/")[:-1])
         _, parent_constraints = facts[parent]
-        facts[candidate] = (
-            None,
-            inherited_constraints(parent_constraints, filesystem_type),
-        )
+        inherited = inherited_constraints(parent_constraints, filesystem_type)
+        if candidate in created:
+            identity = facts[candidate][0] if candidate in facts else None
+            facts[candidate] = (identity, inherited)
+        elif candidate not in facts:
+            facts[candidate] = (None, inherited)
     return facts
+
+
+def _record_observation(
+    observations: dict[str, DirectoryFacts | Frontier],
+    prefix: str,
+    observed: DirectoryFacts | Frontier,
+) -> None:
+    previous = observations.get(prefix)
+    if previous is None:
+        observations[prefix] = observed
+        return
+    if previous == observed:
+        return
+    if isinstance(previous, DirectoryFacts) and _is_same_directory(observed, previous):
+        return
+    if isinstance(observed, DirectoryFacts) and _is_same_directory(previous, observed):
+        observations[prefix] = observed
+        return
+    raise PreconditionRefused(
+        f"prefix {prefix!r} changed between declared-path resolutions: "
+        f"{previous!r} then {observed!r}; the engine will not assemble one topology "
+        "from different filesystem moments"
+    )
+
+
+def _is_same_directory(observed: DirectoryFacts | Frontier, facts: DirectoryFacts) -> bool:
+    return (
+        isinstance(observed, PresentFrontier)
+        and observed.kind is EntryKind.DIRECTORY
+        and observed.identity == facts.identity
+    )
 
 
 def _keys_by_prefix(
@@ -287,14 +331,22 @@ def _directory_entries(
     keys: Mapping[str, object],
     nodes: Mapping[object, TopologyNode],
     parents: frozenset[TopologyNode] | set[TopologyNode],
+    created: frozenset[str] | set[str],
 ) -> tuple[ApprovedDirectory, ...]:
+    created_constraints = {
+        nodes[keys[prefix]]: facts[prefix][1] for prefix in created
+    }
     entries: dict[TopologyNode, ApprovedDirectory] = {}
     for prefix in sorted(facts, key=_depth_then_name):
         identity, constraints = facts[prefix]
         node = nodes[keys[prefix]]
         if node not in parents:
             continue
-        if identity is None:
+        if node in created_constraints:
+            entries[node] = ApprovedPlannedDirectory(
+                node=node, constraints=created_constraints[node]
+            )
+        elif identity is None:
             entries[node] = ApprovedPlannedDirectory(node=node, constraints=constraints)
         else:
             entries[node] = ApprovedExistingDirectory(

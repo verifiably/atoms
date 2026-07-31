@@ -35,7 +35,8 @@ Plan B is written only after Plan A's interfaces settle.
   `CompiledSpec`.
   A4b-2 owns the judgment in `atoms/fs/approval.py`, `atoms/fs/judgment.py`, and
   `atoms/fs/topology.py`: `approve_for_project`, `ProjectApprovedSpec`, and ledger entries #2,
-  #3 (its part), #4, #5, #6, #9, #10, #11, #16, and #20, all discharged.
+  #3 (its part), #4, #5, #6, #10, #11, #16, and #20 are discharged. The factory half of #9
+  is complete; enforcement at the future A5–A8 entry points remains open.
   It admits #21, the txid binding, owned by A5.
   A4b-1 approves only non-casefold ext4; XFS, Btrfs, and casefold directories fail closed.
 

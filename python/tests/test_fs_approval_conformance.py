@@ -6,12 +6,19 @@ import os
 
 import pytest
 
-from atoms.core.effects import CreateDirectory, CreateFileNoClobber, DeletePath
+from atoms.core.effects import (
+    CreateDirectory,
+    CreateFileNoClobber,
+    DeletePath,
+    Effect,
+    MoveNoClobber,
+)
 from atoms.core.errors import ProjectApprovalRefused
 from atoms.core.fingerprint import DirectoryState
 from atoms.core.recovery import PersistentNode
 from atoms.fs.approval import approve_for_project
 from atoms.fs.lookup import read_lookup_constraints
+from atoms.fs.topology import ApprovedPlannedDirectory
 from tests.fs_support import compiled_for, file_state
 
 
@@ -177,6 +184,36 @@ def test_a_file_ancestor_the_timeline_converts_approves_on_disk(approval_context
         approve_for_project(compiled, context)
 
 
+def test_a_move_source_converted_to_a_directory_approves_on_disk(approval_context):
+    with approval_context() as (context, binding):
+        root = binding.project_root_fd
+        fd = os.open("p", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644, dir_fd=root)
+        os.close(fd)
+        compiled = compiled_for(
+            MoveNoClobber("mv", "p", "moved", file_state()),
+            CreateDirectory("mk", "p", DirectoryState(mode=0o755)),
+            CreateFileNoClobber("put", "p/q", file_state()),
+        )
+
+        approve_for_project(compiled, context)
+
+
+def test_a_live_created_parent_is_approved_as_planned(approval_context):
+    with approval_context() as (context, binding):
+        os.mkdir("a", dir_fd=binding.project_root_fd)
+        compiled = compiled_for(
+            CreateDirectory("mk", "a", DirectoryState(mode=0o755)),
+            CreateFileNoClobber("put", "a/leaf", file_state()),
+        )
+
+        proof = approve_for_project(compiled, context)
+
+        entry = next(
+            item for item in proof.directories if item.node == PersistentNode("a")
+        )
+        assert isinstance(entry, ApprovedPlannedDirectory)
+
+
 def test_two_spellings_stay_two_directories_on_a_real_volume(approval_context):
     """Criterion 15's `EXACT_BYTES` half, against a real fixture rather than a synthetic
     table. Physical `a` exists, so `a/x` resolves through it and keys by inode; `A` is a
@@ -207,6 +244,29 @@ def test_a_component_over_name_max_is_refused(approval_context):
         with pytest.raises(ProjectApprovalRefused) as caught:
             approve_for_project(compiled, context)
         assert "NAME_MAX" in str(caught.value)
+
+
+@pytest.mark.parametrize("kind", ["planned-leaf", "planned-ancestor"])
+def test_a_planned_component_over_name_max_is_refused(approval_context, kind):
+    wide = "x" * 256
+    effects: list[Effect] = [
+        CreateDirectory("outer", "a", DirectoryState(mode=0o755))
+    ]
+    if kind == "planned-ancestor":
+        effects.append(
+            CreateDirectory("inner", f"a/{wide}", DirectoryState(mode=0o755))
+        )
+        path = f"a/{wide}/leaf"
+    else:
+        path = f"a/{wide}"
+    effects.append(CreateFileNoClobber("put", path, file_state()))
+
+    with approval_context() as (context, _binding), pytest.raises(
+        ProjectApprovalRefused
+    ) as caught:
+        approve_for_project(compiled_for(*effects), context)
+
+    assert "NAME_MAX" in str(caught.value)
 
 
 def test_a_path_over_path_max_is_refused(approval_context):

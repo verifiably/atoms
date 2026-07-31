@@ -1,6 +1,6 @@
 # A4b-2 Rooted Project Approval Implementation Plan
 
-**Status:** Planned 2026-07-31; unimplemented. A5–A8 remain unimplemented. A4b-2 reads project
+**Status:** Implemented on 2026-07-31. A5–A8 remain unimplemented. A4b-2 reads project
 space and never writes to it.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
@@ -9,10 +9,11 @@ space and never writes to it.
 project context and issues the `ProjectApprovedSpec` that A5–A8 accept in place of a raw specification.
 
 **Architecture:** Three new modules under `atoms/fs/`. `topology.py` owns the approved value types,
-node assignment, edges, the fact table, and the re-run of A2's surface and ordering rules over resolved
-nodes. `judgment.py` owns ancestor legality, endpoint distinctness, and scratch binding. `approval.py`
-owns `ProjectContext`, `ProjectApprovedSpec`, its construction token, and the four-phase pipeline —
-the only module of the three that touches a filesystem, and only in phase B.
+cross-resolution observation coherence, node assignment, edges, the fact table, and the re-run of A2's
+surface and ordering rules over resolved nodes. `judgment.py` owns ancestor legality, persistent-name
+limits, endpoint distinctness, and scratch binding. `approval.py` owns `ProjectContext`,
+`ProjectApprovedSpec`, its construction token, and the four-phase pipeline — the only module of the
+three that touches a filesystem, and only in phase B.
 
 **Tech Stack:** Python 3.13, stdlib only (`os`, `dataclasses`, `itertools`), `pytest`, `ruff`,
 `pyright`. Builds on A4b-1's `PathResolver`, `ResolvedPrefix`, `DirectoryConstraints`, and
@@ -23,6 +24,27 @@ A2's `CompiledSpec`.
 **Authority:** [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md).
 Where this plan and either document disagree, the design wins over this plan and the authority wins
 over both.
+
+## Final correction record — 2026-07-31
+
+The task-by-task snippets below are retained as execution history. This record supersedes them where
+the final whole-branch review found a trust-boundary gap:
+
+- `PathResolver.resolve` validates only through its first frontier. Pure judgment now validates every
+  derived directory component and final leaf against the actual or inherited parent `NAME_MAX`.
+- Ancestor conversion recognizes both `DeletePath` and a `MoveNoClobber` source as removers.
+- Topology construction compares repeated lexical-prefix directory/frontier observations and raises
+  `PreconditionRefused` on disagreement before building nodes.
+- A transaction-created parent remains `ApprovedPlannedDirectory` with inherited constraints even when
+  a live endpoint directory was traversed; A6 owns the resulting declared-precondition mismatch.
+- Ledger #9 remains open for A5–A8 entry-point enforcement. A4b completed only its factory half and
+  continues to assert that no production consumer exists yet.
+- The injected folding topology is passed through A3's `build_recovery_snapshot`, and the design,
+  implementation plan, `AGENTS.md`, and ledger statuses are synchronized.
+
+The final regressions live in `test_fs_judgment.py`, `test_fs_topology.py`,
+`test_fs_approval_conformance.py`, and `test_fs_architecture.py`. The implementation still preserves
+the pure/IO boundary and performs no project-space write.
 
 ## Global Constraints
 
@@ -67,8 +89,8 @@ over both.
 | File | Responsibility |
 | --- | --- |
 | `src/atoms/fs/lookup.py` | **Modify.** Add `lookup_equivalence_key`, beside `read_lookup_constraints` and `inherited_constraints`. |
-| `src/atoms/fs/topology.py` | **Create.** The `Approved*` value types, `ResolvedTopology`, `build_topology`, `require_resolved_surface_and_ordering`. Pure. Built before any judgment, and every judgment keys on its nodes. |
-| `src/atoms/fs/judgment.py` | **Create.** `require_ancestors_legal`, `require_endpoints_distinct`, `bind_scratch`. Pure. |
+| `src/atoms/fs/topology.py` | **Create.** The `Approved*` value types, `ResolvedTopology`, repeated-prefix coherence, `build_topology`, `require_resolved_surface_and_ordering`. Pure. Built before any judgment, and every judgment keys on its nodes. |
+| `src/atoms/fs/judgment.py` | **Create.** `require_ancestors_legal`, persistent component/leaf limit checks, `require_endpoints_distinct`, `bind_scratch`. Pure. |
 | `src/atoms/fs/approval.py` | **Create.** `ProjectContext`, `ProjectApprovedSpec`, the construction token, `approve_for_project`. |
 | `tests/fs_support.py` | **Modify.** Synthetic `ResolvedPrefix` and `CompiledSpec` builders shared by every pure tier. |
 | `tests/conftest.py` | **Modify.** `injected_equivalence` (a factory), `truncate_to_eight`, `approval_context`. |
@@ -3322,25 +3344,28 @@ and replace `A4b-2 owns the judgment:` through the end of that bullet with:
 ```markdown
   A4b-2 owns the judgment in `atoms/fs/approval.py`, `atoms/fs/judgment.py`, and
   `atoms/fs/topology.py`: `approve_for_project`, `ProjectApprovedSpec`, and ledger entries #2,
-  #3 (its part), #4, #5, #6, #9, #10, #11, #16, and #20, all discharged. It admits #21, the txid
-  binding, owned by A5. A4b-1 approves only non-casefold ext4; XFS, Btrfs, and casefold
-  directories fail closed.
+  #3 (its part), #4, #5, #6, #10, #11, #16, and #20 are discharged. The factory half of #9 is
+  complete; enforcement at the future A5–A8 entry points remains open. It admits #21, the txid
+  binding, owned by A5. A4b-1 approves only non-casefold ext4; XFS, Btrfs, and casefold directories
+  fail closed.
 ```
 
 - [ ] **Step 4: Remove the discharged ledger entries**
 
-Nine rows move and one is narrowed. This file carries authority (`AGENTS.md` §"Deferred obligations"),
-so the exact Markdown is given rather than described.
+Eight rows move and two are narrowed. This file carries authority (`AGENTS.md` §"Deferred
+obligations"), so the exact Markdown is given rather than described.
 
-**Delete** rows #2, #4, #5, #6, #9, #10, #11, #16, and #20 from the "Open obligations" table. Rows #1,
-#7, #8, #12, #13, #14, #15, #17, #18, and #21 are untouched.
+**Delete** rows #2, #4, #5, #6, #10, #11, #16, and #20 from the "Open obligations" table. Rows #1,
+#7, #8, #12, #13, #14, #15, #17, #18, and #21 are untouched. Row #9 stays open, narrowed to A5 and
+the future A5–A8 entry-point enforcement; A4b's factory half is recorded in the design and status note.
 
 **Row #3 stays**, because it names three owners and only A3's and A4b's parts are complete. Replace it
 with this row — owner list narrowed to `A6`, required behavior trimmed to A6's clause, and the `§13.1`
 verification reference dropped with A3's clause:
 
 ```markdown
-| 3 | An ancestor whose type changes mid-transaction (`FILE`/`SYMLINK` → `ABSENT` → `DIRECTORY`) with declared descendants | A2 phase 12 | A6 | §6's second absence-capture case infers descendant absence from the ancestor's verified fingerprint — descriptor-coherent for a file, destructive-transfer validation for a symlink — then hands §9.5's published descriptor down | §13.2, §13.4 |
+| 3 | An ancestor whose type changes mid-transaction (`FILE`/`SYMLINK` → `ABSENT` by `DeletePath` or a `MoveNoClobber` source → `DIRECTORY`) with declared descendants | A2 phase 12 | A6 | §6's second absence-capture case infers descendant absence from the ancestor's verified fingerprint — descriptor-coherent for a file, destructive-transfer validation for a symlink — then hands §9.5's published descriptor down | §13.2, §13.4 |
+| 9 | `CompiledSpec` proves only A2's pure lexical/model rules and carries no project/root approval | A2 boundary | A5 | Require every A5–A8 transaction entry point to accept `ProjectApprovedSpec`, never raw `TransactionSpec`, raw `CompiledSpec`, or an A3 synthetic model snapshot; replace A4b's no-consumer guard with architecture tests over each entry point as those stages land | §5.4, §13.3 |
 ```
 
 **Replace** the "Discharged obligations" section — currently the "None yet" paragraph — with this,
@@ -3358,7 +3383,6 @@ appended columns are the discharge record.
 | 4 | Path and component lengths are unbounded | A2 phase 3 | A4b | As part of `approve_for_project`, refuse actual-filesystem `NAME_MAX` / `PATH_MAX` violations before capture and before any transaction-record or blob write; the limits are per-filesystem and not lexically decidable | §5.4, §13.2 | A4b-2 | 2026-07-31 | `tests/test_fs_resolve_walk.py`, `tests/test_fs_judgment.py`, `tests/test_fs_approval.py`, `tests/test_fs_approval_conformance.py` |
 | 5 | Paths are stored verbatim; no resolution or containment is performed | A2 (whole) | A4b | Ancestor-resolved, leaf-retaining containment inside the project root, and metadata-root exclusion by `st_dev`/`st_ino` rather than spelling | §13.3 surfaces 1–2 | A4b-2 | 2026-07-31 | `tests/test_fs_resolve_walk.py`, `tests/test_fs_resolve_conformance.py`, `tests/test_fs_approval_conformance.py` |
 | 6 | A required-capability set is derived but never checked against a backend | A2 §3 | A4b | A4a supplies the mechanism only — it probes the volume and reports the supplied capability set without judging it, and must **not** refuse merely because an optional capability is absent, which would break progressive capability support. A4b holds the exact `CompiledSpec` required set and is the sole adjudicator of "required ⊆ supplied", refusing before any transaction-record write or project mutation; the §5.5 bootstrap is exempt and precedes it | §13.2 | A4b-2 | 2026-07-31 | `tests/test_fs_approval.py` |
-| 9 | `CompiledSpec` proves only A2's pure lexical/model rules and carries no project/root approval | A2 boundary | A4b | Define frozen, factory-controlled `ProjectApprovedSpec` composed with the exact `CompiledSpec`; construct it only through `approve_for_project`, make ordinary construction and `dataclasses.replace` refuse, and require A5–A8 to accept this proof rather than raw `TransactionSpec`, raw `CompiledSpec`, or an A3 synthetic model snapshot | §5.4, §13.3 | A4b-2 | 2026-07-31 | `tests/test_fs_approval.py`, `tests/test_fs_architecture.py` |
 | 10 | A2's exact-spelling tree may differ from the tree after actual per-directory name equivalence is resolved (`A` versus `a/x`) | A2 phases 4, 12–13 | A3, A4b | A3 defines the pure logical topology shape; A4b builds and retains its production instance, re-runs surface-tree consistency and created-directory-before-descendant ordering over resolved nodes, and supplies it to A3 through `ProjectApprovedSpec` rather than allowing A3 to substitute the lexical tree | §5.4, §13.1, §13.3 surface 3 | A3, A4b-2 | 2026-07-31 | `tests/test_fs_topology.py`, `tests/test_fs_approval_conformance.py` |
 | 11 | A2 proves scratch grammar separation and fixed NFC/casefold effect-ID uniqueness, but not the actual distinctness of every instantiated effect/role leaf in its concrete parent | A1 §5.1, A2 phases 3 and 6 | A4b | Instantiate the complete scratch-name set and prove it pairwise distinct under each actual parent policy before issuing `ProjectApprovedSpec`; an intrinsic collision refuses approval and txid regeneration is not a remedy | §5.4, §13.3 surface 4 | A4b-2 | 2026-07-31 | `tests/test_fs_judgment.py` |
 | 16 | `VolumeEvidence` is a detached frozen value describing a volume, and authorizes no access to it | A4a binding contract | A4b | `ProjectApprovedSpec` retains the live `ProjectBinding` or equivalent held descriptors; it may not authorize filesystem access from detached evidence, and an architecture test asserts the retained binding is present | §13.3 | A4b-2 | 2026-07-31 | `tests/test_fs_approval.py`, `tests/test_fs_architecture.py` |

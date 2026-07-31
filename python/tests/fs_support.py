@@ -32,8 +32,10 @@ from atoms.fs.lookup import DirectoryConstraints, LookupProof
 from atoms.fs.resolve import (
     AbsentFrontier,
     DirectoryFacts,
+    EntryKind,
     FilesystemIdentity,
     Frontier,
+    PresentFrontier,
     ResolvedHop,
     ResolvedPrefix,
 )
@@ -615,13 +617,21 @@ def prefixes_for(compiled: CompiledSpec) -> dict[str, ResolvedPrefix]:
     this transaction creates.
 
     The created check compares whole prefix strings, not `startswith`: `d/newer` starts
-    with `d/new` and is not beneath it.
+    with `d/new` and is not beneath it. A declared endpoint that is also another
+    declared path's live ancestor is observed as that same directory at both walks;
+    fingerprint agreement belongs to A6 capture, not this A4b topology fixture.
     """
     created = {
         effect.path
         for effect in compiled.spec.effects
         if isinstance(effect, CreateDirectory)
     }
+    live_ancestors = {
+        "/".join(components[:index])
+        for timeline in compiled.timelines
+        for components in (timeline.path.split("/"),)
+        for index in range(1, len(components))
+    } - created
     table: dict[str, ResolvedPrefix] = {}
     for timeline in compiled.timelines:
         components = timeline.path.split("/")
@@ -630,7 +640,17 @@ def prefixes_for(compiled: CompiledSpec) -> dict[str, ResolvedPrefix]:
             if "/".join(components[: index + 1]) in created:
                 depth = index
                 break
-        table[timeline.path] = resolved_prefix(timeline.path, existing_depth=depth)
+        frontier = None
+        if depth == len(components) - 1 and timeline.path in live_ancestors:
+            frontier = PresentFrontier(
+                identity=FilesystemIdentity(
+                    device=41, inode=_synthetic_inode(timeline.path)
+                ),
+                kind=EntryKind.DIRECTORY,
+            )
+        table[timeline.path] = resolved_prefix(
+            timeline.path, existing_depth=depth, frontier=frontier
+        )
     return table
 
 

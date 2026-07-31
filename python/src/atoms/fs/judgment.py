@@ -15,7 +15,7 @@ from atoms.core.errors import ProjectApprovalRefused, ProtocolError
 from atoms.core.recovery import ScratchRole, TopologyNode, WorkRoot
 from atoms.core.recovery.snapshot import required_scratch_role
 from atoms.core.scratch import scratch_leaf
-from atoms.fs.lookup import lookup_equivalence_key
+from atoms.fs.lookup import DirectoryConstraints, lookup_equivalence_key
 from atoms.fs.resolve import EntryKind, PresentFrontier, ResolvedPrefix
 from atoms.fs.topology import ApprovedScratch, ResolvedTopology
 
@@ -44,18 +44,21 @@ def require_ancestors_legal(
     creators: dict[TopologyNode, int] = {}
     removers: dict[TopologyNode, int] = {}
     for index, effect in enumerate(compiled.spec.effects):
-        # Narrowed before `.path` is read: MoveNoClobber has `source` and `destination`
-        # and no `path`, and these are the only two variants that create or clear a
-        # directory anyway.
-        if not isinstance(effect, (CreateDirectory, DeletePath)):
+        if isinstance(effect, CreateDirectory):
+            path = effect.path
+            target = creators
+        elif isinstance(effect, DeletePath):
+            path = effect.path
+            target = removers
+        elif isinstance(effect, MoveNoClobber):
+            path = effect.source
+            target = removers
+        else:
             continue
-        node = resolved.directory_node(effect.path)
+        node = resolved.directory_node(path)
         if node is None:
             continue
-        if isinstance(effect, CreateDirectory):
-            creators.setdefault(node, index)
-        else:
-            removers.setdefault(node, index)
+        target.setdefault(node, index)
 
     first_touch: dict[str, int] = {}
     for index, effect in enumerate(compiled.spec.effects):
@@ -71,8 +74,14 @@ def require_ancestors_legal(
         _require_frontier_convertible(path, prefix, components[depth])
         for index in range(depth, len(components) - 1):
             ancestor = "/".join(components[: index + 1])
+            node = _node_of(resolved, ancestor)
+            _require_name_fits(
+                components[index],
+                path,
+                resolved.constraints_of(resolved.parent_node_of(node)),
+            )
             _require_created_first(
-                ancestor, _node_of(resolved, ancestor), path, first_touch[path], creators
+                ancestor, node, path, first_touch[path], creators
             )
         if isinstance(prefix.frontier, PresentFrontier):
             blocking = "/".join(components[: depth + 1])
@@ -173,6 +182,7 @@ def require_endpoints_distinct(resolved: ResolvedTopology) -> None:
     seen: dict[tuple[TopologyNode, str], str] = {}
     for entry in resolved.paths:
         constraints = resolved.constraints_of(entry.parent_node)
+        _require_name_fits(entry.leaf, entry.path, constraints)
         key = (entry.parent_node, lookup_equivalence_key(constraints, entry.leaf))
         if key in seen:
             raise ProjectApprovalRefused(
@@ -180,6 +190,17 @@ def require_endpoints_distinct(resolved: ResolvedTopology) -> None:
                 f"the actual lookup policy of their shared parent {entry.parent_node!r}"
             )
         seen[key] = entry.path
+
+
+def _require_name_fits(
+    name: str, path: str, constraints: DirectoryConstraints
+) -> None:
+    width = len(name.encode("utf-8"))
+    if width > constraints.name_max:
+        raise ProjectApprovalRefused(
+            f"component {name!r} of {path!r} is {width} bytes, over its parent's "
+            f"NAME_MAX of {constraints.name_max}"
+        )
 
 
 def bind_scratch(

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from atoms.core.effects import (
@@ -11,7 +13,7 @@ from atoms.core.effects import (
     MoveNoClobber,
     ReplaceFile,
 )
-from atoms.core.errors import ProjectApprovalRefused
+from atoms.core.errors import PreconditionRefused, ProjectApprovalRefused
 from atoms.core.fingerprint import DirectoryState, SymlinkState
 from atoms.core.recovery import (
     PersistentNode,
@@ -21,6 +23,7 @@ from atoms.core.recovery import (
     TopologyDirectory,
     WorkRoot,
 )
+from atoms.fs.resolve import AbsentFrontier, EntryKind, FilesystemIdentity, PresentFrontier
 from atoms.fs.topology import (
     ApprovedExistingDirectory,
     ApprovedPlannedDirectory,
@@ -199,6 +202,79 @@ def test_two_paths_through_one_physical_directory_share_its_node():
     assert resolved.parent_of("d/one") == resolved.parent_of("d/two")
 
 
+def test_a_replaced_directory_between_resolutions_is_refused():
+    compiled = compiled_for(
+        CreateFileNoClobber("e1", "d/one", file_state()),
+        CreateFileNoClobber("e2", "d/two", file_state()),
+    )
+    first = resolved_prefix("d/one", existing_depth=1)
+    second = resolved_prefix("d/two", existing_depth=1)
+    changed = replace(
+        second.hops[0].facts,
+        identity=FilesystemIdentity(device=41, inode=999_999),
+    )
+    second = replace(second, hops=(replace(second.hops[0], facts=changed),))
+
+    with pytest.raises(PreconditionRefused):
+        build_topology(compiled, {"d/one": first, "d/two": second}, EXT4, None)
+
+
+@pytest.mark.parametrize(
+    "frontier",
+    [
+        AbsentFrontier(),
+        PresentFrontier(
+            identity=FilesystemIdentity(device=41, inode=999_999),
+            kind=EntryKind.REGULAR_FILE,
+        ),
+    ],
+    ids=["absent", "blocking-file"],
+)
+def test_a_directory_that_becomes_a_frontier_between_resolutions_is_refused(
+    frontier,
+):
+    compiled = compiled_for(
+        CreateFileNoClobber("e1", "d/one", file_state()),
+        CreateFileNoClobber("e2", "d/two", file_state()),
+    )
+    prefixes = {
+        "d/one": resolved_prefix("d/one", existing_depth=1),
+        "d/two": resolved_prefix("d/two", existing_depth=0, frontier=frontier),
+    }
+
+    with pytest.raises(PreconditionRefused):
+        build_topology(compiled, prefixes, EXT4, None)
+
+
+def test_a_live_created_parent_is_still_planned():
+    compiled = compiled_for(
+        CreateDirectory("mk", "a", DirectoryState(mode=0o755)),
+        CreateFileNoClobber("put", "a/leaf", file_state()),
+    )
+    descendant = resolved_prefix("a/leaf", existing_depth=1, name_max=17)
+    endpoint = resolved_prefix(
+        "a",
+        existing_depth=0,
+        name_max=17,
+        frontier=PresentFrontier(
+            identity=descendant.hops[0].facts.identity,
+            kind=EntryKind.DIRECTORY,
+        ),
+    )
+    resolved = build_topology(
+        compiled,
+        {"a": endpoint, "a/leaf": descendant},
+        EXT4,
+        WORK_CONSTRAINTS,
+    )
+
+    entry = next(
+        item for item in resolved.directories if item.node == PersistentNode("a")
+    )
+    assert isinstance(entry, ApprovedPlannedDirectory)
+    assert entry.constraints == WORK_CONSTRAINTS
+
+
 def test_every_planned_component_is_asked_about(injected_equivalence):
     """The positive half of the bypass check for construction: each planned prefix must
     be keyed through the helper, so `a` and `b` both appear. The root and any existing
@@ -228,6 +304,7 @@ def test_planned_directories_merge_under_a_folding_key(injected_equivalence):
     resolved = build_topology(compiled, prefixes, EXT4, WORK_CONSTRAINTS)
     assert resolved.parent_of("a/x") == PersistentNode("A")
     assert resolved.directory_node("a") == PersistentNode("A")
+    assert _prepared_snapshot(compiled, resolved).topology == resolved.topology
 
 
 def test_the_same_pair_stays_two_directories_under_exact_bytes():

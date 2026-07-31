@@ -1,6 +1,6 @@
 # A4b-2 — rooted project approval
 
-**Status:** Designed 2026-07-31; unimplemented. A5–A8 remain unimplemented. A4b-2 reads project space
+**Status:** Implemented on 2026-07-31. A5–A8 remain unimplemented. A4b-2 reads project space
 and never writes to it.
 
 **Authority:** [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md).
@@ -28,7 +28,8 @@ observed `metadata_root/work` facts.
 
 ### 2.1 In scope
 
-- `approve_for_project`, `ProjectContext`, and `ProjectApprovedSpec` with its factory guard (ledger #9).
+- `approve_for_project`, `ProjectContext`, and `ProjectApprovedSpec` with its factory guard (the
+  completed factory half of ledger #9).
 - Resolution of every declared persistent path and every scratch parent through A4b-1 (ledger #4, #5).
 - Endpoint distinctness under each parent's actual lookup policy, covering `ABSENT`-declared paths
   (ledger #2).
@@ -69,7 +70,8 @@ than a lint.
 
 Toward A5, the proof is the whole interface. A5 receives a `ProjectApprovedSpec` and may not
 reconstruct any part of it. Ledger #19 constrains what A5 may *do* with the retained facts: compare,
-never authorize.
+never authorize. Ledger #9 remains open until the future A5–A8 entry points enforce that interface;
+A4b can prove only the factory half and that no consumer exists yet.
 
 ## 3. Seam review against the deferred-obligation ledger
 
@@ -77,17 +79,18 @@ never authorize.
 
 ### 3.1 Existing entries
 
-A4b-2 discharges ten entries — every entry naming it as an owner. Each is discharged only when the
-verification tier named beside it lands.
+A4b-2 completes its part of ten entries. #3 remains open for A6 and #9 remains open for the future
+A5–A8 entry points; each completed part is recorded only when the verification tier named beside it
+lands.
 
 | # | What discharges it | Tier |
 | --- | --- | --- |
 | 2 | Endpoint distinctness keyed by (resolved parent node, exact leaf bytes), covering `ABSENT`-declared paths, before any capture or mutation | §11.1, §11.4 |
-| 3 | **A4's part only.** An ancestor that exists as a file or symlink is admitted iff the timeline converts it to a directory and orders the conversion before every descendant effect. The entry stays open against A6 | §11.1, §11.4 |
-| 4 | Every declared path resolved through `PathResolver.resolve`, which enforces real `PATH_MAX` and per-directory `NAME_MAX`; every generated scratch leaf checked against its concrete parent's approved `name_max` | §11.1, §11.4 |
+| 3 | **A4's part only.** An ancestor that exists as a file or symlink is admitted iff the timeline removes it — by `DeletePath` or a `MoveNoClobber` source — then creates a directory before every descendant effect. The entry stays open against A6 | §11.1, §11.4 |
+| 4 | `PathResolver.resolve` enforces `PATH_MAX` and every component it reaches; pure judgment validates every derived component after the first frontier and every final leaf against its actual or inherited parent's `NAME_MAX`; generated scratch leaves are checked against their concrete parents too | §11.1, §11.4 |
 | 5 | The same resolution enforces containment, metadata-root exclusion by `st_dev`/`st_ino`, and mount membership | §11.4 |
 | 6 | `compiled.spec.required_capabilities() ⊆ binding.evidence.supplied_capabilities`, refused before any traversal and long before any record write | §11.1, §11.4 |
-| 9 | Frozen, token-guarded `ProjectApprovedSpec`; ordinary construction and `dataclasses.replace` both refuse | §11.6 |
+| 9 | **A4's factory half only.** Frozen, token-guarded `ProjectApprovedSpec`; ordinary construction and `dataclasses.replace` both refuse. The entry stays open until A5–A8 accept only this proof | §11.6 |
 | 10 | Topology built over resolved identity; surface consistency and created-directory ordering re-derived from its nodes, never from A2's verdict | §11.2, §11.3, §11.4 |
 | 11 | The complete `.#~<txid>.<effect-id>.<role>` set instantiated and proved pairwise distinct under each concrete parent's actual policy | §11.1, §11.4 |
 | 16 | The proof retains the live `ProjectBinding`; an architecture test asserts its presence | §11.6 |
@@ -116,17 +119,17 @@ and Btrfs; that admits nothing and §2.2 records it as non-scope.
 ### 3.3 Delivery obligations that are not ledger entries
 
 - **Authority §11 gains approval-time drift as a `PreconditionRefused` case.** A4b-1 raises that
-  exception when two observations of one directory or entry disagree within a single approval, and
-  A4b-2 propagates it under #20. §11 as written defines it only for drift detected "at capture or by
+  exception for an incoherent walk or changed constraints, and A4b-2 propagates it under #20. Pure
+  topology construction raises the same type when separate resolutions disagree about one lexical
+  prefix. §11 as written defines it only for drift detected "at capture or by
   validating an atomically displaced entry", and conditions its return on the current effect and every
   earlier one having been restored — none of which describes approval, which holds no transaction
   record and has mutated nothing. The exception *name* was already declared, which is why A4b-1's
   review did not catch this; its *meaning* did not cover the case. The amendment lands in the same
   commit as this design.
 - `ProjectContext`'s concrete fields need no amendment: §5.4 already assigns them to A4's reviewed plan.
-- `AGENTS.md`'s A4b status line changes from "A4b-1 implemented, A4b-2 unimplemented" when the
-  implementation lands. A4a's `test_a4a_status_is_synchronized_across_authority_documents` establishes
-  the pattern for keeping that line honest.
+- `AGENTS.md` and both A4b-2 status paragraphs say implemented. The synchronized-status architecture
+  test keeps all three claims honest.
 
 ## 4. Architecture and ownership
 
@@ -273,8 +276,9 @@ durability allowlist, so no `ProjectBinding` exists for an unlisted volume.
    A4b-1's reason for making that method lazy: a specification with no `CreateDirectory` must not be
    refused by an unapprovable `work/`.
 
-This phase discharges #4 and #5 by construction — every limit, containment, metadata-root, and
-mount-membership rule is enforced inside `resolve()` — and produces the table every later phase reads.
+This phase discharges #5 and the `PATH_MAX`/walked-prefix part of #4. `resolve()` necessarily returns
+at the first missing or blocking ancestor, so phase C validates the remaining derived components and
+final leaf against the actual or inherited parent constraints before #4 is discharged.
 
 Sorted order matters for diagnostics only, but it matters: an approval that refuses a different path on
 each run because dictionary order shifted is much harder to act on.
@@ -292,9 +296,9 @@ are.
 The order within phase C is therefore:
 
 1. Build the topology (§7).
-2. Endpoint distinctness (§6.3.2). It comes before the rest so every later phase may key a map by
-   declared path: once it has passed, no two declared paths name one entry.
-3. Ancestor legality (§6.3.1).
+2. Endpoint leaf limits and distinctness (§6.3.2). It comes before the rest so every later phase may
+   key a map by declared path: once it has passed, no two declared paths name one entry.
+3. Ancestor legality and derived-component limits (§6.3.1).
 4. The resolved surface and ordering re-run (§7.4).
 5. Scratch instantiation (§6.3.3).
 
@@ -316,6 +320,11 @@ effect in this transaction creates, and that effect's index must precede every e
 beneath it. A missing component no effect creates is `ProjectApprovalRefused` — authority §5.4's "a
 parent that neither exists nor is created by the transaction cannot be captured."
 
+Resolution has not looked up those components. Each is therefore checked here, in order, against its
+actual or inherited parent node's `NAME_MAX`; endpoint distinctness performs the same byte-width check
+for every final leaf. This closes the suffix left unvalidated when `resolve()` returns at the first
+frontier.
+
 **"Is a directory some `CreateDirectory` creates" is decided by node, not by spelling.** Each missing
 prefix is mapped through §7.1's assignment to the node it names, and each `CreateDirectory` endpoint
 through the same assignment; the check compares those nodes. Under a folding parent
@@ -326,7 +335,7 @@ In the third case the frontier's `EntryKind` decides:
 
 | Frontier kind | Verdict |
 | --- | --- |
-| `REGULAR_FILE`, `SYMLINK` | Admitted iff the timeline converts it — the path is declared, deleted, and re-created as a directory, with the `CreateDirectory` ordered before every descendant effect |
+| `REGULAR_FILE`, `SYMLINK` | Admitted iff the timeline converts it — the path is declared, removed by `DeletePath` or as a `MoveNoClobber` source, and re-created as a directory, with the `CreateDirectory` ordered before every descendant effect |
 | `OTHER` | Refused. No closed effect variant converts a socket, FIFO, or device node into a directory, so no admissible timeline reaches a directory there |
 | `DIRECTORY` | Unreachable. `open_child_directory` succeeds on a directory, so resolution would not have stopped |
 
@@ -397,6 +406,12 @@ project space, and no `except` clause encloses any resolver call.
 
 ### 7.1 Nodes
 
+Before assigning nodes, construction compares every repeated lexical prefix observation. Two directory
+observations must carry the same identity and constraints; a directory and a leaf-frontier observation
+are compatible only when the frontier is that same directory; repeated absent or blocking frontiers
+must be equal. Any other pair raises `PreconditionRefused` before a fact can overwrite another. This is
+pure cross-resolution drift detection, not an exception handler around A4b-1.
+
 | Node | When |
 | --- | --- |
 | `ProjectRoot()` | Always |
@@ -452,8 +467,10 @@ floor changes `lookup_equivalence_key` and nothing here.
 **Every `PersistentNode` acting as a parent is transaction-created.** No effect variant declares a
 `DirectoryState` precondition: `DeletePath.pre` is a file or symlink, `ReplaceFile.pre` and
 `MoveNoClobber.source_pre` are files, and `CreateFileNoClobber`, `CreateDirectory`, and a move
-destination all take `ABSENT`. A2 phase 11 forces `initial_surface` to equal each timeline's first
-`pre`, so no declared path can be an existing directory at approval time.
+destination all take `ABSENT`. A live directory may nevertheless occupy a `CreateDirectory` endpoint;
+that is a declared-precondition mismatch for A6 capture, not an approval refusal. Even when another
+path traverses that live directory, its `PersistentNode` remains planned and carries constraints
+inherited from its approved parent, never the live endpoint's observed constraints.
 
 **Every `TopologyDirectory` exists at approval time.** An absent undeclared intermediate would need a
 `CreateDirectory` naming it, which would make it declared.
@@ -581,8 +598,8 @@ for a stored value to serve.
 
 | Raised | For |
 | --- | --- |
-| `ProjectApprovalRefused` | endpoint collision at leaf level (§6.3.2) or directory level (§7.1), illegal ancestor (missing, `OTHER`, or unconverted), scratch-leaf collision, resolved-topology surface or ordering violation — and A4b-1's own `ProjectApprovalRefused` instances, passing through untouched |
-| `PreconditionRefused` | raised only by A4b-1 and propagated: two observations of one directory or entry disagreeing within a single approval. A4b-2 never raises it directly |
+| `ProjectApprovalRefused` | endpoint collision or over-limit leaf (§6.3.2), directory-level collision (§7.1), illegal or over-limit derived ancestor, scratch-leaf collision, resolved-topology surface or ordering violation — and A4b-1's own `ProjectApprovalRefused` instances, passing through untouched |
+| `PreconditionRefused` | raised by A4b-1 for an incoherent walk and by pure topology construction when two path resolutions report incompatible facts for one lexical prefix |
 | `CapabilityUnavailable` | required ⊄ supplied, and `lookup_equivalence_key` on an unapproved `LookupProof` |
 | `ProtocolError` | a `compiled`, `context`, `binding`, or `txid` of the wrong exact type; a malformed txid; a closed binding or released lock |
 | bare `OSError` | everything else, unwrapped |
@@ -615,7 +632,8 @@ I/O.
 Hand-built resolution tables drive ancestor legality, endpoint distinctness, scratch instantiation and
 distinctness, and capability adjudication. Synthetic `ResolvedPrefix` values make the awkward cases
 cheap: a missing ancestor no effect creates; a `REGULAR_FILE` ancestor correctly converted; the same
-ancestor left unconverted; and an `OTHER` ancestor.
+ancestor left unconverted; a `MoveNoClobber` source converted into a directory; planned-ancestor and
+planned-leaf `NAME_MAX` violations; and an `OTHER` ancestor.
 
 The cases that need an injected equivalence use a *different relation for each job*, because one
 relation cannot do both. Ancestor merging and ordering-too-late use case folding, which A2 admits since
@@ -643,7 +661,9 @@ pins the §6.1 ordering, since both exceptions are reachable and only the order 
 
 Node assignment, edge construction, the `ApprovedExistingDirectory`/`ApprovedPlannedDirectory`
 partition of §7.3, `node_id` reproducibility across runs, and `WorkRoot` present exactly when a
-`CreateDirectory` exists.
+`CreateDirectory` exists. Repeated-prefix cases cover directory replacement and directory-to-absent or
+blocking drift. A live `CreateDirectory` endpoint traversed for a descendant remains planned with
+inherited constraints.
 
 Planned-node keying gets a dedicated case, because it is the half of §7.1's key that is easy to get
 wrong: `CreateDirectory("A")` alongside an effect on `a/x` must yield **one** directory node when the
@@ -679,7 +699,10 @@ against a restatement of this document.
 
 - a specification whose paths, ancestors, and scratch leaves all approve;
 - a genuine `FILE → ABSENT → DIRECTORY` ancestor conversion on disk;
-- a `PATH_MAX` and a per-directory `NAME_MAX` refusal;
+- the same conversion when a `MoveNoClobber` source produces the absence;
+- a `PATH_MAX`, a walked per-directory `NAME_MAX`, and planned-ancestor/planned-leaf `NAME_MAX`
+  refusal;
+- a live `CreateDirectory` endpoint classified planned while approval remains read-only;
 - the nested-metadata-root refusal, reached through `approve_for_project` rather than the resolver;
 - `work_base` retained with the identity and constraints of the real `metadata_root/work` — asserted
   equal to an independent `fstat` and `read_lookup_constraints` on that directory, so the retained
@@ -719,16 +742,18 @@ same-class exception the code might raise on its own.
   syscalls — asserted by AST, not by trust.
 - `resolve.py` and `lookup.py` still import none of `compiler`, `spec`, or `recovery`; the new modules
   may. The guard's module list is asserted to be exactly `["resolve", "lookup"]`.
-- `test_no_consumer_of_the_approved_spec_exists_yet`, arming the A5–A8 boundary before there is
-  anything to guard, as A4a armed `test_no_production_caller_of_bind_exists_yet`.
-- The `AGENTS.md` A4b status line matches the implementation state.
+- `test_no_consumer_of_the_approved_spec_exists_yet`, arming open ledger #9 before there is anything to
+  guard, as A4a armed `test_no_production_caller_of_bind_exists_yet`.
+- The `AGENTS.md` A4b status line and both A4b-2 document status paragraphs match the implementation
+  state, while the architecture guard keeps ledger #9 open against A5–A8.
 
 The casefold tier stays skipped by default, exactly as A4b-1 left it.
 
 ## 12. Deferred and delivery obligations
 
-**Ledger entries discharged:** #2, A4's part of #3, #4, #5, #6, #9, #10, #11, #16, #20 — each when its
-tier lands.
+**Ledger entries discharged:** #2, A4's part of #3, #4, #5, #6, #10, #11, #16, #20 — each when its
+tier lands. A4's factory half of #9 is complete, but #9 remains open until A5–A8 enforce their entry
+points.
 
 **Ledger entries created:** #21, the txid binding, owned by A5.
 
@@ -751,13 +776,15 @@ amendment covering approval-time drift (§3.3).
    when a required capability is also missing.
 5. A required capability the bound volume does not supply raises `CapabilityUnavailable`, before any
    `openat2` is issued.
-6. Every path in `compiled.timelines` is resolved exactly once, in sorted order.
+6. Every path in `compiled.timelines` is resolved exactly once, in sorted order; incompatible repeated
+   lexical-prefix observations raise `PreconditionRefused` before topology construction overwrites one.
 7. `work_base_facts()` is called iff the specification contains a `CreateDirectory`, and `work_base` is
    non-`None` on exactly those approvals, carrying the observed identity and constraints of physical
    `metadata_root/work`.
 8. A declared path whose missing ancestor no `CreateDirectory` creates raises
    `ProjectApprovalRefused`; one whose `CreateDirectory` is ordered after a descendant effect does too.
-9. A `REGULAR_FILE` or `SYMLINK` ancestor converted by the timeline is admitted; the same ancestor left
+9. A `REGULAR_FILE` or `SYMLINK` ancestor converted by the timeline is admitted, with either
+   `DeletePath` or a `MoveNoClobber` source recognized as the removal; the same ancestor left
    unconverted, and any `OTHER` ancestor, raise `ProjectApprovalRefused`.
 10. Two declared paths resolving to the same parent node whose leaves share a
     `lookup_equivalence_key` under that parent's constraints raise `ProjectApprovalRefused` naming both
@@ -765,12 +792,14 @@ amendment covering approval-time drift (§3.3).
 11. `lookup_equivalence_key` is the identity on `EXACT_BYTES` and raises `CapabilityUnavailable` on
     every other member of the `LookupProof` vocabulary, the test parametrized over the enum so a new
     member fails until its key is decided.
-12. The complete scratch set is instantiated, bound to concrete parents per §6.3.3, proved pairwise
-    distinct, and each leaf is within its parent's `name_max`.
+12. Every derived path component, persistent leaf, and complete scratch set member is within its
+    actual or inherited parent's `name_max`; scratch is bound per §6.3.3 and proved pairwise distinct.
 13. The produced `RecoveryTopology` validates through `build_recovery_snapshot` for every specification
     the suite approves.
 14. `ApprovedExistingDirectory` covers exactly `ProjectRoot` and the `TopologyDirectory`s;
-    `ApprovedPlannedDirectory` covers exactly `WorkRoot` and the parent `PersistentNode`s.
+    `ApprovedPlannedDirectory` covers exactly `WorkRoot` and the parent `PersistentNode`s, including a
+    transaction-created endpoint observed live and traversed for a descendant, using inherited
+    constraints.
 15. Planned directories are keyed by `lookup_equivalence_key`. `CreateDirectory("A")` with an effect on
     `a/x` yields two directory nodes under `EXACT_BYTES` against a real fixture, and one under the
     `injected_equivalence` double of §11.2 — the folding half being unreachable in production, since no
@@ -791,5 +820,6 @@ amendment covering approval-time drift (§3.3).
     the only observation retained beyond the per-node directory facts.
 22. `resolve.py` and `lookup.py` import none of `atoms.core.compiler`, `atoms.core.spec`, or
     `atoms.core.recovery`, and the guard covering them names exactly those two modules.
-23. No production consumer of `ProjectApprovedSpec` exists, asserted rather than assumed.
+23. No production consumer of `ProjectApprovedSpec` exists, asserted rather than assumed; ledger #9
+    remains open until each A5–A8 entry point accepts only that proof.
 24. Approval issues no write of any kind to project space.

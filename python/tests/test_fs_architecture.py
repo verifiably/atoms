@@ -735,6 +735,7 @@ PURE_FS_IMPORTS = {
     "judgment": frozenset(
         {
             "atoms.fs.lookup",
+            "atoms.fs.lookup.DirectoryConstraints",
             "atoms.fs.lookup.lookup_equivalence_key",
             "atoms.fs.resolve",
             "atoms.fs.resolve.EntryKind",
@@ -752,7 +753,11 @@ PURE_FS_IMPORTS = {
             "atoms.fs.lookup.inherited_constraints",
             "atoms.fs.lookup.lookup_equivalence_key",
             "atoms.fs.resolve",
+            "atoms.fs.resolve.DirectoryFacts",
+            "atoms.fs.resolve.EntryKind",
             "atoms.fs.resolve.FilesystemIdentity",
+            "atoms.fs.resolve.Frontier",
+            "atoms.fs.resolve.PresentFrontier",
             "atoms.fs.resolve.ResolvedPrefix",
         }
     ),
@@ -1036,7 +1041,32 @@ def test_no_consumer_of_the_approved_spec_exists_yet():
 
 def test_a4b_status_is_synchronized_across_authority_documents():
     root = Path(__file__).parents[2]
+    expected = (
+        "Implemented on 2026-07-31. A5–A8 remain unimplemented. "
+        "A4b-2 reads project space and never writes to it."
+    )
+    assert _status_paragraph(
+        root / "docs" / "plans" / "2026-07-31-a4b2-project-approval-design.md"
+    ) == expected
+    assert _status_paragraph(
+        root / "docs" / "plans" / "2026-07-31-plan-a4b2-project-approval.md"
+    ) == expected
+
     agents = (root / "AGENTS.md").read_text(encoding="utf-8")
     assert "**A4b — rooted project approval: implemented on 2026-07-31.**" in agents
     assert "A4b and A5–A8 remain unimplemented" not in agents
     assert "It admits #21, the txid binding, owned by A5." in agents
+    assert "factory half of #9" in agents
+
+    ledger = (root / "docs" / "deferred-obligation-ledger.md").read_text(
+        encoding="utf-8"
+    )
+    open_obligations, discharged = ledger.split("## Discharged obligations", 1)
+    row = next(
+        line for line in open_obligations.splitlines() if line.startswith("| 9 |")
+    )
+    assert "| A5 |" in row
+    assert "A5–A8" in row
+    assert not any(
+        line.startswith("| 9 |") for line in discharged.splitlines()
+    )
