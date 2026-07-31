@@ -726,3 +726,307 @@ def test_the_memo_never_shortcuts_the_constraints_read():
     assert len(reads) == 1
     guarded = _conditional_ancestors(facts_for, reads[0])
     assert guarded == [], "read_lookup_constraints must not sit behind a memo branch"
+
+
+APPROVAL_MODULES = ("approval", "judgment", "topology")
+PURE_MODULES = ("judgment", "topology")
+PURE_IMPORT_PREFIXES = ("__future__", "atoms.core", "collections", "dataclasses")
+PURE_FS_IMPORTS = {
+    "judgment": frozenset(
+        {
+            "atoms.fs.lookup",
+            "atoms.fs.lookup.lookup_equivalence_key",
+            "atoms.fs.resolve",
+            "atoms.fs.resolve.EntryKind",
+            "atoms.fs.resolve.PresentFrontier",
+            "atoms.fs.resolve.ResolvedPrefix",
+            "atoms.fs.topology",
+            "atoms.fs.topology.ApprovedScratch",
+            "atoms.fs.topology.ResolvedTopology",
+        }
+    ),
+    "topology": frozenset(
+        {
+            "atoms.fs.lookup",
+            "atoms.fs.lookup.DirectoryConstraints",
+            "atoms.fs.lookup.inherited_constraints",
+            "atoms.fs.lookup.lookup_equivalence_key",
+            "atoms.fs.resolve",
+            "atoms.fs.resolve.FilesystemIdentity",
+            "atoms.fs.resolve.ResolvedPrefix",
+        }
+    ),
+}
+
+
+def test_the_resolution_guard_still_names_exactly_the_two_mechanism_modules():
+    """The seam is the guard's module list. If A4b-2's modules were added to it they
+    could not import a CompiledSpec; if resolve.py were removed from it, the mechanism
+    could start judging."""
+    source = (Path(__file__)).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        if node.name != "test_resolution_modules_judge_no_specification":
+            continue
+        marks = [
+            decorator
+            for decorator in node.decorator_list
+            if isinstance(decorator, ast.Call)
+        ]
+        names = ast.literal_eval(marks[0].args[1])
+        assert names == ["resolve", "lookup"]
+        return
+    raise AssertionError("the resolution guard is missing")
+
+
+@pytest.mark.parametrize("module_name", APPROVAL_MODULES)
+def test_approval_modules_may_judge_a_specification(module_name):
+    """The complement of the resolution guard: these modules exist to see a spec."""
+    source = (SOURCE_ROOT / "fs" / f"{module_name}.py").read_text(encoding="utf-8")
+    assert ast.parse(source) is not None
+
+
+def _forbidden_pure_imports(module_name, tree):
+    imported = _resolved_imports(tree, package="atoms.fs")
+    forbidden = {
+        name
+        for name in imported
+        if not any(
+            name == prefix or name.startswith(f"{prefix}.")
+            for prefix in PURE_IMPORT_PREFIXES
+        )
+        and name not in PURE_FS_IMPORTS[module_name]
+    }
+    if any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "open"
+        for node in ast.walk(tree)
+    ):
+        forbidden.add("builtins.open")
+    return forbidden
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import os",
+        "from atoms.fs.resolve import PathResolver",
+        "from atoms.fs.syscalls import linux",
+        "import atoms.corex",
+        'open("path")',
+    ],
+)
+def test_the_pure_import_guard_detects_direct_and_indirect_io(source):
+    """The converse keeps the allowlist from becoming another vacuous denylist."""
+    assert _forbidden_pure_imports("topology", ast.parse(source))
+
+
+@pytest.mark.parametrize("module_name", PURE_MODULES)
+def test_the_pure_modules_import_only_pure_dependencies(module_name):
+    source = (SOURCE_ROOT / "fs" / f"{module_name}.py").read_text(encoding="utf-8")
+    forbidden = _forbidden_pure_imports(module_name, ast.parse(source))
+    assert not forbidden, f"{module_name}.py imports I/O authority: {sorted(forbidden)}"
+
+
+def test_the_approved_proof_retains_only_the_authorized_schema():
+    """Criterion 21 is a negative schema contract, not an identity assertion.
+
+    Exact field sets make a copied frontier or mount identifier fail even if it is added
+    with a default. The live binding deliberately retains its own VolumeEvidence; this
+    guard covers the fields A4b-2 copies into its proof and approved fact values.
+    """
+    from atoms.fs.approval import ProjectApprovedSpec
+    from atoms.fs.topology import (
+        ApprovedExistingDirectory,
+        ApprovedPath,
+        ApprovedPlannedDirectory,
+        ApprovedScratch,
+        ApprovedWorkBase,
+    )
+
+    expected = {
+        ProjectApprovedSpec: frozenset(
+            {
+                "compiled",
+                "binding",
+                "txid",
+                "topology",
+                "directories",
+                "paths",
+                "scratch",
+                "work_base",
+            }
+        ),
+        ApprovedExistingDirectory: frozenset({"node", "identity", "constraints"}),
+        ApprovedPlannedDirectory: frozenset({"node", "constraints"}),
+        ApprovedPath: frozenset({"path", "parent_node", "leaf"}),
+        ApprovedScratch: frozenset({"effect_id", "role", "parent_node", "leaf"}),
+        ApprovedWorkBase: frozenset({"identity", "constraints"}),
+    }
+    assert {
+        value_type: frozenset(typing.get_type_hints(value_type))
+        for value_type in expected
+    } == expected
+
+
+RAW_COMPONENT_ATTRS = frozenset({"leaf", "declared_component"})
+LAUNDERING_CALLS = frozenset({"lookup_equivalence_key", "len"})
+
+
+def _called_name(call):
+    func = call.func
+    return func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+
+
+def _mentions_raw(node):
+    """True if this expression still carries a raw path component.
+
+    A subtree rooted at a laundering call does not: lookup_equivalence_key is the whole
+    point of the rule, and len() yields a byte width, which no equality decision about a
+    name can be made from.
+    """
+    if isinstance(node, ast.Call) and _called_name(node) in LAUNDERING_CALLS:
+        return False
+    if isinstance(node, ast.Attribute) and node.attr in RAW_COMPONENT_ATTRS:
+        return True
+    return any(_mentions_raw(child) for child in ast.iter_child_nodes(node))
+
+
+def _aliases_of_raw(tree):
+    """Locals bound to a raw component, so `leaf = entry.leaf` does not launder it.
+
+    Only plain-name targets are tainted. `seen[key] = entry.leaf` stores a raw component
+    in a container, which is not aliasing — tainting `seen` there would reject the
+    pipeline's own idiom.
+    """
+    tainted = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        if node.value is None or not _mentions_raw(node.value):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+            if isinstance(target, ast.Name):
+                tainted.add(target.id)
+            elif isinstance(target, ast.Tuple):
+                tainted.update(
+                    element.id
+                    for element in target.elts
+                    if isinstance(element, ast.Name)
+                )
+    return tainted
+
+
+@pytest.mark.parametrize("module_name", PURE_MODULES)
+def test_the_pure_modules_never_decide_equality_on_a_raw_component(module_name):
+    """What the injected_equivalence double cannot catch: under an identity key a direct
+    comparison behaves exactly like the function it bypasses, so every EXACT_BYTES case
+    still passes and the double reports nothing.
+
+    Guarded shapes are comparisons — which covers `==`, `!=`, `in`, and `not in` — and
+    mapping keys, over both a raw attribute and any local aliased from one. A value
+    produced BY lookup_equivalence_key launders the taint, which is what makes the
+    pipeline's `key = (parent, lookup_equivalence_key(...))` idiom legal.
+
+    **This is a lint over the shapes it names, not a soundness proof.** Alias discovery is
+    one hop, so `a = entry.leaf; b = a; b == x` slips through, as do a component recovered
+    via `split`, a key built from a length, and a dict-literal key. Making it sound needs
+    real dataflow analysis, which is not worth building here. The positive check is what
+    carries the weight: injected_equivalence records the names it is asked about, so a
+    call site that bypasses the helper contributes nothing to that list however it is
+    written. This guard catches the direct shape cheaply; the recording catches omission.
+    """
+    tree = ast.parse(
+        (SOURCE_ROOT / "fs" / f"{module_name}.py").read_text(encoding="utf-8")
+    )
+    tainted = _aliases_of_raw(tree)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Compare):
+            checked = [node.left, *node.comparators]
+        elif isinstance(node, ast.Subscript):
+            checked = [node.slice]
+        else:
+            continue
+        for expression in checked:
+            for inner in ast.walk(expression):
+                if isinstance(inner, ast.Attribute):
+                    assert inner.attr not in RAW_COMPONENT_ATTRS, (
+                        f"{module_name}.py decides {inner.attr} equality directly; "
+                        "route it through lookup_equivalence_key"
+                    )
+                if isinstance(inner, ast.Name):
+                    assert inner.id not in tainted, (
+                        f"{module_name}.py decides equality on {inner.id}, aliased from "
+                        "a raw path component; route it through lookup_equivalence_key"
+                    )
+
+
+def test_approval_catches_nothing_a_resolver_raises():
+    """Ledger #20 is categorical. The correct number of handlers enclosing a resolver
+    call is zero — not "no blanket handler", which is the weaker rule resolve.py has.
+    `contextlib.suppress` is checked too: it swallows exactly as a handler does, and a
+    guard that missed it would be satisfied by the one bypass someone would reach for."""
+    tree = ast.parse((SOURCE_ROOT / "fs" / "approval.py").read_text(encoding="utf-8"))
+    calls = {"resolve", "work_base_facts", "PathResolver"}
+    enclosing = [node for node in ast.walk(tree) if isinstance(node, ast.Try)]
+    enclosing += [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.With)
+        and any(
+            isinstance(item.context_expr, ast.Call)
+            and _called_name(item.context_expr) == "suppress"
+            for item in node.items
+        )
+    ]
+    for node in enclosing:
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.Call):
+                assert _called_name(inner) not in calls, (
+                    f"a handler in approval.py encloses {_called_name(inner)}(); "
+                    "ledger #20 requires every A4b-1 refusal to reach the caller "
+                    "unhandled"
+                )
+
+
+def test_the_approved_spec_is_not_exported():
+    import atoms.fs as package
+
+    assert "ProjectApprovedSpec" not in package.__all__
+    assert not hasattr(package, "ProjectApprovedSpec")
+
+
+def test_no_consumer_of_the_approved_spec_exists_yet():
+    """Arms the A5-A8 boundary before there is anything to guard, as A4a armed
+    test_no_production_caller_of_bind_exists_yet. When A5 lands, this test is replaced by
+    one asserting A5-A8 accept only this proof."""
+    consumers = []
+    for path in sorted((SOURCE_ROOT).rglob("*.py")):
+        if path.name in {"approval.py"}:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        _, package = _source_module(SOURCE_ROOT.parent, path)
+        imports = _resolved_imports(tree, package=package)
+        if "atoms.fs.approval.ProjectApprovedSpec" in imports or any(
+            (
+                isinstance(node, ast.Name) and node.id == "ProjectApprovedSpec"
+            )
+            or (
+                isinstance(node, ast.Attribute)
+                and node.attr == "ProjectApprovedSpec"
+            )
+            for node in ast.walk(tree)
+        ):
+            consumers.append(str(path.relative_to(SOURCE_ROOT)))
+    assert consumers == []
+
+
+def test_a4b_status_is_synchronized_across_authority_documents():
+    root = Path(__file__).parents[2]
+    agents = (root / "AGENTS.md").read_text(encoding="utf-8")
+    assert "**A4b — rooted project approval: implemented on 2026-07-31.**" in agents
+    assert "It admits #21, the txid binding, owned by A5." in agents
