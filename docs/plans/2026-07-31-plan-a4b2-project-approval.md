@@ -228,10 +228,10 @@ that the *functions* exported by `atoms.core.recovery` are exactly the five A3 o
 
 Append to `tests/fs_support.py`. Every pure tier builds `ResolvedPrefix` values and compiled specs
 by hand, so the builders belong beside the other test support rather than in fixtures — they take
-arguments and return values, which a fixture cannot do without an extra factory layer:
+arguments and return values, which a fixture cannot do without an extra factory layer. `EXT4` is
+already defined at `fs_support.py:25` and is used as-is — do not redefine it:
 
 ```python
-EXT4 = "ext4"
 WORK_CONSTRAINTS = DirectoryConstraints(
     lookup_proof=LookupProof.EXACT_BYTES, name_max=255
 )
@@ -352,6 +352,11 @@ def prefixes_for(compiled: CompiledSpec) -> dict[str, ResolvedPrefix]:
 
 GENERATOR_PATHS = ("a", "a/b", "d/one", "d/two", "p")
 GENERATOR_MOVES = (("d/one", "d/two"), ("a", "p"), ("d/one", "a/b"))
+GENERATED_SPECIFICATION_COUNT = 4841
+"""How many of the 12719 candidate sequences A2 admits, measured on this checkout.
+
+Asserted exactly by the §7.4 property test, so a generator that silently narrows fails
+rather than passing on a smaller matrix. Change it only alongside a pool change."""
 
 
 def _generated_effect(tag: str, argument, index: int) -> Effect:
@@ -376,6 +381,11 @@ def generated_specifications():
     single-path variants against each of five paths, plus three moves. Sequences A2
     refuses are skipped rather than reported -- an input that does not compile is not an
     input to this layer.
+
+    `product`, not `permutations`: a candidate may repeat. `permutations` draws without
+    replacement and so silently omits every sequence that touches one path twice with the
+    same variant -- including create -> delete -> create, which A2 admits and which is
+    exactly the ancestor-type churn ledger entry #3 is about. That is 16 sequences.
     """
     pool = [
         (tag, path)
@@ -384,7 +394,7 @@ def generated_specifications():
     ]
     pool += [("mv", pair) for pair in GENERATOR_MOVES]
     for size in (1, 2, 3):
-        for combination in itertools.permutations(pool, size):
+        for combination in itertools.product(pool, repeat=size):
             effects = tuple(
                 _generated_effect(tag, argument, index)
                 for index, (tag, argument) in enumerate(combination)
@@ -1709,20 +1719,20 @@ def test_a3_and_the_rerun_accept_every_specification_the_generator_compiles():
     """Criterion 18 says *every* compiled input, and ten named examples are a corpus, not
     a property. The generator enumerates all ordered sequences of length 1-3 over a fixed
     23-effect pool -- every variant against every path in a five-path alphabet, plus three
-    moves -- and keeps the ones A2 admits. On this checkout that is 4825 specifications
-    out of 11155 candidates, and it runs in under three seconds.
+    moves -- and keeps the ones A2 admits. On this checkout that is 4841 specifications
+    out of 12719 candidates, and it runs in about four seconds.
 
     Bounded and deterministic rather than random: no seed to record, no flake, and a
-    failure is reproducible from its label. `checked == compiled` is asserted so a
-    generator that silently stops producing cannot pass by producing nothing.
+    failure is reproducible from its label. The exact count is asserted rather than a
+    floor: `checked == compiled_count` would be tautological, since nothing between the
+    two increments can skip, and `> 4000` would still pass if the generator quietly lost
+    a whole variant. Update the constant deliberately when the pool changes.
     """
     from atoms.fs.topology import require_resolved_surface_and_ordering
 
-    compiled_count = 0
     checked = 0
     for label, effects in generated_specifications():
         compiled = compiled_for(*effects)
-        compiled_count += 1
         resolved = build_topology(
             compiled, prefixes_for(compiled), EXT4, work_for(compiled)
         )
@@ -1730,8 +1740,7 @@ def test_a3_and_the_rerun_accept_every_specification_the_generator_compiles():
         require_resolved_surface_and_ordering(compiled, resolved)
         checked += 1
 
-    assert checked == compiled_count
-    assert compiled_count > 4000
+    assert checked == GENERATED_SPECIFICATION_COUNT
 
 
 def test_the_rerun_refuses_a_creation_ordered_after_its_descendant(injected_equivalence):
@@ -1772,6 +1781,7 @@ from atoms.core.effects import DeletePath, ReplaceFile
 from atoms.core.errors import ProjectApprovalRefused
 from atoms.core.fingerprint import SymlinkState
 from tests.fs_support import (
+    GENERATED_SPECIFICATION_COUNT,
     generated_specifications,
     nonempty_state,
     prefixes_for,
@@ -1798,7 +1808,13 @@ def require_resolved_surface_and_ordering(
     insensitive parent, declared `A` and declared descendant `a/x` do not collide as
     endpoints yet `A` is genuinely the ancestor of `a/x`.
     """
-    node_by_path = {entry.path: PersistentNode(entry.path) for entry in resolved.paths}
+    # Annotated rather than inferred: the values are inserted as PersistentNode, but every
+    # lookup below feeds them to a map that is also queried with parent nodes, and a parent
+    # may be ProjectRoot. Without the annotation pyright infers dict[str, PersistentNode]
+    # and reports the two `.get(ancestor)` calls as reportArgumentType.
+    node_by_path: dict[str, TopologyNode] = {
+        entry.path: PersistentNode(entry.path) for entry in resolved.paths
+    }
     parent_by_node = {edge.node: edge.parent for edge in resolved.topology.parents}
 
     for label in ("initial_surface", "final_surface"):
@@ -2433,10 +2449,16 @@ def test_the_proof_refuses_ordinary_construction_and_replace(approval_context):
             dataclasses.replace(proof, txid="tx02")
 
 
-def test_the_proof_retains_the_binding_object_it_approved(approval_context):
+def test_the_proof_retains_the_objects_it_approved(approval_context):
+    """Criterion 1 says the *exact* `CompiledSpec` passed in, and criterion 16's ledger
+    entry says the live binding. Identity, not equality: `CompiledSpec` is a frozen value,
+    so an equal-but-reconstructed one would compare equal while proving nothing about what
+    was actually judged, and ledger entry #19 turns on approval and use naming one object.
+    """
     compiled = compiled_for(CreateFileNoClobber("e1", "leaf", file_state()))
     with approval_context() as (context, binding):
         proof = approve_for_project(compiled, context)
+        assert proof.compiled is compiled
         assert proof.binding is binding
 
 
@@ -2749,6 +2771,105 @@ def test_a_wholly_resolvable_specification_approves(approval_context):
         assert proof.work_base is None
 
 
+@pytest.mark.parametrize(
+    ("effect", "expected"),
+    [
+        (CreateFileNoClobber("e1", "leaf", file_state()), 0),
+        (CreateDirectory("mk", "made", DirectoryState(mode=0o755)), 1),
+    ],
+    ids=["no-create-directory", "create-directory"],
+)
+def test_work_base_facts_is_called_exactly_when_a_directory_is_created(
+    approval_context, monkeypatch, effect, expected
+):
+    """Criterion 7 says *iff*, which is two claims, and `proof.work_base is None` proves
+    only the weaker one. An implementation that observed the work base and then discarded
+    the observation would satisfy that assertion while still issuing the I/O the criterion
+    forbids — and that I/O is not free: it opens `metadata_root/work`, which A5 has not yet
+    created at this point in the lifecycle. Counting on the method fails on the call rather
+    than on the value.
+
+    Patched on the class, not the instance: approval constructs its own `PathResolver`, so
+    a test never holds the instance to patch.
+    """
+    from atoms.fs.resolve import PathResolver
+
+    calls = 0
+    original = PathResolver.work_base_facts
+
+    def counting(self):
+        nonlocal calls
+        calls += 1
+        return original(self)
+
+    monkeypatch.setattr(PathResolver, "work_base_facts", counting)
+    with approval_context() as (context, _binding):
+        proof = approve_for_project(compiled_for(effect), context)
+
+    assert calls == expected
+    assert (proof.work_base is not None) is bool(expected)
+
+
+def test_approval_writes_nothing_into_project_space(approval_context):
+    """Criterion 24. Approval is a judgment: it opens project directories read-only and
+    must leave every byte of the tree it judged alone. The specification is chosen to
+    exercise the branches that are most tempted to write — a `CreateDirectory` whose
+    directory does not exist yet, and a scratch set that A5 will later instantiate.
+
+    Compares a full recursive snapshot including names, types, sizes, inodes, and mtimes
+    rather than a bare `listdir`: a same-size rewrite keeps both the entry list and the
+    size unchanged.
+    """
+    with approval_context() as (context, binding):
+        root = binding.project_root_fd
+        os.mkdir("d", dir_fd=root)
+        fd = os.open("d/kept", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644, dir_fd=root)
+        try:
+            os.write(fd, b"payload")
+        finally:
+            os.close(fd)
+
+        before = _tree_snapshot(root)
+        compiled = compiled_for(
+            CreateDirectory("mk", "d/made", DirectoryState(mode=0o755)),
+            CreateFileNoClobber("e1", "d/made/leaf", file_state()),
+        )
+        approve_for_project(compiled, context)
+
+        assert _tree_snapshot(root) == before
+
+
+def _tree_snapshot(root_fd: int, path: str = ".") -> dict[str, tuple]:
+    """Every entry beneath `root_fd`, keyed by relative path.
+
+    `st_ino` and `st_mtime_ns` are included so a same-size rewrite or an atomic replace is
+    visible, not just a change in the entry list.
+
+    The descriptor is closed explicitly. `os.scandir(fd)` does not take ownership of the
+    descriptor it is handed and exiting its context manager does not close it, so relying
+    on that leaks one per directory per call.
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=root_fd)
+    try:
+        snapshot: dict[str, tuple] = {}
+        with os.scandir(fd) as items:
+            for entry in items:
+                relative = f"{path}/{entry.name}"
+                info = entry.stat(follow_symlinks=False)
+                snapshot[relative] = (
+                    entry.is_dir(follow_symlinks=False),
+                    info.st_mode,
+                    info.st_size,
+                    info.st_ino,
+                    info.st_mtime_ns,
+                )
+                if entry.is_dir(follow_symlinks=False):
+                    snapshot |= _tree_snapshot(root_fd, relative)
+        return snapshot
+    finally:
+        os.close(fd)
+
+
 def test_work_base_is_retained_and_matches_an_independent_observation(approval_context):
     """Asserted against a fresh fstat and constraints read on metadata_root/work, so the
     retained baseline is checked against the filesystem rather than against the same call
@@ -2872,6 +2993,7 @@ git commit -m "test(fs): approve specifications against a real ext4 volume"
 **Files:**
 - Modify: `tests/test_fs_architecture.py`
 - Modify: `AGENTS.md`
+- Modify: `docs/deferred-obligation-ledger.md`
 
 **Interfaces:**
 - Consumes: the existing `_resolved_imports` and `FORBIDDEN_FOR_RESOLUTION` helpers.
@@ -3095,10 +3217,44 @@ and replace `A4b-2 owns the judgment:` through the end of that bullet with:
 
 - [ ] **Step 4: Remove the discharged ledger entries**
 
-In `docs/deferred-obligation-ledger.md`, delete rows #2, #3, #4, #5, #6, #9, #10, #11, #16, and #20
-from the open table and append them to a new "Discharged obligations" table naming A4b-2 and the date.
-Row #3 is deleted only if A6's part is also complete; it is not, so **row #3 stays** with its owner list
-narrowed from `A3, A4b, A6` to `A6` and its required behavior trimmed to A6's clause.
+Nine rows move and one is narrowed. This file carries authority (`AGENTS.md` §"Deferred obligations"),
+so the exact Markdown is given rather than described.
+
+**Delete** rows #2, #4, #5, #6, #9, #10, #11, #16, and #20 from the "Open obligations" table. Rows #1,
+#7, #8, #12, #13, #14, #15, #17, #18, and #21 are untouched.
+
+**Row #3 stays**, because it names three owners and only A3's and A4b's parts are complete. Replace it
+with this row — owner list narrowed to `A6`, required behavior trimmed to A6's clause, and the `§13.1`
+verification reference dropped with A3's clause:
+
+```markdown
+| 3 | An ancestor whose type changes mid-transaction (`FILE`/`SYMLINK` → `ABSENT` → `DIRECTORY`) with declared descendants | A2 phase 12 | A6 | §6's second absence-capture case infers descendant absence from the ancestor's verified fingerprint — descriptor-coherent for a file, destructive-transfer validation for a symlink — then hands §9.5's published descriptor down | §13.2, §13.4 |
+```
+
+**Replace** the "Discharged obligations" section — currently the "None yet" paragraph — with this,
+keeping that paragraph's second sentence, which is still true:
+
+```markdown
+## Discharged obligations
+
+| # | Admitted shape | Admitted by | Discharged by | Date | Verification suite |
+| --- | --- | --- | --- | --- | --- |
+| 2 | Two declared paths distinct under A2's whole-path portability key may still name one entry | A2 phase 4 | A4b-2 | 2026-07-31 | `tests/test_fs_judgment.py` |
+| 4 | Path and component lengths are unbounded | A2 phase 3 | A4b-1, A4b-2 | 2026-07-31 | `tests/test_fs_resolve_walk.py`, `tests/test_fs_judgment.py`, `tests/test_fs_approval.py` |
+| 5 | Paths are stored verbatim; no resolution or containment is performed | A2 (whole) | A4b-1 | 2026-07-31 | `tests/test_fs_resolve_walk.py`, `tests/test_fs_resolve_conformance.py` |
+| 6 | A required-capability set is derived but never checked against a backend | A2 §3 | A4b-2 | 2026-07-31 | `tests/test_fs_approval.py` |
+| 9 | `CompiledSpec` proves only A2's pure lexical/model rules and carries no project/root approval | A2 boundary | A4b-2 | 2026-07-31 | `tests/test_fs_approval.py`, `tests/test_fs_architecture.py` |
+| 10 | A2's exact-spelling tree may differ from the tree after actual per-directory name equivalence is resolved (`A` versus `a/x`) | A2 phases 4, 12–13 | A3, A4b-2 | 2026-07-31 | `tests/test_fs_topology.py` |
+| 11 | A2 proves scratch grammar separation and fixed NFC/casefold effect-ID uniqueness, but not the actual distinctness of every instantiated effect/role leaf in its concrete parent | A1 §5.1, A2 phases 3 and 6 | A4b-2 | 2026-07-31 | `tests/test_fs_judgment.py` |
+| 16 | `VolumeEvidence` is a detached frozen value describing a volume, and authorizes no access to it | A4a binding contract | A4b-2 | 2026-07-31 | `tests/test_fs_approval.py`, `tests/test_fs_architecture.py` |
+| 20 | A4b-1 refuses by raising, and nothing forces A4b-2 to surface those refusals rather than catching them | A4b-1/A4b-2 seam | A4b-2 | 2026-07-31 | `tests/test_fs_approval.py`, `tests/test_fs_architecture.py` |
+
+A1's admissions were all discharged by A2; they are listed in that plan's self-review rather than
+duplicated here.
+```
+
+The "Required behavior" column is not carried over: for a discharged entry the behavior is whatever the
+suite in the last column asserts, and a frozen restatement beside it would drift.
 
 - [ ] **Step 5: Run every gate**
 
@@ -3197,13 +3353,17 @@ Design §11.6 and criterion 16 were amended to require both.
 **The agreement property is generated, not curated.** Criterion 18 says *every* compiled input, and ten
 named examples are a corpus. `generated_specifications` enumerates all ordered sequences of length 1–3
 over a 23-effect pool — four single-path variants against five paths, plus three moves — and keeps the
-ones A2 admits. On this checkout that is **4825 specifications out of 11155 candidates**, all of which
-build a topology A3 accepts and pass the re-run, in 2.6 seconds. Bounded and deterministic: no seed, no
+ones A2 admits. On this checkout that is **4841 specifications out of 12719 candidates**, all of which
+build a topology A3 accepts and pass the re-run, in 3.6 seconds. Bounded and deterministic: no seed, no
 flake, and a failure reproduces from its label. The named corpus stays for readable failure messages.
+The enumeration is `itertools.product`, not `permutations`: drawing without replacement omitted the 16
+sequences that touch one path twice with the same variant, `cf:a | rm:a | cf:a` among them — precisely
+the ancestor-type churn of ledger entry #3. The count is asserted exactly, because the former
+`checked == compiled_count` could not fail and `> 4000` would survive losing a whole variant.
 
 **Every expected value in this round was executed before it was written down.** The extracted modules
 were run against each new case: the symlink pair, both move cases, the partition equality, the lone
-`CreateDirectory`, the three spy call lists, and the full 4825-entry matrix. `CompiledSpec` and
+`CreateDirectory`, the three spy call lists, and the full 4841-entry matrix. `CompiledSpec` and
 `ProjectBinding` subclasses are constructed through `__new__`, since both are token-guarded — which
 strengthens the test rather than weakening it, because the resulting object has no usable attribute,
 so a gate that admits it fails loudly.
@@ -3236,8 +3396,42 @@ in Task 6; and `ext4_bound_volume` already accepts `withhold`. Every entry in Ta
 `AGREEMENT_CORPUS` was run through `compile_spec` — that is how the `ReplaceFile` cases were found to
 need real digests, since A2 refuses a non-zero `byte_len` under the empty-content hash.
 
+**The third round closed five findings, and three of them were the same mistake.** Criteria 1, 7, and 24
+each state a claim the plan asserted a *proxy* for. Criterion 1 says the exact `CompiledSpec`; the plan
+checked only `proof.binding is binding`. Criterion 7 says `work_base_facts()` is *called* iff a
+`CreateDirectory` is present; the plan checked `proof.work_base is None`, which an implementation that
+observed the work base and discarded the result would also satisfy — and that call is not free, since it
+opens `metadata_root/work`, which A5 has not created at this point. Criterion 24 says no write to
+project space and had no test at all. All three are now asserted directly: identity, a call counter on
+`PathResolver.work_base_facts` patched at the class because approval builds its own resolver, and a
+recursive before/after tree snapshot carrying inode and mtime so a same-size rewrite is visible.
+
+Writing that snapshot surfaced a real leak: `os.scandir(fd)` does not take ownership of the descriptor,
+and exiting its context manager does not close it. Measured — 500 calls over a four-entry tree held 600
+descriptors open. The helper closes explicitly in a `finally`.
+
+**The property was drawing without replacement.** `itertools.permutations` cannot emit a sequence that
+uses one candidate twice, so the matrix silently omitted all 16 A2-admitted sequences that touch one
+path twice with the same variant — `cf:a | rm:a | cf:a` and its siblings, which is exactly the
+ancestor-type churn ledger entry #3 describes. `product` raises the matrix from 4825 to 4841; all 16 pass
+A3 and the re-run, so this was a coverage hole rather than a hidden defect. The count is now asserted
+exactly: `checked == compiled_count` could not fail, since nothing between the two increments can skip,
+and `> 4000` would have survived losing a whole variant.
+
+**`node_by_path` needed an annotation, not a cast.** Its values go in as `PersistentNode` but every
+lookup queries the resulting maps with parent nodes, and a parent may be `ProjectRoot` — two
+`reportArgumentType` errors, reproduced by assembling the fence and running pyright on it. Annotating
+the dict as `dict[str, TopologyNode]` clears both, and is the honest description of what it holds.
+
+**The ledger step now contains the ledger.** It named no file and left the implementer to reconstruct
+row #3's narrowing and a table that does not yet exist. Both are written out verbatim, and every copied
+cell was diffed against the current ledger. The discharged table drops the "Required behavior" column:
+for a discharged entry the behavior is whatever its suite asserts, and a frozen restatement beside it
+would drift.
+
 **Placeholder scan.** Clean — no TBD, no "similar to Task N", no step that describes without showing,
-no test whose body is a shape to be finished later.
+no test whose body is a shape to be finished later. `EXT4` is no longer redefined in Task 2; it has
+existed at `fs_support.py:25` since A4a.
 
 **Type consistency.** `ResolvedTopology.parent_of` takes a path string and returns a `TopologyNode`;
 `parent_node_of` takes a node and returns its parent node; `directory_node` takes a directory prefix and
