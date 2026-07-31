@@ -16,6 +16,7 @@ from atoms.fs.lookup import (
     DirectoryConstraints,
     LookupProof,
     inherited_constraints,
+    lookup_equivalence_key,
     read_lookup_constraints,
 )
 
@@ -161,3 +162,32 @@ def test_constraints_are_frozen(field):
     constraints = DirectoryConstraints(lookup_proof=LookupProof.EXACT_BYTES, name_max=255)
     with pytest.raises(dataclasses.FrozenInstanceError):
         setattr(constraints, field, object())
+
+
+def test_the_equivalence_key_is_the_identity_under_exact_bytes():
+    constraints = DirectoryConstraints(
+        lookup_proof=LookupProof.EXACT_BYTES, name_max=255
+    )
+    for name in ("a", "A", "é", ".hidden", "x" * 255):
+        assert lookup_equivalence_key(constraints, name) == name
+
+
+@pytest.mark.parametrize(
+    "proof", [proof for proof in LookupProof if proof is not LookupProof.EXACT_BYTES]
+)
+def test_the_equivalence_key_refuses_every_unreproducible_proof(proof):
+    """Parametrized over the enum, not over the one member that exists today, so a
+    future LookupProof fails this suite until someone decides what its key is."""
+    constraints = DirectoryConstraints(lookup_proof=proof, name_max=255)
+    with pytest.raises(CapabilityUnavailable) as caught:
+        lookup_equivalence_key(constraints, "a")
+    assert proof.value in str(caught.value)
+
+
+def test_the_vocabulary_still_has_exactly_one_reproducible_proof():
+    """Guards the design's claim that the folding path has no production route: if a
+    second reproducible proof lands, the test that asserts one must be revisited."""
+    reproducible = [
+        proof for proof in LookupProof if proof is LookupProof.EXACT_BYTES
+    ]
+    assert len(reproducible) == 1

@@ -110,3 +110,20 @@ def inherited_constraints(
     return DirectoryConstraints(
         lookup_proof=parent.lookup_proof, name_max=EXT4_NAME_MAX
     )
+
+
+def lookup_equivalence_key(constraints: DirectoryConstraints, name: str) -> str:
+    """Return the key under which ``name`` collides with another name in this directory.
+
+    Two names reach the same entry iff their keys are equal. For EXACT_BYTES the key is
+    the name itself. Any other proof raises: a policy whose relation the engine cannot
+    reproduce has no equivalence key either, and inventing one would be exactly the
+    silent fallback this engine refuses. This mirrors inherited_constraints' treatment
+    of an unapproved filesystem type.
+    """
+    if constraints.lookup_proof is LookupProof.EXACT_BYTES:
+        return name
+    raise CapabilityUnavailable(
+        f"lookup proof {constraints.lookup_proof.value!r} has no reproducible name "
+        f"equivalence, so {name!r} cannot be compared against sibling names"
+    )
