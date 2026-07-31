@@ -321,6 +321,13 @@ relation the engine cannot reproduce has no equivalence key either, and inventin
 silent fallback this engine refuses. When the floor widens, the new policy's key lands here and every
 caller inherits it.
 
+**No member of today's vocabulary is both insensitive and reproducible.** `LookupProof` holds exactly
+`EXACT_BYTES` and `UNREPRODUCIBLE_CASEFOLD`, and the second raises. So the merging behavior this
+function exists to enable — two spellings reaching one directory — has no production path today, and
+cannot be exercised by choosing a different enum member. §11.2 states how the tests reach it anyway.
+This is the honest form of the floor-agnosticism claim: the *call sites* are policy-derived now, and
+the policy that makes them do something different does not exist yet.
+
 Two declared paths name one entry iff they resolve to the same parent node and their leaves share a
 `lookup_equivalence_key` under that parent's constraints. Under `EXACT_BYTES` that reduces to exact
 byte equality, which is why the check is currently equivalent to comparing leaf bytes and is
@@ -522,7 +529,7 @@ for a stored value to serve.
 
 | Raised | For |
 | --- | --- |
-| `ProjectApprovalRefused` | endpoint collision, illegal ancestor (missing, `OTHER`, or unconverted), scratch-leaf collision, resolved-topology surface or ordering violation — and everything A4b-1 raises, passing through untouched |
+| `ProjectApprovalRefused` | endpoint collision, illegal ancestor (missing, `OTHER`, or unconverted), scratch-leaf collision, resolved-topology surface or ordering violation — and A4b-1's own `ProjectApprovalRefused` instances, passing through untouched |
 | `PreconditionRefused` | raised only by A4b-1 and propagated: two observations of one directory or entry disagreeing within a single approval. A4b-2 never raises it directly |
 | `CapabilityUnavailable` | required ⊄ supplied, and `lookup_equivalence_key` on an unapproved `LookupProof` |
 | `ProtocolError` | a `compiled`, `context`, `binding`, or `txid` of the wrong exact type; a malformed txid; a closed binding or released lock |
@@ -556,13 +563,14 @@ I/O.
 Hand-built resolution tables drive ancestor legality, endpoint distinctness, scratch instantiation and
 distinctness, and capability adjudication. Synthetic `ResolvedPrefix` values make the awkward cases
 cheap: a missing ancestor no effect creates; an ancestor created too late; a `REGULAR_FILE` ancestor
-correctly converted; the same ancestor left unconverted; an `OTHER` ancestor; an endpoint collision;
-and `A` versus `a/x` merging under a hypothetical insensitive parent, which no real approved volume can
-produce.
+correctly converted; the same ancestor left unconverted; an `OTHER` ancestor; and an endpoint
+collision. Endpoint merging under a folding parent uses the same `injected_equivalence` fixture §11.2
+describes, with the same two limits on what it proves.
 
 `lookup_equivalence_key` gets its own cases: identity on `EXACT_BYTES`, and `CapabilityUnavailable` on
-every other `LookupProof` member, parametrized over the enum so a future member fails the suite until
-someone decides what its key is.
+every other member of the current `LookupProof` vocabulary — today only `UNREPRODUCIBLE_CASEFOLD`.
+The test is parametrized over the enum rather than over that one member, so adding a future member
+fails the suite until someone decides what its key is.
 
 Phase A's gates are pure and tested here rather than against a volume: each of `compiled`, `context`,
 `context.binding`, and `context.txid` given a wrong exact type raises `ProtocolError`; a subclass of
@@ -579,8 +587,24 @@ partition of §7.3, `node_id` reproducibility across runs, and `WorkRoot` presen
 `CreateDirectory` exists.
 
 Planned-node keying gets a dedicated case, because it is the half of §7.1's key that is easy to get
-wrong: `CreateDirectory("A")` alongside an effect on `a/x`, under a synthetic insensitive parent, must
-yield **one** node. An exact-bytes key passes every other test in this tier and fails only this one.
+wrong: `CreateDirectory("A")` alongside an effect on `a/x` must yield **one** directory node when the
+parent's policy folds case, and **two** under `EXACT_BYTES`. An exact-bytes key passes every other test
+in this tier and fails only the first half.
+
+**How the merging half is reached.** §6.3.2 records that no `LookupProof` member is both insensitive
+and reproducible, so the case cannot be produced by picking a different enum value. An
+`injected_equivalence` fixture supplies it instead, monkeypatching `lookup_equivalence_key` on the
+*consuming* modules — `atoms.fs.topology` and `atoms.fs.judgment` — with a case-folding double. This
+follows the existing `injected_lookup` fixture, which patches `atoms.fs.resolve.read_lookup_constraints`
+by the same consuming-module path for the same reason.
+
+Two limits on what that test proves, both stated so nobody later reads more into it. It exercises the
+*call sites* — that both keys route through the function and merge whatever it says merges — and not
+any real folding relation, which remains unreproducible and refused. And it is a double, so it cannot
+detect a call site that bypasses the function while still passing exact-bytes cases; §11.6's AST guard
+covers that instead, asserting neither module compares leaf names directly.
+
+The `EXACT_BYTES` half needs no injection and runs against real fixtures.
 
 ### 11.3 Tier 3 — A3 acceptance
 
@@ -621,6 +645,10 @@ same-class exception the code might raise on its own.
 - `ProjectApprovedSpec(...)` and `dataclasses.replace(proof, ...)` both raise `TypeError`.
 - The retained binding is present and is the object passed in (ledger #16).
 - No `except` clause in `approval.py` encloses a `PathResolver` call, by AST.
+- Neither `topology.py` nor `judgment.py` compares leaf names directly — no `==`, `!=`, `in`, or
+  set/dict membership over a raw component — by AST. This is what §11.2's injected double cannot
+  catch: a call site that bypasses `lookup_equivalence_key` still passes every `EXACT_BYTES` case,
+  because under that policy the function is the identity.
 - `topology.py` and `judgment.py` import nothing from `atoms.fs.resolve` beyond its types, and issue no
   syscalls — asserted by AST, not by trust.
 - `resolve.py` and `lookup.py` still import none of `compiler`, `spec`, or `recovery`; the new modules
@@ -669,23 +697,29 @@ amendment covering approval-time drift (§3.3).
     `lookup_equivalence_key` under that parent's constraints raise `ProjectApprovalRefused` naming both
     spellings.
 11. `lookup_equivalence_key` is the identity on `EXACT_BYTES` and raises `CapabilityUnavailable` on
-    every other `LookupProof` member.
+    every other member of the `LookupProof` vocabulary, the test parametrized over the enum so a new
+    member fails until its key is decided.
 12. The complete scratch set is instantiated, bound to concrete parents per §6.3.3, proved pairwise
     distinct, and each leaf is within its parent's `name_max`.
 13. The produced `RecoveryTopology` validates through `build_recovery_snapshot` for every specification
     the suite approves.
 14. `ApprovedExistingDirectory` covers exactly `ProjectRoot` and the `TopologyDirectory`s;
     `ApprovedPlannedDirectory` covers exactly `WorkRoot` and the parent `PersistentNode`s.
-15. Planned directories are keyed by `lookup_equivalence_key`, so `CreateDirectory("A")` and an effect
-    on `a/x` yield one node under an insensitive parent and two under `EXACT_BYTES`.
-16. `node_id` assignment is identical across repeated approvals of one specification.
-17. The §7.4 re-run reaches A2's verdict on every compiled input.
-18. Every exception A4b-1 raises reaches the caller as the same object, for every declared type and
+15. Planned directories are keyed by `lookup_equivalence_key`. `CreateDirectory("A")` with an effect on
+    `a/x` yields two directory nodes under `EXACT_BYTES` against a real fixture, and one under the
+    `injected_equivalence` double of §11.2 — the folding half being unreachable in production, since no
+    `LookupProof` member is both insensitive and reproducible.
+16. Neither `topology.py` nor `judgment.py` compares a raw component directly; every name comparison
+    routes through `lookup_equivalence_key`, asserted by AST rather than by the injected double, which
+    cannot distinguish the two under an identity key.
+17. `node_id` assignment is identical across repeated approvals of one specification.
+18. The §7.4 re-run reaches A2's verdict on every compiled input.
+19. Every exception A4b-1 raises reaches the caller as the same object, for every declared type and
     every load-bearing branch.
-19. `approval.py` contains no `except` clause enclosing a resolver call.
-20. No leaf frontier observation and no mount identifier appears in the retained proof; `work_base` is
+20. `approval.py` contains no `except` clause enclosing a resolver call.
+21. No leaf frontier observation and no mount identifier appears in the retained proof; `work_base` is
     the only observation retained beyond the per-node directory facts.
-21. `resolve.py` and `lookup.py` import none of `atoms.core.compiler`, `atoms.core.spec`, or
+22. `resolve.py` and `lookup.py` import none of `atoms.core.compiler`, `atoms.core.spec`, or
     `atoms.core.recovery`, and the guard covering them names exactly those two modules.
-22. No production consumer of `ProjectApprovedSpec` exists, asserted rather than assumed.
-23. Approval issues no write of any kind to project space.
+23. No production consumer of `ProjectApprovedSpec` exists, asserted rather than assumed.
+24. Approval issues no write of any kind to project space.
