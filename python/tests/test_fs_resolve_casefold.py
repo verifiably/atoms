@@ -13,6 +13,16 @@ import pytest
 from atoms.core.errors import ProjectApprovalRefused
 from atoms.fs.lookup import LookupProof, inherited_constraints, read_lookup_constraints
 from atoms.fs.resolve import PathResolver
+from tests.fs_support import CASEFOLD_ENVIRONMENT, casefold_volume_or_reason
+
+
+def test_an_explicit_empty_casefold_volume_is_an_error(monkeypatch):
+    monkeypatch.setenv(CASEFOLD_ENVIRONMENT, "")
+    assert casefold_volume_or_reason() == (
+        None,
+        "ATOMS_CASEFOLD_VOLUME='' is not a directory",
+        True,
+    )
 
 
 def test_the_folded_directory_really_folds(mixed_policy):

@@ -472,11 +472,13 @@ def casefold_volume_or_reason() -> tuple[Path | None, str, bool]:
     nothing is worse than no opt-in at all.
     """
     declared = os.environ.get(CASEFOLD_ENVIRONMENT)
-    if not declared:
+    if declared is None:
         return None, (
             f"{CASEFOLD_ENVIRONMENT} is unset; see the A4b-1 design §9.4 for the "
             "one-time setup recipe"
         ), False
+    if declared == "":
+        return None, f"{CASEFOLD_ENVIRONMENT}={declared!r} is not a directory", True
     base = Path(declared)
     if not base.is_dir():
         return None, f"{CASEFOLD_ENVIRONMENT}={declared!r} is not a directory", True

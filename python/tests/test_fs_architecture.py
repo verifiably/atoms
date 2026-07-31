@@ -53,7 +53,7 @@ def _core_package(source_path: Path) -> str:
     return ".".join(source_path.relative_to(source_root).parent.parts)
 
 
-def _imports_filesystem_layer(tree: ast.Module, *, package: str) -> bool:
+def _resolved_imports(tree: ast.Module, *, package: str) -> set[str]:
     targets: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -73,7 +73,14 @@ def _imports_filesystem_layer(tree: ast.Module, *, package: str) -> bool:
             for alias in node.names
             if alias.name != "*"
         )
-    return any(target == "atoms.fs" or target.startswith("atoms.fs.") for target in targets)
+    return targets
+
+
+def _imports_filesystem_layer(tree: ast.Module, *, package: str) -> bool:
+    return any(
+        target == "atoms.fs" or target.startswith("atoms.fs.")
+        for target in _resolved_imports(tree, package=package)
+    )
 
 
 @pytest.mark.parametrize(
@@ -462,22 +469,30 @@ FORBIDDEN_FOR_RESOLUTION = (
 )
 
 
+def _imports_forbidden_resolution(tree: ast.Module, *, package: str) -> bool:
+    return any(
+        name.startswith(forbidden)
+        for name in _resolved_imports(tree, package=package)
+        for forbidden in FORBIDDEN_FOR_RESOLUTION
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from atoms.core import compiler",
+        "from ..core import recovery",
+    ],
+)
+def test_resolution_import_scanner_detects_imported_aliases_and_relatives(source):
+    assert _imports_forbidden_resolution(ast.parse(source), package="atoms.fs")
+
+
 @pytest.mark.parametrize("module_name", ["resolve", "lookup"])
 def test_resolution_modules_judge_no_specification(module_name):
     """A dependency on any of these would mean the mechanism had begun judging."""
     source = (SOURCE_ROOT / "fs" / f"{module_name}.py").read_text()
-    tree = ast.parse(source)
-    imported = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.module:
-            imported.add(node.module)
-        elif isinstance(node, ast.Import):
-            imported.update(alias.name for alias in node.names)
-    assert not any(
-        name.startswith(forbidden)
-        for name in imported
-        for forbidden in FORBIDDEN_FOR_RESOLUTION
-    )
+    assert not _imports_forbidden_resolution(ast.parse(source), package="atoms.fs")
 
 
 @pytest.mark.parametrize("name", ["PathResolver", "read_lookup_constraints"])
@@ -500,34 +515,191 @@ def test_no_blanket_oserror_handler(module_name):
         )
         for entry in names:
             if isinstance(entry, ast.Name) and entry.id == "OSError":
-                handler = ast.Module(body=node.body, type_ignores=[])
-                body = ast.dump(handler)
-                delegates = (
-                    node.name is not None
-                    and any(
-                        isinstance(call, ast.Call)
-                        and isinstance(call.func, ast.Attribute)
-                        and call.func.attr == "_frontier_from"
-                        and any(
-                            isinstance(argument, ast.Name)
-                            and argument.id == node.name
-                            for argument in call.args
-                        )
-                        for call in ast.walk(handler)
-                    )
-                )
-                assert "errno" in body or delegates, (
+                assert _oserror_handler_discriminates(node), (
                     f"{module_name}.py catches OSError without discriminating on errno "
                     "or passing the caught object to _frontier_from"
                 )
 
 
-def test_the_backend_protocol_gained_no_method():
+def _handler_nodes(handler: ast.ExceptHandler):
+    stack: list[ast.AST] = list(reversed(handler.body))
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
+        stack.extend(reversed(list(ast.iter_child_nodes(node))))
+
+
+def _oserror_handler_discriminates(handler: ast.ExceptHandler) -> bool:
+    if handler.name is None:
+        return False
+    nodes = list(_handler_nodes(handler))
+    delegates = any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_frontier_from"
+        and any(
+            isinstance(argument, ast.Name) and argument.id == handler.name
+            for argument in node.args
+        )
+        for node in nodes
+    )
+    errno_controls_branch = any(
+        isinstance(node, (ast.If, ast.IfExp))
+        and isinstance(node.test, ast.Compare)
+        and any(
+            isinstance(part, ast.Attribute)
+            and isinstance(part.value, ast.Name)
+            and part.value.id == handler.name
+            and part.attr == "errno"
+            for part in ast.walk(node.test)
+        )
+        for node in nodes
+    )
+    return delegates or errno_controls_branch
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        (
+            (
+                "try:\n"
+                "    pass\n"
+                "except OSError as caught:\n"
+                "    if caught.errno == 2:\n"
+                "        raise\n"
+            ),
+            True,
+        ),
+        (
+            (
+                "try:\n"
+                "    pass\n"
+                "except OSError as caught:\n"
+                "    return self._frontier_from(caught)\n"
+            ),
+            True,
+        ),
+        (
+            (
+                "try:\n"
+                "    pass\n"
+                "except OSError as caught:\n"
+                "    caught.errno\n"
+                "    raise\n"
+            ),
+            False,
+        ),
+        (
+            (
+                "try:\n"
+                "    pass\n"
+                "except OSError as caught:\n"
+                "    raise RuntimeError('errno')\n"
+            ),
+            False,
+        ),
+    ],
+)
+def test_oserror_guard_requires_control_flow_or_delegation(source, expected):
+    handler = next(
+        node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.ExceptHandler)
+    )
+    assert _oserror_handler_discriminates(handler) is expected
+
+
+def test_the_backend_protocol_and_revision_are_exact():
     from atoms.fs.backend import Backend
     from atoms.fs.platform import BACKEND_REVISION
 
     assert BACKEND_REVISION == "linux-1"
-    assert not hasattr(Backend, "read_lookup_constraints")
+    assert {
+        name
+        for name, member in inspect.getmembers(Backend, inspect.isfunction)
+        if not name.startswith("__")
+    } == {
+        "exchange",
+        "flush_directory",
+        "flush_file",
+        "link_anchor",
+        "lock_exclusive",
+        "open_child_directory",
+        "open_regular_nofollow",
+        "open_root",
+        "symlink_fingerprint",
+        "transfer_noclobber",
+        "try_lock_exclusive",
+    }
+
+
+_CONDITIONAL_EXECUTION = (
+    ast.If,
+    ast.IfExp,
+    ast.BoolOp,
+    ast.For,
+    ast.AsyncFor,
+    ast.While,
+    ast.ListComp,
+    ast.SetComp,
+    ast.DictComp,
+    ast.GeneratorExp,
+    ast.comprehension,
+    ast.Match,
+    ast.Lambda,
+)
+
+
+def _conditional_ancestors(root: ast.AST, target: ast.AST) -> list[ast.AST]:
+    parents = {
+        child: parent
+        for parent in ast.walk(root)
+        for child in ast.iter_child_nodes(parent)
+    }
+    guarded: list[ast.AST] = []
+    node = target
+    while (parent := parents.get(node)) is not None:
+        if isinstance(parent, _CONDITIONAL_EXECUTION):
+            guarded.append(parent)
+        node = parent
+    return guarded
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            "def _facts_for():\n"
+            "    return ready and read_lookup_constraints(fd, filesystem)\n"
+        ),
+        (
+            "def _facts_for():\n"
+            "    for unused in ():\n"
+            "        read_lookup_constraints(fd, filesystem)\n"
+        ),
+        (
+            "def _facts_for():\n"
+            "    return [item for item in () if "
+            "read_lookup_constraints(fd, filesystem)]\n"
+        ),
+    ],
+)
+def test_constraint_read_guard_catches_missed_conditional_mutations(source):
+    tree = ast.parse(source)
+    facts_for = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_facts_for"
+    )
+    read = next(
+        node
+        for node in ast.walk(facts_for)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "read_lookup_constraints"
+    )
+    assert _conditional_ancestors(facts_for, read)
 
 
 def test_the_memo_never_shortcuts_the_constraints_read():
@@ -552,11 +724,5 @@ def test_the_memo_never_shortcuts_the_constraints_read():
         and node.func.id == "read_lookup_constraints"
     ]
     assert len(reads) == 1
-    guarded = [
-        node
-        for branch in ast.walk(facts_for)
-        if isinstance(branch, (ast.If, ast.IfExp))
-        for node in ast.walk(branch)
-        if node in reads
-    ]
+    guarded = _conditional_ancestors(facts_for, reads[0])
     assert guarded == [], "read_lookup_constraints must not sit behind a memo branch"
