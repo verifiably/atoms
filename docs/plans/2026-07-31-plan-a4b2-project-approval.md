@@ -383,9 +383,12 @@ def generated_specifications():
     input to this layer.
 
     `product`, not `permutations`: a candidate may repeat. `permutations` draws without
-    replacement and so silently omits every sequence that touches one path twice with the
-    same variant -- including create -> delete -> create, which A2 admits and which is
-    exactly the ancestor-type churn ledger entry #3 is about. That is 16 sequences.
+    replacement and so silently omits every sequence that uses one candidate twice -- the
+    multi-touch timelines, where a path is created, deleted, and created again, or appears
+    as a move endpoint between two direct touches. That is 16 sequences: 10 cf/rm
+    alternations and 6 involving a move. None contains a CreateDirectory, because a
+    repeated `mk` on one path does not compile, so this recovers longer per-path timelines
+    rather than new ancestor shapes.
     """
     pool = [
         (tag, path)
@@ -2784,10 +2787,15 @@ def test_work_base_facts_is_called_exactly_when_a_directory_is_created(
 ):
     """Criterion 7 says *iff*, which is two claims, and `proof.work_base is None` proves
     only the weaker one. An implementation that observed the work base and then discarded
-    the observation would satisfy that assertion while still issuing the I/O the criterion
-    forbids — and that I/O is not free: it opens `metadata_root/work`, which A5 has not yet
-    created at this point in the lifecycle. Counting on the method fails on the call rather
-    than on the value.
+    the observation would satisfy that assertion while still issuing the call the criterion
+    forbids. Counting on the method fails on the call rather than on the value.
+
+    The call must be skipped rather than merely ignored for the reason design §6.2 step 7
+    gives, inherited from A4b-1 §6.6: `work_base_facts` can refuse — an unapprovable or
+    over-constrained `work/` raises — and a specification with no `CreateDirectory` has no
+    stake in the work namespace and must not be refused by it. (`metadata_root/work` itself
+    always exists by this point: A4a's `ensure_metadata_layout` creates it at bind time,
+    `bootstrap.py:11`. What is absent is `work/<txid>`, which A5 creates.)
 
     Patched on the class, not the instance: approval constructs its own `PathResolver`, so
     a test never holds the instance to patch.
@@ -3232,29 +3240,36 @@ verification reference dropped with A3's clause:
 ```
 
 **Replace** the "Discharged obligations" section — currently the "None yet" paragraph — with this,
-keeping that paragraph's second sentence, which is still true:
+keeping that paragraph's second sentence, which is still true. Every cell through "Verification" is the
+row's original text, carried over unchanged: the ledger is the authority on what each obligation
+*required*, and the suite is evidence that the requirement was met, not a restatement of it. The three
+appended columns are the discharge record.
 
 ```markdown
 ## Discharged obligations
 
-| # | Admitted shape | Admitted by | Discharged by | Date | Verification suite |
-| --- | --- | --- | --- | --- | --- |
-| 2 | Two declared paths distinct under A2's whole-path portability key may still name one entry | A2 phase 4 | A4b-2 | 2026-07-31 | `tests/test_fs_judgment.py` |
-| 4 | Path and component lengths are unbounded | A2 phase 3 | A4b-1, A4b-2 | 2026-07-31 | `tests/test_fs_resolve_walk.py`, `tests/test_fs_judgment.py`, `tests/test_fs_approval.py` |
-| 5 | Paths are stored verbatim; no resolution or containment is performed | A2 (whole) | A4b-1 | 2026-07-31 | `tests/test_fs_resolve_walk.py`, `tests/test_fs_resolve_conformance.py` |
-| 6 | A required-capability set is derived but never checked against a backend | A2 §3 | A4b-2 | 2026-07-31 | `tests/test_fs_approval.py` |
-| 9 | `CompiledSpec` proves only A2's pure lexical/model rules and carries no project/root approval | A2 boundary | A4b-2 | 2026-07-31 | `tests/test_fs_approval.py`, `tests/test_fs_architecture.py` |
-| 10 | A2's exact-spelling tree may differ from the tree after actual per-directory name equivalence is resolved (`A` versus `a/x`) | A2 phases 4, 12–13 | A3, A4b-2 | 2026-07-31 | `tests/test_fs_topology.py` |
-| 11 | A2 proves scratch grammar separation and fixed NFC/casefold effect-ID uniqueness, but not the actual distinctness of every instantiated effect/role leaf in its concrete parent | A1 §5.1, A2 phases 3 and 6 | A4b-2 | 2026-07-31 | `tests/test_fs_judgment.py` |
-| 16 | `VolumeEvidence` is a detached frozen value describing a volume, and authorizes no access to it | A4a binding contract | A4b-2 | 2026-07-31 | `tests/test_fs_approval.py`, `tests/test_fs_architecture.py` |
-| 20 | A4b-1 refuses by raising, and nothing forces A4b-2 to surface those refusals rather than catching them | A4b-1/A4b-2 seam | A4b-2 | 2026-07-31 | `tests/test_fs_approval.py`, `tests/test_fs_architecture.py` |
+| # | Admitted shape | Admitted by | First owner | Required behavior | Verification | Discharged by | Date | Suite |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 2 | Two declared paths distinct under A2's whole-path portability key may still name one entry | A2 phase 4 | A4b | As part of `approve_for_project`, prove endpoint distinctness against each **parent directory's** actual lookup policy, covering `ABSENT`-declared paths, before any capture or mutation; successful A2 compilation is not sufficient | §13.3 surface 3 | A4b-2 | 2026-07-31 | `tests/test_fs_judgment.py` |
+| 4 | Path and component lengths are unbounded | A2 phase 3 | A4b | As part of `approve_for_project`, refuse actual-filesystem `NAME_MAX` / `PATH_MAX` violations before capture and before any transaction-record or blob write; the limits are per-filesystem and not lexically decidable | §5.4, §13.2 | A4b-2 | 2026-07-31 | `tests/test_fs_resolve_walk.py`, `tests/test_fs_judgment.py`, `tests/test_fs_approval.py`, `tests/test_fs_approval_conformance.py` |
+| 5 | Paths are stored verbatim; no resolution or containment is performed | A2 (whole) | A4b | Ancestor-resolved, leaf-retaining containment inside the project root, and metadata-root exclusion by `st_dev`/`st_ino` rather than spelling | §13.3 surfaces 1–2 | A4b-2 | 2026-07-31 | `tests/test_fs_resolve_walk.py`, `tests/test_fs_resolve_conformance.py`, `tests/test_fs_approval_conformance.py` |
+| 6 | A required-capability set is derived but never checked against a backend | A2 §3 | A4b | A4a supplies the mechanism only — it probes the volume and reports the supplied capability set without judging it, and must **not** refuse merely because an optional capability is absent, which would break progressive capability support. A4b holds the exact `CompiledSpec` required set and is the sole adjudicator of "required ⊆ supplied", refusing before any transaction-record write or project mutation; the §5.5 bootstrap is exempt and precedes it | §13.2 | A4b-2 | 2026-07-31 | `tests/test_fs_approval.py` |
+| 9 | `CompiledSpec` proves only A2's pure lexical/model rules and carries no project/root approval | A2 boundary | A4b | Define frozen, factory-controlled `ProjectApprovedSpec` composed with the exact `CompiledSpec`; construct it only through `approve_for_project`, make ordinary construction and `dataclasses.replace` refuse, and require A5–A8 to accept this proof rather than raw `TransactionSpec`, raw `CompiledSpec`, or an A3 synthetic model snapshot | §5.4, §13.3 | A4b-2 | 2026-07-31 | `tests/test_fs_approval.py`, `tests/test_fs_architecture.py` |
+| 10 | A2's exact-spelling tree may differ from the tree after actual per-directory name equivalence is resolved (`A` versus `a/x`) | A2 phases 4, 12–13 | A3, A4b | A3 defines the pure logical topology shape; A4b builds and retains its production instance, re-runs surface-tree consistency and created-directory-before-descendant ordering over resolved nodes, and supplies it to A3 through `ProjectApprovedSpec` rather than allowing A3 to substitute the lexical tree | §5.4, §13.1, §13.3 surface 3 | A3, A4b-2 | 2026-07-31 | `tests/test_fs_topology.py`, `tests/test_fs_approval_conformance.py` |
+| 11 | A2 proves scratch grammar separation and fixed NFC/casefold effect-ID uniqueness, but not the actual distinctness of every instantiated effect/role leaf in its concrete parent | A1 §5.1, A2 phases 3 and 6 | A4b | Instantiate the complete scratch-name set and prove it pairwise distinct under each actual parent policy before issuing `ProjectApprovedSpec`; an intrinsic collision refuses approval and txid regeneration is not a remedy | §5.4, §13.3 surface 4 | A4b-2 | 2026-07-31 | `tests/test_fs_judgment.py` |
+| 16 | `VolumeEvidence` is a detached frozen value describing a volume, and authorizes no access to it | A4a binding contract | A4b | `ProjectApprovedSpec` retains the live `ProjectBinding` or equivalent held descriptors; it may not authorize filesystem access from detached evidence, and an architecture test asserts the retained binding is present | §13.3 | A4b-2 | 2026-07-31 | `tests/test_fs_approval.py`, `tests/test_fs_architecture.py` |
+| 20 | A4b-1 refuses by raising, and nothing forces A4b-2 to surface those refusals rather than catching them | A4b-1/A4b-2 seam | A4b-2 | `approve_for_project` catches no exception raised by A4b-1. The requirement is categorical rather than an enumeration, which would drift as A4b-1's error contract grows; propagation tests cover every declared exception type — `ProjectApprovalRefused`, `PreconditionRefused`, `CapabilityUnavailable`, `ProtocolError`, bare `OSError` — and each load-bearing branch producing one | §5.4, §13.3 | A4b-2 | 2026-07-31 | `tests/test_fs_approval.py`, `tests/test_fs_architecture.py` |
 
 A1's admissions were all discharged by A2; they are listed in that plan's self-review rather than
 duplicated here.
 ```
 
-The "Required behavior" column is not carried over: for a discharged entry the behavior is whatever the
-suite in the last column asserts, and a frozen restatement beside it would drift.
+Two "Discharged by" cells differ from "First owner". #10's first owner is `A3, A4b`, and A3's half
+landed with A3, so both are named. #4 and #5 are discharged by **A4b-2**, not A4b-1, per design §12 and
+§6.2: A4b-1 supplies the mechanism inside `resolve()`, but nothing calls it on a `CompiledSpec` until
+phase B walks `compiled.timelines`, and that is where the obligation is actually met. Their suites name
+both layers' tests for the same reason, `test_fs_approval_conformance.py` included — that is where the
+`NAME_MAX`, `PATH_MAX`, and nested-metadata-root refusals are exercised through `approve_for_project`.
 
 - [ ] **Step 5: Run every gate**
 
@@ -3358,7 +3373,7 @@ build a topology A3 accepts and pass the re-run, in 3.6 seconds. Bounded and det
 flake, and a failure reproduces from its label. The named corpus stays for readable failure messages.
 The enumeration is `itertools.product`, not `permutations`: drawing without replacement omitted the 16
 sequences that touch one path twice with the same variant, `cf:a | rm:a | cf:a` among them — precisely
-the ancestor-type churn of ledger entry #3. The count is asserted exactly, because the former
+the multi-touch timelines. The count is asserted exactly, because the former
 `checked == compiled_count` could not fail and `> 4000` would survive losing a whole variant.
 
 **Every expected value in this round was executed before it was written down.** The extracted modules
@@ -3411,10 +3426,13 @@ and exiting its context manager does not close it. Measured — 500 calls over a
 descriptors open. The helper closes explicitly in a `finally`.
 
 **The property was drawing without replacement.** `itertools.permutations` cannot emit a sequence that
-uses one candidate twice, so the matrix silently omitted all 16 A2-admitted sequences that touch one
-path twice with the same variant — `cf:a | rm:a | cf:a` and its siblings, which is exactly the
-ancestor-type churn ledger entry #3 describes. `product` raises the matrix from 4825 to 4841; all 16 pass
-A3 and the re-run, so this was a coverage hole rather than a hidden defect. The count is now asserted
+uses one candidate twice, so the matrix silently omitted all 16 A2-admitted multi-touch timelines —
+`cf:a | rm:a | cf:a` and its siblings, 10 create/delete/recreate alternations and 6 where a path is a
+move endpoint between two direct touches. They are *not* ledger entry #3's ancestor-type churn: none
+contains a `CreateDirectory`, since a repeated `mk` on one path does not compile, and #3's
+file-to-directory sequences use three distinct candidates and so were already covered. `product` raises
+the matrix from 4825 to 4841; all 16 pass A3 and the re-run, so this was a coverage hole in per-path
+timeline depth rather than a hidden defect or a missing ancestor shape. The count is now asserted
 exactly: `checked == compiled_count` could not fail, since nothing between the two increments can skip,
 and `> 4000` would have survived losing a whole variant.
 
@@ -3425,9 +3443,13 @@ the dict as `dict[str, TopologyNode]` clears both, and is the honest description
 
 **The ledger step now contains the ledger.** It named no file and left the implementer to reconstruct
 row #3's narrowing and a table that does not yet exist. Both are written out verbatim, and every copied
-cell was diffed against the current ledger. The discharged table drops the "Required behavior" column:
-for a discharged entry the behavior is whatever its suite asserts, and a frozen restatement beside it
-would drift.
+cell was diffed against the current ledger. The discharged table carries every original column through
+"Verification" unchanged and appends three: dropping "Required behavior" in favour of the suite would
+have inverted the repository's authority order, since the ledger defines what was required and the
+suite is only evidence that it was met. The discharge record also corrects the owners: #4 and #5 are
+A4b-2's, per design §12 and §6.2 — A4b-1 supplies the mechanism inside `resolve()`, but the obligation
+is met where phase B walks `compiled.timelines`, and `test_fs_approval_conformance.py` is where those
+refusals are exercised through `approve_for_project`.
 
 **Placeholder scan.** Clean — no TBD, no "similar to Task N", no step that describes without showing,
 no test whose body is a shape to be finished later. `EXT4` is no longer redefined in Task 2; it has
