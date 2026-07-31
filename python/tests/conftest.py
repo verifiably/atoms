@@ -507,3 +507,18 @@ def mixed_policy(casefold_project_root):
             "The volume is probably not formatted with -O casefold."
         )
     return plain, folded
+
+
+@pytest.fixture
+def approval_context(ext4_bound_volume):
+    """A ProjectContext over a real ext4 binding, with a fixed txid."""
+    import contextlib
+
+    from atoms.fs.approval import ProjectContext
+
+    @contextlib.contextmanager
+    def build(txid: str = "tx01", withhold=frozenset()):
+        with ext4_bound_volume(withhold=withhold) as binding:
+            yield ProjectContext(binding=binding, txid=txid), binding
+
+    return build
