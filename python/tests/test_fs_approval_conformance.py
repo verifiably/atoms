@@ -113,7 +113,10 @@ def _tree_snapshot(root_fd: int, path: str = ".") -> dict[str, tuple]:
     """
     fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=root_fd)
     try:
-        snapshot: dict[str, tuple] = {}
+        info = os.fstat(fd)
+        snapshot: dict[str, tuple] = {
+            path: (True, info.st_mode, info.st_size, info.st_ino, info.st_mtime_ns)
+        }
         with os.scandir(fd) as items:
             for entry in items:
                 relative = f"{path}/{entry.name}"
