@@ -32,10 +32,13 @@ a stated required behavior.
 | 22 | `promote_staging` returns only after the promoted blobs are durable, but nothing binds that call to the `COMMIT` that references the digests | A5a store contract | A5b | Enforce §7.3's cross-substrate rule — every blob a record references is durable on the filesystem before the COMMIT that references it — and prove it by a fresh-process test that a committed record never names a missing blob | §7.3, §13.4 |
 
 A shape no sub-plan will ever own is not an admitted shape either. A5a opens the database by verified
-path rather than by held descriptor, leaving an ancestor substituted between verification and SQLite's
-open undefended; the authority states that as its cooperating-process assumption (§7) and names the
-optional hardened VFS as the remedy, so the A5a design records it as a threat-model limitation rather
-than an entry with a fictional owner.
+path rather than by held descriptor, so it defends against neither an ancestor of `metadata_root` nor
+any of `atoms.db`, `atoms.db-wal`, `atoms.db-shm`, and `atoms.db-journal` being substituted between
+verification and SQLite's open — the leaf preflight is a time-of-check operation with the same window as
+the ancestor check. The authority states this as its cooperating-process assumption (§7), amended to
+name the four database entries alongside the ancestors, and names the optional hardened VFS as the
+remedy, so the A5a design records it as a threat-model limitation rather than an entry with a fictional
+owner.
 
 A fail-closed platform is not an admitted shape. A4b-1's refusal of XFS, Btrfs, and ext4 casefold
 directories admits nothing and therefore has no entry here; the A4b-1 design records those as
