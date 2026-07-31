@@ -29,12 +29,13 @@ Plan B is written only after Plan A's interfaces settle.
   explicit `HeldProjectLock`, the empirical capability probe, and `bind_project_volume`.
   `CERTIFIED_ALLOWLIST` ships empty, so production binding refuses every volume until A8
   crash-certifies a configuration tuple.
-- **A4b — rooted project approval: A4b-1 implemented, A4b-2 unimplemented.** A4b-1 owns the
-  resolution mechanism in `atoms/fs/resolve.py` and `atoms/fs/lookup.py` — `PathResolver`,
+- **A4b — rooted project approval: A4b-1 implemented, A4b-2 designed and unimplemented.** A4b-1 owns
+  the resolution mechanism in `atoms/fs/resolve.py` and `atoms/fs/lookup.py` — `PathResolver`,
   lookup-constraint reading, real-filesystem limits, containment, and mount membership — and sees no
   `CompiledSpec`.
   A4b-2 owns the judgment: `approve_for_project`,
   `ProjectApprovedSpec`, and ledger entries #2, #3 (its part), #4, #5, #6, #9, #10, #11, #16, and #20.
+  It admits #21, the txid binding, owned by A5.
   A4b-1 approves only non-casefold ext4; XFS, Btrfs, and casefold directories fail closed.
 
 Work lives under `python/` (`uv run pytest`, `uv run ruff check`, `uv run pyright`, all from
