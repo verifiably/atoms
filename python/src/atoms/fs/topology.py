@@ -11,8 +11,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from atoms.core.compiler import CompiledSpec
-from atoms.core.effects import CreateDirectory, MoveNoClobber
+from atoms.core.effects import CreateDirectory, MoveNoClobber, occurrences
 from atoms.core.errors import ProjectApprovalRefused, ProtocolError
+from atoms.core.fingerprint import AbsentState, DirectoryState
 from atoms.core.recovery import (
     PersistentNode,
     ProjectRoot,
@@ -316,3 +317,64 @@ def _scratch_edges(
         anchor = effect.source if isinstance(effect, MoveNoClobber) else effect.path
         edges.append(TopologyParent(node=node, parent=parent_by_path[anchor]))
     return edges
+
+
+def require_resolved_surface_and_ordering(
+    compiled: CompiledSpec, resolved: ResolvedTopology
+) -> None:
+    """Re-derive A2's surface and ordering rules from resolved parentage.
+
+    Authority §5.4 forbids reusing A2's lexical verdict, and gives the reason: on an
+    insensitive parent, declared `A` and declared descendant `a/x` do not collide as
+    endpoints yet `A` is genuinely the ancestor of `a/x`.
+    """
+    # Annotated rather than inferred: the values are inserted as PersistentNode, but every
+    # lookup below feeds them to a map that is also queried with parent nodes, and a parent
+    # may be ProjectRoot. Without the annotation pyright infers dict[str, PersistentNode]
+    # and reports the two `.get(ancestor)` calls as reportArgumentType.
+    node_by_path: dict[str, TopologyNode] = {
+        entry.path: PersistentNode(entry.path) for entry in resolved.paths
+    }
+    parent_by_node = {edge.node: edge.parent for edge in resolved.topology.parents}
+
+    for label in ("initial_surface", "final_surface"):
+        states = {
+            node_by_path[entry.path]: entry.state
+            for entry in getattr(compiled.spec, label)
+        }
+        for node, state in states.items():
+            ancestor = parent_by_node.get(node)
+            while ancestor is not None:
+                blocker = states.get(ancestor)
+                # An ABSENT ancestor blocks exactly as a file does: A2's phase 12 sets its
+                # trie constraint from any declared state that is not a DirectoryState,
+                # absence included, so omitting it here would admit what A2 refuses.
+                if (
+                    blocker is not None
+                    and not isinstance(blocker, DirectoryState)
+                    and not isinstance(state, AbsentState)
+                ):
+                    raise ProjectApprovalRefused(
+                        f"{label} places {node!r} beneath {ancestor!r}, which is "
+                        f"{type(blocker).__name__} and cannot contain entries; "
+                        "the descendant must be declared absent"
+                    )
+                ancestor = parent_by_node.get(ancestor)
+
+    creators = {
+        node_by_path[effect.path]: index
+        for index, effect in enumerate(compiled.spec.effects)
+        if isinstance(effect, CreateDirectory)
+    }
+    for index, effect in enumerate(compiled.spec.effects):
+        for occurrence in occurrences(effect):
+            ancestor = parent_by_node.get(node_by_path[occurrence.path])
+            while ancestor is not None:
+                creator = creators.get(ancestor)
+                if creator is not None and creator >= index:
+                    raise ProjectApprovalRefused(
+                        f"effect {effect.effect_id!r} touches {occurrence.path!r} "
+                        f"beneath a directory this transaction creates at effect "
+                        f"{creator}; creation must come first"
+                    )
+                ancestor = parent_by_node.get(ancestor)
