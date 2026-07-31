@@ -12,7 +12,7 @@ from atoms.fs.lock import acquire_project_lock
 from atoms.fs.volume import StorageProfile
 from tests.fs_support import (
     build_test_allowlist,
-    descriptor_count,  # noqa: F401 - later resolver tasks consume this shared fixture support.
+    casefold_volume_or_reason,
     ext4_volume_or_skip_reason,
     find_distinct_mount,
     make_bound_volume,
@@ -378,3 +378,53 @@ def resolver_after_lock_release(
     with binding:
         assert binding.active and not lock.held
         yield resolver
+
+
+@pytest.fixture
+def casefold_volume():
+    base, reason, is_error = casefold_volume_or_reason()
+    if base is None:
+        if is_error:
+            pytest.fail(reason)
+        pytest.skip(reason)
+    with tempfile.TemporaryDirectory(dir=base) as directory:
+        yield Path(directory)
+
+
+@pytest.fixture
+def casefold_project_root(casefold_volume):
+    return make_project_root(casefold_volume)
+
+
+@pytest.fixture
+def casefold_bound_volume(casefold_project_root, casefold_volume, test_storage_profile):
+    return make_bound_volume(
+        make_fake_backend(),
+        casefold_project_root,
+        make_metadata_root(casefold_volume),
+        test_storage_profile,
+    )
+
+
+@pytest.fixture
+def mixed_policy(casefold_project_root):
+    """A folded directory and a plain sibling inside one project root.
+
+    Both live under the project root rather than beside it, so a PathResolver bound to
+    that root can be asked about each — which is the assertion the tier exists for.
+    """
+    import subprocess
+
+    plain = casefold_project_root / "plain"
+    folded = casefold_project_root / "folded"
+    plain.mkdir()
+    folded.mkdir()
+    completed = subprocess.run(
+        ["chattr", "+F", str(folded)], capture_output=True, text=True, check=False
+    )
+    if completed.returncode != 0:
+        pytest.fail(
+            f"chattr +F failed on {folded}: {completed.stderr.strip()}. "
+            "The volume is probably not formatted with -O casefold."
+        )
+    return plain, folded

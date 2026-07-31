@@ -15,6 +15,8 @@ from atoms.fs import platform as fs_platform
 from atoms.fs.volume import CERTIFIED_ALLOWLIST, DurabilityAllowlist
 from tests.architecture_support import fixture_names, unregistered_test_arguments
 
+SOURCE_ROOT = Path(__file__).parents[1] / "src" / "atoms"
+
 _CORE_IMPORT_ALLOWLIST = {
     "__future__",
     "atoms",
@@ -451,3 +453,110 @@ def test_fs_fixture_registry_still_catches_a_genuine_omission(tmp_path):
     assert unregistered_test_arguments(tmp_path, set(), "test_fs_*.py") == {
         "nonexistent_fixture"
     }
+
+
+FORBIDDEN_FOR_RESOLUTION = (
+    "atoms.core.compiler",
+    "atoms.core.spec",
+    "atoms.core.recovery",
+)
+
+
+@pytest.mark.parametrize("module_name", ["resolve", "lookup"])
+def test_resolution_modules_judge_no_specification(module_name):
+    """A dependency on any of these would mean the mechanism had begun judging."""
+    source = (SOURCE_ROOT / "fs" / f"{module_name}.py").read_text()
+    tree = ast.parse(source)
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module)
+        elif isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+    assert not any(
+        name.startswith(forbidden)
+        for name in imported
+        for forbidden in FORBIDDEN_FOR_RESOLUTION
+    )
+
+
+@pytest.mark.parametrize("name", ["PathResolver", "read_lookup_constraints"])
+def test_resolution_internals_are_not_exported(name):
+    import atoms.fs as package
+
+    assert name not in package.__all__
+    assert not hasattr(package, name)
+
+
+@pytest.mark.parametrize("module_name", ["resolve", "lookup"])
+def test_no_blanket_oserror_handler(module_name):
+    """Every OSError handler either discriminates or delegates to the discriminator."""
+    source = (SOURCE_ROOT / "fs" / f"{module_name}.py").read_text()
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.ExceptHandler) or node.type is None:
+            continue
+        names = (
+            [node.type] if not isinstance(node.type, ast.Tuple) else list(node.type.elts)
+        )
+        for entry in names:
+            if isinstance(entry, ast.Name) and entry.id == "OSError":
+                handler = ast.Module(body=node.body, type_ignores=[])
+                body = ast.dump(handler)
+                delegates = (
+                    node.name is not None
+                    and any(
+                        isinstance(call, ast.Call)
+                        and isinstance(call.func, ast.Attribute)
+                        and call.func.attr == "_frontier_from"
+                        and any(
+                            isinstance(argument, ast.Name)
+                            and argument.id == node.name
+                            for argument in call.args
+                        )
+                        for call in ast.walk(handler)
+                    )
+                )
+                assert "errno" in body or delegates, (
+                    f"{module_name}.py catches OSError without discriminating on errno "
+                    "or passing the caught object to _frontier_from"
+                )
+
+
+def test_the_backend_protocol_gained_no_method():
+    from atoms.fs.backend import Backend
+    from atoms.fs.platform import BACKEND_REVISION
+
+    assert BACKEND_REVISION == "linux-1"
+    assert not hasattr(Backend, "read_lookup_constraints")
+
+
+def test_the_memo_never_shortcuts_the_constraints_read():
+    """A structural guard on §6.5's rule.
+
+    The behavioural tests in the walk suite can only fail once someone reintroduces
+    the shortcut; this one names the shape, so the reason survives a refactor. The
+    memo lookup must not gate the read_lookup_constraints call.
+    """
+    source = (SOURCE_ROOT / "fs" / "resolve.py").read_text()
+    tree = ast.parse(source)
+    facts_for = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_facts_for"
+    )
+    reads = [
+        node
+        for node in ast.walk(facts_for)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "read_lookup_constraints"
+    ]
+    assert len(reads) == 1
+    guarded = [
+        node
+        for branch in ast.walk(facts_for)
+        if isinstance(branch, (ast.If, ast.IfExp))
+        for node in ast.walk(branch)
+        if node in reads
+    ]
+    assert guarded == [], "read_lookup_constraints must not sit behind a memo branch"

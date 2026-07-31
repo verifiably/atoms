@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import errno as _errno
 import os
+import shutil
 from pathlib import Path
 
 from atoms.core.capabilities import Capability
@@ -458,3 +459,32 @@ def find_distinct_mount(base):
         finally:
             os.close(fd)
     return None
+
+
+CASEFOLD_ENVIRONMENT = "ATOMS_CASEFOLD_VOLUME"
+
+
+def casefold_volume_or_reason() -> tuple[Path | None, str, bool]:
+    """Resolve the opt-in casefold volume.
+
+    Returns (path, reason, is_error). An unset variable skips; an explicitly supplied
+    variable that does not work is an error, because an opt-in that silently does
+    nothing is worse than no opt-in at all.
+    """
+    declared = os.environ.get(CASEFOLD_ENVIRONMENT)
+    if not declared:
+        return None, (
+            f"{CASEFOLD_ENVIRONMENT} is unset; see the A4b-1 design §9.4 for the "
+            "one-time setup recipe"
+        ), False
+    base = Path(declared)
+    if not base.is_dir():
+        return None, f"{CASEFOLD_ENVIRONMENT}={declared!r} is not a directory", True
+    found = _filesystem_type_for(base)
+    if found != EXT4:
+        return None, (
+            f"{CASEFOLD_ENVIRONMENT}={declared!r} is {found!r}, not ext4"
+        ), True
+    if shutil.which("chattr") is None:
+        return None, "chattr is not installed; the casefold tier cannot run", True
+    return base, "", False

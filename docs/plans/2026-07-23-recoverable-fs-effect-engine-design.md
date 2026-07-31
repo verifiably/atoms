@@ -1236,6 +1236,10 @@ staging swap during rollback cannot be laundered into a false restoration.
 - **`PreconditionRefused`** — concurrent drift was detected either at capture or by validating an
   atomically displaced entry. The executor returns this refusal only after the current effect and every
   earlier effect have been restored; inability to prove that restoration becomes `TransactionHalted`.
+- **`SpecValidationError`** — a `TransactionSpec` failed A2's pure lexical/model proof. Raised by
+  `compile_spec` before any project context exists.
+- **`ProjectApprovalRefused`** — the rooted project proof failed. Raised during approval, before any
+  transaction-record or blob write and before any project mutation.
 - **`CapabilityUnavailable`** — required semantics cannot be supplied. Raised during preparation before
   project mutation.
 - **`TransactionHalted`** — the journal, live state, or rollback survivor is unattributable. The engine
