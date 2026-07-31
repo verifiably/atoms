@@ -20,7 +20,7 @@ Plan B is written only after Plan A's interfaces settle.
 - **A3 — executable recovery reference model: implemented.** The pure production authority exposes
   `build_recovery_snapshot`, `classify_recovery`, `authorize_recovery_step`,
   `reduce_recovery_plan_prefix`, and `apply_recovery_plan` with the closed recovery model, fresh-step
-  authorization, and abstract reducer. A4b and A5–A8 remain unimplemented, and no project mutation code
+  authorization, and abstract reducer. A5–A8 remain unimplemented, and no project mutation code
   has landed.
 - **A4a — capability backend and project volume binding: implemented on 2026-07-30.**
   `python/src/atoms/fs/`

@@ -395,7 +395,7 @@ def test_a4a_status_is_synchronized_across_authority_documents():
         "**A4a — capability backend and project volume binding: implemented on "
         "2026-07-30.**"
     ) in agents
-    assert "A4b and A5–A8 remain unimplemented" in agents
+    assert "A5–A8 remain unimplemented" in agents
     assert (
         "A4a mutates only engine-owned `metadata_root`, never project paths."
     ) in agents
@@ -799,6 +799,13 @@ def _forbidden_pure_imports(module_name, tree):
         )
         and name not in PURE_FS_IMPORTS[module_name]
     }
+    forbidden.update(
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+        if alias.name == "atoms.fs" or alias.name.startswith("atoms.fs.")
+    )
     if any(
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
@@ -813,6 +820,8 @@ def _forbidden_pure_imports(module_name, tree):
     "source",
     [
         "import os",
+        "import atoms.fs.lookup as lookup",
+        "import atoms.fs.resolve as resolve",
         "from atoms.fs.resolve import PathResolver",
         "from atoms.fs.syscalls import linux",
         "import atoms.corex",
@@ -1029,4 +1038,5 @@ def test_a4b_status_is_synchronized_across_authority_documents():
     root = Path(__file__).parents[2]
     agents = (root / "AGENTS.md").read_text(encoding="utf-8")
     assert "**A4b — rooted project approval: implemented on 2026-07-31.**" in agents
+    assert "A4b and A5–A8 remain unimplemented" not in agents
     assert "It admits #21, the txid binding, owned by A5." in agents
