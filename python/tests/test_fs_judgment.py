@@ -12,9 +12,15 @@ from atoms.core.effects import (
 )
 from atoms.core.errors import ProjectApprovalRefused, ProtocolError
 from atoms.core.fingerprint import DirectoryState, SymlinkState
-from atoms.fs.judgment import require_ancestors_legal
+from atoms.core.recovery import WorkRoot
+from atoms.fs.judgment import (
+    bind_scratch,
+    require_ancestors_legal,
+    require_endpoints_distinct,
+)
 from atoms.fs.resolve import EntryKind, FilesystemIdentity, PresentFrontier
 from atoms.fs.topology import build_topology
+from tests.conftest import truncate_to_eight
 from tests.fs_support import (
     EXT4,
     WORK_CONSTRAINTS,
@@ -241,3 +247,145 @@ def test_a_directory_frontier_with_a_remainder_is_a_protocol_error():
     resolved = build_topology(compiled, prefixes, EXT4, None)
     with pytest.raises(ProtocolError):
         require_ancestors_legal(compiled, prefixes, resolved)
+
+
+def test_distinct_leaves_in_one_parent_are_admitted():
+    compiled = compiled_for(
+        CreateFileNoClobber("e1", "d/one", file_state()),
+        CreateFileNoClobber("e2", "d/two", file_state()),
+    )
+    prefixes = {
+        "d/one": resolved_prefix("d/one", existing_depth=1),
+        "d/two": resolved_prefix("d/two", existing_depth=1),
+    }
+    require_endpoints_distinct(build_topology(compiled, prefixes, EXT4, None))
+
+
+def test_two_paths_colliding_in_one_parent_are_refused(injected_equivalence):
+    """Case folding cannot reach this check: two leaves fold in one parent only when
+    their whole paths fold too, and A2 phase 4 refuses that pair before approval runs.
+    A truncating relation — a real filesystem equivalence class A2's key does not
+    subsume — is what makes the check observable."""
+    injected_equivalence(truncate_to_eight)
+    compiled = compiled_for(
+        CreateFileNoClobber("e1", "d/sharedprefix-one", file_state()),
+        CreateFileNoClobber("e2", "d/sharedprefix-two", file_state()),
+    )
+    prefixes = {
+        "d/sharedprefix-one": resolved_prefix(
+            "d/sharedprefix-one", existing_depth=1
+        ),
+        "d/sharedprefix-two": resolved_prefix(
+            "d/sharedprefix-two", existing_depth=1
+        ),
+    }
+    resolved = build_topology(compiled, prefixes, EXT4, None)
+    with pytest.raises(ProjectApprovalRefused) as caught:
+        require_endpoints_distinct(resolved)
+    assert "one entry" in str(caught.value)
+
+
+def test_scratch_leaves_bind_to_their_effects_parent():
+    compiled = compiled_for(CreateFileNoClobber("e1", "d/leaf", file_state()))
+    prefixes = {"d/leaf": resolved_prefix("d/leaf", existing_depth=1)}
+    resolved = build_topology(compiled, prefixes, EXT4, None)
+    bound = bind_scratch(compiled, "tx01", resolved)
+
+    assert len(bound) == 1
+    assert bound[0].effect_id == "e1"
+    assert bound[0].leaf == ".#~tx01.e1.staging"
+    assert bound[0].parent_node == resolved.parent_of("d/leaf")
+
+
+def test_a_work_scratch_leaf_binds_to_the_work_root():
+    compiled = compiled_for(CreateDirectory("mk", "a", DirectoryState(mode=0o755)))
+    prefixes = {"a": resolved_prefix("a", existing_depth=0)}
+    resolved = build_topology(
+        compiled,
+        prefixes,
+        EXT4,
+        WORK_CONSTRAINTS,
+    )
+    bound = bind_scratch(compiled, "tx01", resolved)
+    assert bound[0].parent_node == WorkRoot()
+    assert bound[0].leaf == ".#~tx01.mk.work"
+
+
+def test_a_scratch_leaf_over_its_parents_name_max_is_refused():
+    compiled = compiled_for(CreateFileNoClobber("e1", "d/leaf", file_state()))
+    prefixes = {
+        "d/leaf": resolved_prefix("d/leaf", existing_depth=1, name_max=8)
+    }
+    resolved = build_topology(compiled, prefixes, EXT4, None)
+    with pytest.raises(ProjectApprovalRefused) as caught:
+        bind_scratch(compiled, "tx01", resolved)
+    assert "name limit" in str(caught.value)
+
+
+def test_colliding_scratch_leaves_are_refused(injected_equivalence):
+    """Effect IDs are exact-string and portability-key unique after A2 phase 6, so under
+    case folding no two scratch leaves can collide. Truncation can: every leaf shares the
+    `.#~tx01.` prefix, so an eight-byte key collapses the whole set. Regeneration is
+    explicitly not a remedy — an intrinsic collision recurs under every txid."""
+    compiled = compiled_for(
+        CreateFileNoClobber("e1", "d/one", file_state()),
+        CreateFileNoClobber("e2", "d/two", file_state()),
+    )
+    prefixes = {
+        "d/one": resolved_prefix("d/one", existing_depth=1),
+        "d/two": resolved_prefix("d/two", existing_depth=1),
+    }
+    resolved = build_topology(compiled, prefixes, EXT4, None)
+    injected_equivalence(truncate_to_eight)
+    with pytest.raises(ProjectApprovalRefused) as caught:
+        bind_scratch(compiled, "tx01", resolved)
+    assert "not a remedy" in str(caught.value)
+
+
+def test_every_endpoint_leaf_is_asked_about(injected_equivalence):
+    """The positive bypass check. A call site that decides `one` against `two` without the
+    helper leaves the corresponding name out of this list, and no behavioural assertion
+    can see that under an identity key."""
+    calls = injected_equivalence(lambda name: name)
+    compiled = compiled_for(
+        CreateFileNoClobber("e1", "d/one", file_state()),
+        CreateFileNoClobber("e2", "d/two", file_state()),
+    )
+    prefixes = {
+        "d/one": resolved_prefix("d/one", existing_depth=1),
+        "d/two": resolved_prefix("d/two", existing_depth=1),
+    }
+    resolved = build_topology(compiled, prefixes, EXT4, None)
+    calls.clear()
+    require_endpoints_distinct(resolved)
+    assert calls == ["one", "two"]
+
+
+def test_every_scratch_leaf_is_asked_about(injected_equivalence):
+    calls = injected_equivalence(lambda name: name)
+    compiled = compiled_for(
+        CreateFileNoClobber("e1", "d/one", file_state()),
+        CreateFileNoClobber("e2", "d/two", file_state()),
+    )
+    prefixes = {
+        "d/one": resolved_prefix("d/one", existing_depth=1),
+        "d/two": resolved_prefix("d/two", existing_depth=1),
+    }
+    resolved = build_topology(compiled, prefixes, EXT4, None)
+    calls.clear()
+    bind_scratch(compiled, "tx01", resolved)
+    assert calls == [".#~tx01.e1.staging", ".#~tx01.e2.staging"]
+
+
+def test_distinct_scratch_leaves_survive_under_exact_bytes():
+    compiled = compiled_for(
+        CreateFileNoClobber("e1", "d/one", file_state()),
+        CreateFileNoClobber("e2", "d/two", file_state()),
+    )
+    prefixes = {
+        "d/one": resolved_prefix("d/one", existing_depth=1),
+        "d/two": resolved_prefix("d/two", existing_depth=1),
+    }
+    resolved = build_topology(compiled, prefixes, EXT4, None)
+    bound = bind_scratch(compiled, "tx01", resolved)
+    assert len({entry.leaf for entry in bound}) == len(bound) == 2

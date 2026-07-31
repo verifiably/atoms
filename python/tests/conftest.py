@@ -411,7 +411,7 @@ def injected_equivalence(monkeypatch):
     return install
 
 
-_EQUIVALENCE_CONSUMERS = ("atoms.fs.topology",)
+_EQUIVALENCE_CONSUMERS = ("atoms.fs.topology", "atoms.fs.judgment")
 
 
 def truncate_to_eight(name: str) -> str:

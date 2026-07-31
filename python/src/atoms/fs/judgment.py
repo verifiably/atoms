@@ -10,11 +10,14 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from atoms.core.compiler import CompiledSpec
-from atoms.core.effects import CreateDirectory, DeletePath, occurrences
+from atoms.core.effects import CreateDirectory, DeletePath, MoveNoClobber, occurrences
 from atoms.core.errors import ProjectApprovalRefused, ProtocolError
-from atoms.core.recovery import TopologyNode
+from atoms.core.recovery import ScratchRole, TopologyNode, WorkRoot
+from atoms.core.recovery.snapshot import required_scratch_role
+from atoms.core.scratch import scratch_leaf
+from atoms.fs.lookup import lookup_equivalence_key
 from atoms.fs.resolve import EntryKind, PresentFrontier, ResolvedPrefix
-from atoms.fs.topology import ResolvedTopology
+from atoms.fs.topology import ApprovedScratch, ResolvedTopology
 
 # The frontier kinds a closed effect variant can remove. DeletePath.pre is typed
 # FileState | SymlinkState, so no admissible timeline removes anything else — which is
@@ -154,3 +157,74 @@ def _require_removed_before_creation(
             f"{blocking!r} is removed by effect {remover} and created by effect "
             f"{creator}; the removal must come first"
         )
+
+
+def require_endpoints_distinct(resolved: ResolvedTopology) -> None:
+    """No two declared paths name one entry under their parent's actual policy.
+
+    Covers paths declared ABSENT, where identity comparison does not apply and is
+    therefore not what is compared. Authority §5.4 gives the reason mutation-time
+    no-clobber is not a substitute: `create x`, `delete x`, `create y` can make every
+    no-clobber operation succeed while x and y aliasing leaves the declared final states
+    unsatisfiable.
+    """
+    # `key in seen` rather than comparing the two leaves: the collision is already decided
+    # by the key, and re-comparing raw leaves is the exact bypass the AST guard forbids.
+    seen: dict[tuple[TopologyNode, str], str] = {}
+    for entry in resolved.paths:
+        constraints = resolved.constraints_of(entry.parent_node)
+        key = (entry.parent_node, lookup_equivalence_key(constraints, entry.leaf))
+        if key in seen:
+            raise ProjectApprovalRefused(
+                f"declared paths {seen[key]!r} and {entry.path!r} name one entry under "
+                f"the actual lookup policy of their shared parent {entry.parent_node!r}"
+            )
+        seen[key] = entry.path
+
+
+def bind_scratch(
+    compiled: CompiledSpec, txid: str, resolved: ResolvedTopology
+) -> tuple[ApprovedScratch, ...]:
+    """Instantiate the complete scratch set and prove it pairwise distinct (ledger #11).
+
+    Placement matches A3's _validate_topology exactly — WORK under the work root, every
+    other role beside its effect's persistent path, with MoveNoClobber anchored to its
+    source — so instantiation and topology construction cannot drift apart.
+    """
+    bound: list[ApprovedScratch] = []
+    for effect in compiled.spec.effects:
+        role = required_scratch_role(effect)
+        parent = (
+            WorkRoot()
+            if role is ScratchRole.WORK
+            else resolved.parent_of(
+                effect.source if isinstance(effect, MoveNoClobber) else effect.path
+            )
+        )
+        bound.append(
+            ApprovedScratch(
+                effect_id=effect.effect_id,
+                role=role,
+                parent_node=parent,
+                leaf=scratch_leaf(txid, effect.effect_id, role.value),
+            )
+        )
+
+    seen: dict[tuple[TopologyNode, str], str] = {}
+    for entry in bound:
+        constraints = resolved.constraints_of(entry.parent_node)
+        width = len(entry.leaf.encode("utf-8"))
+        if width > constraints.name_max:
+            raise ProjectApprovalRefused(
+                f"scratch leaf {entry.leaf!r} is {width} bytes, over its parent's "
+                f"name limit of {constraints.name_max}"
+            )
+        key = (entry.parent_node, lookup_equivalence_key(constraints, entry.leaf))
+        if key in seen:
+            raise ProjectApprovalRefused(
+                f"scratch leaves {seen[key]!r} and {entry.leaf!r} collide in one parent "
+                "under its actual lookup policy; regenerating the txid is not a remedy "
+                "because an intrinsic collision recurs under every txid"
+            )
+        seen[key] = entry.leaf
+    return tuple(bound)
