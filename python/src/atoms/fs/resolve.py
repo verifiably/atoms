@@ -6,6 +6,7 @@ project space; A4b-2 composes these observations into the approval proof.
 
 from __future__ import annotations
 
+import errno
 import os
 import stat
 from dataclasses import dataclass
@@ -13,7 +14,9 @@ from enum import Enum
 
 from atoms.core.errors import CapabilityUnavailable, ProjectApprovalRefused
 from atoms.fs.binding import ProjectBinding
+from atoms.fs.lock import close_all
 from atoms.fs.lookup import DirectoryConstraints, LookupProof, read_lookup_constraints
+from atoms.fs.volume import read_mount_id
 
 _LINUX = "linux"
 
@@ -123,6 +126,8 @@ class PathResolver:
         "_work_base",
     )
 
+    _OBSERVE_FLAGS = os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC
+
     def __init__(self, binding: ProjectBinding) -> None:
         # Liveness gate. project_root_fd routes through ProjectBinding._require_active,
         # which checks the binding's own flag AND lock.held. It is read before
@@ -162,3 +167,39 @@ class PathResolver:
             identity: DirectoryFacts(identity, constraints)
         }
         self._work_base: DirectoryFacts | None = None
+
+    def _observe(self, parent_fd: int, name: str, rel_path: str) -> Frontier:
+        """Observe one entry coherently: kind, identity, and mount membership.
+
+        O_PATH | O_NOFOLLOW returns the entry itself rather than following a symlink,
+        and fdinfo answers for the same descriptor that fstat did — lstat could not
+        see a bind mount that shares st_dev with its source.
+        """
+        try:
+            fd = os.open(name, self._OBSERVE_FLAGS, dir_fd=parent_fd)
+        except FileNotFoundError:
+            return AbsentFrontier()
+        except OSError as caught:
+            if caught.errno == errno.ENAMETOOLONG:
+                raise ProjectApprovalRefused(
+                    f"component {name!r} of {rel_path!r} exceeds the filesystem name limit"
+                ) from caught
+            raise
+        try:
+            info = os.fstat(fd)
+            identity = _identity(info)
+            if identity == self._metadata_identity:
+                raise ProjectApprovalRefused(
+                    f"{rel_path!r} resolves to the metadata root by identity "
+                    f"(device {identity.device}, inode {identity.inode})"
+                )
+            mount = read_mount_id(fd)
+            expected = self._binding.evidence.mount_id
+            if mount != expected:
+                raise ProjectApprovalRefused(
+                    f"component {name!r} of {rel_path!r} is on mount {mount}, "
+                    f"not the bound volume's mount {expected}"
+                )
+        finally:
+            close_all((fd,))
+        return PresentFrontier(identity, _entry_kind(info.st_mode))
