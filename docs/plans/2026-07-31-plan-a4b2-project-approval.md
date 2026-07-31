@@ -67,10 +67,10 @@ over both.
 | File | Responsibility |
 | --- | --- |
 | `src/atoms/fs/lookup.py` | **Modify.** Add `lookup_equivalence_key`, beside `read_lookup_constraints` and `inherited_constraints`. |
-| `src/atoms/fs/topology.py` | **Create.** The `Approved*` value types, `ResolvedTopology`, `build_topology`, `require_resolved_surface_and_ordering`. Pure. |
+| `src/atoms/fs/topology.py` | **Create.** The `Approved*` value types, `ResolvedTopology`, `build_topology`, `require_resolved_surface_and_ordering`. Pure. Built before any judgment, and every judgment keys on its nodes. |
 | `src/atoms/fs/judgment.py` | **Create.** `require_ancestors_legal`, `require_endpoints_distinct`, `bind_scratch`. Pure. |
 | `src/atoms/fs/approval.py` | **Create.** `ProjectContext`, `ProjectApprovedSpec`, the construction token, `approve_for_project`. |
-| `tests/fs_support.py` | **Modify.** Synthetic `ResolvedPrefix` builders for the pure tiers. |
+| `tests/fs_support.py` | **Modify.** Synthetic `ResolvedPrefix` and `CompiledSpec` builders shared by every pure tier. |
 | `tests/conftest.py` | **Modify.** `injected_equivalence` (a factory), `truncate_to_eight`, `approval_context`. |
 | `tests/test_fs_lookup.py` | **Modify.** `lookup_equivalence_key` cases. |
 | `tests/test_fs_judgment.py` | **Create.** Tier 1 — ancestor legality, endpoint distinctness, scratch binding. |
@@ -86,6 +86,10 @@ by responsibility and does not place these types; putting them in `approval.py` 
 `approval → judgment → topology` with no cycle.
 
 Eight tasks. Each ends with a deliverable a reviewer could reject while approving its neighbour.
+
+**Topology construction is Task 2 and ancestor legality is Task 3, not the reverse.** Judgment is
+keyed on topology nodes, so `judgment.py` imports `topology.py` and not the other way round; the
+dependency runs `approval -> judgment -> topology` throughout.
 
 ---
 
@@ -183,26 +187,90 @@ git commit -m "feat(fs): derive name equivalence from a directory's lookup proof
 
 ---
 
-## Task 2: Ancestor legality
+## Task 2: Topology construction
 
 **Files:**
-- Create: `src/atoms/fs/judgment.py`
+- Create: `src/atoms/fs/topology.py`
 - Modify: `tests/fs_support.py`
-- Create: `tests/test_fs_judgment.py`
+- Modify: `tests/conftest.py`
+- Create: `tests/test_fs_topology.py`
+
+**Why construction precedes every judgment.** Design §5.4's motivating case is
+`CreateDirectory("A")` with an effect on `a/x`: on a folding parent those are one directory, and
+the creation is what supplies the ancestor. A judgment keyed on path *spelling* cannot see that —
+it looks for a creator of the string `"a"`, finds none, and refuses a legal specification. So the
+node keying runs first and every later phase is keyed on nodes. `build_topology` therefore decides
+only *which directories exist and which of them are the same directory*; it decides nothing about
+legality.
+
+That also fixes what counts as a directory candidate. A candidate is every proper prefix of a
+declared path **plus every `CreateDirectory` endpoint** — without the second half `"A"` is never a
+directory at all and cannot merge with `"a"`.
 
 **Interfaces:**
-- Consumes: `CompiledSpec`, `ResolvedPrefix`, `PresentFrontier`, `EntryKind`, `CreateDirectory`,
-  `DeletePath`, `occurrences`, `ProjectApprovalRefused`, `ProtocolError`.
-- Produces: `require_ancestors_legal(compiled: CompiledSpec, prefixes: Mapping[str, ResolvedPrefix]) -> None`;
-  the `resolved_prefix` helper in `tests/fs_support.py`.
+- Consumes: `CompiledSpec`, `ResolvedPrefix`, `DirectoryConstraints`, `inherited_constraints`,
+  `lookup_equivalence_key`, A3's `ProjectRoot`, `WorkRoot`, `TopologyDirectory`, `PersistentNode`,
+  `ScratchNode`, `TopologyParent`, `TopologyNode`, `RecoveryTopology`, `ScratchRole`, and
+  `required_scratch_role`.
+- Produces: `ApprovedExistingDirectory`, `ApprovedPlannedDirectory`, `ApprovedDirectory`,
+  `ApprovedPath`, `ApprovedScratch`, `ApprovedWorkBase`, `ResolvedTopology`,
+  `build_topology(compiled, prefixes, filesystem_type, work_constraints) -> ResolvedTopology`;
+  the `resolved_prefix`, `directory_facts`, `compiled_for`, and `file_state` helpers plus the
+  `EXT4` and `WORK_CONSTRAINTS` constants in `tests/fs_support.py`.
 
-- [ ] **Step 1: Add the synthetic prefix builder**
+**`required_scratch_role` is imported from `atoms.core.recovery.snapshot`, not from
+`atoms.core.recovery`.** It is not in the package's `__all__`, and it may not be added:
+`test_public_surface_has_exactly_five_operations` in `tests/test_recovery_architecture.py` asserts
+that the *functions* exported by `atoms.core.recovery` are exactly the five A3 operations. A3's own
+`variants.py` and `reducer.py` import it from the submodule for the same reason.
 
-Append to `tests/fs_support.py`. Every pure tier builds `ResolvedPrefix` values by hand, so the builder
-belongs beside the other test support rather than in a fixture — it takes arguments and returns a
-value, which a fixture cannot do without an extra factory layer:
+- [ ] **Step 1: Add the synthetic builders**
+
+Append to `tests/fs_support.py`. Every pure tier builds `ResolvedPrefix` values and compiled specs
+by hand, so the builders belong beside the other test support rather than in fixtures — they take
+arguments and return values, which a fixture cannot do without an extra factory layer:
 
 ```python
+EXT4 = "ext4"
+WORK_CONSTRAINTS = DirectoryConstraints(
+    lookup_proof=LookupProof.EXACT_BYTES, name_max=255
+)
+EMPTY_DIGEST = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+
+def file_state(mode: int = 0o644) -> FileState:
+    return FileState(content_hash=EMPTY_DIGEST, mode=mode, byte_len=0)
+
+
+def nonempty_state(content: bytes, mode: int = 0o644) -> FileState:
+    """A2 refuses a FileState whose byte_len is non-zero under the empty-content hash and
+    vice versa, so ReplaceFile's two distinct states need real digests."""
+    digest = hashlib.sha256(content).hexdigest()
+    return FileState(
+        content_hash=f"sha256:{digest}", mode=mode, byte_len=len(content)
+    )
+
+
+def compiled_for(*effects: Effect) -> CompiledSpec:
+    """Compile a spec whose surfaces are derived from the effects, so every test states
+    only what it is about."""
+    initial: dict[str, PathState] = {}
+    final: dict[str, PathState] = {}
+    for effect in effects:
+        for occurrence in occurrences(effect):
+            initial.setdefault(occurrence.path, occurrence.pre)
+            final[occurrence.path] = occurrence.post
+    return compile_spec(
+        build_spec(
+            consumer_tag="test",
+            intent_digest=EMPTY_DIGEST,
+            initial_surface=initial,
+            final_surface=final,
+            effects=effects,
+        )
+    )
+
+
 def directory_facts(inode: int, *, name_max: int = 255, device: int = 41) -> DirectoryFacts:
     """A synthetic existing directory. Distinct inodes give distinct identities."""
     return DirectoryFacts(
@@ -248,13 +316,60 @@ def resolved_prefix(
 
 
 def _synthetic_inode(prefix: str) -> int:
-    """Stable per prefix string, and never the root's inode."""
-    return 1000 + (hash(prefix) % 100000)
+    """Stable per prefix string, and never the root's inode.
+
+    `crc32` rather than `hash`, whose string salt is randomized per process — a test that
+    passes only within one interpreter run is not a test.
+    """
+    return 1000 + zlib.crc32(prefix.encode("utf-8"))
+
+
+def prefixes_for(compiled: CompiledSpec) -> dict[str, ResolvedPrefix]:
+    """The resolution table a walk produces when every ancestor exists except the ones
+    this transaction creates.
+
+    The created check compares whole prefix strings, not `startswith`: `d/newer` starts
+    with `d/new` and is not beneath it.
+    """
+    created = {
+        effect.path
+        for effect in compiled.spec.effects
+        if isinstance(effect, CreateDirectory)
+    }
+    table: dict[str, ResolvedPrefix] = {}
+    for timeline in compiled.timelines:
+        components = timeline.path.split("/")
+        depth = len(components) - 1
+        for index in range(len(components) - 1):
+            if "/".join(components[: index + 1]) in created:
+                depth = index
+                break
+        table[timeline.path] = resolved_prefix(timeline.path, existing_depth=depth)
+    return table
+
+
+def work_for(compiled: CompiledSpec) -> DirectoryConstraints | None:
+    """The work-root constraints approval derives, present exactly when a CreateDirectory
+    is, which is what A3's WorkRoot rule requires."""
+    return (
+        WORK_CONSTRAINTS
+        if any(
+            isinstance(effect, CreateDirectory) for effect in compiled.spec.effects
+        )
+        else None
+    )
 ```
 
 Add to `tests/fs_support.py`'s imports:
 
 ```python
+import hashlib
+import zlib
+
+from atoms.core.compiler import CompiledSpec, compile_spec
+from atoms.core.effects import CreateDirectory, Effect, occurrences
+from atoms.core.fingerprint import FileState, PathState
+from atoms.core.spec import build_spec
 from atoms.fs.lookup import DirectoryConstraints, LookupProof
 from atoms.fs.resolve import (
     AbsentFrontier,
@@ -266,360 +381,70 @@ from atoms.fs.resolve import (
 )
 ```
 
-- [ ] **Step 2: Write the failing tests**
+If `atoms.core.effects` exports no `Effect` union alias, annotate `*effects` as `object` and add
+`# type: ignore[arg-type]` on the `effects=effects` argument instead; do not invent the alias.
 
-Create `tests/test_fs_judgment.py`:
+- [ ] **Step 2: Register the equivalence double in conftest**
 
-```python
-"""Tier 1 — pure judgment over hand-built resolution tables (design §11.1)."""
-
-from __future__ import annotations
-
-import pytest
-
-from atoms.core.compiler import compile_spec
-from atoms.core.effects import (
-    CreateDirectory,
-    CreateFileNoClobber,
-    DeletePath,
-)
-from atoms.core.errors import ProjectApprovalRefused, ProtocolError
-from atoms.core.fingerprint import ABSENT, DirectoryState, FileState
-from atoms.core.spec import build_spec
-from atoms.fs.judgment import require_ancestors_legal
-from atoms.fs.resolve import EntryKind, FilesystemIdentity, PresentFrontier
-from tests.fs_support import resolved_prefix
-
-EMPTY = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-
-
-def file_state(mode: int = 0o644) -> FileState:
-    return FileState(content_hash=EMPTY, mode=mode, byte_len=0)
-
-
-def compiled_for(*effects):
-    """Compile a spec whose surfaces are derived from the effects, so every test states
-    only what it is about."""
-    initial: dict[str, object] = {}
-    final: dict[str, object] = {}
-    from atoms.core.effects import occurrences
-
-    for effect in effects:
-        for occurrence in occurrences(effect):
-            initial.setdefault(occurrence.path, occurrence.pre)
-            final[occurrence.path] = occurrence.post
-    return compile_spec(
-        build_spec(
-            consumer_tag="test",
-            intent_digest=EMPTY,
-            initial_surface=initial,  # type: ignore[arg-type]
-            final_surface=final,  # type: ignore[arg-type]
-            effects=effects,
-        )
-    )
-
-
-def test_a_fully_resolved_path_needs_no_ancestor_proof():
-    compiled = compiled_for(CreateFileNoClobber("e1", "a/b/leaf", file_state()))
-    prefixes = {"a/b/leaf": resolved_prefix("a/b/leaf", existing_depth=2)}
-    require_ancestors_legal(compiled, prefixes)
-
-
-def test_a_missing_ancestor_no_effect_creates_is_refused():
-    compiled = compiled_for(CreateFileNoClobber("e1", "a/b/leaf", file_state()))
-    prefixes = {"a/b/leaf": resolved_prefix("a/b/leaf", existing_depth=1)}
-    with pytest.raises(ProjectApprovalRefused) as caught:
-        require_ancestors_legal(compiled, prefixes)
-    assert "a/b" in str(caught.value)
-
-
-def test_a_created_ancestor_ordered_before_its_descendant_is_admitted():
-    compiled = compiled_for(
-        CreateDirectory("mk", "a/b", DirectoryState(mode=0o755)),
-        CreateFileNoClobber("e1", "a/b/leaf", file_state()),
-    )
-    prefixes = {
-        "a/b": resolved_prefix("a/b", existing_depth=1),
-        "a/b/leaf": resolved_prefix("a/b/leaf", existing_depth=1),
-    }
-    require_ancestors_legal(compiled, prefixes)
-
-
-def test_a_created_ancestor_ordered_after_its_descendant_is_refused():
-    """A2 phase 13 refuses this lexically; the resolved re-check must not depend on that.
-    The spec is therefore assembled without compile_spec's ordering phase having a say —
-    it would refuse first — so the effects are ordered legally and the prefixes describe
-    a deeper missing ancestor that only the later CreateDirectory could supply."""
-    compiled = compiled_for(
-        CreateFileNoClobber("e1", "a/b/leaf", file_state()),
-        CreateDirectory("mk", "a/c", DirectoryState(mode=0o755)),
-    )
-    prefixes = {
-        "a/b/leaf": resolved_prefix("a/b/leaf", existing_depth=1),
-        "a/c": resolved_prefix("a/c", existing_depth=1),
-    }
-    with pytest.raises(ProjectApprovalRefused) as caught:
-        require_ancestors_legal(compiled, prefixes)
-    assert "a/b" in str(caught.value)
-
-
-def test_a_regular_file_ancestor_the_timeline_converts_is_admitted():
-    compiled = compiled_for(
-        DeletePath("rm", "p", file_state()),
-        CreateDirectory("mk", "p", DirectoryState(mode=0o755)),
-        CreateFileNoClobber("e1", "p/q", file_state()),
-    )
-    blocked = resolved_prefix(
-        "p/q",
-        existing_depth=0,
-        frontier=PresentFrontier(
-            identity=FilesystemIdentity(device=41, inode=77),
-            kind=EntryKind.REGULAR_FILE,
-        ),
-    )
-    prefixes = {"p": resolved_prefix("p", existing_depth=0), "p/q": blocked}
-    require_ancestors_legal(compiled, prefixes)
-
-
-def test_a_regular_file_ancestor_the_timeline_leaves_alone_is_refused():
-    compiled = compiled_for(
-        CreateDirectory("mk", "p", DirectoryState(mode=0o755)),
-        CreateFileNoClobber("e1", "p/q", file_state()),
-    )
-    blocked = resolved_prefix(
-        "p/q",
-        existing_depth=0,
-        frontier=PresentFrontier(
-            identity=FilesystemIdentity(device=41, inode=77),
-            kind=EntryKind.REGULAR_FILE,
-        ),
-    )
-    prefixes = {"p": resolved_prefix("p", existing_depth=0), "p/q": blocked}
-    with pytest.raises(ProjectApprovalRefused) as caught:
-        require_ancestors_legal(compiled, prefixes)
-    assert "removes" in str(caught.value)
-
-
-def test_an_other_ancestor_is_refused_whatever_the_timeline_says():
-    """No closed effect variant accepts an OTHER precondition — DeletePath.pre is a file
-    or a symlink — so no admissible timeline can turn a socket into a directory."""
-    compiled = compiled_for(
-        CreateDirectory("mk", "p", DirectoryState(mode=0o755)),
-        CreateFileNoClobber("e1", "p/q", file_state()),
-    )
-    blocked = resolved_prefix(
-        "p/q",
-        existing_depth=0,
-        frontier=PresentFrontier(
-            identity=FilesystemIdentity(device=41, inode=77), kind=EntryKind.OTHER
-        ),
-    )
-    prefixes = {"p": resolved_prefix("p", existing_depth=0), "p/q": blocked}
-    with pytest.raises(ProjectApprovalRefused) as caught:
-        require_ancestors_legal(compiled, prefixes)
-    assert "other" in str(caught.value)
-
-
-def test_a_directory_frontier_with_a_remainder_is_a_protocol_error():
-    """open_child_directory succeeds on a directory, so the walk would not have stopped.
-    Asserted rather than assumed, because it is a claim about openat2 and not about this
-    module."""
-    compiled = compiled_for(CreateFileNoClobber("e1", "p/q", file_state()))
-    blocked = resolved_prefix(
-        "p/q",
-        existing_depth=0,
-        frontier=PresentFrontier(
-            identity=FilesystemIdentity(device=41, inode=77), kind=EntryKind.DIRECTORY
-        ),
-    )
-    with pytest.raises(ProtocolError):
-        require_ancestors_legal(compiled, {"p/q": blocked})
-```
-
-- [ ] **Step 3: Run the tests to verify they fail**
-
-Run: `uv run pytest tests/test_fs_judgment.py -v`
-Expected: FAIL with `ModuleNotFoundError: No module named 'atoms.fs.judgment'`.
-
-- [ ] **Step 4: Write `judgment.py`**
-
-Create `src/atoms/fs/judgment.py`:
+Append to `tests/conftest.py`. Both go here because the fixture-registry guard reads `conftest.py`
+alone:
 
 ```python
-"""Pure judgment over a resolution table (A4b-2 design §6.3).
+@pytest.fixture
+def injected_equivalence(monkeypatch):
+    """Install a chosen name-equivalence double on the modules that consume it.
 
-No filesystem access, no descriptor, no syscall. Every function here takes values the
-resolution phase already produced and either returns or raises.
-"""
+    Patched by consuming-module path, like injected_lookup patches
+    atoms.fs.resolve.read_lookup_constraints, because both modules bind the name at
+    import time.
 
-from __future__ import annotations
+    A factory rather than a fixed double, because the two behaviours under test need
+    different relations. Case folding merges directories (`A` and `a`), which A2 admits
+    because its phase 4 key is the whole path and `A` differs from `a/x`. Case folding
+    can NOT exercise endpoint distinctness: two leaves fold in one parent only when their
+    whole paths fold too, and A2 phase 4 already refuses that pair before approval sees
+    it. Endpoint tests therefore use a truncating relation — a real filesystem
+    equivalence class that A2's key does not subsume.
 
-from collections.abc import Mapping
-
-from atoms.core.compiler import CompiledSpec
-from atoms.core.effects import CreateDirectory, DeletePath, occurrences
-from atoms.core.errors import ProjectApprovalRefused, ProtocolError
-from atoms.fs.resolve import EntryKind, PresentFrontier, ResolvedPrefix
-
-# The frontier kinds a closed effect variant can remove. DeletePath.pre is typed
-# FileState | SymlinkState, so no admissible timeline removes anything else — which is
-# why OTHER is refused on a model ground rather than on an observation.
-_REMOVABLE_KINDS = frozenset({EntryKind.REGULAR_FILE, EntryKind.SYMLINK})
-
-
-def require_ancestors_legal(
-    compiled: CompiledSpec, prefixes: Mapping[str, ResolvedPrefix]
-) -> None:
-    """Every component past the frontier is a directory this transaction creates first.
-
-    Two routes reach the same rule. A missing component simply does not exist yet. A
-    component that exists as a file or symlink is the authority §6 case where absence is
-    inferred from the ancestor's verified state rather than probed; it is admitted only
-    when the timeline removes it and creates a directory in its place.
+    This is a double either way. It proves the call sites route through the function and
+    merge whatever it merges; it proves nothing about any real relation, all of which
+    stay unreproducible and refused. It also cannot detect a call site that bypasses the
+    function — under an identity key a direct comparison behaves identically — which is
+    what the AST guard in test_fs_architecture.py covers instead.
     """
-    creators = {
-        effect.path: index
-        for index, effect in enumerate(compiled.spec.effects)
-        if isinstance(effect, CreateDirectory)
-    }
-    removers = {
-        effect.path: index
-        for index, effect in enumerate(compiled.spec.effects)
-        if isinstance(effect, DeletePath)
-    }
-    first_touch: dict[str, int] = {}
-    for index, effect in enumerate(compiled.spec.effects):
-        for occurrence in occurrences(effect):
-            first_touch.setdefault(occurrence.path, index)
 
-    for path in sorted(prefixes):
-        prefix = prefixes[path]
-        if not prefix.remainder:
-            continue
-        components = path.split("/")
-        depth = len(prefix.hops)
-        _require_frontier_convertible(path, prefix, components[depth])
-        for index in range(depth, len(components) - 1):
-            ancestor = "/".join(components[: index + 1])
-            _require_created_first(ancestor, path, creators, first_touch)
-        if isinstance(prefix.frontier, PresentFrontier):
-            _require_removed_before_creation(
-                components[depth], path, creators, removers, len(prefix.hops)
+    def install(key):
+        for module in _EQUIVALENCE_CONSUMERS:
+            monkeypatch.setattr(
+                f"{module}.lookup_equivalence_key",
+                lambda constraints, name: key(name),
             )
 
-
-def _require_frontier_convertible(
-    path: str, prefix: ResolvedPrefix, component: str
-) -> None:
-    frontier = prefix.frontier
-    if not isinstance(frontier, PresentFrontier):
-        return
-    if frontier.kind is EntryKind.DIRECTORY:
-        raise ProtocolError(
-            f"resolution of {path!r} stopped at directory {component!r} with "
-            f"{len(prefix.remainder)} components remaining; open_child_directory "
-            "succeeds on a directory, so the walk should have continued"
-        )
-    if frontier.kind not in _REMOVABLE_KINDS:
-        raise ProjectApprovalRefused(
-            f"component {component!r} of {path!r} is {frontier.kind.value}, which no "
-            "effect variant can remove, so no timeline can make it a directory"
-        )
+    return install
 
 
-def _require_created_first(
-    ancestor: str,
-    path: str,
-    creators: Mapping[str, int],
-    first_touch: Mapping[str, int],
-) -> None:
-    creator = creators.get(ancestor)
-    if creator is None:
-        raise ProjectApprovalRefused(
-            f"{path!r} needs directory {ancestor!r}, which does not exist and which no "
-            "CreateDirectory effect creates; a parent that neither exists nor is "
-            "created by this transaction cannot be captured"
-        )
-    if creator >= first_touch[path]:
-        raise ProjectApprovalRefused(
-            f"{path!r} is touched by effect {first_touch[path]} but its ancestor "
-            f"{ancestor!r} is created by effect {creator}; outer directory creation "
-            "must precede every affected descendant"
-        )
+_EQUIVALENCE_CONSUMERS = ("atoms.fs.topology",)
 
 
-def _require_removed_before_creation(
-    component: str,
-    path: str,
-    creators: Mapping[str, int],
-    removers: Mapping[str, int],
-    depth: int,
-) -> None:
-    """A blocking non-directory must be removed, then re-created as a directory.
-
-    This is design §5.2's one bounded exception to "approval does not compare live state
-    against a declared precondition": resolution stopped here, so the topology cannot be
-    built without deciding whether this path becomes a directory, and the observation is
-    already in hand.
-    """
-    components = path.split("/")
-    blocking = "/".join(components[: depth + 1])
-    remover = removers.get(blocking)
-    creator = creators[blocking]  # _require_created_first already proved it exists
-    if remover is None:
-        raise ProjectApprovalRefused(
-            f"{blocking!r} exists and is not a directory, but no effect removes it "
-            f"before effect {creator} creates a directory there"
-        )
-    if remover >= creator:
-        raise ProjectApprovalRefused(
-            f"{blocking!r} is removed by effect {remover} and created by effect "
-            f"{creator}; the removal must come first"
-        )
+def truncate_to_eight(name: str) -> str:
+    """A truncating name equivalence, in conftest so the registry guard sees it."""
+    return name[:8]
 ```
 
-- [ ] **Step 5: Run the tests and the gates**
+`_EQUIVALENCE_CONSUMERS` holds one module here because `atoms.fs.judgment` does not exist yet and
+`monkeypatch.setattr` with a string target imports what it names. Task 5 adds
+`"atoms.fs.judgment"` to it, at the step that gives that module its first call to
+`lookup_equivalence_key`. Task 3's `require_ancestors_legal` never calls it — it is keyed on
+topology nodes, so the equivalence relation has already been applied by the time it runs.
 
-```bash
-uv run pytest tests/test_fs_judgment.py -v
-uv run ruff check src/atoms/fs/judgment.py tests/
-uv run pyright
-```
-Expected: PASS, `All checks passed!`, `0 errors`.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add src/atoms/fs/judgment.py tests/test_fs_judgment.py tests/fs_support.py
-git commit -m "feat(fs): prove every unresolved ancestor is created in order"
-```
-
----
-
-## Task 3: Topology construction
-
-**Files:**
-- Create: `src/atoms/fs/topology.py`
-- Create: `tests/test_fs_topology.py`
-
-**Interfaces:**
-- Consumes: `CompiledSpec`, `ResolvedPrefix`, `DirectoryConstraints`, `inherited_constraints`,
-  `lookup_equivalence_key`, A3's `ProjectRoot`, `WorkRoot`, `TopologyDirectory`, `PersistentNode`,
-  `ScratchNode`, `TopologyParent`, `RecoveryTopology`, `required_scratch_role`, `ScratchRole`.
-- Produces: `ApprovedExistingDirectory`, `ApprovedPlannedDirectory`, `ApprovedDirectory`,
-  `ApprovedPath`, `ApprovedScratch`, `ApprovedWorkBase`, `ResolvedTopology`,
-  `build_topology(compiled, prefixes, filesystem_type, work_constraints) -> ResolvedTopology`.
-
-- [ ] **Step 1: Write the failing tests**
+- [ ] **Step 3: Write the failing tests**
 
 Create `tests/test_fs_topology.py`:
 
 ```python
-"""Tiers 2 and 3 — topology construction and A3 acceptance (design §11.2, §11.3)."""
+"""Tier 2 — topology construction (design §11.2)."""
 
 from __future__ import annotations
-
-import pytest
 
 from atoms.core.effects import CreateDirectory, CreateFileNoClobber, MoveNoClobber
 from atoms.core.fingerprint import DirectoryState
@@ -631,18 +456,17 @@ from atoms.core.recovery import (
     TopologyDirectory,
     WorkRoot,
 )
-from atoms.fs.lookup import DirectoryConstraints, LookupProof
 from atoms.fs.topology import (
     ApprovedExistingDirectory,
     ApprovedPlannedDirectory,
     build_topology,
 )
-from tests.fs_support import resolved_prefix
-from tests.test_fs_judgment import compiled_for, file_state
-
-EXT4 = "ext4"
-WORK_CONSTRAINTS = DirectoryConstraints(
-    lookup_proof=LookupProof.EXACT_BYTES, name_max=255
+from tests.fs_support import (
+    EXT4,
+    WORK_CONSTRAINTS,
+    compiled_for,
+    file_state,
+    resolved_prefix,
 )
 
 
@@ -671,6 +495,16 @@ def test_a_declared_intermediate_keeps_its_persistent_node():
     }
     resolved = build_topology(compiled, prefixes, EXT4, WORK_CONSTRAINTS)
     assert resolved.parent_of("a/leaf") == PersistentNode("a")
+
+
+def test_a_create_directory_endpoint_is_a_directory_candidate():
+    """The half of the candidate set that makes design §5.4's case representable. `A` is
+    nobody's lexical prefix, so only its being a CreateDirectory endpoint puts it in the
+    key space where `a` can merge into it."""
+    compiled = compiled_for(CreateDirectory("mk", "A", DirectoryState(mode=0o755)))
+    prefixes = {"A": resolved_prefix("A", existing_depth=0)}
+    resolved = build_topology(compiled, prefixes, EXT4, WORK_CONSTRAINTS)
+    assert resolved.directory_node("A") == PersistentNode("A")
 
 
 def test_the_work_root_exists_exactly_when_a_create_directory_does():
@@ -762,11 +596,25 @@ def test_node_ids_are_reproducible_across_repeated_construction():
     assert first.topology == second.topology
 
 
+def test_two_paths_through_one_physical_directory_share_its_node():
+    """Identity keying, which needs no double: two prefixes that resolved to the same
+    inode are the same directory whatever they are spelled."""
+    compiled = compiled_for(
+        CreateFileNoClobber("e1", "d/one", file_state()),
+        CreateFileNoClobber("e2", "d/two", file_state()),
+    )
+    prefixes = {
+        "d/one": resolved_prefix("d/one", existing_depth=1),
+        "d/two": resolved_prefix("d/two", existing_depth=1),
+    }
+    resolved = build_topology(compiled, prefixes, EXT4, None)
+    assert resolved.parent_of("d/one") == resolved.parent_of("d/two")
+
+
 def test_planned_directories_merge_under_a_folding_key(injected_equivalence):
-    """CreateDirectory("A") with an effect on a/x is one directory under a folding
-    parent. An exact-bytes key passes every other test in this module and fails only
-    this one. No LookupProof member is both insensitive and reproducible, so the double
-    is the only route to the behaviour (design §6.3.2).
+    """Design §5.4's case. CreateDirectory("A") with an effect on a/x is one directory
+    under a folding parent. No LookupProof member is both insensitive and reproducible,
+    so the double is the only route to the behaviour (design §6.3.2).
 
     A2 admits the pair: its phase 4 key is the whole path, and "a" differs from "a/x"."""
     injected_equivalence(str.casefold)
@@ -780,73 +628,40 @@ def test_planned_directories_merge_under_a_folding_key(injected_equivalence):
     }
     resolved = build_topology(compiled, prefixes, EXT4, WORK_CONSTRAINTS)
     assert resolved.parent_of("a/x") == PersistentNode("A")
+    assert resolved.directory_node("a") == PersistentNode("A")
 
 
-def test_planned_directories_stay_distinct_under_exact_bytes():
+def test_the_same_pair_stays_two_directories_under_exact_bytes():
+    """The counterpart, without the double: `A` and `a` are two directories, so `a/x`
+    hangs off an undeclared intermediate instead. The pair proves the merge is the
+    equivalence function's doing rather than an accident of construction — and Task 3
+    refuses this one, because nothing creates that intermediate."""
     compiled = compiled_for(
         CreateDirectory("mk", "A", DirectoryState(mode=0o755)),
-        CreateDirectory("mk2", "a", DirectoryState(mode=0o755)),
         CreateFileNoClobber("e1", "a/x", file_state()),
     )
     prefixes = {
         "A": resolved_prefix("A", existing_depth=0),
-        "a": resolved_prefix("a", existing_depth=0),
         "a/x": resolved_prefix("a/x", existing_depth=0),
     }
     resolved = build_topology(compiled, prefixes, EXT4, WORK_CONSTRAINTS)
-    assert resolved.parent_of("a/x") == PersistentNode("a")
+    assert isinstance(resolved.parent_of("a/x"), TopologyDirectory)
+    assert resolved.directory_node("A") == PersistentNode("A")
 ```
 
-- [ ] **Step 2: Register the folding fixtures in conftest**
+**There is deliberately no test for two declared directories that name one entry.** That is the
+directory half of ledger #2, and it is unreachable through `compile_spec`: A2 phase 4 applies
+`portability_equivalence_key` to the whole path, so `CreateDirectory("A")` alongside
+`CreateDirectory("a")` is refused at compilation with `declared paths 'A' and 'a' alias one another
+under Unicode caseless matching`. The refusal branch is still written in Step 5 as a fail-closed
+guard against a wider floor; a test whose input cannot compile is not a test.
 
-Append to `tests/conftest.py`. Both go here because the fixture-registry guard reads `conftest.py`
-alone:
-
-```python
-@pytest.fixture
-def injected_equivalence(monkeypatch):
-    """Install a chosen name-equivalence double on the modules that consume it.
-
-    Patched by consuming-module path, like injected_lookup patches
-    atoms.fs.resolve.read_lookup_constraints, because both modules bind the name at
-    import time.
-
-    A factory rather than a fixed double, because the two behaviours under test need
-    different relations. Case folding merges directories (`A` and `a`), which A2 admits
-    because its phase 4 key is the whole path and `A` differs from `a/x`. Case folding
-    can NOT exercise endpoint distinctness: two leaves fold in one parent only when their
-    whole paths fold too, and A2 phase 4 already refuses that pair before approval sees
-    it. Endpoint tests therefore use a truncating relation — a real filesystem
-    equivalence class that A2's key does not subsume.
-
-    This is a double either way. It proves the call sites route through the function and
-    merge whatever it merges; it proves nothing about any real relation, all of which
-    stay unreproducible and refused. It also cannot detect a call site that bypasses the
-    function — under an identity key a direct comparison behaves identically — which is
-    what the AST guard in test_fs_architecture.py covers instead.
-    """
-
-    def install(key):
-        for module in ("atoms.fs.topology", "atoms.fs.judgment"):
-            monkeypatch.setattr(
-                f"{module}.lookup_equivalence_key",
-                lambda constraints, name: key(name),
-            )
-
-    return install
-
-
-def truncate_to_eight(name: str) -> str:
-    """A truncating name equivalence, in conftest so the registry guard sees it."""
-    return name[:8]
-```
-
-- [ ] **Step 3: Run the tests to verify they fail**
+- [ ] **Step 4: Run the tests to verify they fail**
 
 Run: `uv run pytest tests/test_fs_topology.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'atoms.fs.topology'`.
 
-- [ ] **Step 4: Write `topology.py`**
+- [ ] **Step 5: Write `topology.py`**
 
 Create `src/atoms/fs/topology.py`:
 
@@ -865,7 +680,7 @@ from dataclasses import dataclass
 
 from atoms.core.compiler import CompiledSpec
 from atoms.core.effects import CreateDirectory, MoveNoClobber
-from atoms.core.errors import ProtocolError
+from atoms.core.errors import ProjectApprovalRefused, ProtocolError
 from atoms.core.recovery import (
     PersistentNode,
     ProjectRoot,
@@ -876,8 +691,8 @@ from atoms.core.recovery import (
     TopologyNode,
     TopologyParent,
     WorkRoot,
-    required_scratch_role,
 )
+from atoms.core.recovery.snapshot import required_scratch_role
 from atoms.fs.lookup import (
     DirectoryConstraints,
     inherited_constraints,
@@ -937,6 +752,7 @@ class ResolvedTopology:
     topology: RecoveryTopology
     directories: tuple[ApprovedDirectory, ...]
     paths: tuple[ApprovedPath, ...]
+    directory_nodes: tuple[tuple[str, TopologyNode], ...]
 
     def constraints_of(self, node: TopologyNode) -> DirectoryConstraints:
         """Derived from `directories` rather than stored twice, so the two cannot drift."""
@@ -957,6 +773,17 @@ class ResolvedTopology:
                 return edge.parent
         raise ProtocolError(f"topology node {node!r} has no parent edge")
 
+    def directory_node(self, prefix: str) -> TopologyNode | None:
+        """The node of the directory at ``prefix``, or None if none sits there.
+
+        Two prefixes that fold together under their parent's policy return the same node.
+        This is the lookup every judgment uses in place of a path-string comparison.
+        """
+        for candidate, node in self.directory_nodes:
+            if candidate == prefix:
+                return node
+        return None
+
 
 def build_topology(
     compiled: CompiledSpec,
@@ -966,23 +793,31 @@ def build_topology(
 ) -> ResolvedTopology:
     """Build A3's production topology plus the node-keyed fact table.
 
-    Caller guarantees require_ancestors_legal has already passed, so every prefix that
-    does not exist is one this transaction creates.
+    Runs before every judgment and judges nothing itself. It decides only which
+    directories exist and which of them are the same directory; ancestor legality,
+    endpoint distinctness, and the surface re-run all need that answer first.
     """
     declared = {timeline.path for timeline in compiled.timelines}
-    facts = _facts_by_prefix(prefixes, filesystem_type)
+    created = {
+        effect.path
+        for effect in compiled.spec.effects
+        if isinstance(effect, CreateDirectory)
+    }
+    facts = _facts_by_prefix(prefixes, created, filesystem_type)
     keys = _keys_by_prefix(facts)
     nodes = _nodes_by_key(keys, declared)
 
     directories = _directory_entries(facts, keys, nodes)
-    edges: list[TopologyParent] = []
+    # Keyed by node, not appended: two prefixes that fold together are one directory and
+    # take one edge. A3 fails a node appearing twice in topology.parents even when both
+    # edges name the same parent.
+    edges: dict[TopologyNode, TopologyParent] = {}
     for prefix in sorted(facts, key=_depth_then_name):
         if prefix == ROOT_PREFIX:
             continue
         parent = "/".join(prefix.split("/")[:-1])
-        edges.append(
-            TopologyParent(node=nodes[keys[prefix]], parent=nodes[keys[parent]])
-        )
+        node = nodes[keys[prefix]]
+        edges.setdefault(node, TopologyParent(node=node, parent=nodes[keys[parent]]))
 
     paths = tuple(
         ApprovedPath(
@@ -994,21 +829,25 @@ def build_topology(
     )
     for entry in paths:
         node = PersistentNode(entry.path)
-        if node not in {edge.node for edge in edges}:
-            edges.append(TopologyParent(node=node, parent=entry.parent_node))
+        edges.setdefault(node, TopologyParent(node=node, parent=entry.parent_node))
 
+    ordered = list(edges.values())
     if work_constraints is not None:
         directories = (
             *directories,
             ApprovedPlannedDirectory(node=WorkRoot(), constraints=work_constraints),
         )
-        edges.append(TopologyParent(node=WorkRoot(), parent=ProjectRoot()))
+        ordered.append(TopologyParent(node=WorkRoot(), parent=ProjectRoot()))
 
-    edges.extend(_scratch_edges(compiled, paths))
+    ordered.extend(_scratch_edges(compiled, paths))
     return ResolvedTopology(
-        topology=RecoveryTopology(parents=tuple(edges)),
+        topology=RecoveryTopology(parents=tuple(ordered)),
         directories=directories,
         paths=paths,
+        directory_nodes=tuple(
+            (prefix, nodes[keys[prefix]])
+            for prefix in sorted(facts, key=_depth_then_name)
+        ),
     )
 
 
@@ -1018,12 +857,18 @@ def _depth_then_name(prefix: str) -> tuple[int, str]:
 
 
 def _facts_by_prefix(
-    prefixes: Mapping[str, ResolvedPrefix], filesystem_type: str
+    prefixes: Mapping[str, ResolvedPrefix],
+    created: frozenset[str] | set[str],
+    filesystem_type: str,
 ) -> dict[str, tuple[FilesystemIdentity | None, DirectoryConstraints]]:
-    """Attribute observed or derived facts to every directory prefix on every path.
+    """Attribute observed or derived facts to every directory candidate.
 
-    A prefix that some path resolved through is existing; one that no path resolved
-    through is created by this transaction and inherits its parent's constraints.
+    A candidate is every proper prefix of a declared path plus every CreateDirectory
+    endpoint. The second half is what makes design §5.4's case representable: `A` is
+    nobody's lexical prefix, so without it there is no directory for `a` to merge into.
+
+    A candidate some path resolved through is existing; one no path resolved through is
+    created by this transaction and inherits its parent's constraints.
     """
     facts: dict[str, tuple[FilesystemIdentity | None, DirectoryConstraints]] = {}
     for path in sorted(prefixes):
@@ -1031,21 +876,32 @@ def _facts_by_prefix(
         facts[ROOT_PREFIX] = (prefix.root.identity, prefix.root.constraints)
         components = path.split("/")
         for index, hop in enumerate(prefix.hops):
-            key = "/".join(components[: index + 1])
-            facts[key] = (hop.facts.identity, hop.facts.constraints)
-
-    for path in sorted(prefixes):
-        components = path.split("/")
-        for index in range(len(components) - 1):
-            key = "/".join(components[: index + 1])
-            if key in facts:
-                continue
-            parent = "/".join(components[:index])
-            _, parent_constraints = facts[parent]
-            facts[key] = (
-                None,
-                inherited_constraints(parent_constraints, filesystem_type),
+            facts["/".join(components[: index + 1])] = (
+                hop.facts.identity,
+                hop.facts.constraints,
             )
+
+    candidates: set[str] = set()
+    for path in prefixes:
+        components = path.split("/")
+        candidates.update(
+            "/".join(components[: index + 1]) for index in range(len(components) - 1)
+        )
+    for path in created:
+        components = path.split("/")
+        candidates.update(
+            "/".join(components[: index + 1]) for index in range(len(components))
+        )
+
+    for candidate in sorted(candidates, key=_depth_then_name):
+        if candidate in facts:
+            continue
+        parent = "/".join(candidate.split("/")[:-1])
+        _, parent_constraints = facts[parent]
+        facts[candidate] = (
+            None,
+            inherited_constraints(parent_constraints, filesystem_type),
+        )
     return facts
 
 
@@ -1069,6 +925,8 @@ def _keys_by_prefix(
 def _nodes_by_key(
     keys: Mapping[str, object], declared: frozenset[str] | set[str]
 ) -> dict[object, TopologyNode]:
+    """Assign one node per key. A declared prefix always wins over an undeclared one, so
+    the pass is order-independent: whichever arrives second overwrites or defers."""
     nodes: dict[object, TopologyNode] = {}
     next_id = 0
     for prefix in sorted(keys, key=_depth_then_name):
@@ -1079,9 +937,10 @@ def _nodes_by_key(
         if prefix in declared:
             existing = nodes.get(key)
             if isinstance(existing, PersistentNode) and existing.path != prefix:
-                raise ProtocolError(
-                    f"declared paths {existing.path!r} and {prefix!r} name one "
-                    "directory; endpoint distinctness should have refused first"
+                raise ProjectApprovalRefused(
+                    f"declared directories {existing.path!r} and {prefix!r} name one "
+                    "entry under the actual lookup policy of their shared parent; "
+                    "construction cannot choose which of them the directory is"
                 )
             nodes[key] = PersistentNode(prefix)
             continue
@@ -1120,17 +979,18 @@ def _scratch_edges(
         if role is ScratchRole.WORK:
             edges.append(TopologyParent(node=node, parent=WorkRoot()))
             continue
-        anchor = (
-            effect.source if isinstance(effect, MoveNoClobber) else effect.path
-        )
+        anchor = effect.source if isinstance(effect, MoveNoClobber) else effect.path
         edges.append(TopologyParent(node=node, parent=parent_by_path[anchor]))
     return edges
 ```
 
-`CreateDirectory` is imported for `require_resolved_surface_and_ordering` in Task 4, not for this step;
-if ruff reports `F401` on it here, leave the import out until Task 4 adds it.
+The `ProjectApprovalRefused` branch in `_nodes_by_key` has no reachable test: A2 phase 4 applies
+`portability_equivalence_key` to the whole path, so `CreateDirectory("A")` alongside
+`CreateDirectory("a")` is refused at compilation with `declared paths 'A' and 'a' alias one
+another under Unicode caseless matching`. Keep the branch — it fails closed if the floor or A2's
+filter ever widens — and do not write a test that cannot compile its own input.
 
-- [ ] **Step 5: Run the tests and the gates**
+- [ ] **Step 6: Run the tests and the gates**
 
 ```bash
 uv run pytest tests/test_fs_topology.py -v
@@ -1139,12 +999,403 @@ uv run pyright
 ```
 Expected: PASS, `All checks passed!`, `0 errors`.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add src/atoms/fs/topology.py tests/test_fs_topology.py tests/conftest.py
+git add src/atoms/fs/topology.py tests/test_fs_topology.py tests/fs_support.py tests/conftest.py
 git commit -m "feat(fs): build the resolved topology over directory identity"
 ```
+
+---
+
+## Task 3: Ancestor legality
+
+**Files:**
+- Create: `src/atoms/fs/judgment.py`
+- Create: `tests/test_fs_judgment.py`
+
+**Interfaces:**
+- Consumes: `CompiledSpec`, `ResolvedPrefix`, `PresentFrontier`, `EntryKind`, `ResolvedTopology`,
+  `TopologyNode`, `CreateDirectory`, `DeletePath`, `occurrences`, `ProjectApprovalRefused`,
+  `ProtocolError`.
+- Produces: `require_ancestors_legal(compiled: CompiledSpec, prefixes: Mapping[str, ResolvedPrefix],
+  resolved: ResolvedTopology) -> None`.
+
+**Judged over nodes, never over spellings.** Every creator, remover, and ancestor is looked up as a
+`TopologyNode` through `resolved.directory_node`. Under a folding parent `CreateDirectory("A")` is
+what creates the ancestor of `a/x`; a check keyed on the string `"a"` refuses a legal
+specification, which is exactly the defect this ordering exists to prevent.
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `tests/test_fs_judgment.py`:
+
+```python
+"""Tier 1 — pure judgment over hand-built resolution tables (design §11.1)."""
+
+from __future__ import annotations
+
+import pytest
+
+from atoms.core.effects import (
+    CreateDirectory,
+    CreateFileNoClobber,
+    DeletePath,
+)
+from atoms.core.errors import ProjectApprovalRefused, ProtocolError
+from atoms.core.fingerprint import DirectoryState
+from atoms.fs.judgment import require_ancestors_legal
+from atoms.fs.resolve import EntryKind, FilesystemIdentity, PresentFrontier
+from atoms.fs.topology import build_topology
+from tests.fs_support import (
+    EXT4,
+    WORK_CONSTRAINTS,
+    compiled_for,
+    file_state,
+    resolved_prefix,
+)
+
+BLOCKING_FILE = PresentFrontier(
+    identity=FilesystemIdentity(device=41, inode=77), kind=EntryKind.REGULAR_FILE
+)
+
+
+def test_a_fully_resolved_path_needs_no_ancestor_proof():
+    compiled = compiled_for(CreateFileNoClobber("e1", "a/b/leaf", file_state()))
+    prefixes = {"a/b/leaf": resolved_prefix("a/b/leaf", existing_depth=2)}
+    resolved = build_topology(compiled, prefixes, EXT4, None)
+    require_ancestors_legal(compiled, prefixes, resolved)
+
+
+def test_a_missing_ancestor_no_effect_creates_is_refused():
+    compiled = compiled_for(CreateFileNoClobber("e1", "a/b/leaf", file_state()))
+    prefixes = {"a/b/leaf": resolved_prefix("a/b/leaf", existing_depth=1)}
+    resolved = build_topology(compiled, prefixes, EXT4, None)
+    with pytest.raises(ProjectApprovalRefused) as caught:
+        require_ancestors_legal(compiled, prefixes, resolved)
+    assert "a/b" in str(caught.value)
+
+
+def test_a_created_ancestor_ordered_before_its_descendant_is_admitted():
+    compiled = compiled_for(
+        CreateDirectory("mk", "a/b", DirectoryState(mode=0o755)),
+        CreateFileNoClobber("e1", "a/b/leaf", file_state()),
+    )
+    prefixes = {
+        "a/b": resolved_prefix("a/b", existing_depth=1),
+        "a/b/leaf": resolved_prefix("a/b/leaf", existing_depth=1),
+    }
+    resolved = build_topology(compiled, prefixes, EXT4, WORK_CONSTRAINTS)
+    require_ancestors_legal(compiled, prefixes, resolved)
+
+
+def test_a_folding_ancestor_created_first_is_admitted(injected_equivalence):
+    """Design §5.4's case, end to end through the two phases that decide it. A2 admits
+    the pair — its phase 4 key is the whole path, and `A` differs from `a/x` — so the
+    resolved judgment is the only thing that can accept or refuse it."""
+    injected_equivalence(str.casefold)
+    compiled = compiled_for(
+        CreateDirectory("mk", "A", DirectoryState(mode=0o755)),
+        CreateFileNoClobber("e1", "a/x", file_state()),
+    )
+    prefixes = {
+        "A": resolved_prefix("A", existing_depth=0),
+        "a/x": resolved_prefix("a/x", existing_depth=0),
+    }
+    resolved = build_topology(compiled, prefixes, EXT4, WORK_CONSTRAINTS)
+    require_ancestors_legal(compiled, prefixes, resolved)
+
+
+def test_the_same_pair_is_refused_under_exact_bytes():
+    """Without the folding key `a` is a second directory that nothing creates. The pair
+    proves the acceptance above is the equivalence function's doing."""
+    compiled = compiled_for(
+        CreateDirectory("mk", "A", DirectoryState(mode=0o755)),
+        CreateFileNoClobber("e1", "a/x", file_state()),
+    )
+    prefixes = {
+        "A": resolved_prefix("A", existing_depth=0),
+        "a/x": resolved_prefix("a/x", existing_depth=0),
+    }
+    resolved = build_topology(compiled, prefixes, EXT4, WORK_CONSTRAINTS)
+    with pytest.raises(ProjectApprovalRefused) as caught:
+        require_ancestors_legal(compiled, prefixes, resolved)
+    assert "no CreateDirectory effect creates" in str(caught.value)
+
+
+def test_a_created_ancestor_ordered_after_its_descendant_is_refused(
+    injected_equivalence,
+):
+    """A2 phase 13 is lexical: it sees CreateDirectory("A") and an effect on "a/x" as
+    unrelated paths and admits this. Under a folding parent they are one directory and
+    the creation is too late. This is the only shape that reaches the ordering branch —
+    under exact bytes A2's verdict and the resolved verdict provably agree (design §7.4),
+    so a test that compiles cannot disagree with A2 unless the key relation differs."""
+    injected_equivalence(str.casefold)
+    compiled = compiled_for(
+        CreateFileNoClobber("e1", "a/x", file_state()),
+        CreateDirectory("mk", "A", DirectoryState(mode=0o755)),
+    )
+    prefixes = {
+        "a/x": resolved_prefix("a/x", existing_depth=0),
+        "A": resolved_prefix("A", existing_depth=0),
+    }
+    resolved = build_topology(compiled, prefixes, EXT4, WORK_CONSTRAINTS)
+    with pytest.raises(ProjectApprovalRefused) as caught:
+        require_ancestors_legal(compiled, prefixes, resolved)
+    assert "must precede" in str(caught.value)
+
+
+def test_a_regular_file_ancestor_the_timeline_converts_is_admitted():
+    compiled = compiled_for(
+        DeletePath("rm", "p", file_state()),
+        CreateDirectory("mk", "p", DirectoryState(mode=0o755)),
+        CreateFileNoClobber("e1", "p/q", file_state()),
+    )
+    prefixes = {
+        "p": resolved_prefix("p", existing_depth=0, frontier=BLOCKING_FILE),
+        "p/q": resolved_prefix("p/q", existing_depth=0, frontier=BLOCKING_FILE),
+    }
+    resolved = build_topology(compiled, prefixes, EXT4, WORK_CONSTRAINTS)
+    require_ancestors_legal(compiled, prefixes, resolved)
+
+
+def test_a_regular_file_ancestor_the_timeline_leaves_alone_is_refused():
+    compiled = compiled_for(
+        CreateDirectory("mk", "p", DirectoryState(mode=0o755)),
+        CreateFileNoClobber("e1", "p/q", file_state()),
+    )
+    prefixes = {
+        "p": resolved_prefix("p", existing_depth=0, frontier=BLOCKING_FILE),
+        "p/q": resolved_prefix("p/q", existing_depth=0, frontier=BLOCKING_FILE),
+    }
+    resolved = build_topology(compiled, prefixes, EXT4, WORK_CONSTRAINTS)
+    with pytest.raises(ProjectApprovalRefused) as caught:
+        require_ancestors_legal(compiled, prefixes, resolved)
+    assert "removes" in str(caught.value)
+
+
+def test_an_other_ancestor_is_refused_whatever_the_timeline_says():
+    """No closed effect variant accepts an OTHER precondition — DeletePath.pre is a file
+    or a symlink — so no admissible timeline can turn a socket into a directory."""
+    compiled = compiled_for(
+        CreateDirectory("mk", "p", DirectoryState(mode=0o755)),
+        CreateFileNoClobber("e1", "p/q", file_state()),
+    )
+    blocked = PresentFrontier(
+        identity=FilesystemIdentity(device=41, inode=77), kind=EntryKind.OTHER
+    )
+    prefixes = {
+        "p": resolved_prefix("p", existing_depth=0, frontier=blocked),
+        "p/q": resolved_prefix("p/q", existing_depth=0, frontier=blocked),
+    }
+    resolved = build_topology(compiled, prefixes, EXT4, WORK_CONSTRAINTS)
+    with pytest.raises(ProjectApprovalRefused) as caught:
+        require_ancestors_legal(compiled, prefixes, resolved)
+    assert "other" in str(caught.value)
+
+
+def test_a_directory_frontier_with_a_remainder_is_a_protocol_error():
+    """open_child_directory succeeds on a directory, so the walk would not have stopped.
+    Asserted rather than assumed, because it is a claim about openat2 and not about this
+    module."""
+    compiled = compiled_for(CreateFileNoClobber("e1", "p/q", file_state()))
+    blocked = resolved_prefix(
+        "p/q",
+        existing_depth=0,
+        frontier=PresentFrontier(
+            identity=FilesystemIdentity(device=41, inode=77), kind=EntryKind.DIRECTORY
+        ),
+    )
+    prefixes = {"p/q": blocked}
+    resolved = build_topology(compiled, prefixes, EXT4, None)
+    with pytest.raises(ProtocolError):
+        require_ancestors_legal(compiled, prefixes, resolved)
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `uv run pytest tests/test_fs_judgment.py -v`
+Expected: FAIL with `ModuleNotFoundError: No module named 'atoms.fs.judgment'`.
+
+- [ ] **Step 3: Write `judgment.py`**
+
+Create `src/atoms/fs/judgment.py`:
+
+```python
+"""Pure judgment over a resolution table and its topology (A4b-2 design §6.3).
+
+No filesystem access, no descriptor, no syscall. Every function here takes values the
+resolution and construction phases already produced and either returns or raises. Every
+directory is identified by its TopologyNode; no function compares a path component.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+
+from atoms.core.compiler import CompiledSpec
+from atoms.core.effects import CreateDirectory, DeletePath, occurrences
+from atoms.core.errors import ProjectApprovalRefused, ProtocolError
+from atoms.core.recovery import TopologyNode
+from atoms.fs.resolve import EntryKind, PresentFrontier, ResolvedPrefix
+from atoms.fs.topology import ResolvedTopology
+
+# The frontier kinds a closed effect variant can remove. DeletePath.pre is typed
+# FileState | SymlinkState, so no admissible timeline removes anything else — which is
+# why OTHER is refused on a model ground rather than on an observation.
+_REMOVABLE_KINDS = frozenset({EntryKind.REGULAR_FILE, EntryKind.SYMLINK})
+
+
+def require_ancestors_legal(
+    compiled: CompiledSpec,
+    prefixes: Mapping[str, ResolvedPrefix],
+    resolved: ResolvedTopology,
+) -> None:
+    """Every component past the frontier is a directory this transaction creates first.
+
+    Two routes reach the same rule. A missing component simply does not exist yet. A
+    component that exists as a file or symlink is the authority §6 case where absence is
+    inferred from the ancestor's verified state rather than probed; it is admitted only
+    when the timeline removes it and creates a directory in its place.
+
+    Judged over nodes: `resolved.directory_node` maps a prefix to the directory it
+    actually names, so `CreateDirectory("A")` is recognised as the creator of `a`'s
+    ancestor on a folding volume.
+    """
+    creators: dict[TopologyNode, int] = {}
+    removers: dict[TopologyNode, int] = {}
+    for index, effect in enumerate(compiled.spec.effects):
+        node = resolved.directory_node(effect.path)
+        if node is None:
+            continue
+        if isinstance(effect, CreateDirectory):
+            creators.setdefault(node, index)
+        elif isinstance(effect, DeletePath):
+            removers.setdefault(node, index)
+
+    first_touch: dict[str, int] = {}
+    for index, effect in enumerate(compiled.spec.effects):
+        for occurrence in occurrences(effect):
+            first_touch.setdefault(occurrence.path, index)
+
+    for path in sorted(prefixes):
+        prefix = prefixes[path]
+        if not prefix.remainder:
+            continue
+        components = path.split("/")
+        depth = len(prefix.hops)
+        _require_frontier_convertible(path, prefix, components[depth])
+        for index in range(depth, len(components) - 1):
+            ancestor = "/".join(components[: index + 1])
+            _require_created_first(
+                ancestor, _node_of(resolved, ancestor), path, first_touch[path], creators
+            )
+        if isinstance(prefix.frontier, PresentFrontier):
+            blocking = "/".join(components[: depth + 1])
+            _require_removed_before_creation(
+                blocking, _node_of(resolved, blocking), creators, removers
+            )
+
+
+def _node_of(resolved: ResolvedTopology, prefix: str) -> TopologyNode:
+    node = resolved.directory_node(prefix)
+    if node is None:
+        raise ProtocolError(
+            f"{prefix!r} is an ancestor of a declared path but the topology assigned it "
+            "no directory node; construction and judgment disagree about the candidates"
+        )
+    return node
+
+
+def _require_frontier_convertible(
+    path: str, prefix: ResolvedPrefix, component: str
+) -> None:
+    frontier = prefix.frontier
+    if not isinstance(frontier, PresentFrontier):
+        return
+    if frontier.kind is EntryKind.DIRECTORY:
+        raise ProtocolError(
+            f"resolution of {path!r} stopped at directory {component!r} with "
+            f"{len(prefix.remainder)} components remaining; open_child_directory "
+            "succeeds on a directory, so the walk should have continued"
+        )
+    if frontier.kind not in _REMOVABLE_KINDS:
+        raise ProjectApprovalRefused(
+            f"component {component!r} of {path!r} is {frontier.kind.value}, which no "
+            "effect variant can remove, so no timeline can make it a directory"
+        )
+
+
+def _require_created_first(
+    ancestor: str,
+    node: TopologyNode,
+    path: str,
+    touched_at: int,
+    creators: Mapping[TopologyNode, int],
+) -> None:
+    creator = creators.get(node)
+    if creator is None:
+        raise ProjectApprovalRefused(
+            f"{path!r} needs directory {ancestor!r}, which does not exist and which no "
+            "CreateDirectory effect creates; a parent that neither exists nor is "
+            "created by this transaction cannot be captured"
+        )
+    if creator >= touched_at:
+        raise ProjectApprovalRefused(
+            f"{path!r} is touched by effect {touched_at} but its ancestor {ancestor!r} "
+            f"is created by effect {creator}; outer directory creation must precede "
+            "every affected descendant"
+        )
+
+
+def _require_removed_before_creation(
+    blocking: str,
+    node: TopologyNode,
+    creators: Mapping[TopologyNode, int],
+    removers: Mapping[TopologyNode, int],
+) -> None:
+    """A blocking non-directory must be removed, then re-created as a directory.
+
+    This is design §5.2's one bounded exception to "approval does not compare live state
+    against a declared precondition": resolution stopped here, so the topology cannot be
+    built without deciding whether this path becomes a directory, and the observation is
+    already in hand.
+    """
+    creator = creators[node]  # _require_created_first already proved it exists
+    remover = removers.get(node)
+    if remover is None:
+        raise ProjectApprovalRefused(
+            f"{blocking!r} exists and is not a directory, but no effect removes it "
+            f"before effect {creator} creates a directory there"
+        )
+    if remover >= creator:
+        raise ProjectApprovalRefused(
+            f"{blocking!r} is removed by effect {remover} and created by effect "
+            f"{creator}; the removal must come first"
+        )
+```
+
+`removers` is keyed by directory node, so a `DeletePath` on a path that is not a directory
+candidate — the common case, deleting a file — is skipped by the `node is None` branch. That is
+correct: only a blocking ancestor's removal is ever consulted here.
+
+- [ ] **Step 4: Run the tests and the gates**
+
+```bash
+uv run pytest tests/test_fs_judgment.py tests/test_fs_topology.py -v
+uv run ruff check src/atoms/fs/judgment.py tests/
+uv run pyright
+```
+Expected: PASS, `All checks passed!`, `0 errors`.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/atoms/fs/judgment.py tests/test_fs_judgment.py
+git commit -m "feat(fs): prove every unresolved ancestor is created in order"
+```
+
 
 ---
 
@@ -1159,11 +1410,54 @@ git commit -m "feat(fs): build the resolved topology over directory identity"
   `JournalState`, `PersistentObservation`, `ScratchObservation`, `ObservedAbsent`.
 - Produces: `require_resolved_surface_and_ordering(compiled: CompiledSpec, resolved: ResolvedTopology) -> None`.
 
+**`CommitDecision` has exactly two members — `UNCOMMITTED` and `COMMITTED`.** There is no
+`UNDECIDED`; a prepared transaction is `UNCOMMITTED`. And `required_scratch_role` comes from
+`atoms.core.recovery.snapshot`, for the reason Task 2 records.
+
 - [ ] **Step 1: Write the failing tests**
 
 Append to `tests/test_fs_topology.py`:
 
 ```python
+AGREEMENT_CORPUS = {
+    "one file in an existing directory": (
+        CreateFileNoClobber("e1", "a/b/leaf", file_state()),
+    ),
+    "a created directory and its child": (
+        CreateDirectory("mk", "a", DirectoryState(mode=0o755)),
+        CreateFileNoClobber("e1", "a/leaf", file_state()),
+    ),
+    "nested created directories": (
+        CreateDirectory("mk", "a", DirectoryState(mode=0o755)),
+        CreateDirectory("mk2", "a/b", DirectoryState(mode=0o755)),
+        CreateFileNoClobber("e1", "a/b/leaf", file_state()),
+    ),
+    "a move across directories": (MoveNoClobber("mv", "src/a", "dst/b", file_state()),),
+    "a move within one directory": (MoveNoClobber("mv", "d/a", "d/b", file_state()),),
+    "a replace": (ReplaceFile("rp", "d/leaf", nonempty_state(b"old"), nonempty_state(b"new")),),
+    "a delete": (DeletePath("rm", "d/leaf", file_state()),),
+    "a file ancestor converted to a directory": (
+        DeletePath("rm", "p", file_state()),
+        CreateDirectory("mk", "p", DirectoryState(mode=0o755)),
+        CreateFileNoClobber("e1", "p/q", file_state()),
+    ),
+    "a symlink removed beside a create": (
+        DeletePath("rm", "d/link", SymlinkState(target="x", mode=0o777)),
+        CreateFileNoClobber("e1", "d/leaf", file_state()),
+    ),
+    "every variant at once": (
+        DeletePath("rm", "d/old", file_state()),
+        CreateDirectory("mk", "d/new", DirectoryState(mode=0o755)),
+        CreateFileNoClobber("e1", "d/new/leaf", file_state()),
+        ReplaceFile("rp", "d/keep", nonempty_state(b"old"), nonempty_state(b"new")),
+        MoveNoClobber("mv", "d/from", "d/new/to", file_state()),
+    ),
+}
+"""Every effect variant, alone and combined, plus the shapes that stress the topology:
+nested creation, a move whose endpoints share a parent, and the FILE → ABSENT → DIRECTORY
+conversion. Each entry is verified to compile — a case A2 refuses is not a case."""
+
+
 def _prepared_snapshot(compiled, resolved):
     """Feed a produced topology to A3's own validator.
 
@@ -1181,14 +1475,14 @@ def _prepared_snapshot(compiled, resolved):
         ScratchObservation,
         TransactionState,
         build_recovery_snapshot,
-        required_scratch_role,
     )
+    from atoms.core.recovery.snapshot import required_scratch_role
 
     return build_recovery_snapshot(
         compiled=compiled,
         topology=resolved.topology,
         transaction_state=TransactionState.PREPARED,
-        commit_decision=CommitDecision.UNDECIDED,
+        commit_decision=CommitDecision.UNCOMMITTED,
         rollback_result=None,
         halt_diagnostic=None,
         active=True,
@@ -1212,89 +1506,66 @@ def _prepared_snapshot(compiled, resolved):
     )
 
 
-@pytest.mark.parametrize(
-    "effects",
-    [
-        (CreateFileNoClobber("e1", "a/b/leaf", file_state()),),
-        (
-            CreateDirectory("mk", "a", DirectoryState(mode=0o755)),
-            CreateFileNoClobber("e1", "a/leaf", file_state()),
-        ),
-        (MoveNoClobber("mv", "src/a", "dst/b", file_state()),),
-    ],
-)
-def test_every_produced_topology_validates_through_a3(effects):
-    compiled = compiled_for(*effects)
-    prefixes = {}
-    for timeline in compiled.timelines:
-        depth = len(timeline.path.split("/")) - 1
-        created = any(
-            isinstance(effect, CreateDirectory) and timeline.path.startswith(effect.path)
-            for effect in compiled.spec.effects
-        )
-        prefixes[timeline.path] = resolved_prefix(
-            timeline.path, existing_depth=0 if created else depth
-        )
-    work = WORK_CONSTRAINTS if any(
-        isinstance(effect, CreateDirectory) for effect in effects
-    ) else None
-    resolved = build_topology(compiled, prefixes, EXT4, work)
+@pytest.mark.parametrize("label", sorted(AGREEMENT_CORPUS))
+def test_every_produced_topology_validates_through_a3(label):
+    compiled = compiled_for(*AGREEMENT_CORPUS[label])
+    resolved = build_topology(compiled, prefixes_for(compiled), EXT4, work_for(compiled))
     snapshot = _prepared_snapshot(compiled, resolved)
     assert snapshot.topology == resolved.topology
 
 
-def test_the_rerun_refuses_a_descendant_of_a_non_directory_surface_node():
+@pytest.mark.parametrize("label", sorted(AGREEMENT_CORPUS))
+def test_the_rerun_reaches_a2s_verdict_on_every_compiled_input(label):
+    """Design §11.4's A2-agreement property, over the whole corpus rather than a sample.
+    Under today's floor the resolved topology is provably identical to the lexical one, so
+    a compiled specification and its re-run cannot disagree. A failure means the re-run
+    drifted or the floor moved (design §7.4)."""
     from atoms.fs.topology import require_resolved_surface_and_ordering
 
+    compiled = compiled_for(*AGREEMENT_CORPUS[label])
+    resolved = build_topology(compiled, prefixes_for(compiled), EXT4, work_for(compiled))
+    require_resolved_surface_and_ordering(compiled, resolved)
+
+
+def test_the_rerun_refuses_a_creation_ordered_after_its_descendant(injected_equivalence):
+    """The reachable half of the re-run. A2 phase 13 is lexical: it sees
+    CreateDirectory("A") and an effect on "a/x" as unrelated and admits this. Under a
+    folding parent they are one directory and the creation is too late.
+
+    The surface half has no reachable case. A declared path becomes an *ancestor node*
+    only by being a directory candidate, and a directory candidate is either a lexical
+    proper prefix — which A2's own trie already walks — or a CreateDirectory endpoint,
+    whose declared state is a DirectoryState and therefore never a blocker. A folding
+    file at `A` above `a/x` is refused one phase earlier, by ancestor legality, because
+    nothing creates the directory `a`. The surface branch stays as a fail-closed guard.
+    """
+    from atoms.fs.topology import require_resolved_surface_and_ordering
+
+    injected_equivalence(str.casefold)
     compiled = compiled_for(
-        CreateFileNoClobber("e1", "p", file_state()),
-        CreateFileNoClobber("e2", "p/q", file_state()),
+        CreateFileNoClobber("e1", "a/x", file_state()),
+        CreateDirectory("mk", "A", DirectoryState(mode=0o755)),
     )
     prefixes = {
-        "p": resolved_prefix("p", existing_depth=0),
-        "p/q": resolved_prefix("p/q", existing_depth=0),
+        "a/x": resolved_prefix("a/x", existing_depth=0),
+        "A": resolved_prefix("A", existing_depth=0),
     }
-    resolved = build_topology(compiled, prefixes, EXT4, None)
-    with pytest.raises(ProjectApprovalRefused):
+    resolved = build_topology(compiled, prefixes, EXT4, WORK_CONSTRAINTS)
+    with pytest.raises(ProjectApprovalRefused) as caught:
         require_resolved_surface_and_ordering(compiled, resolved)
-
-
-def test_the_rerun_reaches_a2s_verdict_on_every_compiled_input():
-    """Under today's floor the resolved topology is provably identical to the lexical
-    one, so these cannot disagree. A failure means the re-run drifted or the floor moved
-    (design §7.4)."""
-    from atoms.fs.topology import require_resolved_surface_and_ordering
-
-    for effects in (
-        (CreateFileNoClobber("e1", "a/b/leaf", file_state()),),
-        (
-            CreateDirectory("mk", "a", DirectoryState(mode=0o755)),
-            CreateFileNoClobber("e1", "a/leaf", file_state()),
-        ),
-        (MoveNoClobber("mv", "src/a", "dst/b", file_state()),),
-    ):
-        compiled = compiled_for(*effects)
-        prefixes = {
-            timeline.path: resolved_prefix(
-                timeline.path,
-                existing_depth=0
-                if any(
-                    isinstance(effect, CreateDirectory)
-                    and timeline.path.startswith(effect.path)
-                    for effect in effects
-                )
-                else len(timeline.path.split("/")) - 1,
-            )
-            for timeline in compiled.timelines
-        }
-        work = WORK_CONSTRAINTS if any(
-            isinstance(effect, CreateDirectory) for effect in effects
-        ) else None
-        resolved = build_topology(compiled, prefixes, EXT4, work)
-        require_resolved_surface_and_ordering(compiled, resolved)
+    assert "creation must come first" in str(caught.value)
 ```
 
-Add `from atoms.core.errors import ProjectApprovalRefused` to the module's imports.
+Extend the module's imports to cover the corpus:
+
+```python
+import pytest
+
+from atoms.core.effects import DeletePath, ReplaceFile
+from atoms.core.errors import ProjectApprovalRefused
+from atoms.core.fingerprint import SymlinkState
+from tests.fs_support import nonempty_state, prefixes_for, work_for
+```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -1327,15 +1598,19 @@ def require_resolved_surface_and_ordering(
             ancestor = parent_by_node.get(node)
             while ancestor is not None:
                 blocker = states.get(ancestor)
-                if blocker is not None and not isinstance(blocker, AbsentState):
-                    if not isinstance(blocker, DirectoryState) and not isinstance(
-                        state, AbsentState
-                    ):
-                        raise ProjectApprovalRefused(
-                            f"{label} places {node!r} beneath {ancestor!r}, which is "
-                            f"{type(blocker).__name__} and cannot contain entries; "
-                            "the descendant must be declared absent"
-                        )
+                # An ABSENT ancestor blocks exactly as a file does: A2's phase 12 sets its
+                # trie constraint from any declared state that is not a DirectoryState,
+                # absence included, so omitting it here would admit what A2 refuses.
+                if (
+                    blocker is not None
+                    and not isinstance(blocker, DirectoryState)
+                    and not isinstance(state, AbsentState)
+                ):
+                    raise ProjectApprovalRefused(
+                        f"{label} places {node!r} beneath {ancestor!r}, which is "
+                        f"{type(blocker).__name__} and cannot contain entries; "
+                        "the descendant must be declared absent"
+                    )
                 ancestor = parent_by_node.get(ancestor)
 
     creators = {
@@ -1388,6 +1663,7 @@ git commit -m "feat(fs): re-run surface and ordering over resolved nodes"
 **Files:**
 - Modify: `src/atoms/fs/judgment.py`
 - Modify: `tests/test_fs_judgment.py`
+- Modify: `tests/conftest.py`
 
 **Interfaces:**
 - Consumes: `ResolvedTopology`, `ApprovedScratch`, `lookup_equivalence_key`, `scratch_leaf`,
@@ -1397,13 +1673,24 @@ git commit -m "feat(fs): re-run surface and ordering over resolved nodes"
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `tests/test_fs_judgment.py`:
+Extend `tests/test_fs_judgment.py`'s existing imports — Task 3 already imports `build_topology`,
+`EXT4`, and `WORK_CONSTRAINTS` at module level, so these tests use them directly rather than
+re-importing inside each function:
+
+```python
+from atoms.core.recovery import WorkRoot
+from atoms.fs.judgment import (
+    bind_scratch,
+    require_ancestors_legal,
+    require_endpoints_distinct,
+)
+from tests.conftest import truncate_to_eight
+```
+
+Then append:
 
 ```python
 def test_distinct_leaves_in_one_parent_are_admitted():
-    from atoms.fs.judgment import require_endpoints_distinct
-    from atoms.fs.topology import build_topology
-
     compiled = compiled_for(
         CreateFileNoClobber("e1", "d/one", file_state()),
         CreateFileNoClobber("e2", "d/two", file_state()),
@@ -1412,7 +1699,7 @@ def test_distinct_leaves_in_one_parent_are_admitted():
         "d/one": resolved_prefix("d/one", existing_depth=1),
         "d/two": resolved_prefix("d/two", existing_depth=1),
     }
-    require_endpoints_distinct(build_topology(compiled, prefixes, "ext4", None))
+    require_endpoints_distinct(build_topology(compiled, prefixes, EXT4, None))
 
 
 def test_two_paths_colliding_in_one_parent_are_refused(injected_equivalence):
@@ -1420,33 +1707,25 @@ def test_two_paths_colliding_in_one_parent_are_refused(injected_equivalence):
     their whole paths fold too, and A2 phase 4 refuses that pair before approval runs.
     A truncating relation — a real filesystem equivalence class A2's key does not
     subsume — is what makes the check observable."""
-    from tests.conftest import truncate_to_eight
-
-    from atoms.fs.judgment import require_endpoints_distinct
-    from atoms.fs.topology import build_topology
-
     injected_equivalence(truncate_to_eight)
     compiled = compiled_for(
-        CreateFileNoClobber("e1", "d/onelongname", file_state()),
-        CreateFileNoClobber("e2", "d/onelongother", file_state()),
+        CreateFileNoClobber("e1", "d/sharedprefix-one", file_state()),
+        CreateFileNoClobber("e2", "d/sharedprefix-two", file_state()),
     )
     prefixes = {
-        "d/onelongname": resolved_prefix("d/onelongname", existing_depth=1),
-        "d/onelongother": resolved_prefix("d/onelongother", existing_depth=1),
+        "d/sharedprefix-one": resolved_prefix("d/sharedprefix-one", existing_depth=1),
+        "d/sharedprefix-two": resolved_prefix("d/sharedprefix-two", existing_depth=1),
     }
-    resolved = build_topology(compiled, prefixes, "ext4", None)
+    resolved = build_topology(compiled, prefixes, EXT4, None)
     with pytest.raises(ProjectApprovalRefused) as caught:
         require_endpoints_distinct(resolved)
     assert "one entry" in str(caught.value)
 
 
 def test_scratch_leaves_bind_to_their_effects_parent():
-    from atoms.fs.judgment import bind_scratch
-    from atoms.fs.topology import build_topology
-
     compiled = compiled_for(CreateFileNoClobber("e1", "d/leaf", file_state()))
     prefixes = {"d/leaf": resolved_prefix("d/leaf", existing_depth=1)}
-    resolved = build_topology(compiled, prefixes, "ext4", None)
+    resolved = build_topology(compiled, prefixes, EXT4, None)
     bound = bind_scratch(compiled, "tx01", resolved)
 
     assert len(bound) == 1
@@ -1456,18 +1735,13 @@ def test_scratch_leaves_bind_to_their_effects_parent():
 
 
 def test_a_work_scratch_leaf_binds_to_the_work_root():
-    from atoms.core.recovery import WorkRoot
-    from atoms.fs.judgment import bind_scratch
-    from atoms.fs.topology import build_topology
-    from atoms.fs.lookup import DirectoryConstraints, LookupProof
-
     compiled = compiled_for(CreateDirectory("mk", "a", DirectoryState(mode=0o755)))
     prefixes = {"a": resolved_prefix("a", existing_depth=0)}
     resolved = build_topology(
         compiled,
         prefixes,
-        "ext4",
-        DirectoryConstraints(lookup_proof=LookupProof.EXACT_BYTES, name_max=255),
+        EXT4,
+        WORK_CONSTRAINTS,
     )
     bound = bind_scratch(compiled, "tx01", resolved)
     assert bound[0].parent_node == WorkRoot()
@@ -1475,12 +1749,9 @@ def test_a_work_scratch_leaf_binds_to_the_work_root():
 
 
 def test_a_scratch_leaf_over_its_parents_name_max_is_refused():
-    from atoms.fs.judgment import bind_scratch
-    from atoms.fs.topology import build_topology
-
     compiled = compiled_for(CreateFileNoClobber("e1", "d/leaf", file_state()))
     prefixes = {"d/leaf": resolved_prefix("d/leaf", existing_depth=1, name_max=8)}
-    resolved = build_topology(compiled, prefixes, "ext4", None)
+    resolved = build_topology(compiled, prefixes, EXT4, None)
     with pytest.raises(ProjectApprovalRefused) as caught:
         bind_scratch(compiled, "tx01", resolved)
     assert "name limit" in str(caught.value)
@@ -1491,11 +1762,6 @@ def test_colliding_scratch_leaves_are_refused(injected_equivalence):
     case folding no two scratch leaves can collide. Truncation can: every leaf shares the
     `.#~tx01.` prefix, so an eight-byte key collapses the whole set. Regeneration is
     explicitly not a remedy — an intrinsic collision recurs under every txid."""
-    from tests.conftest import truncate_to_eight
-
-    from atoms.fs.judgment import bind_scratch
-    from atoms.fs.topology import build_topology
-
     compiled = compiled_for(
         CreateFileNoClobber("e1", "d/one", file_state()),
         CreateFileNoClobber("e2", "d/two", file_state()),
@@ -1504,7 +1770,7 @@ def test_colliding_scratch_leaves_are_refused(injected_equivalence):
         "d/one": resolved_prefix("d/one", existing_depth=1),
         "d/two": resolved_prefix("d/two", existing_depth=1),
     }
-    resolved = build_topology(compiled, prefixes, "ext4", None)
+    resolved = build_topology(compiled, prefixes, EXT4, None)
     injected_equivalence(truncate_to_eight)
     with pytest.raises(ProjectApprovalRefused) as caught:
         bind_scratch(compiled, "tx01", resolved)
@@ -1512,9 +1778,6 @@ def test_colliding_scratch_leaves_are_refused(injected_equivalence):
 
 
 def test_distinct_scratch_leaves_survive_under_exact_bytes():
-    from atoms.fs.judgment import bind_scratch
-    from atoms.fs.topology import build_topology
-
     compiled = compiled_for(
         CreateFileNoClobber("e1", "d/one", file_state()),
         CreateFileNoClobber("e2", "d/two", file_state()),
@@ -1523,7 +1786,7 @@ def test_distinct_scratch_leaves_survive_under_exact_bytes():
         "d/one": resolved_prefix("d/one", existing_depth=1),
         "d/two": resolved_prefix("d/two", existing_depth=1),
     }
-    resolved = build_topology(compiled, prefixes, "ext4", None)
+    resolved = build_topology(compiled, prefixes, EXT4, None)
     bound = bind_scratch(compiled, "tx01", resolved)
     assert len({entry.leaf for entry in bound}) == len(bound) == 2
 ```
@@ -1547,16 +1810,18 @@ def require_endpoints_distinct(resolved: ResolvedTopology) -> None:
     no-clobber operation succeed while x and y aliasing leaves the declared final states
     unsatisfiable.
     """
+    # `key in seen` rather than comparing the two leaves: the collision is already decided
+    # by the key, and re-comparing raw leaves is the exact bypass the AST guard forbids.
     seen: dict[tuple[TopologyNode, str], str] = {}
     for entry in resolved.paths:
         constraints = resolved.constraints_of(entry.parent_node)
         key = (entry.parent_node, lookup_equivalence_key(constraints, entry.leaf))
-        previous = seen.setdefault(key, entry.path)
-        if previous != entry.path:
+        if key in seen:
             raise ProjectApprovalRefused(
-                f"declared paths {previous!r} and {entry.path!r} name one entry under "
+                f"declared paths {seen[key]!r} and {entry.path!r} name one entry under "
                 f"the actual lookup policy of their shared parent {entry.parent_node!r}"
             )
+        seen[key] = entry.path
 
 
 def bind_scratch(
@@ -1597,24 +1862,34 @@ def bind_scratch(
                 f"name limit of {constraints.name_max}"
             )
         key = (entry.parent_node, lookup_equivalence_key(constraints, entry.leaf))
-        previous = seen.setdefault(key, entry.leaf)
-        if previous != entry.leaf:
+        if key in seen:
             raise ProjectApprovalRefused(
-                f"scratch leaves {previous!r} and {entry.leaf!r} collide in one parent "
+                f"scratch leaves {seen[key]!r} and {entry.leaf!r} collide in one parent "
                 "under its actual lookup policy; regenerating the txid is not a remedy "
                 "because an intrinsic collision recurs under every txid"
             )
+        seen[key] = entry.leaf
     return tuple(bound)
 ```
 
-Add to `judgment.py`'s imports:
+Extend `judgment.py`'s imports. `TopologyNode` and `ResolvedTopology` are already there from Task 3,
+and `MoveNoClobber` joins the existing `atoms.core.effects` line rather than starting a second one —
+ruff's isort would rewrite a duplicate:
 
 ```python
 from atoms.core.effects import CreateDirectory, DeletePath, MoveNoClobber, occurrences
-from atoms.core.recovery import ScratchRole, TopologyNode, WorkRoot, required_scratch_role
+from atoms.core.recovery import ScratchRole, TopologyNode, WorkRoot
+from atoms.core.recovery.snapshot import required_scratch_role
 from atoms.core.scratch import scratch_leaf
 from atoms.fs.lookup import lookup_equivalence_key
 from atoms.fs.topology import ApprovedScratch, ResolvedTopology
+```
+
+This step gives `judgment.py` its first call to `lookup_equivalence_key`, so extend the double's
+target list in `tests/conftest.py`:
+
+```python
+_EQUIVALENCE_CONSUMERS = ("atoms.fs.topology", "atoms.fs.judgment")
 ```
 
 - [ ] **Step 4: Run the tests and the gates**
@@ -1629,7 +1904,7 @@ Expected: PASS, `All checks passed!`, `0 errors`.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/atoms/fs/judgment.py tests/test_fs_judgment.py
+git add src/atoms/fs/judgment.py tests/test_fs_judgment.py tests/conftest.py
 git commit -m "feat(fs): prove endpoints and scratch leaves pairwise distinct"
 ```
 
@@ -1650,7 +1925,9 @@ git commit -m "feat(fs): prove endpoints and scratch leaves pairwise distinct"
 
 - [ ] **Step 1: Register the approval fixture**
 
-Append to `tests/conftest.py`:
+Append to `tests/conftest.py`. It forwards `withhold` to `ext4_bound_volume`, which already knows how
+to bind a fake backend supplying everything except a named set — that is the only honest lever for
+arming the capability refusal, because a real ext4 volume supplies every probed capability:
 
 ```python
 @pytest.fixture
@@ -1661,8 +1938,8 @@ def approval_context(ext4_bound_volume):
     from atoms.fs.approval import ProjectContext
 
     @contextlib.contextmanager
-    def build(txid: str = "tx01"):
-        with ext4_bound_volume() as binding:
+    def build(txid: str = "tx01", withhold=frozenset()):
+        with ext4_bound_volume(withhold=withhold) as binding:
             yield ProjectContext(binding=binding, txid=txid), binding
 
     return build
@@ -1681,6 +1958,8 @@ import dataclasses
 
 import pytest
 
+from atoms.core.capabilities import Capability
+from atoms.core.effects import CreateDirectory, CreateFileNoClobber
 from atoms.core.errors import (
     CapabilityUnavailable,
     PreconditionRefused,
@@ -1688,9 +1967,13 @@ from atoms.core.errors import (
     ProtocolError,
     SpecValidationError,
 )
+from atoms.core.fingerprint import DirectoryState
 from atoms.fs.approval import ProjectApprovedSpec, ProjectContext, approve_for_project
-from tests.test_fs_judgment import compiled_for, file_state
-from atoms.core.effects import CreateFileNoClobber
+from tests.fs_support import compiled_for, file_state
+
+WITHHELD = frozenset({Capability.DURABLE_PUBLISH})
+"""DURABLE_PUBLISH is in ALWAYS_REQUIRED, so withholding it makes every specification's
+required set unsatisfiable — no effect variant has to be chosen to arm the refusal."""
 
 
 class _FakeBinding:
@@ -1709,6 +1992,15 @@ class _FakeBinding:
         raise AssertionError("evidence must not be read before liveness")
 
 
+class _SubContext(ProjectContext):
+    """A subclass passes an isinstance gate. §6.1 requires exact types, because a
+    subclass can override a property the pipeline reads after the gate."""
+
+
+class _SubTxid(str):
+    pass
+
+
 def test_a_non_compiled_spec_is_refused(approval_context):
     with approval_context() as (context, _binding):
         with pytest.raises(ProtocolError):
@@ -1723,12 +2015,30 @@ def test_a_duck_typed_binding_is_refused():
     assert "ProjectBinding" in str(caught.value)
 
 
+def test_a_context_subclass_is_refused(approval_context):
+    compiled = compiled_for(CreateFileNoClobber("e1", "leaf", file_state()))
+    with approval_context() as (_context, binding):
+        subclassed = _SubContext(binding=binding, txid="tx01")
+        with pytest.raises(ProtocolError) as caught:
+            approve_for_project(compiled, subclassed)
+        assert "exactly ProjectContext" in str(caught.value)
+
+
+def test_a_txid_subclass_is_refused(approval_context):
+    compiled = compiled_for(CreateFileNoClobber("e1", "leaf", file_state()))
+    with approval_context() as (_context, binding):
+        context = ProjectContext(binding=binding, txid=_SubTxid("tx01"))
+        with pytest.raises(ProtocolError) as caught:
+            approve_for_project(compiled, context)
+        assert "exactly str" in str(caught.value)
+
+
 @pytest.mark.parametrize("txid", [3, None, b"tx01"])
 def test_a_non_string_txid_raises_protocol_error_not_type_error(approval_context, txid):
     """require_valid_identifier reaches re.Pattern.fullmatch, which raises TypeError on a
     non-string. The exact-type gate is what makes §5.1's promised ProtocolError reachable."""
     compiled = compiled_for(CreateFileNoClobber("e1", "leaf", file_state()))
-    with approval_context() as (context, binding):
+    with approval_context() as (_context, binding):
         bad = ProjectContext(binding=binding, txid=txid)  # type: ignore[arg-type]
         with pytest.raises(ProtocolError):
             approve_for_project(compiled, bad)
@@ -1743,14 +2053,74 @@ def test_a_malformed_txid_carries_the_validation_error_as_its_cause(approval_con
 
 
 def test_a_closed_binding_refuses_before_capabilities_are_compared(approval_context):
-    """Both exceptions are reachable; only the §6.1 order distinguishes them. evidence
-    performs no liveness check by design, so reading it first would report
-    CapabilityUnavailable for a lease that is simply gone."""
+    """Discriminating only because both refusals are armed at once. While the binding is
+    live this specification raises CapabilityUnavailable; once it is closed the same call
+    must raise ProtocolError instead, because §6.1 reads `backend` before `evidence`.
+    `evidence` performs no liveness check by design, so an evidence-first pipeline would
+    still see the missing capability and report it for a lease that is simply gone.
+
+    Without the withheld capability this test passes under either ordering, which is the
+    defect it exists to catch."""
     compiled = compiled_for(CreateFileNoClobber("e1", "leaf", file_state()))
-    with approval_context() as (context, binding):
-        binding.__exit__()
-        with pytest.raises(ProtocolError):
+    with approval_context(withhold=WITHHELD) as (context, binding):
+        with pytest.raises(CapabilityUnavailable):
             approve_for_project(compiled, context)
+        binding.__exit__()
+        with pytest.raises(ProtocolError) as caught:
+            approve_for_project(compiled, context)
+        assert "closed" in str(caught.value)
+
+
+def test_a_released_lock_refuses_the_same_way(approval_context, monkeypatch):
+    """ProjectBinding._require_active has two branches. The lock outliving check is the
+    one A5's lease will exercise for real, so both are armed here."""
+    compiled = compiled_for(CreateFileNoClobber("e1", "leaf", file_state()))
+    with approval_context(withhold=WITHHELD) as (context, binding):
+        monkeypatch.setattr(binding._lock, "_held", False)
+        with pytest.raises(ProtocolError) as caught:
+            approve_for_project(compiled, context)
+        assert "released" in str(caught.value)
+
+
+def test_a_missing_capability_refuses_before_any_path_is_resolved(
+    approval_context, monkeypatch
+):
+    """Ledger #6: A4b is the sole adjudicator, and it refuses before touching the
+    project. A resolver that raises on entry proves nothing reached phase B."""
+
+    def forbidden(self, rel_path):
+        raise AssertionError("phase B ran before capabilities were adjudicated")
+
+    monkeypatch.setattr("atoms.fs.approval.PathResolver.resolve", forbidden)
+    compiled = compiled_for(CreateFileNoClobber("e1", "leaf", file_state()))
+    with approval_context(withhold=WITHHELD) as (context, _binding):
+        with pytest.raises(CapabilityUnavailable) as caught:
+            approve_for_project(compiled, context)
+        assert "durable_publish" in str(caught.value)
+
+
+def test_every_declared_path_resolves_exactly_once_in_sorted_order(
+    approval_context, monkeypatch
+):
+    """§6.2: one resolution per declared path, in sorted order, so the observation set is
+    reproducible and no path is walked twice under a different lock state."""
+    from atoms.fs.resolve import PathResolver
+
+    seen: list[str] = []
+    original = PathResolver.resolve
+
+    def recording(self, rel_path):
+        seen.append(rel_path)
+        return original(self, rel_path)
+
+    monkeypatch.setattr("atoms.fs.approval.PathResolver.resolve", recording)
+    compiled = compiled_for(
+        CreateFileNoClobber("e2", "b", file_state()),
+        CreateFileNoClobber("e1", "a", file_state()),
+    )
+    with approval_context() as (context, _binding):
+        approve_for_project(compiled, context)
+    assert seen == ["a", "b"]
 
 
 def test_the_proof_refuses_ordinary_construction_and_replace(approval_context):
@@ -1789,22 +2159,35 @@ def test_the_proof_retains_the_binding_object_it_approved(approval_context):
         OSError(5, "EIO"),
     ],
 )
+@pytest.mark.parametrize("target", ["__init__", "resolve", "work_base_facts"])
 def test_every_resolver_exception_reaches_the_caller_unchanged(
-    approval_context, monkeypatch, raised
+    approval_context, monkeypatch, raised, target
 ):
-    """Ledger #20 is categorical. Identity rather than type, because a type assertion is
-    satisfied by any same-class exception the code might raise on its own."""
-    compiled = compiled_for(CreateFileNoClobber("e1", "leaf", file_state()))
+    """Ledger #20 is categorical, so every load-bearing branch is covered, not just
+    `resolve`: the constructor and `work_base_facts` are also A4b-1 calls approval makes.
+    Identity rather than type, because a type assertion is satisfied by any same-class
+    exception the code might raise on its own.
 
-    def failing(self, rel_path):
+    The specification carries a CreateDirectory so work_base_facts is reached at all."""
+
+    def failing(self, *args, **kwargs):
         raise raised
 
-    monkeypatch.setattr("atoms.fs.approval.PathResolver.resolve", failing)
+    monkeypatch.setattr(f"atoms.fs.approval.PathResolver.{target}", failing)
+    compiled = compiled_for(
+        CreateDirectory("mk", "made", DirectoryState(mode=0o755))
+    )
     with approval_context() as (context, _binding):
         with pytest.raises(type(raised)) as caught:
             approve_for_project(compiled, context)
         assert caught.value is raised
 ```
+
+Patching `__init__` makes the constructor raise before it returns, which is what the
+`PathResolver(binding)` branch needs. A4b-1's `PathResolver` exposes exactly three entry points
+approval calls — `__init__`, `resolve`, and `work_base_facts` (`resolve.py:148`, `:235`, `:186`) —
+so the three parameters are the complete set, not a sample.
+
 
 - [ ] **Step 3: Run the tests to verify they fail**
 
@@ -1967,10 +2350,13 @@ def approve_for_project(
             )
         work_constraints = inherited_constraints(facts.constraints, filesystem_type)
 
-    # Phase C: judgment, pure.
-    require_ancestors_legal(compiled, prefixes)
+    # Phase C: judgment, pure. Construction first — every judgment below is keyed on the
+    # nodes it produces, never on path spellings. Endpoint distinctness comes next, so
+    # that every later phase may key a map by declared path: once it has passed, no two
+    # declared paths name one entry.
     resolved = build_topology(compiled, prefixes, filesystem_type, work_constraints)
     require_endpoints_distinct(resolved)
+    require_ancestors_legal(compiled, prefixes, resolved)
     require_resolved_surface_and_ordering(compiled, resolved)
     scratch = bind_scratch(compiled, context.txid, resolved)
 
@@ -2039,7 +2425,7 @@ from atoms.core.errors import ProjectApprovalRefused
 from atoms.core.fingerprint import DirectoryState
 from atoms.fs.approval import approve_for_project
 from atoms.fs.lookup import read_lookup_constraints
-from tests.test_fs_judgment import compiled_for, file_state
+from tests.fs_support import compiled_for, file_state
 
 
 def test_a_wholly_resolvable_specification_approves(approval_context):
@@ -2206,44 +2592,116 @@ def test_the_pure_modules_issue_no_syscall(module_name):
     assert not any(name.split(".")[0] in {"os", "fcntl", "ctypes"} for name in imported)
 
 
+RAW_COMPONENT_ATTRS = frozenset({"leaf", "declared_component"})
+LAUNDERING_CALLS = frozenset({"lookup_equivalence_key", "len"})
+
+
+def _called_name(call):
+    func = call.func
+    return func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+
+
+def _mentions_raw(node):
+    """True if this expression still carries a raw path component.
+
+    A subtree rooted at a laundering call does not: lookup_equivalence_key is the whole
+    point of the rule, and len() yields a byte width, which no equality decision about a
+    name can be made from.
+    """
+    if isinstance(node, ast.Call) and _called_name(node) in LAUNDERING_CALLS:
+        return False
+    if isinstance(node, ast.Attribute) and node.attr in RAW_COMPONENT_ATTRS:
+        return True
+    return any(_mentions_raw(child) for child in ast.iter_child_nodes(node))
+
+
+def _aliases_of_raw(tree):
+    """Locals bound to a raw component, so `leaf = entry.leaf` does not launder it.
+
+    Only plain-name targets are tainted. `seen[key] = entry.leaf` stores a raw component
+    in a container, which is not aliasing — tainting `seen` there would reject the
+    pipeline's own idiom.
+    """
+    tainted = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        if node.value is None or not _mentions_raw(node.value):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+            if isinstance(target, ast.Name):
+                tainted.add(target.id)
+            elif isinstance(target, ast.Tuple):
+                tainted.update(
+                    element.id
+                    for element in target.elts
+                    if isinstance(element, ast.Name)
+                )
+    return tainted
+
+
 @pytest.mark.parametrize("module_name", PURE_MODULES)
-def test_the_pure_modules_never_compare_a_raw_component(module_name):
+def test_the_pure_modules_never_decide_equality_on_a_raw_component(module_name):
     """What the injected_equivalence double cannot catch: under an identity key a direct
     comparison behaves exactly like the function it bypasses, so every EXACT_BYTES case
-    still passes. Only `leaf` and `declared_component` are guarded — the names the
-    modules bind a raw path component to."""
-    source = (SOURCE_ROOT / "fs" / f"{module_name}.py").read_text(encoding="utf-8")
-    raw = {"leaf", "declared_component"}
-    for node in ast.walk(ast.parse(source)):
+    still passes and the double reports nothing.
+
+    Guarded shapes are comparisons — which covers `==`, `!=`, `in`, and `not in` — and
+    mapping keys, over both a raw attribute and any local aliased from one. A value
+    produced BY lookup_equivalence_key launders the taint, which is what makes the
+    pipeline's `key = (parent, lookup_equivalence_key(...))` idiom legal.
+    """
+    tree = ast.parse(
+        (SOURCE_ROOT / "fs" / f"{module_name}.py").read_text(encoding="utf-8")
+    )
+    tainted = _aliases_of_raw(tree)
+    for node in ast.walk(tree):
         if isinstance(node, ast.Compare):
-            operands = [node.left, *node.comparators]
-            for operand in operands:
-                if isinstance(operand, ast.Attribute) and operand.attr in raw:
-                    raise AssertionError(
-                        f"{module_name}.py compares {operand.attr} directly; route it "
-                        "through lookup_equivalence_key"
+            checked = [node.left, *node.comparators]
+        elif isinstance(node, ast.Subscript):
+            checked = [node.slice]
+        else:
+            continue
+        for expression in checked:
+            for inner in ast.walk(expression):
+                if isinstance(inner, ast.Attribute):
+                    assert inner.attr not in RAW_COMPONENT_ATTRS, (
+                        f"{module_name}.py decides {inner.attr} equality directly; "
+                        "route it through lookup_equivalence_key"
+                    )
+                if isinstance(inner, ast.Name):
+                    assert inner.id not in tainted, (
+                        f"{module_name}.py decides equality on {inner.id}, aliased from "
+                        "a raw path component; route it through lookup_equivalence_key"
                     )
 
 
 def test_approval_catches_nothing_a_resolver_raises():
     """Ledger #20 is categorical. The correct number of handlers enclosing a resolver
-    call is zero — not "no blanket handler", which is the weaker rule resolve.py has."""
-    source = (SOURCE_ROOT / "fs" / "approval.py").read_text(encoding="utf-8")
+    call is zero — not "no blanket handler", which is the weaker rule resolve.py has.
+    `contextlib.suppress` is checked too: it swallows exactly as a handler does, and a
+    guard that missed it would be satisfied by the one bypass someone would reach for."""
+    tree = ast.parse((SOURCE_ROOT / "fs" / "approval.py").read_text(encoding="utf-8"))
     calls = {"resolve", "work_base_facts", "PathResolver"}
-    for node in ast.walk(ast.parse(source)):
-        if not isinstance(node, ast.Try):
-            continue
+    enclosing = [node for node in ast.walk(tree) if isinstance(node, ast.Try)]
+    enclosing += [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.With)
+        and any(
+            isinstance(item.context_expr, ast.Call)
+            and _called_name(item.context_expr) == "suppress"
+            for item in node.items
+        )
+    ]
+    for node in enclosing:
         for inner in ast.walk(node):
             if isinstance(inner, ast.Call):
-                func = inner.func
-                name = (
-                    func.attr
-                    if isinstance(func, ast.Attribute)
-                    else getattr(func, "id", "")
-                )
-                assert name not in calls, (
-                    f"a try block in approval.py encloses {name}(); ledger #20 requires "
-                    "every A4b-1 refusal to reach the caller unhandled"
+                assert _called_name(inner) not in calls, (
+                    f"a handler in approval.py encloses {_called_name(inner)}(); "
+                    "ledger #20 requires every A4b-1 refusal to reach the caller "
+                    "unhandled"
                 )
 
 
@@ -2325,24 +2783,53 @@ git commit -m "test(fs): guard the a4b-2 seam and discharge its ledger entries"
 ## Self-review
 
 **Spec coverage.** Every design section maps to a task: §5.1 `ProjectContext` and §6.1 phase A → Task 6;
-§6.2 phase B → Task 6; §6.3.1 → Task 2; §6.3.2 → Tasks 1 and 5; §6.3.3 → Task 5; §7.1–§7.3 → Task 3;
-§7.4 → Task 4; §7.5 → Tasks 6 and 7; §8 → Tasks 3 and 6; §9 → Tasks 2, 5, 6; §11.1 → Tasks 2 and 5;
-§11.2 → Task 3; §11.3 → Task 4; §11.4 → Task 7; §11.5 → Task 6; §11.6 → Task 8.
+§6.2 phase B → Task 6; §6.3.1 → Task 3; §6.3.2 → Tasks 1 and 5; §6.3.3 → Task 5; §7.1–§7.3 → Task 2;
+§7.4 → Task 4; §7.5 → Tasks 6 and 7; §8 → Tasks 2 and 6; §9 → Tasks 3, 5, 6; §11.1 → Tasks 3 and 5;
+§11.2 → Task 2; §11.3 → Task 4; §11.4 → Task 7; §11.5 → Task 6; §11.6 → Task 8.
 
-**A finding that changed the test doubles.** A case-folding double cannot exercise endpoint
-distinctness *at all*. Two leaves fold in one parent only when their whole paths fold too, and A2 phase
-4's `portability_equivalence_key` is applied to the whole path — so it already refuses every pair the
-check would catch, before approval runs. The same holds for scratch leaves, whose effect IDs A2 phase 6
-makes portability-key unique. The injected double is therefore a **factory**: case folding for the
-topology-merge case, where A2 admits `A` alongside `a/x` because those whole paths differ, and an
-eight-byte truncation — a real filesystem equivalence class A2's key does not subsume — for the
-endpoint and scratch collision cases.
+**Construction precedes judgment, and the design was amended to say so.** The first draft ran
+`require_ancestors_legal` before `build_topology` and keyed it on path strings. That cannot implement
+its own motivating case: with `CreateDirectory("A")` and an effect on `a/x`, it looks for a creator of
+the string `"a"`, finds none, and refuses a specification A2 admits and a folding volume makes legal.
+The candidate set was wrong for the same reason — `A` is nobody's lexical prefix, so it was not a
+directory in the key space at all and there was nothing for `a` to merge into.
 
-This is worth stating plainly rather than burying: under the current floor *plus* A2's conservative
-whole-path filter, endpoint distinctness has no reachable failure mode. Ledger #2 and authority §5.4
-still require it, and it is still the correct check; it simply cannot fire today, exactly as design
-§7.4 says of the resolved-versus-lexical re-run. A reviewer who expects a real-volume endpoint-collision
-case should know none exists to write.
+Both are fixed structurally rather than patched: §7.1's candidates now include every `CreateDirectory`
+endpoint, phase C runs construction → endpoint distinctness → ancestor legality → the re-run → scratch
+binding, and every judgment is keyed on `TopologyNode` through `ResolvedTopology.directory_node`.
+Design §6.3, §6.3.1, §7.1, and §7.4 were amended in the same commit; the plan does not deviate from the
+design silently.
+
+**Which refusals are reachable, stated rather than implied.** Three of this layer's checks have no
+failure mode that can be written today, and a reviewer should know that before hunting for the missing
+test.
+
+| Check | Reachable? | Why |
+| --- | --- | --- |
+| Endpoint distinctness (leaf level) | Only under an injected key | Two leaves fold in one parent only when their whole paths fold too, and A2 phase 4 applies `portability_equivalence_key` to the whole path, so it refuses every such pair first |
+| Directory-level collision in `_nodes_by_key` | No | Same subsumption, applied to two `CreateDirectory` endpoints: `A` and `a` never compile together |
+| The re-run's **surface** half | No | A declared path is an ancestor node only by being a directory candidate — a lexical proper prefix (A2's trie already walks it) or a `CreateDirectory` endpoint (declared `DirectoryState`, never a blocker). A folding *file* at `A` above `a/x` is refused one phase earlier by ancestor legality |
+| The re-run's **ordering** half | Yes, under an injected key | A2 phase 13 is lexical and admits `CreateDirectory("A")` after an effect on `a/x`; the resolved judgment refuses it |
+| Ancestor legality, both directions | Yes, under an injected key | The folding pair is admitted when created first and refused when created second, and refused outright under exact bytes |
+
+Each unreachable branch stays in the production code as a fail-closed guard. None of them gets a test
+whose input cannot compile — that is a test that asserts nothing while looking like coverage, which is
+the defect this section exists to prevent.
+
+**The equivalence double is a factory, because one relation cannot do both jobs.** Case folding merges
+directories, which A2 admits (`A` differs from `a/x` as whole paths). Case folding cannot reach
+endpoint or scratch distinctness at all, for the reason in the table. Those tests use an eight-byte
+truncation — a real filesystem equivalence class A2's whole-path key does not subsume. The fixtures are
+`d/sharedprefix-one` / `d/sharedprefix-two`, which share `sharedpr`, and the scratch leaves
+`.#~tx01.e1.staging` / `.#~tx01.e2.staging`, which share `.#~tx01.`.
+
+**What the double cannot catch, and what covers it instead.** Under an identity key a direct comparison
+behaves exactly like the function it bypasses, so no injected relation detects a call site that skips
+`lookup_equivalence_key`. Task 8's AST guard covers that, and it is stronger than a comparison scan: it
+taints locals aliased from a raw component, checks mapping keys as well as comparisons, and treats a
+value produced *by* `lookup_equivalence_key` — or by `len`, which yields a byte width and not a name —
+as laundered. It was run against the proposed `topology.py` and `judgment.py` before this plan was
+committed, which is how `previous != entry.leaf` was found and replaced with `if key in seen`.
 
 **Two places a reviewer should look hardest.**
 
@@ -2350,21 +2837,33 @@ case should know none exists to write.
    contains only nodes that have edges.** A path parented by `ProjectRoot` terminates correctly because
    `ProjectRoot` has no parent edge, so `.get` returns `None`. Verify that on a single-component path
    before trusting the loop.
-2. **Task 3's `_nodes_by_key` raises `ProtocolError` for two declared paths sharing a *directory* key,
-   while `require_endpoints_distinct` raises `ProjectApprovalRefused` for two sharing a *leaf* key.**
-   Different collisions at different levels, and the second runs after the first. A reviewer may
-   reasonably argue both should be `ProjectApprovalRefused`; the plan chose `ProtocolError` because
-   `build_topology` documents that its caller has already run the legality pass, so reaching it means
-   the pipeline ran out of order.
+2. **`build_topology`'s edge set is keyed by node, not appended.** Two prefixes that fold together are
+   one directory and must contribute one edge; A3's `_validate_topology` fails a node appearing twice in
+   `topology.parents` even when both edges name the same parent. That deduplication is the only thing
+   standing between the folding merge and an A3 rejection, and it has no dedicated test — it is covered
+   only through `test_planned_directories_merge_under_a_folding_key` reaching construction at all.
 
-**Placeholder scan.** Clean — no TBD, no "similar to Task N", no step that describes without showing.
+**Verified against the codebase rather than assumed.** Every API this plan calls was checked on this
+checkout: `CommitDecision` has exactly `UNCOMMITTED` and `COMMITTED`; `required_scratch_role` is not in
+`atoms.core.recovery.__all__` and may not be added, because
+`test_public_surface_has_exactly_five_operations` pins that package's exported functions to A3's five
+operations; `PathResolver` exposes exactly `__init__`, `resolve`, and `work_base_facts`; `scratch_leaf`
+takes `(txid, effect_id, role)`; the scratch roles are STAGING / WORK / TOMBSTONE / ANCHOR / STAGING for
+the five variants; `DURABLE_PUBLISH` is in `ALWAYS_REQUIRED`, which is what arms the capability refusal
+in Task 6; and `ext4_bound_volume` already accepts `withhold`. Every entry in Task 4's
+`AGREEMENT_CORPUS` was run through `compile_spec` — that is how the `ReplaceFile` cases were found to
+need real digests, since A2 refuses a non-zero `byte_len` under the empty-content hash.
+
+**Placeholder scan.** Clean — no TBD, no "similar to Task N", no step that describes without showing,
+no test whose body is a shape to be finished later.
 
 **Type consistency.** `ResolvedTopology.parent_of` takes a path string and returns a `TopologyNode`;
-`parent_node_of` takes a node and returns its parent node. Both are used with those meanings in Tasks
-3, 4, and 5. `ApprovedScratch.leaf` and `ApprovedPath.leaf` are both plain `str`. `work_constraints` is
-`DirectoryConstraints | None` in `build_topology` and `ApprovedWorkBase.constraints` is non-optional —
-these are different values: the first is `work/<txid>/`'s derived constraints, the second is physical
-`work/`'s observed ones.
+`parent_node_of` takes a node and returns its parent node; `directory_node` takes a directory prefix and
+returns `TopologyNode | None`, `None` meaning no directory sits there. All three are used with those
+meanings in Tasks 2 through 6. `ApprovedScratch.leaf` and `ApprovedPath.leaf` are both plain `str`.
+`work_constraints` is `DirectoryConstraints | None` in `build_topology` and `ApprovedWorkBase.constraints`
+is non-optional — these are different values: the first is `work/<txid>/`'s derived constraints, the
+second is physical `work/`'s observed ones.
 
 ---
 

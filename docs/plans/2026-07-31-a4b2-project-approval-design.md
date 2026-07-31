@@ -281,6 +281,25 @@ each run because dictionary order shifted is much harder to act on.
 
 ### 6.3 Phase C — judgment, pure
 
+**Construction runs first, and every judgment below is keyed on the nodes it produces.** §7's topology
+decides which directories exist and which of them are the *same* directory; it judges nothing. That
+order is forced rather than stylistic: §5.4's motivating case is `CreateDirectory("A")` with an effect
+on `a/x`, where the creation is what supplies `a`'s ancestor, and a judgment keyed on path spelling
+looks for a creator of the string `"a"`, finds none, and refuses a legal specification. A check cannot
+ask "does this transaction create that directory" before something has decided which directories there
+are.
+
+The order within phase C is therefore:
+
+1. Build the topology (§7).
+2. Endpoint distinctness (§6.3.2). It comes before the rest so every later phase may key a map by
+   declared path: once it has passed, no two declared paths name one entry.
+3. Ancestor legality (§6.3.1).
+4. The resolved surface and ordering re-run (§7.4).
+5. Scratch instantiation (§6.3.3).
+
+The subsection numbering below is by topic, not by sequence.
+
 #### 6.3.1 Ancestor legality
 
 For each declared path, `ResolvedPrefix` reports how far resolution got. Three cases:
@@ -292,10 +311,16 @@ frontier present, remainder non-empty         -> existing-non-directory-ancestor
 ```
 
 In the second case, the missing directories are `frontier_name` followed by `remainder[:-1]`, each
-relative to the deepest resolved hop. Every one of them must be the path of a `CreateDirectory` effect
-in this transaction, and that effect's index must precede every effect touching a path beneath it. A
-missing component no effect creates is `ProjectApprovalRefused` — authority §5.4's "a parent that
-neither exists nor is created by the transaction cannot be captured."
+relative to the deepest resolved hop. Every one of them must be a directory some `CreateDirectory`
+effect in this transaction creates, and that effect's index must precede every effect touching a path
+beneath it. A missing component no effect creates is `ProjectApprovalRefused` — authority §5.4's "a
+parent that neither exists nor is created by the transaction cannot be captured."
+
+**"Is a directory some `CreateDirectory` creates" is decided by node, not by spelling.** Each missing
+prefix is mapped through §7.1's assignment to the node it names, and each `CreateDirectory` endpoint
+through the same assignment; the check compares those nodes. Under a folding parent
+`CreateDirectory("A")` and the missing prefix `a` are one node, so the creation is recognised —
+which is the whole reason construction precedes judgment.
 
 In the third case the frontier's `EntryKind` decides:
 
@@ -380,11 +405,24 @@ project space, and no `except` clause encloses any resolver call.
 | `ScratchNode(effect_id, role)` | One per effect, `role = required_scratch_role(effect)` |
 | `TopologyDirectory(node_id)` | One per *undeclared* intermediate directory |
 
-The directory node for a path prefix is `ProjectRoot()` when the prefix is empty, that prefix's own
+The **directory candidates** are every proper prefix of a declared path *plus every `CreateDirectory`
+endpoint*. The second half is load-bearing: `A` is nobody's lexical prefix, so without it `A` is not a
+directory in the key space at all and `a` has nothing to merge into — §5.4's case would be
+unrepresentable rather than merely unexercised.
+
+The directory node for a candidate is `ProjectRoot()` when the prefix is empty, that prefix's own
 `PersistentNode` when the prefix is itself a declared path, and a `TopologyDirectory` otherwise. A
 declared path that is also an intermediate directory of another declared path therefore appears once,
 as its `PersistentNode` — A3's `_validate_topology` requires exact persistent coverage, and a second
-node for the same directory would break it.
+node for the same directory would break it. Where a declared and an undeclared candidate share a key,
+the declared one wins, so the assignment does not depend on iteration order.
+
+Two *declared* candidates sharing one key is a directory-level endpoint collision; construction cannot
+choose which `PersistentNode` the directory is, so it refuses with `ProjectApprovalRefused` rather than
+deferring to §6.3.2, which handles the leaf-level case. A2 phase 4 already subsumes this shape — it
+applies `portability_equivalence_key` to the whole path, so `CreateDirectory("A")` alongside
+`CreateDirectory("a")` never compiles — making the branch a fail-closed guard against a wider floor
+rather than a reachable refusal.
 
 `node_id` values are assigned in first-encounter order over lexically sorted declared paths, so the
 topology is reproducible across runs. The assignment *key* is the `FilesystemIdentity` for an existing
@@ -445,6 +483,16 @@ hard-linked directories (which ext4 does not permit). So the resolved topology i
 the lexical one *right now*. That is a property of the current platform floor, not a rule, and §11.4
 asserts the agreement as a property test — so if the floor widens and the two diverge, a test says so
 rather than a production refusal discovering it.
+
+**The two halves differ in how a synthetic equivalence reaches them, and the design states which.** The
+ordering half is reachable: an injected folding key makes `CreateDirectory("A")` the ancestor of an
+earlier effect on `a/x`, a pair A2 phase 13 admits because it sees the two paths as unrelated. The
+surface half is not. A declared path becomes an *ancestor node* only by being a §7.1 directory
+candidate, and a candidate is either a lexical proper prefix — which A2's own trie already walks — or a
+`CreateDirectory` endpoint, whose declared state is a `DirectoryState` and therefore never a blocker. A
+folding *file* at `A` above `a/x` is refused one phase earlier by §6.3.1, because nothing creates the
+directory `a`. The surface branch is written and correct; it is a fail-closed guard, and no test
+asserts a refusal it cannot produce.
 
 ### 7.5 `work/<txid>/`
 
@@ -533,7 +581,7 @@ for a stored value to serve.
 
 | Raised | For |
 | --- | --- |
-| `ProjectApprovalRefused` | endpoint collision, illegal ancestor (missing, `OTHER`, or unconverted), scratch-leaf collision, resolved-topology surface or ordering violation — and A4b-1's own `ProjectApprovalRefused` instances, passing through untouched |
+| `ProjectApprovalRefused` | endpoint collision at leaf level (§6.3.2) or directory level (§7.1), illegal ancestor (missing, `OTHER`, or unconverted), scratch-leaf collision, resolved-topology surface or ordering violation — and A4b-1's own `ProjectApprovalRefused` instances, passing through untouched |
 | `PreconditionRefused` | raised only by A4b-1 and propagated: two observations of one directory or entry disagreeing within a single approval. A4b-2 never raises it directly |
 | `CapabilityUnavailable` | required ⊄ supplied, and `lookup_equivalence_key` on an unapproved `LookupProof` |
 | `ProtocolError` | a `compiled`, `context`, `binding`, or `txid` of the wrong exact type; a malformed txid; a closed binding or released lock |
@@ -566,10 +614,17 @@ I/O.
 
 Hand-built resolution tables drive ancestor legality, endpoint distinctness, scratch instantiation and
 distinctness, and capability adjudication. Synthetic `ResolvedPrefix` values make the awkward cases
-cheap: a missing ancestor no effect creates; an ancestor created too late; a `REGULAR_FILE` ancestor
-correctly converted; the same ancestor left unconverted; an `OTHER` ancestor; and an endpoint
-collision. Endpoint merging under a folding parent uses the same `injected_equivalence` fixture §11.2
-describes, with the same two limits on what it proves.
+cheap: a missing ancestor no effect creates; a `REGULAR_FILE` ancestor correctly converted; the same
+ancestor left unconverted; and an `OTHER` ancestor.
+
+The cases that need an injected equivalence use a *different relation for each job*, because one
+relation cannot do both. Ancestor merging and ordering-too-late use case folding, which A2 admits since
+its phase 4 key is the whole path and `A` differs from `a/x`. Endpoint and scratch collisions use a
+truncating relation instead: two leaves fold in one parent only when their whole paths fold too, and A2
+phase 4 already refuses every such pair, so a case-folding double cannot reach those checks at all.
+Truncation is a real filesystem equivalence class A2's key does not subsume. The fixture is therefore a
+factory over the relation rather than a fixed double, and both limits §11.2 states apply to every use
+of it.
 
 `lookup_equivalence_key` gets its own cases: identity on `EXACT_BYTES`, and `CapabilityUnavailable` on
 every other member of the current `LookupProof` vocabulary — today only `UNREPRODUCIBLE_CASEFOLD`.
