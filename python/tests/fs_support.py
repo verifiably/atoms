@@ -21,6 +21,7 @@ from atoms.fs.volume import (
 )
 
 SUPPORTED_FILESYSTEMS = frozenset({"ext4", "xfs", "btrfs"})
+EXT4 = "ext4"
 
 _MOUNTINFO_CASES = {
     "ext4_defaults": (
@@ -127,6 +128,33 @@ def test_volume_or_skip_reason() -> tuple[Path | None, str]:
         f"no supported test volume: repository filesystem is {found!r}; "
         "set ATOMS_TEST_VOLUME to a directory on ext4, xfs, or btrfs"
     )
+
+
+def ext4_volume_or_skip_reason() -> tuple[Path | None, str]:
+    """A4b-1 approves only ext4, while A4a admits ext4, xfs, and btrfs.
+
+    A contributor on btrfs must be told why this suite skips, not merely that it does.
+    """
+    resolved = resolve_test_volume()
+    if resolved is None:
+        return None, "no test volume: set ATOMS_TEST_VOLUME to a directory on ext4"
+    probe = resolved if resolved.exists() else resolved.parent
+    found = _filesystem_type_for(probe)
+    if found != EXT4:
+        return None, (
+            f"A4b-1 approves only ext4; the test volume is {found!r}. "
+            "Set ATOMS_TEST_VOLUME to a directory on ext4."
+        )
+    return resolved, ""
+
+
+def descriptor_count() -> int:
+    """Open descriptors for this process.
+
+    The listing itself opens one descriptor, so this contributes a constant; only
+    deltas between counts measured this way are meaningful.
+    """
+    return len(os.listdir("/proc/self/fd"))
 
 
 def make_mountinfo_text():

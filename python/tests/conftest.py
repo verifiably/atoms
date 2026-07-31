@@ -1,5 +1,6 @@
 """Explicit recovery-model fixture registry."""
 
+import contextlib
 import os
 import tempfile
 from pathlib import Path
@@ -10,6 +11,9 @@ from atoms.fs.linux import LinuxBackend
 from atoms.fs.lock import acquire_project_lock
 from atoms.fs.volume import StorageProfile
 from tests.fs_support import (
+    build_test_allowlist,
+    descriptor_count,  # noqa: F401 - later resolver tasks consume this shared fixture support.
+    ext4_volume_or_skip_reason,
     find_distinct_mount,
     make_bound_volume,
     make_fake_backend,
@@ -283,3 +287,87 @@ def directory_fd(tmp_path):
     fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     yield fd
     os.close(fd)
+
+
+@pytest.fixture
+def ext4_volume():
+    base, reason = ext4_volume_or_skip_reason()
+    if base is None:
+        pytest.skip(reason)
+    base.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=base) as directory:
+        yield Path(directory)
+
+
+@pytest.fixture
+def ext4_project_root(ext4_volume):
+    return make_project_root(ext4_volume)
+
+
+@pytest.fixture
+def ext4_metadata_root(ext4_volume):
+    return make_metadata_root(ext4_volume)
+
+
+@pytest.fixture
+def ext4_bound_volume(ext4_project_root, ext4_metadata_root, test_storage_profile):
+    return make_bound_volume(
+        make_fake_backend(), ext4_project_root, ext4_metadata_root, test_storage_profile
+    )
+
+
+@pytest.fixture
+def ext4_nested_bound_volume(ext4_project_root, test_storage_profile):
+    """A binding whose metadata root sits INSIDE its project root.
+
+    The sibling layout of `project_root`/`metadata_root` makes every declared path's
+    relative spelling start with '..', which require_rel_path rejects, so a
+    metadata-root containment test written against it can only skip itself. This is
+    also the layout a real project uses.
+    """
+    return make_bound_volume(
+        make_fake_backend(),
+        ext4_project_root,
+        ext4_project_root / "metadata",
+        test_storage_profile,
+    )
+
+
+@pytest.fixture
+def resolver_on(ext4_bound_volume):
+    """A resolver and its live binding, on ext4."""
+    from atoms.fs.resolve import PathResolver
+
+    @contextlib.contextmanager
+    def build():
+        with ext4_bound_volume() as binding:
+            yield PathResolver(binding), binding
+
+    return build
+
+
+@pytest.fixture
+def resolver_after_lock_release(
+    linux_backend, ext4_project_root, ext4_metadata_root, test_storage_profile
+):
+    """A resolver whose binding is still active but whose lock has been released.
+
+    ProjectBinding._require_active checks its own flag AND lock.held, so this is a
+    distinct liveness failure from a closed binding — and it needs a binding that
+    outlives its lock, which no context-managed fixture produces.
+    """
+    from atoms.fs.binding import bind_project_volume
+    from atoms.fs.resolve import PathResolver
+
+    with acquire_project_lock(linux_backend, str(ext4_metadata_root)) as lock:
+        allowlist = build_test_allowlist(lock, ext4_project_root, test_storage_profile)
+        binding = bind_project_volume(
+            str(ext4_project_root),
+            lock,
+            allowlist=allowlist,
+            storage=test_storage_profile,
+        )
+        resolver = PathResolver(binding)
+    with binding:
+        assert binding.active and not lock.held
+        yield resolver
