@@ -254,20 +254,22 @@ def nonempty_state(content: bytes, mode: int = 0o644) -> FileState:
 def compiled_for(*effects: Effect) -> CompiledSpec:
     """Compile a spec whose surfaces are derived from the effects, so every test states
     only what it is about."""
+    return compile_spec(_spec_for(effects))
+
+
+def _spec_for(effects: tuple[Effect, ...]) -> TransactionSpec:
     initial: dict[str, PathState] = {}
     final: dict[str, PathState] = {}
     for effect in effects:
         for occurrence in occurrences(effect):
             initial.setdefault(occurrence.path, occurrence.pre)
             final[occurrence.path] = occurrence.post
-    return compile_spec(
-        build_spec(
-            consumer_tag="test",
-            intent_digest=EMPTY_DIGEST,
-            initial_surface=initial,
-            final_surface=final,
-            effects=effects,
-        )
+    return build_spec(
+        consumer_tag="test",
+        intent_digest=EMPTY_DIGEST,
+        initial_surface=initial,
+        final_surface=final,
+        effects=effects,
     )
 
 
@@ -348,6 +350,52 @@ def prefixes_for(compiled: CompiledSpec) -> dict[str, ResolvedPrefix]:
     return table
 
 
+GENERATOR_PATHS = ("a", "a/b", "d/one", "d/two", "p")
+GENERATOR_MOVES = (("d/one", "d/two"), ("a", "p"), ("d/one", "a/b"))
+
+
+def _generated_effect(tag: str, argument, index: int) -> Effect:
+    effect_id = f"e{index}"
+    if tag == "cf":
+        return CreateFileNoClobber(effect_id, argument, file_state())
+    if tag == "mk":
+        return CreateDirectory(effect_id, argument, DirectoryState(mode=0o755))
+    if tag == "rm":
+        return DeletePath(effect_id, argument, file_state())
+    if tag == "rp":
+        return ReplaceFile(
+            effect_id, argument, nonempty_state(b"old"), nonempty_state(b"new")
+        )
+    return MoveNoClobber(effect_id, argument[0], argument[1], file_state())
+
+
+def generated_specifications():
+    """Yield `(label, effects)` for every effect sequence A2 admits, over a fixed pool.
+
+    All ordered sequences of length 1-3 over 23 candidate effects: each of the four
+    single-path variants against each of five paths, plus three moves. Sequences A2
+    refuses are skipped rather than reported -- an input that does not compile is not an
+    input to this layer.
+    """
+    pool = [
+        (tag, path)
+        for path in GENERATOR_PATHS
+        for tag in ("cf", "mk", "rm", "rp")
+    ]
+    pool += [("mv", pair) for pair in GENERATOR_MOVES]
+    for size in (1, 2, 3):
+        for combination in itertools.permutations(pool, size):
+            effects = tuple(
+                _generated_effect(tag, argument, index)
+                for index, (tag, argument) in enumerate(combination)
+            )
+            try:
+                compile_spec(_spec_for(effects))
+            except SpecValidationError:
+                continue
+            yield "|".join(f"{tag}:{argument}" for tag, argument in combination), effects
+
+
 def work_for(compiled: CompiledSpec) -> DirectoryConstraints | None:
     """The work-root constraints approval derives, present exactly when a CreateDirectory
     is, which is what A3's WorkRoot rule requires."""
@@ -364,12 +412,22 @@ Add to `tests/fs_support.py`'s imports:
 
 ```python
 import hashlib
+import itertools
 import zlib
 
 from atoms.core.compiler import CompiledSpec, compile_spec
-from atoms.core.effects import CreateDirectory, Effect, occurrences
-from atoms.core.fingerprint import FileState, PathState
-from atoms.core.spec import build_spec
+from atoms.core.effects import (
+    CreateDirectory,
+    CreateFileNoClobber,
+    DeletePath,
+    Effect,
+    MoveNoClobber,
+    ReplaceFile,
+    occurrences,
+)
+from atoms.core.errors import SpecValidationError
+from atoms.core.fingerprint import DirectoryState, FileState, PathState
+from atoms.core.spec import TransactionSpec, build_spec
 from atoms.fs.lookup import DirectoryConstraints, LookupProof
 from atoms.fs.resolve import (
     AbsentFrontier,
@@ -406,19 +464,29 @@ def injected_equivalence(monkeypatch):
     it. Endpoint tests therefore use a truncating relation — a real filesystem
     equivalence class that A2's key does not subsume.
 
+    `install` returns the list of names the double was asked about, in call order. That
+    is the positive half of the bypass check: a call site that decides a name without the
+    helper contributes nothing to the list, whatever shape the bypass takes. Under an
+    identity key the *behaviour* is unchanged, so only the recording distinguishes the
+    two. The AST guard in test_fs_architecture.py is the negative half and catches the
+    specific shapes it names; neither alone is a proof, and the pair is what the design
+    asks for.
+
     This is a double either way. It proves the call sites route through the function and
     merge whatever it merges; it proves nothing about any real relation, all of which
-    stay unreproducible and refused. It also cannot detect a call site that bypasses the
-    function — under an identity key a direct comparison behaves identically — which is
-    what the AST guard in test_fs_architecture.py covers instead.
+    stay unreproducible and refused.
     """
 
     def install(key):
+        calls: list[str] = []
+
+        def recording(constraints, name):
+            calls.append(name)
+            return key(name)
+
         for module in _EQUIVALENCE_CONSUMERS:
-            monkeypatch.setattr(
-                f"{module}.lookup_equivalence_key",
-                lambda constraints, name: key(name),
-            )
+            monkeypatch.setattr(f"{module}.lookup_equivalence_key", recording)
+        return calls
 
     return install
 
@@ -575,11 +643,32 @@ def test_the_directory_partition_is_exactly_existing_root_and_intermediates():
         for entry in resolved.directories
         if isinstance(entry, ApprovedPlannedDirectory)
     }
-    assert all(
-        isinstance(node, (ProjectRoot, TopologyDirectory)) for node in existing
-    )
-    assert all(isinstance(node, (WorkRoot, PersistentNode)) for node in planned)
+    parents = {edge.parent for edge in resolved.topology.parents}
+
+    # Set equality, not a type predicate. A predicate passes when a node is missing and
+    # when an extra one is retained; the first draft retained a lone CreateDirectory
+    # endpoint that parents nothing, and a type check said nothing about it.
+    assert existing == {
+        node for node in parents if isinstance(node, (ProjectRoot, TopologyDirectory))
+    }
+    assert planned == {
+        node for node in parents if isinstance(node, (WorkRoot, PersistentNode))
+    }
     assert not existing & planned
+
+
+def test_a_directory_that_parents_nothing_is_not_retained():
+    """§7.3's partition names the *parent* PersistentNodes. A lone CreateDirectory has
+    nothing declared beneath it, so its constraints bound no name and retaining them would
+    put a fact in the proof that no later stage can act on."""
+    compiled = compiled_for(CreateDirectory("mk", "a", DirectoryState(mode=0o755)))
+    resolved = build_topology(
+        compiled, {"a": resolved_prefix("a", existing_depth=0)}, EXT4, WORK_CONSTRAINTS
+    )
+    assert {entry.node for entry in resolved.directories} == {
+        ProjectRoot(),
+        WorkRoot(),
+    }
 
 
 def test_node_ids_are_reproducible_across_repeated_construction():
@@ -609,6 +698,17 @@ def test_two_paths_through_one_physical_directory_share_its_node():
     }
     resolved = build_topology(compiled, prefixes, EXT4, None)
     assert resolved.parent_of("d/one") == resolved.parent_of("d/two")
+
+
+def test_every_planned_component_is_asked_about(injected_equivalence):
+    """The positive half of the bypass check for construction: each planned prefix must
+    be keyed through the helper, so `a` and `b` both appear. The root and any existing
+    prefix key by identity and correctly do not."""
+    calls = injected_equivalence(lambda name: name)
+    compiled = compiled_for(CreateFileNoClobber("e1", "a/b/leaf", file_state()))
+    prefixes = {"a/b/leaf": resolved_prefix("a/b/leaf", existing_depth=0)}
+    build_topology(compiled, prefixes, EXT4, None)
+    assert calls == ["a", "b"]
 
 
 def test_planned_directories_merge_under_a_folding_key(injected_equivalence):
@@ -807,7 +907,6 @@ def build_topology(
     keys = _keys_by_prefix(facts)
     nodes = _nodes_by_key(keys, declared)
 
-    directories = _directory_entries(facts, keys, nodes)
     # Keyed by node, not appended: two prefixes that fold together are one directory and
     # take one edge. A3 fails a node appearing twice in topology.parents even when both
     # edges name the same parent.
@@ -833,13 +932,21 @@ def build_topology(
 
     ordered = list(edges.values())
     if work_constraints is not None:
+        ordered.append(TopologyParent(node=WorkRoot(), parent=ProjectRoot()))
+    ordered.extend(_scratch_edges(compiled, paths))
+
+    # Facts are retained only for nodes that actually parent something. A candidate that
+    # parents nothing -- a lone CreateDirectory endpoint, say -- is a directory this
+    # transaction creates and nothing is declared beneath, so its constraints bound no
+    # name. Retaining it would break §7.3's partition and criterion 14, which say
+    # ApprovedPlannedDirectory is exactly WorkRoot plus the *parent* PersistentNodes.
+    parents = {edge.parent for edge in ordered}
+    directories = _directory_entries(facts, keys, nodes, parents)
+    if work_constraints is not None:
         directories = (
             *directories,
             ApprovedPlannedDirectory(node=WorkRoot(), constraints=work_constraints),
         )
-        ordered.append(TopologyParent(node=WorkRoot(), parent=ProjectRoot()))
-
-    ordered.extend(_scratch_edges(compiled, paths))
     return ResolvedTopology(
         topology=RecoveryTopology(parents=tuple(ordered)),
         directories=directories,
@@ -954,11 +1061,14 @@ def _directory_entries(
     facts: Mapping[str, tuple[FilesystemIdentity | None, DirectoryConstraints]],
     keys: Mapping[str, object],
     nodes: Mapping[object, TopologyNode],
+    parents: frozenset[TopologyNode] | set[TopologyNode],
 ) -> tuple[ApprovedDirectory, ...]:
     entries: dict[TopologyNode, ApprovedDirectory] = {}
     for prefix in sorted(facts, key=_depth_then_name):
         identity, constraints = facts[prefix]
         node = nodes[keys[prefix]]
+        if node not in parents:
+            continue
         if identity is None:
             entries[node] = ApprovedPlannedDirectory(node=node, constraints=constraints)
         else:
@@ -1041,9 +1151,10 @@ from atoms.core.effects import (
     CreateDirectory,
     CreateFileNoClobber,
     DeletePath,
+    MoveNoClobber,
 )
 from atoms.core.errors import ProjectApprovalRefused, ProtocolError
-from atoms.core.fingerprint import DirectoryState
+from atoms.core.fingerprint import DirectoryState, SymlinkState
 from atoms.fs.judgment import require_ancestors_legal
 from atoms.fs.resolve import EntryKind, FilesystemIdentity, PresentFrontier
 from atoms.fs.topology import build_topology
@@ -1057,6 +1168,9 @@ from tests.fs_support import (
 
 BLOCKING_FILE = PresentFrontier(
     identity=FilesystemIdentity(device=41, inode=77), kind=EntryKind.REGULAR_FILE
+)
+BLOCKING_SYMLINK = PresentFrontier(
+    identity=FilesystemIdentity(device=41, inode=88), kind=EntryKind.SYMLINK
 )
 
 
@@ -1175,6 +1289,65 @@ def test_a_regular_file_ancestor_the_timeline_leaves_alone_is_refused():
     assert "removes" in str(caught.value)
 
 
+def test_a_symlink_ancestor_the_timeline_converts_is_admitted():
+    """Criterion 9 names SYMLINK beside REGULAR_FILE, and the two reach _REMOVABLE_KINDS
+    by different routes -- DeletePath.pre is `FileState | SymlinkState`, so a symlink is
+    removable only because of the second arm."""
+    compiled = compiled_for(
+        DeletePath("rm", "p", SymlinkState(target="x", mode=0o777)),
+        CreateDirectory("mk", "p", DirectoryState(mode=0o755)),
+        CreateFileNoClobber("e1", "p/q", file_state()),
+    )
+    prefixes = {
+        "p": resolved_prefix("p", existing_depth=0, frontier=BLOCKING_SYMLINK),
+        "p/q": resolved_prefix("p/q", existing_depth=0, frontier=BLOCKING_SYMLINK),
+    }
+    resolved = build_topology(compiled, prefixes, EXT4, WORK_CONSTRAINTS)
+    require_ancestors_legal(compiled, prefixes, resolved)
+
+
+def test_a_symlink_ancestor_the_timeline_leaves_alone_is_refused():
+    compiled = compiled_for(
+        CreateDirectory("mk", "p", DirectoryState(mode=0o755)),
+        CreateFileNoClobber("e1", "p/q", file_state()),
+    )
+    prefixes = {
+        "p": resolved_prefix("p", existing_depth=0, frontier=BLOCKING_SYMLINK),
+        "p/q": resolved_prefix("p/q", existing_depth=0, frontier=BLOCKING_SYMLINK),
+    }
+    resolved = build_topology(compiled, prefixes, EXT4, WORK_CONSTRAINTS)
+    with pytest.raises(ProjectApprovalRefused) as caught:
+        require_ancestors_legal(compiled, prefixes, resolved)
+    assert "removes" in str(caught.value)
+
+
+def test_a_move_carries_no_path_attribute_and_is_still_judged():
+    """MoveNoClobber has `source` and `destination` and no `path`. The creator scan must
+    narrow the variant before reading one; the first draft did not, and every move raised
+    AttributeError before any rule ran."""
+    compiled = compiled_for(MoveNoClobber("mv", "src/a", "dst/b", file_state()))
+    prefixes = {
+        "src/a": resolved_prefix("src/a", existing_depth=1),
+        "dst/b": resolved_prefix("dst/b", existing_depth=1),
+    }
+    resolved = build_topology(compiled, prefixes, EXT4, None)
+    require_ancestors_legal(compiled, prefixes, resolved)
+
+
+def test_a_move_beneath_a_created_directory_is_ordered():
+    compiled = compiled_for(
+        CreateDirectory("mk", "dst", DirectoryState(mode=0o755)),
+        MoveNoClobber("mv", "src/a", "dst/b", file_state()),
+    )
+    prefixes = {
+        "dst": resolved_prefix("dst", existing_depth=0),
+        "dst/b": resolved_prefix("dst/b", existing_depth=0),
+        "src/a": resolved_prefix("src/a", existing_depth=1),
+    }
+    resolved = build_topology(compiled, prefixes, EXT4, WORK_CONSTRAINTS)
+    require_ancestors_legal(compiled, prefixes, resolved)
+
+
 def test_an_other_ancestor_is_refused_whatever_the_timeline_says():
     """No closed effect variant accepts an OTHER precondition — DeletePath.pre is a file
     or a symlink — so no admissible timeline can turn a socket into a directory."""
@@ -1266,12 +1439,17 @@ def require_ancestors_legal(
     creators: dict[TopologyNode, int] = {}
     removers: dict[TopologyNode, int] = {}
     for index, effect in enumerate(compiled.spec.effects):
+        # Narrowed before `.path` is read: MoveNoClobber has `source` and `destination`
+        # and no `path`, and these are the only two variants that create or clear a
+        # directory anyway.
+        if not isinstance(effect, (CreateDirectory, DeletePath)):
+            continue
         node = resolved.directory_node(effect.path)
         if node is None:
             continue
         if isinstance(effect, CreateDirectory):
             creators.setdefault(node, index)
-        elif isinstance(effect, DeletePath):
+        else:
             removers.setdefault(node, index)
 
     first_touch: dict[str, int] = {}
@@ -1515,16 +1693,45 @@ def test_every_produced_topology_validates_through_a3(label):
 
 
 @pytest.mark.parametrize("label", sorted(AGREEMENT_CORPUS))
-def test_the_rerun_reaches_a2s_verdict_on_every_compiled_input(label):
-    """Design §11.4's A2-agreement property, over the whole corpus rather than a sample.
-    Under today's floor the resolved topology is provably identical to the lexical one, so
-    a compiled specification and its re-run cannot disagree. A failure means the re-run
-    drifted or the floor moved (design §7.4)."""
+def test_the_rerun_reaches_a2s_verdict_on_the_named_corpus(label):
+    """The readable half of design §11.4's A2-agreement property. Under today's floor the
+    resolved topology is provably identical to the lexical one, so a compiled
+    specification and its re-run cannot disagree. A failure means the re-run drifted or
+    the floor moved (design §7.4)."""
     from atoms.fs.topology import require_resolved_surface_and_ordering
 
     compiled = compiled_for(*AGREEMENT_CORPUS[label])
     resolved = build_topology(compiled, prefixes_for(compiled), EXT4, work_for(compiled))
     require_resolved_surface_and_ordering(compiled, resolved)
+
+
+def test_a3_and_the_rerun_accept_every_specification_the_generator_compiles():
+    """Criterion 18 says *every* compiled input, and ten named examples are a corpus, not
+    a property. The generator enumerates all ordered sequences of length 1-3 over a fixed
+    23-effect pool -- every variant against every path in a five-path alphabet, plus three
+    moves -- and keeps the ones A2 admits. On this checkout that is 4825 specifications
+    out of 11155 candidates, and it runs in under three seconds.
+
+    Bounded and deterministic rather than random: no seed to record, no flake, and a
+    failure is reproducible from its label. `checked == compiled` is asserted so a
+    generator that silently stops producing cannot pass by producing nothing.
+    """
+    from atoms.fs.topology import require_resolved_surface_and_ordering
+
+    compiled_count = 0
+    checked = 0
+    for label, effects in generated_specifications():
+        compiled = compiled_for(*effects)
+        compiled_count += 1
+        resolved = build_topology(
+            compiled, prefixes_for(compiled), EXT4, work_for(compiled)
+        )
+        assert _prepared_snapshot(compiled, resolved).topology == resolved.topology, label
+        require_resolved_surface_and_ordering(compiled, resolved)
+        checked += 1
+
+    assert checked == compiled_count
+    assert compiled_count > 4000
 
 
 def test_the_rerun_refuses_a_creation_ordered_after_its_descendant(injected_equivalence):
@@ -1564,7 +1771,12 @@ import pytest
 from atoms.core.effects import DeletePath, ReplaceFile
 from atoms.core.errors import ProjectApprovalRefused
 from atoms.core.fingerprint import SymlinkState
-from tests.fs_support import nonempty_state, prefixes_for, work_for
+from tests.fs_support import (
+    generated_specifications,
+    nonempty_state,
+    prefixes_for,
+    work_for,
+)
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -1777,6 +1989,41 @@ def test_colliding_scratch_leaves_are_refused(injected_equivalence):
     assert "not a remedy" in str(caught.value)
 
 
+def test_every_endpoint_leaf_is_asked_about(injected_equivalence):
+    """The positive bypass check. A call site that decides `one` against `two` without the
+    helper leaves the corresponding name out of this list, and no behavioural assertion
+    can see that under an identity key."""
+    calls = injected_equivalence(lambda name: name)
+    compiled = compiled_for(
+        CreateFileNoClobber("e1", "d/one", file_state()),
+        CreateFileNoClobber("e2", "d/two", file_state()),
+    )
+    prefixes = {
+        "d/one": resolved_prefix("d/one", existing_depth=1),
+        "d/two": resolved_prefix("d/two", existing_depth=1),
+    }
+    resolved = build_topology(compiled, prefixes, EXT4, None)
+    calls.clear()
+    require_endpoints_distinct(resolved)
+    assert calls == ["one", "two"]
+
+
+def test_every_scratch_leaf_is_asked_about(injected_equivalence):
+    calls = injected_equivalence(lambda name: name)
+    compiled = compiled_for(
+        CreateFileNoClobber("e1", "d/one", file_state()),
+        CreateFileNoClobber("e2", "d/two", file_state()),
+    )
+    prefixes = {
+        "d/one": resolved_prefix("d/one", existing_depth=1),
+        "d/two": resolved_prefix("d/two", existing_depth=1),
+    }
+    resolved = build_topology(compiled, prefixes, EXT4, None)
+    calls.clear()
+    bind_scratch(compiled, "tx01", resolved)
+    assert calls == [".#~tx01.e1.staging", ".#~tx01.e2.staging"]
+
+
 def test_distinct_scratch_leaves_survive_under_exact_bytes():
     compiled = compiled_for(
         CreateFileNoClobber("e1", "d/one", file_state()),
@@ -1959,6 +2206,7 @@ import dataclasses
 import pytest
 
 from atoms.core.capabilities import Capability
+from atoms.core.compiler import CompiledSpec
 from atoms.core.effects import CreateDirectory, CreateFileNoClobber
 from atoms.core.errors import (
     CapabilityUnavailable,
@@ -1969,6 +2217,7 @@ from atoms.core.errors import (
 )
 from atoms.core.fingerprint import DirectoryState
 from atoms.fs.approval import ProjectApprovedSpec, ProjectContext, approve_for_project
+from atoms.fs.binding import ProjectBinding
 from tests.fs_support import compiled_for, file_state
 
 WITHHELD = frozenset({Capability.DURABLE_PUBLISH})
@@ -2001,6 +2250,25 @@ class _SubTxid(str):
     pass
 
 
+class _SubCompiled(CompiledSpec):
+    pass
+
+
+class _SubBinding(ProjectBinding):
+    pass
+
+
+def _uninitialised(subclass):
+    """A subclass instance without running __init__.
+
+    CompiledSpec and ProjectBinding are both factory-token guarded, so a subclass cannot
+    be constructed normally — which is the point: `__new__` yields an object whose every
+    attribute access would fail, so a gate that admits it and reads anything afterwards
+    fails loudly instead of silently accepting a subclass.
+    """
+    return subclass.__new__(subclass)
+
+
 def test_a_non_compiled_spec_is_refused(approval_context):
     with approval_context() as (context, _binding):
         with pytest.raises(ProtocolError):
@@ -2013,6 +2281,21 @@ def test_a_duck_typed_binding_is_refused():
     with pytest.raises(ProtocolError) as caught:
         approve_for_project(compiled, context)
     assert "ProjectBinding" in str(caught.value)
+
+
+def test_a_compiled_spec_subclass_is_refused(approval_context):
+    with approval_context() as (context, _binding):
+        with pytest.raises(ProtocolError) as caught:
+            approve_for_project(_uninitialised(_SubCompiled), context)
+        assert "exactly CompiledSpec" in str(caught.value)
+
+
+def test_a_binding_subclass_is_refused():
+    compiled = compiled_for(CreateFileNoClobber("e1", "leaf", file_state()))
+    context = ProjectContext(binding=_uninitialised(_SubBinding), txid="tx01")
+    with pytest.raises(ProtocolError) as caught:
+        approve_for_project(compiled, context)
+    assert "exactly ProjectBinding" in str(caught.value)
 
 
 def test_a_context_subclass_is_refused(approval_context):
@@ -2071,12 +2354,20 @@ def test_a_closed_binding_refuses_before_capabilities_are_compared(approval_cont
         assert "closed" in str(caught.value)
 
 
-def test_a_released_lock_refuses_the_same_way(approval_context, monkeypatch):
+def test_a_released_lock_refuses_the_same_way(approval_context):
     """ProjectBinding._require_active has two branches. The lock outliving check is the
-    one A5's lease will exercise for real, so both are armed here."""
+    one A5's lease will exercise for real, so both are armed here.
+
+    The lock is released through its own `__exit__`, not by setting `_held` directly:
+    `HeldProjectLock.__exit__` returns early when `_held` is already False, so poking the
+    flag would skip `close_all` and leak the lock and metadata-root descriptors while
+    leaving the flock held for the process lifetime. `__exit__` is idempotent, so the
+    fixture's own teardown is unaffected. Reaching `_lock` is private access, and
+    deliberate: there is no public way to outlive a lock, which is the state under test.
+    """
     compiled = compiled_for(CreateFileNoClobber("e1", "leaf", file_state()))
     with approval_context(withhold=WITHHELD) as (context, binding):
-        monkeypatch.setattr(binding._lock, "_held", False)
+        binding._lock.__exit__()
         with pytest.raises(ProtocolError) as caught:
             approve_for_project(compiled, context)
         assert "released" in str(caught.value)
@@ -2170,17 +2461,33 @@ def test_every_resolver_exception_reaches_the_caller_unchanged(
 
     The specification carries a CreateDirectory so work_base_facts is reached at all."""
 
+    seen: list[tuple] = []
+
     def failing(self, *args, **kwargs):
+        seen.append((args, kwargs))
         raise raised
 
     monkeypatch.setattr(f"atoms.fs.approval.PathResolver.{target}", failing)
     compiled = compiled_for(
         CreateDirectory("mk", "made", DirectoryState(mode=0o755))
     )
-    with approval_context() as (context, _binding):
+    with approval_context() as (context, binding):
         with pytest.raises(type(raised)) as caught:
             approve_for_project(compiled, context)
         assert caught.value is raised
+
+    # §11.5 requires the call count and arguments, not just the object. Exactly one call
+    # reaches the injected branch: the refusal propagates rather than being caught and
+    # retried, which a re-raising handler around a retry loop would not satisfy.
+    assert len(seen) == 1
+    arguments, keywords = seen[0]
+    assert keywords == {}
+    if target == "__init__":
+        assert arguments == (binding,)
+    elif target == "resolve":
+        assert arguments == ("made",)
+    else:
+        assert arguments == ()
 ```
 
 Patching `__init__` makes the constructor raise before it returns, which is what the
@@ -2423,6 +2730,7 @@ import pytest
 from atoms.core.effects import CreateDirectory, CreateFileNoClobber, DeletePath
 from atoms.core.errors import ProjectApprovalRefused
 from atoms.core.fingerprint import DirectoryState
+from atoms.core.recovery import PersistentNode
 from atoms.fs.approval import approve_for_project
 from atoms.fs.lookup import read_lookup_constraints
 from tests.fs_support import compiled_for, file_state
@@ -2481,6 +2789,28 @@ def test_a_file_ancestor_the_timeline_converts_approves_on_disk(approval_context
             CreateFileNoClobber("e1", "p/q", file_state()),
         )
         approve_for_project(compiled, context)
+
+
+def test_two_spellings_stay_two_directories_on_a_real_volume(approval_context):
+    """Criterion 15's `EXACT_BYTES` half, against a real fixture rather than a synthetic
+    table. Physical `a` exists, so `a/x` resolves through it and keys by inode; `A` is a
+    planned directory keyed by (root, "A"). ext4 without casefold distinguishes them, so
+    approval issues two nodes — and this is the half that needs no injected double,
+    because the real volume supplies the relation."""
+    with approval_context() as (context, binding):
+        root = binding.project_root_fd
+        os.mkdir("a", dir_fd=root)
+        compiled = compiled_for(
+            CreateDirectory("mk", "A", DirectoryState(mode=0o755)),
+            CreateFileNoClobber("e1", "a/x", file_state()),
+        )
+        proof = approve_for_project(compiled, context)
+
+        parent_of_x = next(
+            entry.parent_node for entry in proof.paths if entry.path == "a/x"
+        )
+        assert parent_of_x != PersistentNode("A")
+        assert PersistentNode("A") in {edge.node for edge in proof.topology.parents}
 
 
 def test_a_component_over_name_max_is_refused(approval_context):
@@ -2651,6 +2981,14 @@ def test_the_pure_modules_never_decide_equality_on_a_raw_component(module_name):
     mapping keys, over both a raw attribute and any local aliased from one. A value
     produced BY lookup_equivalence_key launders the taint, which is what makes the
     pipeline's `key = (parent, lookup_equivalence_key(...))` idiom legal.
+
+    **This is a lint over the shapes it names, not a soundness proof.** Alias discovery is
+    one hop, so `a = entry.leaf; b = a; b == x` slips through, as do a component recovered
+    via `split`, a key built from a length, and a dict-literal key. Making it sound needs
+    real dataflow analysis, which is not worth building here. The positive check is what
+    carries the weight: injected_equivalence records the names it is asked about, so a
+    call site that bypasses the helper contributes nothing to that list however it is
+    written. This guard catches the direct shape cheaply; the recording catches omission.
     """
     tree = ast.parse(
         (SOURCE_ROOT / "fs" / f"{module_name}.py").read_text(encoding="utf-8")
@@ -2831,13 +3169,57 @@ value produced *by* `lookup_equivalence_key` — or by `len`, which yields a byt
 as laundered. It was run against the proposed `topology.py` and `judgment.py` before this plan was
 committed, which is how `previous != entry.leaf` was found and replaced with `if key in seen`.
 
+**Two production defects the extracted-fence run caught, after the plan looked right.** Both were
+found by copying the plan's `topology.py` and `judgment.py` out of their fences into the package and
+exercising them, not by reading.
+
+1. **Every `MoveNoClobber` raised `AttributeError`.** The creator scan read `effect.path` before
+   narrowing the variant; a move has `source` and `destination` and no `path`. The scan now narrows to
+   `CreateDirectory | DeletePath` first, and Task 3 covers a resolved move and a move beneath a created
+   directory.
+2. **A `CreateDirectory` endpoint that parents nothing was retained in the proof.** Adding those
+   endpoints to the candidate set — the fix for the previous round's P0 — also put them in the fact
+   table, so a lone `CreateDirectory("a")` retained `PersistentNode("a")`. That contradicts §7.3 and
+   criterion 14, which say `ApprovedPlannedDirectory` is exactly `WorkRoot` plus the **parent**
+   `PersistentNode`s. Edges are now built first and facts filtered to nodes that actually parent
+   something. The partition test asserted only types and disjointness, which passes for both an
+   omission and an extra; it now asserts set equality.
+
+**The bypass check is two mechanisms, and the AST guard is the weaker one.** It is a lint over the
+shapes it names — comparisons and mapping keys, over a raw attribute or a one-hop alias. It does not
+catch a transitive alias, a component recovered through `split`, a key built from a length, or a
+dict-literal key, and making it sound needs real dataflow analysis. So `injected_equivalence` now
+records the names it is asked about, and each phase asserts the exact list: `["one", "two"]` for
+endpoint distinctness, the two full scratch leaves for binding, `["a", "b"]` for planned keying. A call
+site that decides a name without the helper contributes nothing to that list however it is written.
+Design §11.6 and criterion 16 were amended to require both.
+
+**The agreement property is generated, not curated.** Criterion 18 says *every* compiled input, and ten
+named examples are a corpus. `generated_specifications` enumerates all ordered sequences of length 1–3
+over a 23-effect pool — four single-path variants against five paths, plus three moves — and keeps the
+ones A2 admits. On this checkout that is **4825 specifications out of 11155 candidates**, all of which
+build a topology A3 accepts and pass the re-run, in 2.6 seconds. Bounded and deterministic: no seed, no
+flake, and a failure reproduces from its label. The named corpus stays for readable failure messages.
+
+**Every expected value in this round was executed before it was written down.** The extracted modules
+were run against each new case: the symlink pair, both move cases, the partition equality, the lone
+`CreateDirectory`, the three spy call lists, and the full 4825-entry matrix. `CompiledSpec` and
+`ProjectBinding` subclasses are constructed through `__new__`, since both are token-guarded — which
+strengthens the test rather than weakening it, because the resulting object has no usable attribute,
+so a gate that admits it fails loudly.
+
 **Two places a reviewer should look hardest.**
 
 1. **Task 4's `require_resolved_surface_and_ordering` walks ancestors through `parent_by_node`, which
    contains only nodes that have edges.** A path parented by `ProjectRoot` terminates correctly because
    `ProjectRoot` has no parent edge, so `.get` returns `None`. Verify that on a single-component path
    before trusting the loop.
-2. **`build_topology`'s edge set is keyed by node, not appended.** Two prefixes that fold together are
+2. **The released-lock test releases through `HeldProjectLock.__exit__`, not by setting `_held`.**
+   `__exit__` returns early when `_held` is already False, so poking the flag skips `close_all` and
+   leaks the lock and metadata-root descriptors while leaving the flock held for the process lifetime.
+   `__exit__` is idempotent, so the fixture's teardown still works. Confirm that reading `lock.py:194`
+   before trusting it.
+3. **`build_topology`'s edge set is keyed by node, not appended.** Two prefixes that fold together are
    one directory and must contribute one edge; A3's `_validate_topology` fails a node appearing twice in
    `topology.parents` even when both edges name the same parent. That deduplication is the only thing
    standing between the folding merge and an A3 rejection, and it has no dedicated test — it is covered

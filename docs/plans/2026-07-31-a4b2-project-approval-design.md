@@ -685,7 +685,10 @@ against a restatement of this document.
   equal to an independent `fstat` and `read_lookup_constraints` on that directory, so the retained
   baseline is checked against the filesystem rather than against the same call that produced it;
 - `work_base is None` for a specification with no `CreateDirectory`, and non-`None` with one;
-- the A2-agreement property: for every compiled specification, the §7.4 re-run reaches A2's verdict.
+- the A2-agreement property: for every compiled specification the generator of criterion 18 produces,
+  the §7.4 re-run reaches A2's verdict, and the produced topology validates through
+  `build_recovery_snapshot`. The generator is pure, so this runs at Tier 3 speed; the volume fixtures
+  above are what make this tier real ext4.
 
 The last is a property test rather than a case: under today's floor the two cannot disagree, so a
 failure means the re-run drifted or the floor moved.
@@ -704,10 +707,14 @@ same-class exception the code might raise on its own.
 - `ProjectApprovedSpec(...)` and `dataclasses.replace(proof, ...)` both raise `TypeError`.
 - The retained binding is present and is the object passed in (ledger #16).
 - No `except` clause in `approval.py` encloses a `PathResolver` call, by AST.
-- Neither `topology.py` nor `judgment.py` compares leaf names directly — no `==`, `!=`, `in`, or
-  set/dict membership over a raw component — by AST. This is what §11.2's injected double cannot
-  catch: a call site that bypasses `lookup_equivalence_key` still passes every `EXACT_BYTES` case,
-  because under that policy the function is the identity.
+- Neither `topology.py` nor `judgment.py` decides a name directly. Two complementary checks, because
+  neither is sufficient alone. **Negative:** an AST guard rejects comparisons and mapping keys over a
+  raw component or a local aliased from one — a lint over those shapes, explicitly not a soundness
+  proof, since alias discovery is one hop and a component recovered through `split` or a key built
+  from a length would slip past. **Positive:** §11.2's double records the names it is asked about, so
+  a call site that bypasses `lookup_equivalence_key` contributes nothing to that list however it is
+  written. Behaviour alone cannot distinguish the two, because under `EXACT_BYTES` the function is
+  the identity.
 - `topology.py` and `judgment.py` import nothing from `atoms.fs.resolve` beyond its types, and issue no
   syscalls — asserted by AST, not by trust.
 - `resolve.py` and `lookup.py` still import none of `compiler`, `spec`, or `recovery`; the new modules
@@ -768,11 +775,15 @@ amendment covering approval-time drift (§3.3).
     `a/x` yields two directory nodes under `EXACT_BYTES` against a real fixture, and one under the
     `injected_equivalence` double of §11.2 — the folding half being unreachable in production, since no
     `LookupProof` member is both insensitive and reproducible.
-16. Neither `topology.py` nor `judgment.py` compares a raw component directly; every name comparison
-    routes through `lookup_equivalence_key`, asserted by AST rather than by the injected double, which
-    cannot distinguish the two under an identity key.
+16. Neither `topology.py` nor `judgment.py` decides a name directly; every name comparison routes
+    through `lookup_equivalence_key`. Asserted twice: by an AST guard over comparisons and mapping
+    keys, which is a lint rather than a proof, and by the injected double recording the names each
+    phase asks about, which catches an omission the guard's shapes miss. Behaviour cannot distinguish
+    them, because under `EXACT_BYTES` the function is the identity.
 17. `node_id` assignment is identical across repeated approvals of one specification.
-18. The §7.4 re-run reaches A2's verdict on every compiled input.
+18. The §7.4 re-run reaches A2's verdict on every compiled input, asserted over a deterministic
+    generator — all ordered effect sequences of length 1–3 over a fixed pool, filtered to those A2
+    admits — rather than over a hand-picked corpus.
 19. Every exception A4b-1 raises reaches the caller as the same object, for every declared type and
     every load-bearing branch.
 20. `approval.py` contains no `except` clause enclosing a resolver call.
