@@ -198,10 +198,14 @@ effect.
 
 Approval proves the specification *may* run. It does not prove it *will* succeed:
 
-- It does not compare any live entry against a declared precondition. A6's capture does that, against
-  a coherent descriptor, and §6 of the authority is explicit that capture-time verification is not
-  compare-and-swap authority. An approval-time precondition check would be a third observation of the
-  same entry, weaker than capture's and stale by the time capture runs.
+- It does not compare any live entry against a declared precondition, **with one bounded exception**:
+  a *blocking* ancestor, where resolution stopped because the entry is not a directory. There approval
+  has no choice — the topology cannot be built without deciding whether that path becomes a directory,
+  and the observation is already in hand — so §6.3.1 requires the timeline to convert it. Everywhere
+  else, A6's capture does the comparing, against a coherent descriptor, and §6 of the authority is
+  explicit that capture-time verification is not compare-and-swap authority. A general approval-time
+  precondition check would be a third observation of the same entry, weaker than capture's and stale
+  by the time capture runs.
 - It does not check scratch-path vacancy (ledger #7).
 - It does not check free space, permissions, or quota.
 
