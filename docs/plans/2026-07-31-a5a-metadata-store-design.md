@@ -370,14 +370,25 @@ authority matters most. So the gate runs **again immediately before COMMIT**, in
 
 **The same rule covers the filesystem barriers, not only the COMMIT one**, and stating it once here
 keeps three sections from each deciding it separately. Every operation that verifies before it mutates
-runs unbounded work in between — promotion streams and hashes every staged file (§8.1 step 1), orphan
-removal hashes the leaf (§7.3), workspace removal stats every capture (§8.3) — and the lock can be
-released inside any of it. So each re-runs the gate **immediately before its first mutating syscall**:
-the first rename, the first unlink. The shape is always gate, verify, gate, mutate, with nothing
-between the second gate and the mutation. A single gate at entry would prove the lock was held when the
-verification began, which is the window the late COMMIT gate already exists to close — and a rename
-issued after the lease has ended writes into a namespace the next lease owner may already be
-reclaiming, which is worse than a stale read, because it is not observable at all from the store.
+runs unbounded work in between — promotion streams and hashes every staged file and every already-indexed
+destination (§8.1 step 1), orphan removal hashes the leaf (§7.3), workspace removal stats every capture
+(§8.3) — and the lock can be released inside any of it. A single gate at entry would prove only that the
+lock was held when the verification began, which is the window the late COMMIT gate already exists to
+close. A rename issued after the lease has ended writes into a namespace the next lease owner may
+already be reclaiming, which is worse than a stale read: it is not observable from the store at all.
+
+**The unit is the syscall, not the operation.** Promotion renames once per manifest entry and workspace
+removal unlinks once per capture, so gating "before the first mutation" fixes the window at the front of
+the batch and reopens it immediately: release the lock after entry one and every remaining entry races
+the next owner. So the gate runs **immediately before each mutating syscall** — every rename, every
+unlink. The shape is gate, verify, then gate-and-mutate repeatedly, with nothing between a gate and the
+syscall it authorizes. This is affordable because the gate is an attribute read on a live object
+(`binding.py:110`), against a loop that is already paying a full file hash per entry.
+
+A batch that fails partway through a mutating loop is **not** a new disposition. It is exactly §8.2's
+post-mutation failure: sources removed, some content published, the staging half spent, and the mixed
+state preserved as evidence for §7.3 and §8.3 to reclaim. The gate refusing at entry seven is the same
+shape as a mismatched blob refusing at entry seven.
 
 If that late gate fails, `ROLLBACK` still runs before `ProtocolError` escapes. Abandoning an open
 write transaction to raise faster would leave the database locked with uncommitted pages and no
@@ -969,14 +980,30 @@ the still-open transaction. A failure **rolls back** and raises; nothing partial
 of touched txids is accumulated by the setters themselves, so the cost is proportional to what was
 written rather than to the store.
 
-**No promoted-digest check runs here, and the reason is worth recording** because an earlier draft put
-one in this slot. It asserted that every digest the transaction promoted had a `blob` row, which was
-necessary while indexing was a separate `insert_blobs` call — and insufficient even then, since
-presence is not agreement and the row could carry a `byte_len` the bytes contradict (§7.1). Now that
-`promote_staging` writes the rows from the same verified manifest it publishes, the property holds by
-construction and the check would only assert that one function ran both halves of its own body. A
-barrier that cannot fail is worse than absent: it reads as the enforcement, so the next reader stops
-looking for where the invariant actually comes from.
+**A second check runs in the same slot: every digest this transaction promoted is referenced by the
+record for the workspace's txid.** `promote_staging` registers both the txid — so §7.6's predicate runs
+for it, which promotion alone would not have caused — and the digests it published.
+
+The check exists because the alternative is an orphan nothing can ever reclaim. `blob` has no foreign
+key to `transaction_record` and cannot have one, since the reference lives inside `spec_json`, so a
+transaction that promotes and commits without inserting a record leaves `(transaction_record=0,
+blob=1)` — reproduced. That row is invisible to both reclaimers by construction: §7.3's predicate is
+*is there a row at all*, and the row is there; §7.5's terminal GC, which asks whether a live record
+still references the blob, is the one A5a explicitly does not ship (§2.2). The blob would be
+permanently stranded, and §7.3's claim that pre-COMMIT reclamation reduces to a row lookup would be
+false in exactly the case that matters.
+
+Requiring the reference restores it. After a successful COMMIT every `blob` row has a referencing
+record, so "no row" and "no reference" are the same question for anything A5a can produce, and §7.3's
+simple predicate is sound rather than merely cheap. A failure rolls back, which removes the rows and
+leaves the published leaves as unindexed orphans — reclaimable by §7.3, the same disposition a crash
+at that point produces.
+
+An earlier draft put a *different* check in this slot: that every promoted digest had a `blob` row. That
+one was necessary while indexing was a separate `insert_blobs` call, insufficient even then — presence
+is not agreement, and the row could carry a `byte_len` the bytes contradict (§7.1) — and is now vacuous,
+since one function writes both. It was the wrong direction throughout. What needed proving was never
+that the blob reached the index, but that something in the record points at it.
 
 **The exit sequence is gate → validate → gate → COMMIT**, and the second gate is adjacent to the COMMIT
 with nothing between them. Validation runs `compile_spec` over every touched spec and re-reads rows; on
@@ -1105,24 +1132,38 @@ directory with its digest and byte length:
    Guarantee 3). That is the same trade `open_blob` makes (§7.2) and the same answer: a content-address
    the engine never checked is a name asserting something nobody verified.
 
-   **Existing `blob` rows are compared here as well.** For every digest in the manifest that already
-   has a row, that row's `byte_len` must equal the verified length, or §8.4's `MetadataStoreInvalid`
-   is raised — before anything moves, rather than at an insert after half the batch has published.
-   Detection and insertion sit at opposite ends of the operation for the same reason the rest of step 1
-   does.
+   **An already-indexed digest has its leaf verified here, in full.** For every manifest digest that
+   already has a `blob` row, the destination leaf is opened and checked exactly as §7.2 checks it —
+   present, regular, and streaming to the digest — and the row's `byte_len` must equal that length.
+   Any failure raises `MetadataStoreInvalid` before anything moves.
+
+   Comparing only the row's `byte_len`, as an earlier draft did, left promotion **silently repairing
+   corruption it is not entitled to repair**. If the indexed leaf is missing, step 2's rename finds no
+   destination, succeeds, and re-creates it — while `open_blob` on that identical starting state calls
+   it `MetadataStoreInvalid` and refuses (§7.2). One operation would have quietly healed the state
+   another reports as unreadable, and the healing is not sound: the row was written against bytes that
+   are gone, and nothing establishes that the manifest's file is those bytes rather than merely a file
+   whose digest matches a name. Two operations disagreeing about whether the same durable state is
+   valid is the defect, independently of which verdict is nicer.
+
+   §8.2 still handles `EEXIST` at step 2, and now covers exactly one case: a destination that exists
+   with **no** row — a promoted orphan from an earlier crash (§7.3). That one cannot be preflighted by
+   the index because the index does not know about it.
 
    Each failure raises `ProtocolError` — the manifest is the caller's argument, not durable state. The
-   one exception is the row comparison just above, which reports durable state and is
-   `MetadataStoreInvalid` by §9's rule.
+   exceptions are the leaf checks just above, which report durable state and are `MetadataStoreInvalid`
+   by §9's rule.
 
-   **The gate runs once more at the end of step 1, immediately before the first rename** (§5.4). Step 1
-   streams and hashes every staged file, which is unbounded work proportional to the capture, and the
-   lock can be released during it. The shape is §5.4's, applied to the filesystem barrier instead of the
-   COMMIT one: gate, verify, gate, mutate — with nothing between the second gate and the first rename.
-   A promotion that renames after the lease has ended is publishing blobs into a namespace the next
-   lease owner is already reclaiming.
-2. For each entry, no-clobber rename `staging/<txid>/<name>` → `blobs/sha256/<hex>`. `EEXIST` is
-   handled in §8.2.
+   **The gate runs once more at the end of step 1** (§5.4), and again before every rename in step 2.
+   Step 1 streams and hashes every staged file and every already-indexed destination, which is unbounded
+   work proportional to the capture, and the lock can be released during it.
+2. For each entry, **re-run the §5.4 gate**, then no-clobber rename `staging/<txid>/<name>` →
+   `blobs/sha256/<hex>`. `EEXIST` is handled in §8.2. The gate is per entry, not per batch: a
+   thousand-file capture is a thousand mutations, and one gate before the first proves only that the
+   lease was held when the loop started. Releasing the lock after entry one leaves the remaining
+   renames racing the next lease owner, which is the same defect a single entry gate had, moved one
+   level in. It is an attribute read against a live object, so per-syscall is affordable; the batch
+   already pays a full hash per file.
 3. `backend.flush_directory` on `blobs/sha256/` **and** `staging/<txid>/`. Flushing only the blob
    directory could leave both the blob and its staging source name durable after power loss,
    resurrecting preparation-only staging — authority §7.3's stated reason.
@@ -1335,17 +1376,16 @@ Both openers validate the txid (§5.5) first. Neither infers anything from the d
   1. `scandir` `staging/<txid>/` from the held `staging_fd` and `fstatat` each entry with
      `AT_SYMLINK_NOFOLLOW`; every one must be a regular file (§8.5). Confirm `work/<txid>/` is empty in
      the same pass.
-  2. Re-run the §5.4 gate, immediately before the first unlink.
-  3. Unlink each entry, `flush_directory` on `staging/<txid>/`, `rmdir` it, `flush_directory` on
-     `staging/`; then `rmdir` `work/<txid>/` and flush `work/`.
+  2. Unlink each entry, re-running the §5.4 gate immediately before each `unlinkat` — per entry, for
+     the reason §5.4 gives: one gate before the loop leaves every entry after the first unauthorized.
+  3. `flush_directory` on `staging/<txid>/`, `rmdir` it, `flush_directory` on `staging/`; then `rmdir`
+     `work/<txid>/` and flush `work/`, each preceded by the same gate.
 
   Splitting it that way is what makes §8.5's promise true. Validating each entry as it is unlinked
   satisfies the letter — every entry is checked — while an invalid entry discovered *last* leaves the
   earlier captures already destroyed and preserves an almost-empty directory as its evidence. That is
   the same defect as promoting entry *k* before validating entry *k+1*, and it deserves the same
-  answer. Step 2 exists because step 1 is unbounded work on a large capture: the lock can be released
-  during the scan, and unlinking afterwards is mutating a namespace the next lease owner may already
-  be reclaiming.
+  answer.
 
   Deleting the entries needs no judgment, and that is what makes it A5a's to do. A staged file is
   **mutation-free scratch** in the authority's own words — it "stays mutation-free scratch until"
@@ -1656,6 +1696,14 @@ record that the following rollback erases.
 `MetadataStoreInvalid` **at step 1, with every source still staged and no row written**; and a single
 manifest carrying one digest with two lengths raises `ProtocolError` at the same preflight.
 
+**An already-indexed digest has its leaf verified, not assumed** (§8.1 step 1), one case per failure:
+the leaf missing, the leaf a directory or symlink, and the leaf a regular file whose bytes hash to
+something else. Each raises `MetadataStoreInvalid` with every source still staged. The missing-leaf case
+carries a second assertion that is the point of the whole check — `open_blob` on that same starting
+state refuses with `MetadataStoreInvalid` too, so the two operations agree about whether the store is
+readable. Against the earlier specification that test fails: promotion's rename succeeded and re-created
+the leaf, healing a state `open_blob` calls corruption.
+
 Every cross-row validation of §7.6, failed one at a time **on both sides**: a `spec_json` that
 `compile_spec` refuses; a missing `effect` row and an extra one; a mismatched variant; a `blob.byte_len`
 disagreeing with the referenced `FileState`; `rollback_result` present without `ROLLED_BACK` and absent
@@ -1771,7 +1819,15 @@ a deferred reclaimer transaction fails even the stale-argument case.
 
 Promotion's transaction binding (§8.1, §7.1): promoting and then rolling the transaction back leaves
 the blobs on disk with no rows, reported by `list_unindexed_blobs` — the rollback disposition, identical
-to a crash at the same point. `promote_staging` outside a transaction is unreachable through the
+to a crash at the same point.
+
+**A transaction that promotes without inserting a record raises `ProtocolError` at exit** (§7.7), with
+the assertion written on the durable state rather than the exception: after the rollback the store holds
+`(transaction_record=0, blob=0)` and the leaves are reported by `list_unindexed_blobs`. The counterpart
+is the state this forbids — a committed `(transaction_record=0, blob=1)`, which is reproducible against
+the earlier specification and which **neither** reclaimer can reach, asserted directly by showing the
+digest absent from `list_unindexed_blobs` while no record references it. A record referencing only
+*some* of the promoted digests fails the same way, since the check is over every promoted digest. `promote_staging` outside a transaction is unreachable through the
 surface, asserted against `__all__` and the `Store` attribute set, and the surface assertion is what
 arms the deeper claim: **`_StoreTransaction` has no `insert_blobs`**, so no test can construct the
 promote-`(digest, 10)`-then-index-`(digest, 11)` sequence that defeated the earlier barrier, and none
@@ -1865,6 +1921,14 @@ and — the half that actually matters — that **nothing moved**: every source 
 leaf still present, every capture still present. A single gate at entry passes the first assertion in
 all three and fails the second, which is why the second is written down separately.
 
+**The gate inside each mutating loop**, which is a different test and catches a different specification:
+a multi-entry promotion and a multi-capture removal, each with the lock released **after the first
+rename or unlink and before the second**. The assertion is on the entries that follow — every remaining
+source still staged, every remaining capture still present — and on the disposition, which is §8.2's
+post-mutation failure rather than a new one: the staging half spent, the mixed state reported by
+`list_workspaces` and `list_unindexed_blobs`. Gating once before the loop passes every other liveness
+test in this tier and fails this one.
+
 ### 11.5 Tier 5 — fresh process
 
 A record written and committed in one process is read back identically in a new one. This is the
@@ -1880,10 +1944,30 @@ certified capability.
 ### 11.6 Tier 6 — architecture
 
 `atoms.fs` and `atoms.core` never import `atoms.store`. The public surface is exactly `__all__` (§7.1)
-and exports no `sqlite3.Connection`. **`promote_staging` is the only writer of a `blob` row** — asserted
-by scanning the package for `INSERT INTO blob`, which must appear exactly once, in promotion's step 6.
-This is the static half of ledger #22: the ordering §8.1 establishes is only worth anything if no second
-site can write a row without it. No `ATTACH` or `VACUUM` statement appears in the package. No
+and exports no `sqlite3.Connection`.
+
+**`promote_staging` is the only writer of a `blob` row.** An earlier draft asserted this by counting
+occurrences of `INSERT INTO blob`, which proves almost nothing: `REPLACE INTO`, `INSERT OR REPLACE`,
+`UPDATE blob`, `DELETE FROM blob`, a trigger writing the table, and the same insert spelled with
+different whitespace or case all pass it. Since ledger #22 now rests on this structurally, the check has
+to be about *statements*, not substrings.
+
+It is built on a property A5a can enforce cheaply: **every SQL string the package issues is a
+module-level constant**, none assembled at the call site. §11.6 asserts that first — an AST walk over
+`atoms.store` finds no f-string, `%`, `+`, `.format`, or `.join` producing a string passed to `execute`
+or `executemany` — because a statement built at runtime is one no static check can classify. Parameter
+placeholders are unaffected; they are values, not statement text.
+
+With that, the inventory is finite and enumerable. Each constant is parsed for its statement kind and
+target table, and the rule is stated over the parse, not the text: **exactly one statement in the
+package writes `blob`, it is an `INSERT`, and it is the one promotion's step 6 issues.** Any other
+`INSERT`, `REPLACE`, `UPDATE`, or `DELETE` targeting `blob` fails, whatever its spelling. The schema DDL
+is checked separately for the same property: no trigger in §6.1 names `blob` as its target, so no write
+to another table can reach it indirectly.
+
+This is the static half of ledger #22, and it is the half that carries the weight: §8.1's ordering —
+verify, publish, flush, then index — is worth exactly nothing if a second site can write a row without
+it. No `ATTACH` or `VACUUM` statement appears in the package. No
 blanket `OSError` handler, extending the existing guard.
 
 **No `os.fsync` call appears in `atoms.store`** — every durability barrier goes through
@@ -1956,8 +2040,9 @@ table shapes, and §11 refusal vocabulary (§3.3).
 12. `ATTACH` and `DETACH` are denied by the authorizer, and no `ATTACH` or `VACUUM` statement appears
     in the package.
 13. **Every** operation gates on `binding.backend`, reads included, and the gate runs again
-    immediately before each barrier — the COMMIT, and the first mutating syscall of promotion, orphan
-    removal, and workspace removal, each of which verifies unbounded content first (§5.4); a lock released between the last write and the transaction's exit rolls
+    immediately before each barrier — the COMMIT, and **every** mutating syscall of promotion, orphan
+    removal, and workspace removal, per rename and per unlink rather than once per batch, since each
+    verifies unbounded content first and a batch is many mutations (§5.4); a lock released between the last write and the transaction's exit rolls
     back and raises `ProtocolError`. The only exemptions are `ROLLBACK`, `Store.close`, and
     `Workspace.close`, each asserted to succeed after the binding or lock dies. `remove_workspace` is
     **not** exempt: it mutates the engine-owned namespace and would race the next lease owner.
@@ -2012,9 +2097,15 @@ table shapes, and §11 refusal vocabulary (§3.3).
     write-lock interval, and there is **no separate `insert_blobs`** — the digest and `byte_len` in the
     index are the ones step 1 verified against the staged file, so no row can contradict its bytes or
     name a leaf that does not exist. A promoted-but-unindexed blob is therefore reachable only through
-    a crash or a rollback, never as a steady state another connection can observe.
+    a crash or a rollback, never as a steady state another connection can observe. The transaction also
+    refuses to COMMIT unless the record for the workspace's txid references every digest it promoted, so
+    the converse orphan — an indexed blob no record names, which **neither** reclaimer can reach — is
+    unreachable as well.
 28. A pre-existing blob is verified by kind, length, and streamed SHA-256 before the staged source is
-    unlinked; on mismatch the staged source survives and `MetadataStoreInvalid` is raised.
+    unlinked; on mismatch the staged source survives and `MetadataStoreInvalid` is raised. A digest that
+    is **already indexed** has its leaf verified the same way in the preflight, so promotion refuses a
+    missing, non-regular, or mismatching leaf instead of re-creating it — the state `open_blob` calls
+    `MetadataStoreInvalid` is not one promotion silently heals.
 29. The `blob.digest` key is `sha256:<hex>` while the `blobs/sha256/` leaf is the bare 64-character
     hex, with the mapping tested in both directions.
 30. Workspace directories are created and removed through guarded traversal from the retained
@@ -2059,9 +2150,12 @@ table shapes, and §11 refusal vocabulary (§3.3).
 36. Promotion's indexing is idempotent on an identical digest and `byte_len`, and raises
     `MetadataStoreInvalid` when an existing row's `byte_len` contradicts verified content — at the
     preflight, before any source moves.
-37. `INSERT INTO blob` appears exactly once in the package, in promotion's step 6, and a fresh process
-    resolves every digest a committed record references through `open_blob` — the two halves of ledger
-    #22, one static and one behavioral.
+37. Every SQL string the package issues is a module-level constant, with no statement text assembled at
+    the call site, so the inventory is finite. Over that inventory, **exactly one statement writes
+    `blob`** — promotion's step 6 `INSERT` — with any other `INSERT`, `REPLACE`, `UPDATE`, or `DELETE`
+    targeting `blob` refused by statement kind and target table rather than by spelling, and no trigger
+    naming `blob`. A fresh process resolves every digest a committed record references through
+    `open_blob`. These are the two halves of ledger #22, one static and one behavioral.
 38. `atoms.fs` and `atoms.core` import nothing from `atoms.store`.
 39. A record committed in one process is read back identically in a fresh process.
 40. No `ProjectApprovedSpec` is accepted anywhere in `atoms.store`, so ledger #9's enforcement cannot
