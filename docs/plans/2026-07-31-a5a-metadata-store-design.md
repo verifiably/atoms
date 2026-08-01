@@ -1397,7 +1397,7 @@ class Workspace:
     descriptor it was opened from is borrowed in turn and stays A4a's.
     """
 
-    __slots__ = ("_staging_fd", "_store", "_txid", "_work_fd")
+    __slots__ = ("_closed", "_staging_fd", "_store", "_txid", "_work_fd")
 
     def __init__(self, *, _construction_token: object | None = None, **kwargs) -> None: ...
 
@@ -1412,7 +1412,18 @@ class Workspace:
     def close(self) -> None: ...          # idempotent; closes both descriptors
     def __enter__(self) -> Workspace: ...
     def __exit__(self, *exc: object) -> None: ...   # calls close()
+
+    def _spend_staging(self) -> None: ...           # PRIVATE; §8.1 step 4 only
 ```
+
+**Spending the staging half is private.** The listing above is the exact public surface, and
+§11.6 asserts it as a set rather than as a lower bound. A public spender would let a caller mark
+the half spent while `staging/<txid>/` is still on disk holding files — after which
+`remove_workspace` sees a spent half, skips that directory, and strands it. Only promotion knows
+the moment step 4's `rmdir` succeeded, which is the only moment the half is genuinely gone.
+`_closed` is separate from the two descriptor slots because "closed" and "spent" are different
+states with different refusals, and a reader who sees only `staging_fd is None` cannot tell which
+one produced it.
 
 **The descriptors are exposed, as borrowed anchors.** An earlier draft made them private on the
 reasoning that no caller needs them. That was wrong, and it made the workspace unusable for its actual
@@ -2198,6 +2209,14 @@ An additional AST check keeps that catch honest without re-banning it: every
 mechanically checkable and is precisely the property §9.1 depends on — an unrecognized code leaves with
 its own class and traceback. A handler that translated unconditionally would fail it.
 
+**One function is exempt, by name.** §7.7's rollback-on-every-failing-exit has to swallow: it runs
+while an exception is already in flight, and re-raising there would replace the cause with the
+consequence, which §7.7 forbids in those words. The exemption is a named string in the guard, not a
+shape, and a second test asserts the package holds **exactly one** such handler — so the reasoning
+cannot be inherited by a later swallow that merely looks similar. `except sqlite3.Error` stays banned
+outright, exemption or not: it also covers `InterfaceError`, and swallowing that hides an A5a bug
+inside a release path.
+
 The `spec_json` guard targets **issued DML, not the DDL**. The required schema necessarily contains
 `BEFORE UPDATE OF spec_json` (§6.1), so a guard forbidding that string everywhere would reject the
 trigger that does the enforcing. It therefore scans for an `UPDATE transaction_record SET ... spec_json`
@@ -2387,17 +2406,34 @@ table shapes, and §11 refusal vocabulary (§3.3).
 36. Promotion's indexing is idempotent on an identical digest and `byte_len`, and raises
     `MetadataStoreInvalid` when an existing row's `byte_len` contradicts verified content — at the
     preflight, before any source moves.
-37. Every `execute` and `executemany` argument **resolves by name** to a module-level string constant
-    of the package — bound in that module or imported from another `atoms.store` module — with the
-    single loop binding over `SCHEMA_STATEMENTS` permitted by naming that iterable and every other
-    form refused, attribute access included. A guard that accepts any attribute, or any name that
-    happens to be some loop's target, is not a resolution and does not make the inventory finite. Over
-    that inventory, and with **`executescript` absent as a call** — proved over parsed calls, not over
-    source text, so the docstrings explaining the ban do not have to lie about it — **exactly one
+37. Every `execute` and `executemany` argument **resolves by name, in the scope where it is used**,
+    to a module-level string constant of the package — bound in that module or imported from another
+    `atoms.store` module — with the two loop bindings that carry SQL permitted by **naming their
+    iterables and the element positions that are statements** (`SCHEMA_STATEMENTS`, and
+    `_CONNECTION_PRAGMAS` positions 1 and 2), and every other form refused, attribute access
+    included. A guard that accepts any attribute, or any name that happens to be some loop's target,
+    is not a resolution and does not make the inventory finite; neither is one that unions the whole
+    module, because `_execute_schema`'s `for statement in SCHEMA_STATEMENTS` and `_set_column`'s
+    `statement` **parameter** share a name, and a module-wide set hands the parameter the loop's
+    permission before the call-site check that would have refused it ever runs. A parameter resolves
+    only when every call site in its module passes an allowed name.
+    The inventory the rule is stated over descends into module-level literal containers: the pragma
+    statements live inside a tuple of tuples, so an inventory of names bound *directly* to a string
+    would omit them, and a `blob` writer hidden there would pass resolution and appear nowhere.
+    Over that inventory, and with **`executescript` absent as a call** — proved over parsed calls, not
+    over source text, so the docstrings explaining the ban do not have to lie about it — **exactly one
     statement writes `blob`** — promotion's step 6 `INSERT` — with any other
     `INSERT`, `REPLACE`, `UPDATE`, or `DELETE` targeting `blob` refused by statement kind and target
-    table rather than by spelling, and with every trigger checked by the targets **inside its body**
-    rather than by its subject table. A fresh process resolves every digest a committed record
+    table rather than by spelling. The kind includes the conflict clause: `INSERT OR REPLACE` and
+    `INSERT … ON CONFLICT … DO UPDATE` are upserts, not inserts, and either could change the
+    `byte_len` of a digest a committed record already names — the disagreement §8.4 refuses at the
+    preflight and nothing downstream re-checks. `ON CONFLICT … DO NOTHING` is §8.4's idempotency and
+    stays a plain `INSERT`. Every trigger is checked by the targets **inside its body**
+    rather than by its subject table.
+    The class surfaces are asserted as **sets**: `Store`, `_StoreTransaction`, and `Workspace` expose
+    exactly §7.1's and §8.3's listings and nothing else. This is where `_StoreTransaction` having no
+    `insert_blobs` and `Workspace._spend_staging` being private are enforceable at all — both are
+    claims about absent methods, which no behavioural test can make. A fresh process resolves every digest a committed record
     references through `open_blob`. These are the two halves of ledger #22, one static and one
     behavioral.
 38. `atoms.fs` and `atoms.core` import nothing from `atoms.store`.
@@ -2412,4 +2448,8 @@ table shapes, and §11 refusal vocabulary (§3.3).
     `__cause__`; every other `sqlite3.Error` propagates with its original class and code, asserted at
     runtime. The static guard bans `except sqlite3.Error` and bare `except:`, permits
     `except sqlite3.DatabaseError` because §9.1 requires it, and requires every such handler to
-    contain a bare `raise`.
+    contain a bare `raise` — with **one exemption, granted by name to one function and asserted to be
+    alone**. That function is the rollback §7.7 routes every failing exit through, and it must return
+    rather than raise, because §7.7 forbids masking the original exception with the rollback's own.
+    A second swallow anywhere in the package fails the count, so the exemption cannot spread by
+    resembling itself.
