@@ -276,19 +276,43 @@ metadata root's identity and returns a pathname; it inspects no leaf (`bootstrap
    any of the four is refused. The rollback journal is included because an interrupted first WAL
    transition (§5.1 step 4) can leave a hot one that SQLite must recover on the next open — a symlink
    there redirects that recovery.
-2. **If `atoms.db` is zero length, re-run §5.1 step 3 here** — gate, `fchmod` to the exact mode,
-   `flush_file`, `flush_directory` on `metadata_root_fd` — from a descriptor opened by the same guarded
-   traversal, before SQLite is involved at all.
+2. **If `atoms.db` is zero length, re-run §5.1 step 3 here**, before SQLite is involved at all, in this
+   order:
 
-   This is where the post-step-2 cut is actually repaired, and putting the repair after classification
-   made it unreachable. Step 2 of §5.1 requests mode `0o600`, which the umask reduces; under `0o277` the
-   file is created `0o400`, and a database A5a cannot write is one it cannot finish initializing.
-   Measured on that exact cut: SQLite falls back to opening read-only, so the classification reads in
-   step 3 all succeed and return `(0, 0, empty)` — and then the very first write of the resume, the WAL
-   transition, fails with `attempt to write a readonly database`. Opened without that fallback the
-   failure moves earlier, to `unable to open database file` at connect. Which of the two occurs depends
-   on how the connection is opened, and the design must not depend on it: either way the instruction to
-   re-run step 3 is issued from a position that can no longer carry it out.
+   1. gate (§5.4);
+   2. `openat(metadata_root_fd, "atoms.db", O_PATH | O_NOFOLLOW | O_CLOEXEC)`;
+   3. `chmod` that descriptor through `/proc/self/fd/<n>` to the exact intended mode;
+   4. `openat` again with `O_RDWR | O_NOFOLLOW | O_CLOEXEC`, now permitted;
+   5. `backend.flush_file` on it, `backend.flush_directory` on `metadata_root_fd`, close both.
+
+   **The mode must be fixed before the file can be opened at all, which is why the repair cannot simply
+   re-run step 3's `fchmod`.** §5.1 step 2 requests `0o600`, and the umask *subtracts*: under `0o277` the
+   file lands at `0o400`, and under `0o777` at `0o000`. Creation itself is unaffected — step 3 holds the
+   descriptor step 2 opened, and an open descriptor's access is already resolved. The resume path has no
+   such descriptor and must obtain one from a name.
+
+   Measured at `0o000`: `O_RDONLY | O_NOFOLLOW` and `O_RDWR` both fail `EACCES`, so there is no
+   descriptor to `fchmod`. `O_PATH | O_NOFOLLOW` opens regardless of mode — it grants no read or write,
+   only identity — but `fchmod` on it fails `EBADF`. `chmod` through `/proc/self/fd/<n>` on that same
+   descriptor succeeds, and `O_RDWR | O_NOFOLLOW` succeeds afterwards. That is the route, and it is
+   race-free for the reason it exists: the descriptor pins the inode step 1 stat'd, so nothing between
+   the two can substitute a symlink or a different file.
+
+   The two rejected alternatives are rejected on measurement, not taste. `os.chmod(name, mode,
+   dir_fd=..., follow_symlinks=False)` appears to work here, but `os.chmod` is **not** in
+   `os.supports_follow_symlinks` on Linux, so the behavior is uncontracted and a future release may
+   raise `NotImplementedError` instead. Dropping `follow_symlinks` does work and re-opens the symlink
+   window step 1 just closed. `/proc/self/fd` is therefore a requirement rather than a convenience:
+   `open_store` checks it once and raises `CapabilityUnavailable` if it is not a directory, per §9's
+   rule for semantics the platform does not supply. There is no fallback to a path-based `chmod`.
+
+   Ordering the repair after classification made it unreachable, which is the defect this step fixes.
+   At `0o400` SQLite falls back to opening read-only, so the classification reads in step 3 all succeed
+   and return `(0, 0, empty)` — and then the very first write of the resume, the WAL transition, fails
+   with `attempt to write a readonly database`. Opened without that fallback the failure moves earlier,
+   to `unable to open database file` at connect. At `0o000` neither happens, because nothing opens at
+   all. Three different failures, one cause: the repair was ordered from a position that could no longer
+   carry it out.
 
    **A zero-length file is why this does not violate "read before writing."** That rule exists so
    reopen cannot mutate a database it has not recognized — but a zero-length file has nothing to
@@ -1833,12 +1857,13 @@ fails on reopen. A non-canonical `spec_json`.
 **Every crash cut in creation resumes**, one test per cut, each by running §5.1 to that point and then
 reopening:
 
-- **after step 2** (created but not published), run under a `0o277` umask so the requested `0o600` is
-  actually reduced to `0o400`. Assert the resumed store ends at the exact intended mode. This is also
-  the test that fails when the repair sits after classification instead of in §5.2 step 2: SQLite falls
-  back to a read-only open, so the classification reads succeed and the first write of the resume raises
-  `attempt to write a readonly database` — measured — leaving the repair unreachable from where it was
-  ordered;
+- **after step 2** (created but not published), run at **two umasks, because they fail differently**.
+  At `0o277` the file is `0o400`: SQLite falls back to a read-only open, so classification succeeds and
+  the first write of the resume raises `attempt to write a readonly database`. At `0o777` it is
+  `0o000`: no `openat` for read or write succeeds at all, so a repair that begins by opening the file
+  cannot even start. Both assert the resumed store ends at the exact intended mode. Both fail against a
+  repair ordered after classification; only the second fails against a repair that reaches for `fchmod`
+  instead of §5.2 step 2's `O_PATH` route;
 - after step 3 (published, zero-length, `journal_mode` still `delete`) — the cut that a WAL-first
   reopen refuses. Assert it resumes and yields a usable store, since this is the state the protocol
   exists to recover;
@@ -2043,7 +2068,8 @@ test per site, each releasing the lock immediately before the syscall in questio
   promotion's `rmdir`, which is how a specified-but-unarmed gate stays that way;
 - **inside `open_store` itself**, which the earlier inventory began after: before creation's
   `openat(O_CREAT)`, asserting `atoms.db` was not created; before §5.1 step 3's `fchmod`, asserting the
-  mode is unchanged; before the WAL transition, asserting the file is still in `delete` mode — the
+  mode is unchanged; before **§5.2 step 2's repair `chmod`**, asserting the reduced mode survives
+  untouched and the store is still resumable by the next lease; before the WAL transition, asserting the file is still in `delete` mode — the
   assertion that matters, since that pragma converts the file permanently; and **partway through the
   DDL loop, before the initialization COMMIT**, asserting the reopened database is `(0, 0, empty)`
   rather than partially built. The last one is the case a gate placed only at `open_store`'s entry
@@ -2174,8 +2200,9 @@ table shapes, and §11 refusal vocabulary (§3.3).
 7. Each of the **four** creation crash cuts — from after step 2 onward, including the one still in
    `delete` mode — is recognized as resumable, and the resumed store matches an uninterrupted creation
    in schema, version, **and mode**. The publication and mode repair of §5.1 step 3 happens in §5.2
-   step 2, **before SQLite opens the file**, because a umask-reduced mode makes every later write fail;
-   the remaining resume is steps 4–5. Skipping the repair, or ordering it after classification, leaves
+   step 2, **before SQLite opens the file**, because a umask-reduced mode makes every later write fail
+   and, at `0o000`, makes the file unopenable at all — so the repair goes through an `O_PATH` descriptor
+   and `/proc/self/fd`, never `fchmod`. The remaining resume is steps 4–5. Skipping the repair, or ordering it after classification, leaves
    the entry unpublished and the mode uncorrected forever, since the resumable shape is consumed once.
 8. On a completed store `journal_mode` is queried and never set; a non-empty `delete`-mode database is
    refused and is still in `delete` mode afterwards.
@@ -2193,8 +2220,9 @@ table shapes, and §11 refusal vocabulary (§3.3).
     removal, per rename, per unlink, per `mkdir`, and per `rmdir` rather than once per batch or once per
     loop, since each verifies unbounded content first and a batch is many mutations. The sites outside a
     loop are covered by name and each independently armed: §8.2's `EEXIST` unlink, promotion's step 4
-    `rmdir`, `create_workspace`'s two `mkdirat`s, `remove_workspace`'s two `rmdir`s, and creation's
-    `openat(O_CREAT)`, `fchmod`, and WAL transition (§5.4). Flushes are the deliberate exception. A lock
+    `rmdir`, `create_workspace`'s two `mkdirat`s, `remove_workspace`'s two `rmdir`s, creation's
+    `openat(O_CREAT)`, `fchmod`, and WAL transition, and reopen's repair `chmod` (§5.4). Flushes are the
+    deliberate exception. A lock
     released between the last write and the transaction's exit rolls
     back and raises `ProtocolError`. The only exemptions are `ROLLBACK`, `Store.close`, and
     `Workspace.close`, each asserted to succeed after the binding or lock dies. `remove_workspace` is
