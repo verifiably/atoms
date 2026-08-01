@@ -193,13 +193,14 @@ cooperating processes, and `O_EXCL` makes it structural rather than assumed.
    **removed that symlink**, measured. It is a silent unlink of an attacker-planted name today, and a
    write through a planted name is the same class of bug one SQLite behavior change away. Refusing the
    shape costs one `fstatat` per entry.
-2. `openat(metadata_root_fd, "atoms.db", O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC | O_RDWR, 0o600)`. A
+2. Gate (§5.4), then `openat(metadata_root_fd, "atoms.db",
+   O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC | O_RDWR, 0o600)`. A
    zero-length file is what SQLite treats as a fresh database. `O_RDWR` rather than the implicit
    `O_RDONLY`: step 3 flushes this descriptor, and while Linux accepts `fsync` on a read-only
    descriptor, POSIX permits `EBADF` and macOS's `F_FULLFSYNC` — the very call §5.3 pins — is a write
    barrier. Opening writable removes the platform question instead of depending on how it is answered.
-3. **Publish the entry durably before SQLite touches it**, holding the descriptor from step 2:
-   `fchmod` it to the exact intended mode rather than trusting the umask to have left `0o600`;
+3. **Publish the entry durably before SQLite touches it**, holding the descriptor from step 2: gate
+   (§5.4), then `fchmod` it to the exact intended mode rather than trusting the umask to have left `0o600`;
    `backend.flush_file` on it; `backend.flush_directory` on `metadata_root_fd`; then close.
 
    This step exists because SQLite did not create the directory entry. SQLite's own COMMIT flushes
@@ -213,8 +214,9 @@ cooperating processes, and `O_EXCL` makes it structural rather than assumed.
    macOS implementation is where `F_FULLFSYNC` belongs. A5a calling `os.fsync` directly would state a
    durability claim the same design calls insufficient on macOS two tables below (§5.3, `fullfsync`).
    §8.1's promotion flushes go through the same two methods for the same reason.
-4. Open through `binding.verified_metadata_path("atoms.db")` (§5.2) and apply the pinned profile
-   (§5.3), including the WAL transition. This is the store's first WAL transition and writes a
+4. Open through `binding.verified_metadata_path("atoms.db")` (§5.2), gate, and apply the pinned profile
+   (§5.3), including the WAL transition — a persistent mutation of the file (§5.3), so it is gated like
+   any other. This is the store's first WAL transition and writes a
    transient rollback journal beside `atoms.db`.
 5. In **one explicit transaction**: the complete DDL, `PRAGMA user_version = SCHEMA_VERSION`, and
    `PRAGMA application_id = APPLICATION_ID`; then COMMIT.
@@ -229,6 +231,11 @@ cooperating processes, and `O_EXCL` makes it structural rather than assumed.
    The atomicity claim below is only true because every statement goes through `execute` inside the
    transaction; §11.6 forbids `executescript` in the package outright rather than carving out an
    exception for this site.
+
+   **The gate runs immediately before this COMMIT** (§5.4), for §7.7's reason applied to the one
+   transaction that is not a `_StoreTransaction`: the DDL is a loop of statements, and a lock released
+   partway through would otherwise reach the durability barrier unauthorized. A failure there rolls
+   back, leaving the `(0, 0, empty)` shape a later lease resumes.
 
 `PRAGMA user_version` and `application_id` **are** transactional: set inside an explicit transaction,
 both revert with a `ROLLBACK`, measured on SQLite 3.50.4. Initialization is therefore atomic in the
@@ -269,7 +276,29 @@ metadata root's identity and returns a pathname; it inspects no leaf (`bootstrap
    any of the four is refused. The rollback journal is included because an interrupted first WAL
    transition (§5.1 step 4) can leave a hot one that SQLite must recover on the next open — a symlink
    there redirects that recovery.
-2. Open, and **read before writing anything at all.** Reopen must not mutate a database it has not yet
+2. **If `atoms.db` is zero length, re-run §5.1 step 3 here** — gate, `fchmod` to the exact mode,
+   `flush_file`, `flush_directory` on `metadata_root_fd` — from a descriptor opened by the same guarded
+   traversal, before SQLite is involved at all.
+
+   This is where the post-step-2 cut is actually repaired, and putting the repair after classification
+   made it unreachable. Step 2 of §5.1 requests mode `0o600`, which the umask reduces; under `0o277` the
+   file is created `0o400`, and a database A5a cannot write is one it cannot finish initializing.
+   Measured on that exact cut: SQLite falls back to opening read-only, so the classification reads in
+   step 3 all succeed and return `(0, 0, empty)` — and then the very first write of the resume, the WAL
+   transition, fails with `attempt to write a readonly database`. Opened without that fallback the
+   failure moves earlier, to `unable to open database file` at connect. Which of the two occurs depends
+   on how the connection is opened, and the design must not depend on it: either way the instruction to
+   re-run step 3 is issued from a position that can no longer carry it out.
+
+   **A zero-length file is why this does not violate "read before writing."** That rule exists so
+   reopen cannot mutate a database it has not recognized — but a zero-length file has nothing to
+   recognize and nothing to rewrite. It cannot be a completed store, since a completed store has a
+   schema and therefore a nonzero length, so the only classification this anticipates is one the
+   `fstat` of step 1 has already settled. The repair changes a mode and issues two flushes; it writes no byte of database
+   content. Every nonzero file keeps the read-before-write path unchanged, including the resumable cut
+   after §5.1 step 4, which is nonzero because SQLite has written a header and whose mode step 3 already
+   made exact.
+3. Open, and **read before writing anything at all.** Reopen must not mutate a database it has not yet
    recognized, and `PRAGMA journal_mode=WAL` is a mutation: on an existing `delete`-mode database it
    persistently converts the file, measured. Applying the profile first would silently convert a
    foreign database *while deciding whether to refuse it*.
@@ -277,17 +306,17 @@ metadata root's identity and returns a pathname; it inspects no leaf (`bootstrap
    **Identity comes first, journal mode second.** This ordering is load-bearing, not stylistic: the
    resumable shape of §5.1 includes a cut where WAL was never reached, and a zero-length file reports
    `journal_mode = delete`, measured. Demanding `wal` before reading the version would make the
-   protocol refuse the one state it exists to resume. So step 3 decides *what this database is* from
-   `application_id`, `user_version`, and the catalog — all reads — and only then does step 4 apply the
+   protocol refuse the one state it exists to resume. So step 4 decides *what this database is* from
+   `application_id`, `user_version`, and the catalog — all reads — and only then does step 5 apply the
    journal-mode rule that the verdict selects.
-3. Identity and version, from reads alone:
+4. Identity and version, from reads alone:
 
    | `application_id` | `user_version` | schema | Verdict |
    | --- | --- | --- | --- |
-   | `APPLICATION_ID` | `SCHEMA_VERSION` | matches | **Completed store.** Continue at step 4. |
+   | `APPLICATION_ID` | `SCHEMA_VERSION` | matches | **Completed store.** Continue at step 5. |
    | `APPLICATION_ID` | other | any | Refuse — incompatible store version. |
    | `APPLICATION_ID` | `SCHEMA_VERSION` | differs | Refuse — same version, wrong schema. |
-   | `0` | `0` | empty | **Resumable initialization.** Continue at step 4. |
+   | `0` | `0` | empty | **Resumable initialization.** Continue at step 5. |
    | `0` | `0` | non-empty | Refuse — foreign database. |
    | other | any | any | Refuse — foreign database. |
 
@@ -307,17 +336,18 @@ metadata root's identity and returns a pathname; it inspects no leaf (`bootstrap
    semicolon, and with each implicit autoindex listed by name with `sql = None`. Set equality means an
    extra object fails just as loudly as a missing one. `user_version` alone does not prove the schema
    is the expected schema.
-4. Apply the journal-mode rule the verdict selects.
+5. Apply the journal-mode rule the verdict selects.
 
    - **Completed store:** query `journal_mode`; it must already be `wal`. Never set it. A completed
      store not in WAL was not written by this engine's creation protocol, and converting it would
      rewrite a database on the strength of a guess.
-   - **Resumable initialization:** re-run §5.1 steps **3–5** — the durable publication of the entry,
-     then the profile including WAL, then the DDL, `user_version`, and `application_id` transaction.
-     Applying the profile alone would leave the database exactly as unfinished as it was found, and the
-     next reopen would resume it again forever; starting at step 4 would skip the publication and mode
-     correction permanently, since the resumable shape is consumed exactly once (§5.1).
-5. `PRAGMA quick_check` and `PRAGMA foreign_key_check`, both of which must be clean, then the
+   - **Resumable initialization:** §5.1 step 3 has already been re-run by step 2 above, so this
+     completes steps **4–5** — the profile including WAL, then the DDL, `user_version`, and
+     `application_id` transaction. Applying the profile alone would leave the database exactly as
+     unfinished as it was found, and the next reopen would resume it again forever; skipping step 3
+     altogether, as an earlier draft did, would leave the publication and mode correction undone
+     permanently, since the resumable shape is consumed exactly once (§5.1).
+6. `PRAGMA quick_check` and `PRAGMA foreign_key_check`, both of which must be clean, then the
    **connection-local** pragmas of §5.3, set and read back.
 
 **Nothing is silently rewritten.** Every mismatch above raises, and the only *application-issued*
@@ -333,7 +363,7 @@ symlink aimed elsewhere.
 
 The profile has two halves, and conflating them is what created the reopen defect above.
 
-**Persistent — a property of the database file. Set only while initializing (§5.1, or §5.2 step 4's
+**Persistent — a property of the database file. Set only while initializing (§5.1, or §5.2 step 5's
 resumable case, which is the same initialization finishing). On a completed store it is verified, never
 set.**
 
@@ -408,6 +438,21 @@ the next owner. So the gate runs **immediately before each mutating syscall** �
 unlink. The shape is gate, verify, then gate-and-mutate repeatedly, with nothing between a gate and the
 syscall it authorizes. This is affordable because the gate is an attribute read on a live object
 (`binding.py:110`), against a loop that is already paying a full file hash per entry.
+
+**Opening the store is not exempt, and an earlier draft's inventory silently began after it.** Both
+§5.1 and §5.2 mutate before any `Store` exists — `openat(O_CREAT)` creates a name, `fchmod` changes a
+mode, `PRAGMA journal_mode=WAL` persistently converts the database file, and step 5's transaction ends
+in a COMMIT — so every argument this section makes applies to them first, not last. `open_store` takes
+the binding as its argument, so the gate is available from its first line. The DDL is the sharpest case:
+it is now executed statement by statement (§5.1 step 5), which is a loop, and without a gate adjacent to
+its COMMIT a lock released partway through reaches the one barrier §7.7 gates everywhere else. The
+inventory is therefore: before `openat(O_CREAT)`, before each `fchmod`, before the WAL transition, and
+immediately before the initialization COMMIT. Reopen's step 2 repair carries the same gate before its
+`fchmod`.
+
+Flushes stay ungated throughout, in initialization as in promotion, for the reason already given: an
+`fsync` on a held descriptor changes no name, and refusing one abandons a half-published state to raise
+faster.
 
 A batch that fails partway through a mutating loop is **not** a new disposition. It is exactly §8.2's
 post-mutation failure: sources removed, some content published, the staging half spent, and the mixed
@@ -1789,9 +1834,11 @@ fails on reopen. A non-canonical `spec_json`.
 reopening:
 
 - **after step 2** (created but not published), run under a `0o277` umask so the requested `0o600` is
-  actually reduced. Assert the resumed store ends at the exact intended mode, which is the assertion
-  that fails if reopen resumes at step 4 — the mode is never revisited, because the resumable shape is
-  consumed once;
+  actually reduced to `0o400`. Assert the resumed store ends at the exact intended mode. This is also
+  the test that fails when the repair sits after classification instead of in §5.2 step 2: SQLite falls
+  back to a read-only open, so the classification reads succeed and the first write of the resume raises
+  `attempt to write a readonly database` — measured — leaving the repair unreachable from where it was
+  ordered;
 - after step 3 (published, zero-length, `journal_mode` still `delete`) — the cut that a WAL-first
   reopen refuses. Assert it resumes and yields a usable store, since this is the state the protocol
   exists to recover;
@@ -1993,7 +2040,18 @@ test per site, each releasing the lock immediately before the syscall in questio
   costs the next lease owner nothing;
 - before `remove_workspace`'s `rmdir` of `staging/<txid>/`, and before its `rmdir` of `work/<txid>/` —
   each directory survives. Both gates were specified and neither was exercised; the tier named only
-  promotion's `rmdir`, which is how a specified-but-unarmed gate stays that way.
+  promotion's `rmdir`, which is how a specified-but-unarmed gate stays that way;
+- **inside `open_store` itself**, which the earlier inventory began after: before creation's
+  `openat(O_CREAT)`, asserting `atoms.db` was not created; before §5.1 step 3's `fchmod`, asserting the
+  mode is unchanged; before the WAL transition, asserting the file is still in `delete` mode — the
+  assertion that matters, since that pragma converts the file permanently; and **partway through the
+  DDL loop, before the initialization COMMIT**, asserting the reopened database is `(0, 0, empty)`
+  rather than partially built. The last one is the case a gate placed only at `open_store`'s entry
+  passes.
+
+Every one of these is a `ProtocolError` naming the released lock, and none leaves the store in a shape
+§5.2 cannot classify — creation's cuts are the resumable shape by construction (§5.1), and the workspace
+and promotion cuts are §8.2's preserved evidence.
 
 ### 11.5 Tier 5 — fresh process
 
@@ -2110,13 +2168,15 @@ table shapes, and §11 refusal vocabulary (§3.3).
 5. Reopen refuses a symlink at `atoms.db`, `atoms.db-wal`, `atoms.db-shm`, or `atoms.db-journal`
    before SQLite opens the path.
 6. Reopen determines identity, version, and schema from reads **before** applying any journal-mode
-   rule; the only *application-issued* metadata write on the reopen path is the resumable
-   `(0, 0, empty)` case. Every row of §5.2's version table produces its stated verdict.
+   rule; the only *application-issued* metadata writes on the reopen path are step 2's zero-length
+   repair, which touches a mode and no database content, and the resumable `(0, 0, empty)` completion.
+   Every row of §5.2's version table produces its stated verdict.
 7. Each of the **four** creation crash cuts — from after step 2 onward, including the one still in
-   `delete` mode — is recognized as resumable, and resuming re-runs steps **3–5**, so the resumed store
-   matches an uninterrupted creation in schema, version, **and mode**. Resuming at step 4 would leave
-   the entry unpublished and the umask-reduced mode uncorrected forever, since the resumable shape is
-   consumed once.
+   `delete` mode — is recognized as resumable, and the resumed store matches an uninterrupted creation
+   in schema, version, **and mode**. The publication and mode repair of §5.1 step 3 happens in §5.2
+   step 2, **before SQLite opens the file**, because a umask-reduced mode makes every later write fail;
+   the remaining resume is steps 4–5. Skipping the repair, or ordering it after classification, leaves
+   the entry unpublished and the mode uncorrected forever, since the resumable shape is consumed once.
 8. On a completed store `journal_mode` is queried and never set; a non-empty `delete`-mode database is
    refused and is still in `delete` mode afterwards.
 9. The schema catalog is compared as `(type, name, tbl_name, sql)` over every `sqlite_schema` row
@@ -2128,12 +2188,14 @@ table shapes, and §11 refusal vocabulary (§3.3).
 12. `ATTACH` and `DETACH` are denied by the authorizer, and no `ATTACH` or `VACUUM` statement appears
     in the package.
 13. **Every** operation gates on `binding.backend`, reads included, and the gate runs again
-    immediately before each barrier — the COMMIT, and **every** mutating syscall of promotion, orphan
-    removal, and workspace creation and removal, per rename, per unlink, per `mkdir`, and per `rmdir`
-    rather than once per batch or once per loop, since each verifies unbounded content first and a batch
-    is many mutations. The sites outside a loop are covered by name and each independently armed:
-    §8.2's `EEXIST` unlink, promotion's step 4 `rmdir`, `create_workspace`'s two `mkdirat`s, and
-    `remove_workspace`'s two `rmdir`s (§5.4); a lock released between the last write and the transaction's exit rolls
+    immediately before each barrier — the initialization COMMIT and every record COMMIT, and **every**
+    mutating syscall of store creation and reopen, promotion, orphan removal, and workspace creation and
+    removal, per rename, per unlink, per `mkdir`, and per `rmdir` rather than once per batch or once per
+    loop, since each verifies unbounded content first and a batch is many mutations. The sites outside a
+    loop are covered by name and each independently armed: §8.2's `EEXIST` unlink, promotion's step 4
+    `rmdir`, `create_workspace`'s two `mkdirat`s, `remove_workspace`'s two `rmdir`s, and creation's
+    `openat(O_CREAT)`, `fchmod`, and WAL transition (§5.4). Flushes are the deliberate exception. A lock
+    released between the last write and the transaction's exit rolls
     back and raises `ProtocolError`. The only exemptions are `ROLLBACK`, `Store.close`, and
     `Workspace.close`, each asserted to succeed after the binding or lock dies. `remove_workspace` is
     **not** exempt: it mutates the engine-owned namespace and would race the next lease owner.
