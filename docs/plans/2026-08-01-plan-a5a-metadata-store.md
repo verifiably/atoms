@@ -7,13 +7,14 @@ reopen under a verified `metadata_root`, the pinned connection profile, the sche
 read/write, content-addressed blob promotion, and per-txid workspaces — with no lease, no recovery
 judgment, and no transition legality.
 
-**Architecture:** Five modules under a new `atoms/store/` package. `schema.py` is pure: DDL statements,
+**Architecture:** Six modules under a new `atoms/store/` package. `schema.py` is pure: DDL statements,
 version constants, enum-derived `CHECK` lists, the effect-variant mapping, and the expected catalog.
-`connection.py` owns creation, reopen, the pinned profile, the authorizer, the liveness gate, `Store`,
-and `_StoreTransaction`. `records.py` owns typed row read/write, the cross-row coherence predicate used
-by both the loader and the pre-COMMIT barrier, and the private halt-diagnostic codec. `blobs.py` owns
-the digest-to-leaf mapping, blob reading, promotion, and unindexed-blob reclamation. `workspace.py`
-owns caller-name validation and the `Workspace` resource.
+`errors.py` owns `MetadataStoreInvalid` and §9.1's narrow result-code translation, in its own module
+because the other four all raise it. `connection.py` owns creation, reopen, the pinned profile, the
+authorizer, the liveness gate, `Store`, and `_StoreTransaction`. `records.py` owns typed row read/write,
+the cross-row coherence predicate used by both the loader and the pre-COMMIT barrier, and the private
+halt-diagnostic codec. `blobs.py` owns the digest-to-leaf mapping, blob reading, promotion, and
+unindexed-blob reclamation. `workspace.py` owns caller-name validation and the `Workspace` resource.
 
 **Tech Stack:** Python 3.11+, stdlib only (`sqlite3`, `os`, `hashlib`, `json`, `dataclasses`), `pytest`,
 `ruff`, `pyright`. Builds on A4a's `ProjectBinding` and `Backend`; A1's `TransactionSpec`,
@@ -33,7 +34,16 @@ over both.
   `uv run ruff check <file>` right after creating each file rather than only at the task gate.
 - **One expected transient:** ruff's isort classifies a module as first-party by *path existence*, so a
   test importing `atoms.store.*` before that module exists reports `I001`. Between "write the failing
-  test" and "write the module" this is expected; **do not reorder imports to satisfy it.**
+  test" and "write the module" this is expected; **do not reorder imports to satisfy it.** Verified:
+  with `src/atoms/store/` absent, ruff wants `from atoms.store.schema import …` grouped beside
+  `import pytest`; once the package exists it groups with `atoms.core` and `atoms.fs` as this plan
+  writes it.
+- **Three rules the test code here is written around**, all enabled in this project's ruff (`0.16`) and
+  all measured against it: `SIM117` refuses `with pytest.raises(...):` wrapping a bare
+  `with store.transaction():` — write them as one `with A, B:`, which is exactly equivalent; `B018`
+  refuses a bare attribute expression, so a `pytest.raises` body that only reads an anchor is
+  `_ = workspace.staging_fd`; and `PYI034` refuses `def __enter__(self) -> Store:` — annotate `Self`,
+  as A4a already does at `binding.py:149`.
 - **pyright type-checks the tests** — `[tool.pyright]` sets no `include`.
 - **Every fixture lands in `tests/conftest.py`.** Task 13 extends the existing fixture-registry guard to
   `test_store_*.py`; until then, still put fixtures there.
@@ -537,18 +547,16 @@ def test_a_garbage_file_translates_to_metadata_store_invalid(tmp_path):
     path = tmp_path / "garbage.db"
     path.write_bytes(b"this is not a database" * 64)
     connection = sqlite3.connect(path)
-    with pytest.raises(MetadataStoreInvalid) as caught:
-        with translated("reading the schema"):
-            connection.execute("SELECT count(*) FROM sqlite_schema").fetchone()
+    with pytest.raises(MetadataStoreInvalid) as caught, translated("reading the schema"):
+        connection.execute("SELECT count(*) FROM sqlite_schema").fetchone()
     assert isinstance(caught.value.__cause__, sqlite3.DatabaseError)
     assert "reading the schema" in str(caught.value)
 
 
 def test_an_operational_error_propagates_unchanged(tmp_path):
     connection = sqlite3.connect(tmp_path / "ok.db")
-    with pytest.raises(sqlite3.OperationalError) as caught:
-        with translated("selecting"):
-            connection.execute("SELECT * FROM nope")
+    with pytest.raises(sqlite3.OperationalError) as caught, translated("selecting"):
+        connection.execute("SELECT * FROM nope")
     assert not isinstance(caught.value, MetadataStoreInvalid)
 
 
@@ -558,9 +566,8 @@ def test_a_programming_error_carrying_no_result_code_propagates(tmp_path):
     handler, replacing a clear message with a failure in the error path."""
     connection = sqlite3.connect(tmp_path / "closed.db")
     connection.close()
-    with pytest.raises(sqlite3.ProgrammingError) as caught:
-        with translated("using a closed connection"):
-            connection.execute("SELECT 1")
+    with pytest.raises(sqlite3.ProgrammingError) as caught, translated("using a closed connection"):
+        connection.execute("SELECT 1")
     assert not hasattr(caught.value, "sqlite_errorcode")
 
 
@@ -570,17 +577,15 @@ def test_an_extended_result_code_still_matches_its_primary(tmp_path):
     extended = SQLITE_CORRUPT | (1 << 8)
     error = sqlite3.DatabaseError("synthetic")
     error.sqlite_errorcode = extended  # type: ignore[attr-defined]
-    with pytest.raises(MetadataStoreInvalid):
-        with translated("synthetic"):
-            raise error
+    with pytest.raises(MetadataStoreInvalid), translated("synthetic"):
+        raise error
 
 
 def test_an_unknown_result_code_keeps_its_class_and_traceback():
     error = sqlite3.DatabaseError("unknown")
     error.sqlite_errorcode = 0x7F  # type: ignore[attr-defined]
-    with pytest.raises(sqlite3.DatabaseError) as caught:
-        with translated("synthetic"):
-            raise error
+    with pytest.raises(sqlite3.DatabaseError) as caught, translated("synthetic"):
+        raise error
     assert caught.value is error
 
 
@@ -589,9 +594,8 @@ def test_the_translated_codes_are_the_two_the_design_names():
 
 
 def test_a_non_sqlite_exception_is_untouched():
-    with pytest.raises(ValueError):
-        with translated("synthetic"):
-            raise ValueError("not sqlite's problem")
+    with pytest.raises(ValueError), translated("synthetic"):
+        raise ValueError("not sqlite's problem")
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -1874,19 +1878,15 @@ from tests.store_support import (
 
 def test_open_store_creates_then_reopens(store_on):
     with store_on() as binding:
-        with open_store(binding) as store:
-            with store.transaction():
-                pass
-        with open_store(binding) as store:
-            with store.transaction():
-                pass
+        with open_store(binding) as store, store.transaction():
+            pass
+        with open_store(binding) as store, store.transaction():
+            pass
 
 
 def test_a_nested_transaction_is_refused(opened_store):
-    with opened_store.transaction():
-        with pytest.raises(ProtocolError) as caught:
-            with opened_store.transaction():
-                pass
+    with opened_store.transaction(), pytest.raises(ProtocolError) as caught, opened_store.transaction():
+        pass
     assert "nest" in str(caught.value).lower()
 
 
@@ -1898,9 +1898,8 @@ def test_a_retained_transaction_is_dead_after_commit(opened_store):
 
 
 def test_a_retained_transaction_is_dead_after_rollback(opened_store):
-    with pytest.raises(RuntimeError):
-        with opened_store.transaction() as txn:
-            raise RuntimeError("caller failure")
+    with pytest.raises(RuntimeError), opened_store.transaction() as txn:
+        raise RuntimeError("caller failure")
     with pytest.raises(ProtocolError):
         txn._require_current()
 
@@ -1908,26 +1907,23 @@ def test_a_retained_transaction_is_dead_after_rollback(opened_store):
 def test_a_stale_transaction_cannot_write_into_a_later_one(opened_store):
     with opened_store.transaction() as first:
         pass
-    with opened_store.transaction():
-        with pytest.raises(ProtocolError) as caught:
-            first._require_current()
+    with opened_store.transaction(), pytest.raises(ProtocolError) as caught:
+        first._require_current()
     assert "spent" in str(caught.value).lower() or "current" in str(caught.value).lower()
 
 
 def test_a_poisoned_transaction_refuses_to_commit(opened_store):
     """Design §7.7. The mechanism here; Task 7 proves it end to end through a real
     mutating method whose failure the caller catches."""
-    with pytest.raises(ProtocolError) as caught:
-        with opened_store.transaction() as txn:
-            txn._poison(RuntimeError("a mutating method raised"))
+    with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
+        txn._poison(RuntimeError("a mutating method raised"))
     assert "poison" in str(caught.value).lower()
     assert isinstance(caught.value.__cause__, RuntimeError)
 
 
 def test_a_poisoned_transaction_leaves_no_open_transaction(opened_store):
-    with pytest.raises(ProtocolError):
-        with opened_store.transaction() as txn:
-            txn._poison(RuntimeError("a mutating method raised"))
+    with pytest.raises(ProtocolError), opened_store.transaction() as txn:
+        txn._poison(RuntimeError("a mutating method raised"))
     with opened_store.transaction():
         pass
 
@@ -1957,9 +1953,8 @@ def test_close_inside_a_transaction_body_raises_protocol_error_not_sqlite(opened
     pysqlite's hierarchy to interpret. `_require_current` at the exit names the real
     condition and `_rollback_quietly` refuses to overwrite it.
     """
-    with pytest.raises(ProtocolError) as caught:
-        with opened_store.transaction() as txn:
-            opened_store.close()
+    with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
+        opened_store.close()
     assert "closed" in str(caught.value).lower()
     assert not isinstance(caught.value, sqlite3.Error)
     with pytest.raises(ProtocolError):
@@ -1986,9 +1981,8 @@ def test_a_failed_commit_leaves_no_open_transaction(opened_store, monkeypatch):
     from tests.store_support import CommitFails
 
     monkeypatch.setattr(opened_store, "_connection", CommitFails(opened_store._connection))
-    with pytest.raises(sqlite3.OperationalError):
-        with opened_store.transaction():
-            pass
+    with pytest.raises(sqlite3.OperationalError), opened_store.transaction():
+        pass
     assert not opened_store._connection.in_transaction
     monkeypatch.undo()
     with opened_store.transaction():
@@ -1997,9 +1991,8 @@ def test_a_failed_commit_leaves_no_open_transaction(opened_store, monkeypatch):
 
 def test_a_transaction_after_close_raises_protocol_error_not_sqlite(opened_store):
     opened_store.close()
-    with pytest.raises(ProtocolError):
-        with opened_store.transaction():
-            pass
+    with pytest.raises(ProtocolError), opened_store.transaction():
+        pass
 
 
 def test_the_store_exposes_no_connection(opened_store):
@@ -2011,9 +2004,8 @@ def test_the_store_exposes_no_connection(opened_store):
 def test_a_released_lock_refuses_every_operation(store_on):
     with store_on() as binding:
         store = open_store(binding)
-    with pytest.raises(ProtocolError):
-        with store.transaction():
-            pass
+    with pytest.raises(ProtocolError), store.transaction():
+        pass
     store.close()
 
 
@@ -2223,7 +2215,7 @@ class Store:
             self._active_transaction = None
         self._connection.close()
 
-    def __enter__(self) -> Store:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *exc: object) -> None:
@@ -2242,8 +2234,11 @@ def open_store(binding: ProjectBinding) -> Store:
     return Store(binding, connection, _construction_token=_STORE_TOKEN)
 ```
 
-Add `from contextlib import contextmanager` and `from collections.abc import Iterator` to
-the imports. `Store.read_active` and `Store.read_record` arrive in Task 8, which extends this same
+Add `from contextlib import contextmanager`, `from collections.abc import Iterator`, and
+`from typing import Self` to
+the imports. `Self` rather than `Store` on `__enter__`: ruff's `PYI034` refuses the class name, and
+A4a already spells it that way (`binding.py:149`, `lock.py:191`).
+`Store.read_active` and `Store.read_record` arrive in Task 8, which extends this same
 test file with the read-side liveness cases; nothing in this task's tests calls them, so this task's
 gate runs the file whole.
 
@@ -2425,6 +2420,10 @@ def test_every_path_state_variant_round_trips_inside_a_diagnostic_entry(state):
         lambda obj: obj.update({"effect_id": 7}),
         lambda obj: obj.update({"expected": {"slot": "a"}}),
         lambda obj: obj["journals"][0].update({"effect_id": None}),
+        # The two nullable fields: null is a value, but only null. A helper that admits
+        # `None` must not thereby admit everything else.
+        lambda obj: obj["expected"][0].update({"has_unmodeled_child": "yes"}),
+        lambda obj: obj.update({"effect_id": False}),
     ],
 )
 def test_a_malformed_diagnostic_payload_refuses(mutate):
@@ -2717,6 +2716,27 @@ def _flag(obj: dict[str, Any], key: str) -> bool:
     return value
 
 
+def _optional_text(obj: dict[str, Any], key: str) -> str | None:
+    """A field A3 declares as `str | None`. Null is a *value* here, not a missing field.
+
+    `HaltDiagnostic.effect_id` is `str | None` and `DiagnosticEntry.has_unmodeled_child`
+    is `bool | None` (`atoms/core/recovery/model.py`). Routing either through the
+    non-null helper refuses the encoder's own output: measured, the two builders in
+    `every_diagnostic_shape()` fail with `effect_id must be a string, got NoneType` and
+    `has_unmodeled_child must be a boolean, got NoneType`. Null passes; anything else
+    still goes through the strict helper, so `{"effect_id": 7}` refuses as before.
+    """
+    if obj[key] is None:
+        return None
+    return _text(obj, key)
+
+
+def _optional_flag(obj: dict[str, Any], key: str) -> bool | None:
+    if obj[key] is None:
+        return None
+    return _flag(obj, key)
+
+
 def _sequence(obj: dict[str, Any], key: str) -> list[Any]:
     """A field the encoder wrote as a JSON array.
 
@@ -2778,7 +2798,7 @@ def _decode_entry(obj: Any) -> DiagnosticEntry:
     return DiagnosticEntry(
         slot=_text(obj, "slot"),
         state=_decode_state(obj["state"]),
-        has_unmodeled_child=_flag(obj, "has_unmodeled_child"),
+        has_unmodeled_child=_optional_flag(obj, "has_unmodeled_child"),
         file_build_relation=(
             None if relation is None
             else _member(FileBuildRelation, relation, "FileBuildRelation")
@@ -2821,7 +2841,7 @@ def decode_diagnostic(text: str) -> HaltDiagnostic:
         projected_journals=tuple(
             _decode_journal(j) for j in _sequence(obj, "projected_journals")
         ),
-        effect_id=_text(obj, "effect_id"),
+        effect_id=_optional_text(obj, "effect_id"),
         paths=tuple(paths),
         expected=tuple(_decode_entry(e) for e in _sequence(obj, "expected")),
         observed=tuple(_decode_entry(e) for e in _sequence(obj, "observed")),
@@ -2961,9 +2981,8 @@ def test_spec_json_is_write_once_at_the_database(opened_store, store_binding):
 def test_a_duplicate_txid_is_refused(opened_store):
     with opened_store.transaction() as txn:
         txn.insert_record("tx1", one_effect_spec())
-    with pytest.raises(Exception):
-        with opened_store.transaction() as txn:
-            txn.insert_record("tx1", one_effect_spec())
+    with pytest.raises(Exception), opened_store.transaction() as txn:
+        txn.insert_record("tx1", one_effect_spec())
 
 
 def test_a_caught_write_failure_cannot_be_committed(opened_store, store_binding):
@@ -2976,10 +2995,16 @@ def test_a_caught_write_failure_cannot_be_committed(opened_store, store_binding)
     them durable. A caller that catches the failure inside the block and carries on must
     not be able to commit that half-written record.
     """
-    with pytest.raises(ProtocolError) as caught:
-        with opened_store.transaction() as txn:
-            with pytest.raises(sqlite3.IntegrityError):
-                txn.insert_record("tx1", duplicate_effect_spec())
+    with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
+        # `try`/`except` rather than a nested `pytest.raises`: this is literally the
+        # shape under test -- a caller that catches A5a's failure and carries on -- and
+        # ruff's SIM117 refuses the nested `with` anyway.
+        try:
+            txn.insert_record("tx1", duplicate_effect_spec())
+        except sqlite3.IntegrityError:
+            pass
+        else:
+            raise AssertionError("the duplicate effect_id did not raise")
     assert "poison" in str(caught.value).lower()
     raw = raw_connect(store_binding)
     try:
@@ -2991,19 +3016,21 @@ def test_a_caught_write_failure_cannot_be_committed(opened_store, store_binding)
 
 def test_a_caught_write_failure_does_not_break_the_next_transaction(opened_store):
     """The poisoned transaction rolls back cleanly, so the store is still usable."""
-    with pytest.raises(ProtocolError):
-        with opened_store.transaction() as txn:
-            with pytest.raises(sqlite3.IntegrityError):
-                txn.insert_record("tx1", duplicate_effect_spec())
+    with pytest.raises(ProtocolError), opened_store.transaction() as txn:
+        try:
+            txn.insert_record("tx1", duplicate_effect_spec())
+        except sqlite3.IntegrityError:
+            pass
+        else:
+            raise AssertionError("the duplicate effect_id did not raise")
     with opened_store.transaction() as txn:
         txn.insert_record("tx1", one_effect_spec())
 
 
 @pytest.mark.parametrize("bad", [3, None, b"tx", "../escape", "", "x" * 65])
 def test_every_setter_validates_the_txid(opened_store, bad):
-    with opened_store.transaction() as txn:
-        with pytest.raises(ProtocolError):
-            txn.set_transaction_state(bad, TransactionState.APPLYING)
+    with opened_store.transaction() as txn, pytest.raises(ProtocolError):
+        txn.set_transaction_state(bad, TransactionState.APPLYING)
 
 
 @pytest.mark.parametrize(
@@ -3033,9 +3060,8 @@ def test_a_wrong_exact_type_refuses_with_protocol_error(opened_store, method, ba
     named. A wrong enum whose value happens not to collide would raise `IntegrityError`
     from the CHECK instead -- correct by accident, and only until someone adds a member.
     """
-    with pytest.raises(ProtocolError) as caught:
-        with opened_store.transaction() as txn:
-            getattr(txn, method)("tx1", bad)
+    with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
+        getattr(txn, method)("tx1", bad)
     assert "exactly" in str(caught.value)
 
 
@@ -3053,10 +3079,9 @@ def test_setting_a_journal_state_updates_exactly_one_row(opened_store, store_bin
 
 
 def test_setting_a_journal_state_for_an_unknown_effect_refuses(opened_store):
-    with pytest.raises(ProtocolError) as caught:
-        with opened_store.transaction() as txn:
-            txn.insert_record("tx1", one_effect_spec(effect_id="only"))
-            txn.set_journal_state("tx1", "ghost", JournalState.STARTED)
+    with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
+        txn.insert_record("tx1", one_effect_spec(effect_id="only"))
+        txn.set_journal_state("tx1", "ghost", JournalState.STARTED)
     assert "ghost" in str(caught.value)
 
 
@@ -3089,9 +3114,8 @@ def test_set_active_refuses_a_transaction_that_does_not_exist(opened_store):
     """foreign_keys=ON makes active.txid a real reference, so `active` can never name a
     transaction that does not exist -- the shape authority §7.3 promises recovery will
     never see (design §6.2)."""
-    with pytest.raises(Exception):
-        with opened_store.transaction() as txn:
-            txn.set_active("never-inserted")
+    with pytest.raises(Exception), opened_store.transaction() as txn:
+        txn.set_active("never-inserted")
 
 
 @pytest.mark.parametrize("value", [42.5, "abc", b"x"])
@@ -3338,6 +3362,7 @@ git commit -m "feat(store): derive every effect row from the spec it was inserte
 **Files:**
 - Modify: `src/atoms/store/records.py`
 - Modify: `src/atoms/store/connection.py`
+- Modify: `tests/store_support.py`
 - Modify: `tests/test_store_records.py`
 - Modify: `tests/test_store_liveness.py`
 
@@ -3345,8 +3370,10 @@ git commit -m "feat(store): derive every effect row from the spec it was inserte
 - Consumes: `compile_spec` from `atoms.core.compiler`; `from_canonical_json` from
   `atoms.core.canonical`; Task 7's writers.
 - Produces: `StoredRecord` (frozen); `coherence_findings(connection, txid) -> tuple[str, ...]`;
+  `COHERENCE_RULES: tuple[str, ...]` and the twelve `RULE_*` constants it lists;
   `journal_vector(spec, rows) -> tuple[EffectJournalState, ...]`; `Store.read_record(txid)`,
-  `Store.read_active()`; a filled-in `_StoreTransaction._run_barrier`.
+  `Store.read_active()`; a filled-in `_StoreTransaction._run_barrier`. In `tests/store_support.py`:
+  `commit_record(store, binding, txid, spec)` and `non_compiling_spec(effect_id="only")`.
 
 **One predicate, two verdicts.** On a load a violation is durable state that cannot be interpreted:
 `MetadataStoreInvalid`. On a write the same violation is a caller assembling an incoherent record,
@@ -3371,7 +3398,32 @@ have run; leaving on that path without a `ROLLBACK` leaves `in_transaction` true
 Append to `tests/test_store_records.py`:
 
 ```python
+from dataclasses import replace
+
 from atoms.store.errors import MetadataStoreInvalid
+from atoms.store.records import (
+    COHERENCE_RULES,
+    RULE_ACTIVE_RECORD,
+    RULE_BLOB_BYTE_LEN,
+    RULE_BLOB_ROW_PRESENT,
+    RULE_DIAGNOSTIC_DECISION,
+    RULE_DIAGNOSTIC_JOURNALS,
+    RULE_EFFECT_COVERAGE,
+    RULE_EFFECT_VARIANT,
+    RULE_HALT_DIAGNOSTIC,
+    RULE_ROLLBACK_RESULT,
+    RULE_SPEC_CANONICAL,
+    RULE_SPEC_COMPILES,
+    RULE_SPEC_DECODES,
+)
+from tests.store_support import (
+    SHARED_DIGEST,
+    commit_record,
+    digest_of,
+    matching_diagnostic,
+    non_compiling_spec,
+    two_length_spec,
+)
 
 
 def test_a_record_round_trips_through_the_store(opened_store):
@@ -3427,27 +3479,172 @@ def test_the_journal_vector_follows_spec_order_not_row_order(opened_store):
     )
 
 
-@pytest.mark.parametrize(
-    ("corrupt", "fragment"),
-    [
-        ("UPDATE transaction_record SET state = 'rolled_back' WHERE txid = 'tx1'", "rollback_result"),
-        ("UPDATE transaction_record SET state = 'halted' WHERE txid = 'tx1'", "halt_diagnostic"),
-        ("DELETE FROM effect WHERE txid = 'tx1'", "effect"),
-        ("UPDATE effect SET variant = 'delete_path' WHERE txid = 'tx1'", "variant"),
-        ("INSERT INTO effect VALUES ('tx1', 'extra', 'delete_path', 'pending')", "effect"),
-    ],
+def _plant_spec_json(raw, spec_json, effect_rows):
+    """Replace tx1's record row wholesale, effect rows included.
+
+    `spec_json` is write-once at the database — Task 7's trigger fires `BEFORE UPDATE OF
+    spec_json` — so a spec-level corruption cannot be planted with an `UPDATE`. A plain
+    `sqlite3.connect` leaves `foreign_keys` **off**: measured, `PRAGMA foreign_keys`
+    returns `0`. That is what lets the parent row be deleted and rewritten with its
+    children re-created afterwards, and it is also why the `active_record_exists` case
+    below can plant an `active` row naming no record at all.
+    """
+    raw.execute("DELETE FROM effect WHERE txid = 'tx1'")
+    raw.execute("DELETE FROM transaction_record WHERE txid = 'tx1'")
+    raw.execute(
+        "INSERT INTO transaction_record VALUES "
+        "('tx1', ?, 'prepared', 'uncommitted', NULL, NULL)",
+        (spec_json,),
+    )
+    for effect_id, variant in effect_rows:
+        raw.execute(
+            "INSERT INTO effect VALUES ('tx1', ?, ?, 'pending')", (effect_id, variant)
+        )
+
+
+def _plant_halted(raw, diagnostic):
+    raw.execute(
+        "UPDATE transaction_record SET state = 'halted', halt_diagnostic = ? "
+        "WHERE txid = 'tx1'",
+        (encode_diagnostic(diagnostic),),
+    )
+
+
+ONE_EFFECT_ROW = (("only", "create_file_no_clobber"),)
+
+
+def _only_spec():
+    """The base record every case that is not about blobs starts from. A plain `def`,
+    not `ONLY_SPEC = lambda: ...`, which ruff refuses as E731."""
+    return one_effect_spec(effect_id="only")
+
+
+READ_SIDE_CORRUPTIONS = (
+    (
+        RULE_SPEC_DECODES,
+        _only_spec,
+        lambda raw: _plant_spec_json(raw, '{"nope": 1}', ()),
+    ),
+    (
+        RULE_SPEC_CANONICAL,
+        _only_spec,
+        lambda raw: _plant_spec_json(
+            raw, " " + canonical_json(one_effect_spec(effect_id="only")), ONE_EFFECT_ROW
+        ),
+    ),
+    (
+        RULE_SPEC_COMPILES,
+        _only_spec,
+        lambda raw: _plant_spec_json(
+            raw, canonical_json(non_compiling_spec()), ONE_EFFECT_ROW
+        ),
+    ),
+    (
+        RULE_EFFECT_COVERAGE,
+        _only_spec,
+        lambda raw: raw.execute("DELETE FROM effect WHERE txid = 'tx1'"),
+    ),
+    (
+        RULE_EFFECT_COVERAGE,
+        _only_spec,
+        lambda raw: raw.execute(
+            "INSERT INTO effect VALUES ('tx1', 'extra', 'delete_path', 'pending')"
+        ),
+    ),
+    (
+        RULE_EFFECT_VARIANT,
+        _only_spec,
+        lambda raw: raw.execute(
+            "UPDATE effect SET variant = 'delete_path' WHERE txid = 'tx1'"
+        ),
+    ),
+    (RULE_BLOB_ROW_PRESENT, replace_spec, lambda raw: raw.execute("DELETE FROM blob")),
+    (
+        RULE_BLOB_BYTE_LEN,
+        replace_spec,
+        lambda raw: raw.execute("UPDATE blob SET byte_len = 999"),
+    ),
+    (
+        RULE_ROLLBACK_RESULT,
+        _only_spec,
+        lambda raw: raw.execute(
+            "UPDATE transaction_record SET state = 'rolled_back' WHERE txid = 'tx1'"
+        ),
+    ),
+    (
+        RULE_ROLLBACK_RESULT,
+        _only_spec,
+        lambda raw: raw.execute(
+            "UPDATE transaction_record SET rollback_result = 'restored' WHERE txid = 'tx1'"
+        ),
+    ),
+    (
+        RULE_HALT_DIAGNOSTIC,
+        _only_spec,
+        lambda raw: raw.execute(
+            "UPDATE transaction_record SET state = 'halted' WHERE txid = 'tx1'"
+        ),
+    ),
+    (
+        RULE_HALT_DIAGNOSTIC,
+        _only_spec,
+        lambda raw: raw.execute(
+            "UPDATE transaction_record SET halt_diagnostic = ? WHERE txid = 'tx1'",
+            (encode_diagnostic(matching_diagnostic("only")),),
+        ),
+    ),
+    (
+        RULE_DIAGNOSTIC_DECISION,
+        _only_spec,
+        lambda raw: _plant_halted(
+            raw,
+            replace(matching_diagnostic("only"), commit_decision=CommitDecision.COMMITTED),
+        ),
+    ),
+    (
+        RULE_DIAGNOSTIC_JOURNALS,
+        _only_spec,
+        lambda raw: _plant_halted(
+            raw,
+            replace(
+                matching_diagnostic("only"),
+                journals=(EffectJournalState(effect_id="only", state=JournalState.DONE),),
+            ),
+        ),
+    ),
+    (
+        RULE_ACTIVE_RECORD,
+        _only_spec,
+        lambda raw: raw.execute("INSERT INTO active VALUES (0, 'ghost')"),
+    ),
 )
-def test_every_cross_row_rule_refuses_on_a_load(opened_store, store_binding, corrupt, fragment):
-    with opened_store.transaction() as txn:
-        txn.insert_record("tx1", replace_spec(effect_id="e1"))
+
+
+@pytest.mark.parametrize(
+    ("rule", "spec", "corrupt"),
+    READ_SIDE_CORRUPTIONS,
+    ids=[f"{i}-{case[0]}" for i, case in enumerate(READ_SIDE_CORRUPTIONS)],
+)
+def test_every_cross_row_rule_refuses_on_a_load(
+    opened_store, store_binding, rule, spec, corrupt
+):
+    """Design §11.2: every §7.6 rule, failed one at a time, on the read side.
+
+    Each case is measured to produce **exactly one** finding against an otherwise
+    coherent record, so the assertion on the rule tag is not passing because some other
+    rule fired first. The tag is what makes that checkable at all: `"effect"` and
+    `"variant"` appear in several messages, so a fragment match would go green on the
+    wrong rule.
+    """
+    commit_record(opened_store, store_binding, "tx1", spec())
     raw = raw_connect(store_binding)
     try:
-        raw.execute(corrupt)
+        corrupt(raw)
     finally:
         raw.close()
     with pytest.raises(MetadataStoreInvalid) as caught:
         opened_store.read_record("tx1")
-    assert fragment in str(caught.value)
+    assert rule in str(caught.value)
 
 
 def test_a_non_canonical_spec_json_refuses_on_a_load(opened_store, store_binding):
@@ -3478,20 +3675,167 @@ def test_a_non_canonical_spec_json_refuses_on_a_load(opened_store, store_binding
 def test_the_same_violation_is_a_protocol_error_on_a_write(opened_store, store_binding):
     """Rejected at the barrier, before anything is durable, so the store is exactly as
     valid as it was -- and the caller is told to fix its call, not to preserve evidence."""
-    with pytest.raises(ProtocolError) as caught:
-        with opened_store.transaction() as txn:
-            txn.insert_record("tx1", one_effect_spec())
-            txn.set_transaction_state("tx1", TransactionState.ROLLED_BACK)
+    with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
+        txn.insert_record("tx1", one_effect_spec())
+        txn.set_transaction_state("tx1", TransactionState.ROLLED_BACK)
     assert "rollback_result" in str(caught.value)
     assert opened_store.read_record("tx1") is None
+
+
+def _halt_with(txn, diagnostic):
+    """HALTED *and* a diagnostic, so `halt_diagnostic_exactly` is satisfied and the only
+    finding left is the one about the diagnostic's own agreement with the row."""
+    txn.set_transaction_state("tx2", TransactionState.HALTED)
+    txn.set_halt_diagnostic("tx2", diagnostic)
+
+
+WRITE_SIDE_INCOHERENCE = (
+    (RULE_SPEC_COMPILES, None, lambda txn: txn.insert_record("tx3", non_compiling_spec())),
+    (RULE_BLOB_ROW_PRESENT, None, lambda txn: txn.insert_record("tx3", replace_spec())),
+    (
+        RULE_BLOB_BYTE_LEN,
+        lambda raw: raw.execute(
+            "INSERT INTO blob (digest, byte_len) VALUES (?, ?)", (digest_of(b"before"), 999)
+        ),
+        lambda txn: txn.insert_record("tx3", replace_spec()),
+    ),
+    (
+        RULE_ROLLBACK_RESULT,
+        None,
+        lambda txn: txn.set_transaction_state("tx2", TransactionState.ROLLED_BACK),
+    ),
+    (
+        RULE_ROLLBACK_RESULT,
+        None,
+        lambda txn: txn.set_rollback_result("tx2", RollbackResult.RESTORED),
+    ),
+    (
+        RULE_HALT_DIAGNOSTIC,
+        None,
+        lambda txn: txn.set_transaction_state("tx2", TransactionState.HALTED),
+    ),
+    (
+        RULE_HALT_DIAGNOSTIC,
+        None,
+        lambda txn: txn.set_halt_diagnostic("tx2", matching_diagnostic("only")),
+    ),
+    (
+        RULE_DIAGNOSTIC_DECISION,
+        None,
+        lambda txn: _halt_with(
+            txn,
+            replace(matching_diagnostic("only"), commit_decision=CommitDecision.COMMITTED),
+        ),
+    ),
+    (
+        RULE_DIAGNOSTIC_JOURNALS,
+        None,
+        lambda txn: _halt_with(
+            txn,
+            replace(
+                matching_diagnostic("only"),
+                journals=(EffectJournalState(effect_id="only", state=JournalState.DONE),),
+            ),
+        ),
+    ),
+)
+
+WRITE_UNREACHABLE_RULES = (
+    # `insert_record` writes `canonical_json(spec)` of an exact `TransactionSpec`, so no
+    # caller can make the stored text fail to decode or fail to re-encode --
+    # `test_insert_record_stores_the_canonical_encoding` is the property.
+    RULE_SPEC_DECODES,
+    RULE_SPEC_CANONICAL,
+    # The same method derives every `effect` row and its variant from that spec, and no
+    # setter adds, drops, or retypes one --
+    # `test_insert_record_derives_every_effect_row_from_the_spec` is the property.
+    RULE_EFFECT_COVERAGE,
+    RULE_EFFECT_VARIANT,
+    # `active.txid` is a real foreign key under `foreign_keys = ON`, so `set_active`
+    # raises `IntegrityError` long before the barrier --
+    # `test_set_active_refuses_a_transaction_that_does_not_exist` is the property.
+    RULE_ACTIVE_RECORD,
+)
+
+
+@pytest.mark.parametrize(
+    ("rule", "plant", "body"),
+    WRITE_SIDE_INCOHERENCE,
+    ids=[f"{i}-{case[0]}" for i, case in enumerate(WRITE_SIDE_INCOHERENCE)],
+)
+def test_every_reachable_cross_row_rule_refuses_on_a_write(
+    opened_store, store_binding, rule, plant, body
+):
+    """The same rules, the other verdict (design §7.6, §11.2).
+
+    `tx2` is committed coherently first, so the setter cases have a record to break and
+    the assertion that it survives unchanged is meaningful. The cases that insert a
+    record of their own use `tx3`, which must not exist afterwards.
+    """
+    commit_record(opened_store, store_binding, "tx2", one_effect_spec(effect_id="only"))
+    if plant is not None:
+        raw = raw_connect(store_binding)
+        try:
+            plant(raw)
+        finally:
+            raw.close()
+    with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
+        body(txn)
+    assert rule in str(caught.value)
+    survivor = opened_store.read_record("tx2")
+    assert survivor is not None
+    assert survivor.state is TransactionState.PREPARED
+    assert survivor.rollback_result is None
+    assert survivor.halt_diagnostic is None
+    assert opened_store.read_record("tx3") is None
+
+
+def test_the_cross_row_matrix_covers_every_rule_on_both_sides():
+    """The claim design §11.2 makes, as an assertion rather than a list.
+
+    The read side is total. The write side covers every rule the public write API can
+    actually produce; the rest are listed once, each with the API property that makes it
+    unreachable and the test that proves that property. A rule added to the predicate
+    with no case on either side fails here.
+    """
+    assert {case[0] for case in READ_SIDE_CORRUPTIONS} == set(COHERENCE_RULES)
+    written = {case[0] for case in WRITE_SIDE_INCOHERENCE}
+    assert not (written & set(WRITE_UNREACHABLE_RULES))
+    assert written | set(WRITE_UNREACHABLE_RULES) == set(COHERENCE_RULES)
+
+
+def test_every_rule_constant_is_listed_in_coherence_rules():
+    """Closes the other direction: a finding tagged with a constant `COHERENCE_RULES`
+    does not name would make the totality assertion above vacuous for that rule."""
+    from atoms.store import records as records_module
+
+    named = {
+        value for name, value in vars(records_module).items() if name.startswith("RULE_")
+    }
+    assert named == set(COHERENCE_RULES)
+
+
+def test_a_transaction_that_touches_two_txids_rolls_back_both(opened_store, store_binding):
+    """Design §11.2's write-side case with no read-side counterpart.
+
+    The barrier walks *every* touched txid in sorted order, so the coherent record
+    written beside the incoherent one is validated first and passes. What must not
+    happen is that it survives anyway: one finding aborts the whole transaction.
+    """
+    with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
+        txn.insert_record("tx1", one_effect_spec(effect_id="only"))
+        txn.insert_record("tx2", one_effect_spec(effect_id="only"))
+        txn.set_transaction_state("tx2", TransactionState.ROLLED_BACK)
+    assert RULE_ROLLBACK_RESULT in str(caught.value)
+    assert opened_store.read_record("tx1") is None
+    assert opened_store.read_record("tx2") is None
 
 
 def test_a_refused_commit_leaves_the_pre_transaction_record(opened_store):
     with opened_store.transaction() as txn:
         txn.insert_record("tx1", one_effect_spec())
-    with pytest.raises(ProtocolError):
-        with opened_store.transaction() as txn:
-            txn.set_transaction_state("tx1", TransactionState.HALTED)
+    with pytest.raises(ProtocolError), opened_store.transaction() as txn:
+        txn.set_transaction_state("tx1", TransactionState.HALTED)
     record = opened_store.read_record("tx1")
     assert record is not None
     assert record.state is TransactionState.PREPARED
@@ -3533,9 +3877,8 @@ def test_one_digest_declared_at_two_lengths_refuses(opened_store, store_binding)
         )
     finally:
         raw.close()
-    with pytest.raises(ProtocolError) as caught:
-        with opened_store.transaction() as txn:
-            txn.insert_record("tx1", two_length_spec())
+    with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
+        txn.insert_record("tx1", two_length_spec())
     assert "byte_len" in str(caught.value)
 
 
@@ -3601,31 +3944,30 @@ def test_a_read_takes_one_snapshot_across_a_concurrent_commit(store_on):
     """
     from atoms.store.connection import open_store
 
-    with store_on() as binding:
-        with open_store(binding) as writer, open_store(binding) as reader:
-            with writer.transaction() as txn:
-                txn.insert_record("tx1", one_effect_spec(effect_id="e1"))
+    with store_on() as binding, open_store(binding) as writer, open_store(binding) as reader:
+        with writer.transaction() as txn:
+            txn.insert_record("tx1", one_effect_spec(effect_id="e1"))
 
-            fired: list[str] = []
+        fired: list[str] = []
 
-            def commit_between(statement: str) -> None:
-                # The trace callback receives the EXPANDED statement -- 'txid = ''tx1'''
-                # rather than 'txid = ?' (measured), so this matches the table, not the
-                # constant. Fire once: the load queries `effect` more than once.
-                if "FROM effect" not in statement or fired:
-                    return
-                fired.append(statement)
-                with writer.transaction() as inner:
-                    inner.set_journal_state("tx1", "e1", JournalState.STARTED)
-                    inner.set_transaction_state("tx1", TransactionState.APPLYING)
+        def commit_between(statement: str) -> None:
+            # The trace callback receives the EXPANDED statement -- 'txid = ''tx1'''
+            # rather than 'txid = ?' (measured), so this matches the table, not the
+            # constant. Fire once: the load queries `effect` more than once.
+            if "FROM effect" not in statement or fired:
+                return
+            fired.append(statement)
+            with writer.transaction() as inner:
+                inner.set_journal_state("tx1", "e1", JournalState.STARTED)
+                inner.set_transaction_state("tx1", TransactionState.APPLYING)
 
-            reader._connection.set_trace_callback(commit_between)
-            try:
-                during = reader.read_record("tx1")
-            finally:
-                reader._connection.set_trace_callback(None)
-            assert fired, "the trace callback never saw the effect query"
-            after = reader.read_record("tx1")
+        reader._connection.set_trace_callback(commit_between)
+        try:
+            during = reader.read_record("tx1")
+        finally:
+            reader._connection.set_trace_callback(None)
+        assert fired, "the trace callback never saw the effect query"
+        after = reader.read_record("tx1")
 
     assert during is not None and after is not None
     assert (during.state, during.journals[0].state) == (
@@ -3649,10 +3991,9 @@ def test_the_lock_released_between_the_last_write_and_the_exit_rolls_back(store_
     with store_on() as binding:
         path = raw_path(binding)
         store = open_store(binding)
-        with pytest.raises(ProtocolError):
-            with store.transaction() as txn:
-                txn.insert_record("tx1", one_effect_spec())
-                release(binding)
+        with pytest.raises(ProtocolError), store.transaction() as txn:
+            txn.insert_record("tx1", one_effect_spec())
+            release(binding)
         store.close()
         raw = sqlite3.connect(path, isolation_level=None)
         try:
@@ -3690,12 +4031,69 @@ def test_the_lock_released_during_a_load_returns_no_record(store_on, monkeypatch
 passing any. `release_lock` and `RELEASES` come from the same module as the gate tiers — see
 `tests/store_support.py`.
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [ ] **Step 2: Add the two support helpers**
+
+Append to `tests/store_support.py`:
+
+```python
+def non_compiling_spec(effect_id: str = "only"):
+    """A spec `build_spec` accepts and `compile_spec` refuses.
+
+    The final surface says the path ends absent while the effect leaves a file there.
+    Measured: `build_spec` builds it, `compile_spec` raises `path 'a.txt' declares a
+    final state of AbsentState() but effect 'only' leaves it FileState(...)`, and
+    `canonical_json(from_canonical_json(text)) == text` still holds -- so it fails the
+    `spec_json_compiles` rule **alone**, with no canonical-encoding finding beside it.
+    `build_spec` does not validate; that is A2's job, and §7.6 is where the store
+    re-asks it of anything durable.
+    """
+    return build_spec(
+        consumer_tag="test",
+        intent_digest="sha256:" + "4" * 64,
+        initial_surface={"a.txt": ABSENT},
+        final_surface={"a.txt": ABSENT},
+        effects=[
+            CreateFileNoClobber(effect_id=effect_id, path="a.txt", post=file_state(b"after"))
+        ],
+    )
+
+
+def commit_record(store, binding, txid: str, spec) -> None:
+    """Commit one record, with whatever `blob` rows its initial surface references.
+
+    A record whose referenced digest has no `blob` row cannot be committed at all --
+    §7.7 runs the same predicate before COMMIT -- so a read-side test that wants to
+    *remove* that row, or contradict it, has to get it there first. Every test that
+    commits a `replace_spec` record needs this; the ones built on `one_effect_spec`
+    start from `ABSENT` and reference no digest, which is why they commit with no blob
+    at all.
+
+    Task 11 replaces the direct insert with a real promotion. Leave the
+    `# Task 11: promote instead` comment on it.
+    """
+    from atoms.store.records import referenced_digests
+
+    # Task 11: promote instead
+    digests = referenced_digests(spec)
+    if digests:
+        raw = raw_connect(binding)
+        try:
+            for digest, byte_len in digests:
+                raw.execute(
+                    "INSERT INTO blob (digest, byte_len) VALUES (?, ?)", (digest, byte_len)
+                )
+        finally:
+            raw.close()
+    with store.transaction() as txn:
+        txn.insert_record(txid, spec)
+```
+
+- [ ] **Step 3: Run the tests to verify they fail**
 
 Run: `uv run pytest tests/test_store_records.py -k "round_trips or cross_row or barrier" -v`
 Expected: FAIL with `AttributeError: 'Store' object has no attribute 'read_record'`.
 
-- [ ] **Step 3: Add the predicate and the reader**
+- [ ] **Step 4: Add the predicate and the reader**
 
 Append to `src/atoms/store/records.py`:
 
@@ -3705,6 +4103,51 @@ from dataclasses import dataclass
 from atoms.core.canonical import from_canonical_json
 from atoms.core.compiler import compile_spec
 from atoms.core.errors import SpecValidationError
+
+RULE_SPEC_DECODES = "spec_json_decodes"
+RULE_SPEC_CANONICAL = "spec_json_canonical"
+RULE_SPEC_COMPILES = "spec_json_compiles"
+RULE_EFFECT_COVERAGE = "effect_coverage"
+RULE_EFFECT_VARIANT = "effect_variant"
+RULE_BLOB_ROW_PRESENT = "blob_row_present"
+RULE_BLOB_BYTE_LEN = "blob_byte_len"
+RULE_ROLLBACK_RESULT = "rollback_result_exactly"
+RULE_HALT_DIAGNOSTIC = "halt_diagnostic_exactly"
+RULE_DIAGNOSTIC_DECISION = "diagnostic_commit_decision"
+RULE_DIAGNOSTIC_JOURNALS = "diagnostic_journal_vector"
+RULE_ACTIVE_RECORD = "active_record_exists"
+
+COHERENCE_RULES: tuple[str, ...] = (
+    RULE_SPEC_DECODES,
+    RULE_SPEC_CANONICAL,
+    RULE_SPEC_COMPILES,
+    RULE_EFFECT_COVERAGE,
+    RULE_EFFECT_VARIANT,
+    RULE_BLOB_ROW_PRESENT,
+    RULE_BLOB_BYTE_LEN,
+    RULE_ROLLBACK_RESULT,
+    RULE_HALT_DIAGNOSTIC,
+    RULE_DIAGNOSTIC_DECISION,
+    RULE_DIAGNOSTIC_JOURNALS,
+    RULE_ACTIVE_RECORD,
+)
+
+
+def _finding(rule: str, detail: str) -> str:
+    """One finding, tagged with the §7.6 rule that produced it.
+
+    Design §11.2 asks for every §7.6 rule to fail *independently*, on both sides. Without
+    a tag that is a list someone keeps in their head: the fragment a test asserts on --
+    `"effect"`, `"variant"` -- appears in several messages, so a matrix can be missing a
+    rule entirely and still be green. With one, the read-side and write-side matrices can
+    assert that between them they name every member of `COHERENCE_RULES`, and a rule
+    nothing exercises fails the suite.
+
+    Every rule is a module-level constant rather than a literal at the call site, so a
+    misspelling is a `NameError` at import rather than a tag no matcher will ever meet.
+    """
+    return f"{rule}: {detail}"
+
 
 SELECT_RECORD = (
     "SELECT spec_json, state, committed, rollback_result, halt_diagnostic "
@@ -3774,77 +4217,95 @@ def coherence_findings(connection: Any, txid: str) -> tuple[str, ...]:
     try:
         spec = from_canonical_json(spec_json)
     except (SpecValidationError, ValueError) as caught:
-        return (f"spec_json does not decode: {caught}",)
+        return (_finding(RULE_SPEC_DECODES, f"spec_json does not decode: {caught}"),)
     if canonical_json(spec) != spec_json:
-        findings.append(
-            "spec_json is not the canonical encoding of what it decodes to"
-        )
+        findings.append(_finding(
+            RULE_SPEC_CANONICAL,
+            "spec_json is not the canonical encoding of what it decodes to",
+        ))
     try:
         compile_spec(spec)
     except SpecValidationError as caught:
-        findings.append(f"spec_json is a spec A2 would refuse: {caught}")
+        findings.append(_finding(
+            RULE_SPEC_COMPILES, f"spec_json is a spec A2 would refuse: {caught}"
+        ))
 
     rows = connection.execute(SELECT_EFFECTS, (txid,)).fetchall()
     stored = {effect_id: (variant, journal) for effect_id, variant, journal in rows}
     declared = {effect.effect_id: variant_of(effect).value for effect in spec.effects}
     covered = set(declared) == set(stored)
     for effect_id in sorted(set(declared) - set(stored)):
-        findings.append(f"effect row missing for effect_id {effect_id!r}")
+        findings.append(_finding(
+            RULE_EFFECT_COVERAGE, f"effect row missing for effect_id {effect_id!r}"
+        ))
     for effect_id in sorted(set(stored) - set(declared)):
-        findings.append(f"effect row {effect_id!r} is not in spec_json")
+        findings.append(_finding(
+            RULE_EFFECT_COVERAGE, f"effect row {effect_id!r} is not in spec_json"
+        ))
     for effect_id in sorted(set(declared) & set(stored)):
         if stored[effect_id][0] != declared[effect_id]:
-            findings.append(
+            findings.append(_finding(
+                RULE_EFFECT_VARIANT,
                 f"effect {effect_id!r} has variant {stored[effect_id][0]!r}, "
-                f"spec_json says {declared[effect_id]!r}"
-            )
+                f"spec_json says {declared[effect_id]!r}",
+            ))
 
     for digest, byte_len in referenced_digests(spec):
         blob = connection.execute(SELECT_BLOB, (digest,)).fetchone()
         if blob is None:
-            findings.append(f"no blob row for referenced digest {digest!r}")
+            findings.append(_finding(
+                RULE_BLOB_ROW_PRESENT, f"no blob row for referenced digest {digest!r}"
+            ))
         elif blob[0] != byte_len:
-            findings.append(
-                f"blob {digest!r} has byte_len {blob[0]}, the record declares {byte_len}"
-            )
+            findings.append(_finding(
+                RULE_BLOB_BYTE_LEN,
+                f"blob {digest!r} has byte_len {blob[0]}, the record declares {byte_len}",
+            ))
 
     state = TransactionState(state_value)
     if (state is TransactionState.ROLLED_BACK) != (rollback_value is not None):
-        findings.append(
+        findings.append(_finding(
+            RULE_ROLLBACK_RESULT,
             f"rollback_result must be present exactly when state is rolled_back; "
-            f"state={state_value!r}, rollback_result={rollback_value!r}"
-        )
+            f"state={state_value!r}, rollback_result={rollback_value!r}",
+        ))
     if (state is TransactionState.HALTED) != (diagnostic_text is not None):
-        findings.append(
+        findings.append(_finding(
+            RULE_HALT_DIAGNOSTIC,
             f"halt_diagnostic must be present exactly when state is halted; "
-            f"state={state_value!r}"
-        )
+            f"state={state_value!r}",
+        ))
     if diagnostic_text is not None:
         diagnostic = decode_diagnostic(diagnostic_text)
         if diagnostic.commit_decision.value != committed_value:
-            findings.append(
-                "the diagnostic's commit_decision disagrees with the durable row"
-            )
+            findings.append(_finding(
+                RULE_DIAGNOSTIC_DECISION,
+                "the diagnostic's commit_decision disagrees with the durable row",
+            ))
         # Only when coverage holds. _journal_vector indexes `stored` by every effect_id
         # in spec_json, so on a record that is already missing an effect row it would
         # raise KeyError -- turning a reported finding into an exception of a type the
         # store does not promise, out of the loader that exists to report findings.
         if covered:
             if diagnostic.journals != _journal_vector(spec, stored):
-                findings.append(
-                    "the diagnostic's journal vector disagrees with the durable rows"
-                )
+                findings.append(_finding(
+                    RULE_DIAGNOSTIC_JOURNALS,
+                    "the diagnostic's journal vector disagrees with the durable rows",
+                ))
         else:
-            findings.append(
+            findings.append(_finding(
+                RULE_DIAGNOSTIC_JOURNALS,
                 "the diagnostic's journal vector cannot be compared: the effect rows do "
-                "not cover spec_json"
-            )
+                "not cover spec_json",
+            ))
 
     active = connection.execute(SELECT_ACTIVE).fetchone()
     if active is not None:
         exists = connection.execute(SELECT_RECORD, (active[0],)).fetchone()
         if exists is None:
-            findings.append(f"active names txid {active[0]!r}, which has no record")
+            findings.append(_finding(
+                RULE_ACTIVE_RECORD, f"active names txid {active[0]!r}, which has no record"
+            ))
 
     return tuple(findings)
 
@@ -3979,42 +4440,32 @@ promotion writing its own rows (Task 11), it can never fire; it is retained only
 statement of the invariant, and Task 11 replaces it with the *record-reference* check the design
 actually requires. Do not leave both.
 
-- [ ] **Step 4: Run the tests and the gates**
+- [ ] **Step 5: Run the tests and the gates**
 
 ```bash
 uv run pytest tests/test_store_records.py tests/test_store_liveness.py -v
-uv run ruff check src/atoms/store tests/test_store_records.py tests/test_store_liveness.py
+uv run ruff check src/atoms/store tests/store_support.py tests/test_store_records.py tests/test_store_liveness.py
 uv run pyright
 ```
 Expected: PASS, `All checks passed!`, `0 errors`.
 
 **Every test in `test_store_records.py` that commits a `replace_spec` record** now needs a `blob`
 row that no task has written yet — `replace_spec`'s `pre` is a `FileState` whose content hash has no
-row, so `coherence_findings` reports "no blob row for referenced digest" and the barrier refuses.
-Run the file, take the list from the failures rather than from this paragraph, and **insert the rows
-directly** in each for now:
-
-```python
-    raw = raw_connect(store_binding)
-    try:
-        raw.execute(
-            "INSERT INTO blob (digest, byte_len) VALUES (?, ?)", (digest_of(b"before"), 6)
-        )
-    finally:
-        raw.close()
-```
+row, so `coherence_findings` reports `blob_row_present` and the barrier refuses. Route every such
+commit through `commit_record`, which inserts exactly the rows `referenced_digests` reports; run the
+file and take the list from the failures rather than from this paragraph.
 
 Only the **initial**-surface digest needs a row — `replace_spec`'s `pre` — because that is the
 one `referenced_digests` reports. `one_effect_spec` starts from `ABSENT` and needs none, which
 is why the tests that use it commit without any blob at all.
 
-Task 11 replaces those inserts with a real promotion; leave a `# Task 11: promote instead`
-comment on each so they are easy to find, and remove the comments there.
+Task 11 replaces `commit_record`'s insert with a real promotion; the
+`# Task 11: promote instead` comment sits on that one line, and Task 11 removes it.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add src/atoms/store tests/test_store_records.py tests/test_store_liveness.py
+git add src/atoms/store tests/store_support.py tests/test_store_records.py tests/test_store_liveness.py
 git commit -m "feat(store): run one coherence predicate on both sides of the store"
 ```
 
@@ -4080,6 +4531,7 @@ Then create `tests/test_store_workspace.py`:
 from __future__ import annotations
 
 import copy
+import errno
 import os
 import pickle
 
@@ -4117,9 +4569,9 @@ def test_reading_an_anchor_after_close_raises_rather_than_returning_a_stale_inte
     workspace = opened_store.create_workspace("tx1")
     workspace.close()
     with pytest.raises(ProtocolError):
-        workspace.staging_fd
+        _ = workspace.staging_fd
     with pytest.raises(ProtocolError):
-        workspace.work_fd
+        _ = workspace.work_fd
 
 
 def test_close_is_idempotent(opened_store):
@@ -4141,12 +4593,12 @@ def test_reopen_accepts_every_legal_disposition(opened_store, store_binding, dis
             assert isinstance(workspace.staging_fd, int)
         else:
             with pytest.raises(ProtocolError):
-                workspace.staging_fd
+                _ = workspace.staging_fd
         if disposition in ("both", "work"):
             assert isinstance(workspace.work_fd, int)
         else:
             with pytest.raises(ProtocolError):
-                workspace.work_fd
+                _ = workspace.work_fd
 
 
 def test_reopen_refuses_when_neither_directory_exists(opened_store):
@@ -4218,7 +4670,7 @@ def test_close_closes_every_workspace_the_store_issued(opened_store):
     assert first._closed
     assert (first._staging_fd, first._work_fd) == (None, None)
     with pytest.raises(ProtocolError):
-        first.staging_fd
+        _ = first.staging_fd
     first.close()
 
 
@@ -4261,6 +4713,46 @@ def test_removal_is_not_idempotent(opened_store):
         opened_store.remove_workspace(workspace)
 
 
+def test_a_failure_after_the_staging_rmdir_leaves_no_anchor_on_a_gone_directory(
+    opened_store, store_binding, monkeypatch
+):
+    """Design §8.3's disposition table, at the moment the operation is half done.
+
+    `remove_workspace` mutates twice. The injected failure is the parent flush that
+    follows the staging `rmdir`, so the staging directory is gone and `work/tx1/` is
+    untouched -- the work-only row of the table, which is legal. What must not survive
+    is a live `staging_fd`: measured, a descriptor to an unlinked directory still lists
+    and `fstat`s (`st_nlink == 0`) while `openat(O_CREAT)` through it fails `ENOENT`, so
+    a retained one turns every later use into a failure far from its cause, and the
+    retry below would `rmdir` a name that is already gone and raise a raw
+    `FileNotFoundError` out of the store.
+    """
+    workspace = opened_store.create_workspace("tx1")
+    backend = store_binding.backend
+    real = backend.flush_directory
+    calls: list[int] = []
+
+    def failing(fd: int) -> None:
+        calls.append(fd)
+        if len(calls) == 2:  # 1 = staging/tx1/ itself, 2 = staging/ after the rmdir
+            raise OSError(errno.EIO, "injected")
+        real(fd)
+
+    monkeypatch.setattr(backend, "flush_directory", failing)
+    with pytest.raises(OSError):
+        opened_store.remove_workspace(workspace)
+
+    with pytest.raises(ProtocolError) as caught:
+        _ = workspace.staging_fd
+    assert "spent" in str(caught.value)
+    assert workspace.work_fd >= 0
+    assert opened_store.list_workspaces() == ("tx1",)
+
+    monkeypatch.setattr(backend, "flush_directory", real)
+    opened_store.remove_workspace(workspace)
+    assert opened_store.list_workspaces() == ()
+
+
 @pytest.mark.parametrize("disposition", ["both", "staging", "work"])
 def test_removal_succeeds_on_every_legal_disposition(opened_store, store_binding, disposition):
     opened_store.create_workspace("tx1").close()
@@ -4289,12 +4781,11 @@ def test_a_foreign_or_forged_workspace_is_refused(opened_store, store_on):
 def test_a_workspace_from_another_store_over_the_same_binding_is_refused(store_on):
     from atoms.store.connection import open_store
 
-    with store_on() as binding:
-        with open_store(binding) as first, open_store(binding) as second:
-            workspace = first.create_workspace("tx1")
-            with pytest.raises(ProtocolError):
-                second.remove_workspace(workspace)
-            workspace.close()
+    with store_on() as binding, open_store(binding) as first, open_store(binding) as second:
+        workspace = first.create_workspace("tx1")
+        with pytest.raises(ProtocolError):
+            second.remove_workspace(workspace)
+        workspace.close()
 
 
 def test_removal_preserves_the_whole_directory_when_the_invalid_entry_is_last(opened_store):
@@ -4366,7 +4857,7 @@ from __future__ import annotations
 import errno
 import os
 import stat
-from typing import TYPE_CHECKING, Never
+from typing import TYPE_CHECKING, Never, Self
 
 from atoms.core.errors import ProtocolError
 from atoms.store.errors import MetadataStoreInvalid
@@ -4457,22 +4948,35 @@ class Workspace:
         return self._anchor(self._work_fd, "work_fd")
 
     def _spend_staging(self) -> None:
-        """Close and mark the staging half spent (design §8.1, §8.2).
+        """Close and mark the staging half spent (design §8.1, §8.2, §8.3).
 
-        On success this is because step 4 removed the directory, and an open descriptor to
-        an unlinked directory is the dangerous kind of still-valid: openat from it succeeds
-        and produces files no path can ever name.
+        Called the instant `staging/<txid>/` stops existing -- promotion's step 4 `rmdir`
+        or `remove_workspace`'s -- and never later. A descriptor that outlives the
+        directory it anchors is not harmless: measured, `listdir` through it still
+        succeeds and `fstat` reports `st_nlink == 0`, while `openat(O_CREAT)` and
+        `mkdirat` both fail `ENOENT`. So every use of a stale anchor fails far from the
+        removal that caused it, and §8.3's disposition table -- which says a half that is
+        not on disk reads as **spent** -- would be false of a live workspace.
 
         **Private, and the leading underscore is load-bearing.** §8.3's class listing is
         the exact surface, and this is not on it. Public, it would let a caller spend the
         staging half while `staging/<txid>/` is still on disk and still holds files --
         after which `remove_workspace` sees a spent half, skips it, and strands the
-        directory the caller was trying to get rid of. Only promotion knows the moment
-        the `rmdir` succeeded, so only promotion may call this.
+        directory the caller was trying to get rid of. Only the code that performed the
+        `rmdir` knows the moment it succeeded, so only that code may call this.
         """
         if self._staging_fd is not None:
             os.close(self._staging_fd)
             self._staging_fd = None
+
+    def _spend_work(self) -> None:
+        """The work half's counterpart, for `remove_workspace`'s second `rmdir`.
+
+        Promotion never touches this half, which is why only removal needs it.
+        """
+        if self._work_fd is not None:
+            os.close(self._work_fd)
+            self._work_fd = None
 
     def close(self) -> None:
         """Idempotent, and does not gate on liveness (design §7.8's reason)."""
@@ -4488,7 +4992,7 @@ class Workspace:
         if store is not None:
             store._workspaces.discard(self)
 
-    def __enter__(self) -> Workspace:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *exc: object) -> None:
@@ -4711,7 +5215,8 @@ def remove_workspace(store: Store, workspace: Workspace) -> None:
                 "inode against the live filesystem, and that judgment is A7's"
             )
 
-        # 2-3. Act, gating before each mutating syscall.
+        # 2-3. Act, gating before each mutating syscall. **Each half is spent the moment
+        # its own rmdir lands**, not once the whole operation succeeds -- see below.
         if workspace._staging_fd is not None:
             for name in staging_names:
                 gate(store._binding)
@@ -4719,16 +5224,33 @@ def remove_workspace(store: Store, workspace: Workspace) -> None:
             store._binding.backend.flush_directory(workspace._staging_fd)
             gate(store._binding)
             os.rmdir(txid, dir_fd=staging_parent)
+            workspace._spend_staging()
             store._binding.backend.flush_directory(staging_parent)
         if workspace._work_fd is not None:
             gate(store._binding)
             os.rmdir(txid, dir_fd=work_parent)
+            workspace._spend_work()
             store._binding.backend.flush_directory(work_parent)
     finally:
         os.close(staging_parent)
         os.close(work_parent)
     workspace.close()
 ```
+
+**Why each half is spent at its own `rmdir` rather than at the end.** `remove_workspace` mutates
+twice and can fail between them — the parent flush after the staging `rmdir` raises, or the gate
+before the work `rmdir` refuses a lease that ended mid-operation. Spending only in the trailing
+`workspace.close()` leaves the caller, who now holds the exception, a `Workspace` whose `staging_fd`
+still returns an integer for a directory that is gone. That contradicts §8.3's disposition table
+directly: a half not on disk reads as **spent**. It also breaks the retry the caller would reasonably
+attempt — the second `remove_workspace` sees a live `_staging_fd`, lists the unlinked directory
+successfully, and `rmdir`s a name that no longer exists, raising a raw `FileNotFoundError` from
+inside the store. Measured on the stale anchor: `listdir` succeeds, `fstat` reports `st_nlink == 0`,
+`openat(O_CREAT)` and `mkdirat` fail `ENOENT`, and the second `rmdir` fails `ENOENT`.
+
+Spending immediately makes the partial state one of the three legal dispositions instead of a fourth
+illegal one: staging removed and work not is exactly the work-only row, which `reopen_workspace`
+already accepts and a retried `remove_workspace` finishes.
 
 Add the workspace registry to `Store` in `connection.py` — design §7.8's promise that `close()`
 closes "any `Workspace` descriptors still outstanding". Extend `__slots__`:
@@ -4991,6 +5513,7 @@ Create `src/atoms/store/blobs.py`:
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import re
@@ -5060,6 +5583,30 @@ def blobs_fd(store: Store) -> int:
     )
 
 
+def open_entry_nofollow(parent_fd: int, name: str, what: str) -> int:
+    """An `O_NOFOLLOW` read open with the symlink refusal translated (design §8.5).
+
+    A symlink at `name` fails **`ELOOP`**, measured, and as a bare `OSError` -- not a
+    named subclass -- from a path whose contract is `MetadataStoreInvalid`. Every
+    producer that writes here writes regular files: `blobs/sha256/` is written by
+    promotion alone and `staging/<txid>/` by A6 through a borrowed anchor, so a symlink
+    is an entry no permitted producer could have written.
+
+    `ENOENT` is *not* translated here, because it means something different at each call
+    site -- an indexed digest with no leaf, or a staged name the entry-set comparison
+    just accounted for -- and each site says so itself.
+
+    A **directory** opens cleanly with `O_RDONLY` and is refused by `verify_leaf`'s
+    `S_ISREG` check instead, which is why both refusals exist rather than one.
+    """
+    try:
+        return os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd)
+    except OSError as caught:
+        if caught.errno == errno.ELOOP:
+            raise MetadataStoreInvalid(f"{what} is a symlink") from caught
+        raise
+
+
 def verify_leaf(fd: int, digest: str, byte_len: int | None) -> int:
     """Kind, length, and streamed SHA-256, then rewind. Returns the observed length.
 
@@ -5103,21 +5650,13 @@ def open_blob(store: Store, digest: str) -> int:
     parent = blobs_fd(store)
     try:
         try:
-            fd = os.open(
-                digest_to_leaf(digest),
-                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                dir_fd=parent,
+            fd = open_entry_nofollow(
+                parent, digest_to_leaf(digest), f"the leaf for {digest}"
             )
         except FileNotFoundError as caught:
             raise MetadataStoreInvalid(
                 f"{digest} has a blob row but no leaf under {BLOBS_PARENT}/"
             ) from caught
-        except OSError as caught:
-            if caught.errno == 40:  # ELOOP -- O_NOFOLLOW refused a symlink
-                raise MetadataStoreInvalid(
-                    f"the leaf for {digest} is a symlink"
-                ) from caught
-            raise
     finally:
         os.close(parent)
     try:
@@ -5135,9 +5674,10 @@ Append to `Store`:
         return open_blob(self, digest)
 ```
 
-`errno == 40` is `ELOOP` on Linux; write `errno.ELOOP` with `import errno` rather than the
-literal. Opening a *directory* with `O_RDONLY` succeeds, so that case is caught by
-`verify_leaf`'s `S_ISREG` check rather than at the open — which is why both exist.
+Every `O_NOFOLLOW` read open in this package goes through `open_entry_nofollow`, including the
+two in Task 11's preflight and the one on §8.2's `EEXIST` path. Written inline, each is one
+`except OSError` away from letting a symlink out as a raw `ELOOP`, and that is exactly what
+happened to the first three of the four.
 
 - [ ] **Step 5: Run the tests and the gates**
 
@@ -5271,23 +5811,22 @@ def test_promotion_spends_the_staging_half(opened_store):
             txn.promote_staging(workspace, _manifest(("one", b"first")))
             txn.insert_record("tx1", spec_referencing(b"first"))
         with pytest.raises(ProtocolError):
-            workspace.staging_fd
-        with pytest.raises(ProtocolError):
-            with opened_store.transaction() as txn:
-                txn.promote_staging(workspace, _manifest(("one", b"first")))
+            _ = workspace.staging_fd
+        with pytest.raises(ProtocolError), opened_store.transaction() as txn:
+            txn.promote_staging(workspace, _manifest(("one", b"first")))
 
 
 def test_an_empty_manifest_still_spends_the_staging_half(opened_store, store_binding):
     """A spec whose initial surface names no file has nothing to capture, so the
     directory is removed with no source removed. Spending on the first source removal
-    would leave this workspace holding a descriptor to an unlinked directory -- openat
-    from it still works and produces files no path can name (design §8.1 step 4)."""
+    would leave this workspace holding a descriptor to an unlinked directory, which
+    §8.3's disposition table says must read as spent (design §8.1 step 4)."""
     with opened_store.create_workspace("tx1") as workspace:
         with opened_store.transaction() as txn:
             txn.promote_staging(workspace, ())
             txn.insert_record("tx1", one_effect_spec())
         with pytest.raises(ProtocolError):
-            workspace.staging_fd
+            _ = workspace.staging_fd
     with child_dir(store_binding.metadata_root_fd, "staging") as staging_fd:
         assert os.listdir(staging_fd) == []
 
@@ -5298,11 +5837,10 @@ def test_a_promoted_digest_the_records_workspace_does_not_reference_refuses(open
     promoted from tx1's workspace, leaving tx1's own record naming nothing."""
     with opened_store.create_workspace("tx1") as first:
         stage(first, "one", b"shared")
-        with pytest.raises(ProtocolError) as caught:
-            with opened_store.transaction() as txn:
-                txn.promote_staging(first, _manifest(("one", b"shared")))
-                txn.insert_record("tx1", one_effect_spec())
-                txn.insert_record("tx2", spec_referencing(b"shared"))
+        with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
+            txn.promote_staging(first, _manifest(("one", b"shared")))
+            txn.insert_record("tx1", one_effect_spec())
+            txn.insert_record("tx2", spec_referencing(b"shared"))
     assert "tx1" in str(caught.value)
 
 
@@ -5318,9 +5856,8 @@ def test_a_promoted_digest_the_records_workspace_does_not_reference_refuses(open
 def test_a_malformed_manifest_moves_nothing(opened_store, manifest):
     with opened_store.create_workspace("tx1") as workspace:
         stage(workspace, "one", b"first")
-        with pytest.raises(ProtocolError):
-            with opened_store.transaction() as txn:
-                txn.promote_staging(workspace, tuple(manifest))
+        with pytest.raises(ProtocolError), opened_store.transaction() as txn:
+            txn.promote_staging(workspace, tuple(manifest))
         assert set(os.listdir(workspace.staging_fd)) == {"one"}
 
 
@@ -5331,9 +5868,8 @@ def test_two_entries_naming_one_source_are_refused_before_anything_moves(opened_
             StagedBlob(name="one", digest=digest_of(b"first"), byte_len=5),
             StagedBlob(name="one", digest=digest_of(b"first"), byte_len=5),
         )
-        with pytest.raises(ProtocolError):
-            with opened_store.transaction() as txn:
-                txn.promote_staging(workspace, manifest)
+        with pytest.raises(ProtocolError), opened_store.transaction() as txn:
+            txn.promote_staging(workspace, manifest)
         assert set(os.listdir(workspace.staging_fd)) == {"one"}
 
 
@@ -5345,27 +5881,35 @@ def test_one_digest_with_two_lengths_in_one_manifest_is_a_caller_error(opened_st
             StagedBlob(name="one", digest=digest_of(b"first"), byte_len=5),
             StagedBlob(name="two", digest=digest_of(b"first"), byte_len=4),
         )
-        with pytest.raises(ProtocolError):
-            with opened_store.transaction() as txn:
-                txn.promote_staging(workspace, manifest)
+        with pytest.raises(ProtocolError), opened_store.transaction() as txn:
+            txn.promote_staging(workspace, manifest)
 
 
 def test_an_omitted_file_fails_at_step_one_with_every_source_still_staged(opened_store):
     with opened_store.create_workspace("tx1") as workspace:
         stage(workspace, "one", b"first")
         stage(workspace, "two", b"second")
-        with pytest.raises(ProtocolError) as caught:
-            with opened_store.transaction() as txn:
-                txn.promote_staging(workspace, _manifest(("one", b"first")))
+        with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
+            txn.promote_staging(workspace, _manifest(("one", b"first")))
         assert "two" in str(caught.value)
         assert set(os.listdir(workspace.staging_fd)) == {"one", "two"}
 
 
-@pytest.mark.parametrize("corrupt", ["length", "content", "kind"])
+@pytest.mark.parametrize("corrupt", ["length", "content", "kind", "symlink"])
 def test_a_staged_source_is_verified_before_it_moves(opened_store, corrupt):
+    """The `symlink` case is the one the kind check alone does not reach. A directory
+    opens fine with `O_RDONLY` and is refused by `verify_leaf`'s `S_ISREG`; a symlink
+    never opens at all -- `O_NOFOLLOW` fails `ELOOP`, measured, as a bare `OSError`
+    rather than a named subclass -- so without `open_entry_nofollow` it left as a raw
+    exception from a path whose contract is `MetadataStoreInvalid` (§8.5). `os.listdir`
+    reports symlinks, so step 1's entry-set comparison passes it through.
+    """
     with opened_store.create_workspace("tx1") as workspace:
         if corrupt == "kind":
             os.mkdir("one", dir_fd=workspace.staging_fd)
+            manifest = _manifest(("one", b"first"))
+        elif corrupt == "symlink":
+            os.symlink("../../elsewhere", "one", dir_fd=workspace.staging_fd)
             manifest = _manifest(("one", b"first"))
         else:
             stage(workspace, "one", b"first")
@@ -5377,9 +5921,8 @@ def test_a_staged_source_is_verified_before_it_moves(opened_store, corrupt):
                     byte_len=99 if corrupt == "length" else 5,
                 ),
             )
-        with pytest.raises(MetadataStoreInvalid):
-            with opened_store.transaction() as txn:
-                txn.promote_staging(workspace, manifest)
+        with pytest.raises(MetadataStoreInvalid), opened_store.transaction() as txn:
+            txn.promote_staging(workspace, manifest)
         assert "one" in set(os.listdir(workspace.staging_fd))
 
 
@@ -5417,10 +5960,48 @@ def test_a_mismatching_pre_existing_blob_preserves_the_staged_source(
                 os.write(fd, b"bad!")
             finally:
                 os.close(fd)
-        with pytest.raises(MetadataStoreInvalid):
-            with opened_store.transaction() as txn:
-                txn.promote_staging(workspace, _manifest(("one", b"good")))
+        with pytest.raises(MetadataStoreInvalid), opened_store.transaction() as txn:
+            txn.promote_staging(workspace, _manifest(("one", b"good")))
         assert "one" in set(os.listdir(workspace.staging_fd))
+
+
+def test_a_pre_existing_destination_that_is_a_symlink_refuses(opened_store, store_binding):
+    """§8.2's `EEXIST` path, with the one destination kind that never opens.
+
+    Measured: `renameat2(RENAME_NOREPLACE)` onto a symlink fails `EEXIST`, so control
+    reaches the verification branch; the `O_NOFOLLOW` open there then fails `ELOOP` as a
+    bare `OSError`. The leaf carries **no** `blob` row, which is what keeps step 1's
+    indexed-leaf check out of the way -- this is the promoted-orphan case §8.2 exists
+    for. The staged source survives, as it does for every other mismatching destination.
+    """
+    with opened_store.create_workspace("tx1") as workspace:
+        stage(workspace, "one", b"good")
+        with child_dir(store_binding.metadata_root_fd, "blobs/sha256") as blobs_fd:
+            os.symlink("../../elsewhere", digest_to_leaf(digest_of(b"good")), dir_fd=blobs_fd)
+        with pytest.raises(MetadataStoreInvalid) as caught, opened_store.transaction() as txn:
+            txn.promote_staging(workspace, _manifest(("one", b"good")))
+        assert "symlink" in str(caught.value)
+        assert "one" in set(os.listdir(workspace.staging_fd))
+
+
+def test_an_indexed_digest_whose_leaf_is_a_symlink_refuses_at_the_preflight(
+    opened_store, store_binding, promoted_blob
+):
+    """Criterion 28's third kind. The row exists, so step 1 opens the leaf to verify it,
+    and a symlink there is an entry promotion -- the only permitted producer under
+    `blobs/sha256/` -- cannot have written (§8.5)."""
+    store, digest, content = promoted_blob
+    with child_dir(store_binding.metadata_root_fd, "blobs/sha256") as blobs_fd:
+        os.unlink(digest_to_leaf(digest), dir_fd=blobs_fd)
+        os.symlink("../../elsewhere", digest_to_leaf(digest), dir_fd=blobs_fd)
+    with store.create_workspace("tx9") as workspace:
+        stage(workspace, "again", content)
+        with pytest.raises(MetadataStoreInvalid) as caught, store.transaction() as txn:
+            txn.promote_staging(workspace, (
+                StagedBlob(name="again", digest=digest, byte_len=len(content)),
+            ))
+        assert "symlink" in str(caught.value)
+        assert "again" in set(os.listdir(workspace.staging_fd))
 
 
 def test_an_already_indexed_digest_has_its_leaf_verified_not_assumed(
@@ -5436,11 +6017,10 @@ def test_an_already_indexed_digest_has_its_leaf_verified_not_assumed(
         store.open_blob(digest)
     with store.create_workspace("tx9") as workspace:
         stage(workspace, "again", content)
-        with pytest.raises(MetadataStoreInvalid):
-            with store.transaction() as txn:
-                txn.promote_staging(workspace, (
-                    StagedBlob(name="again", digest=digest, byte_len=len(content)),
-                ))
+        with pytest.raises(MetadataStoreInvalid), store.transaction() as txn:
+            txn.promote_staging(workspace, (
+                StagedBlob(name="again", digest=digest, byte_len=len(content)),
+            ))
         assert "again" in set(os.listdir(workspace.staging_fd))
 
 
@@ -5450,11 +6030,10 @@ def test_promoting_an_already_indexed_digest_with_a_different_length_refuses(
     store, digest, content = promoted_blob
     with store.create_workspace("tx9") as workspace:
         stage(workspace, "again", content)
-        with pytest.raises(MetadataStoreInvalid):
-            with store.transaction() as txn:
-                txn.promote_staging(workspace, (
-                    StagedBlob(name="again", digest=digest, byte_len=len(content) + 1),
-                ))
+        with pytest.raises(MetadataStoreInvalid), store.transaction() as txn:
+            txn.promote_staging(workspace, (
+                StagedBlob(name="again", digest=digest, byte_len=len(content) + 1),
+            ))
 
 
 def test_a_replay_of_a_promoted_entry_raises_enoent_not_eexist(opened_store, store_binding):
@@ -5483,9 +6062,8 @@ def test_promoting_without_inserting_a_record_is_refused_at_the_barrier(
     leaves an indexed blob nothing names, invisible to both reclaimers (design §7.7)."""
     with opened_store.create_workspace("tx1") as workspace:
         stage(workspace, "one", b"first")
-        with pytest.raises(ProtocolError) as caught:
-            with opened_store.transaction() as txn:
-                txn.promote_staging(workspace, _manifest(("one", b"first")))
+        with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
+            txn.promote_staging(workspace, _manifest(("one", b"first")))
         assert "reference" in str(caught.value)
     raw = raw_connect(store_binding)
     try:
@@ -5560,7 +6138,9 @@ def _preflight(store: Store, workspace: Workspace, manifest: tuple[StagedBlob, .
         )
 
     for entry in manifest:
-        fd = os.open(entry.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=staging_fd)
+        fd = open_entry_nofollow(
+            staging_fd, entry.name, f"staging/{workspace.txid}/{entry.name}"
+        )
         try:
             observed = verify_leaf(fd, entry.digest, entry.byte_len)
         finally:
@@ -5579,10 +6159,8 @@ def _preflight(store: Store, workspace: Workspace, manifest: tuple[StagedBlob, .
                     f"content is {lengths[digest]}"
                 )
             try:
-                fd = os.open(
-                    digest_to_leaf(digest),
-                    os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                    dir_fd=parent,
+                fd = open_entry_nofollow(
+                    parent, digest_to_leaf(digest), f"the leaf for {digest}"
                 )
             except FileNotFoundError as caught:
                 raise MetadataStoreInvalid(
@@ -5624,8 +6202,8 @@ def promote_staging(
             except FileExistsError:
                 # Design §8.2 -- a destination with no row: a promoted orphan from an
                 # earlier crash, the one case the index cannot preflight.
-                existing = os.open(
-                    leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent
+                existing = open_entry_nofollow(
+                    parent, leaf, f"the existing leaf for {entry.digest}"
                 )
                 try:
                     verify_leaf(existing, entry.digest, entry.byte_len)
@@ -5678,8 +6256,8 @@ Add `from atoms.store.workspace import STAGING_PARENT, Workspace` to the imports
 - On the **success** path, the half is spent when step 4's `rmdir` succeeds, which is strictly more
   cases: an **empty manifest removes the directory without removing any source**. Spending on source
   removal alone would leave that workspace holding an open descriptor to an unlinked directory —
-  `openat` from it still succeeds and produces files no path can ever name, which is the exact state
-  `_spend_staging` exists to prevent (design §8.1 step 4).
+  the exact state `_spend_staging` exists to prevent, since §8.3's disposition table says a half not
+  on disk reads as **spent** (design §8.1 step 4).
 
 Append to `_StoreTransaction`:
 
@@ -5781,13 +6359,15 @@ git commit -m "feat(store): publish and index a blob in one write-lock interval"
 - Modify: `src/atoms/store/blobs.py`
 - Modify: `src/atoms/store/connection.py`
 - Modify: `src/atoms/store/__init__.py`
+- Modify: `tests/store_support.py`
 - Modify: `tests/test_store_blobs.py`
 - Modify: `tests/test_store_liveness.py`
 
 **Interfaces:**
 - Consumes: Task 10's `verify_leaf`, `leaf_to_digest`, `blobs_fd`; Task 11's `INSERT_BLOB`.
 - Produces: `list_unindexed_blobs(store)`, `remove_unindexed_blob(store, digest)`, and the two `Store`
-  methods.
+  methods. In `tests/store_support.py`: `STORE_SURFACE`, read by both the after-close suite here and
+  Task 13's `Store` attribute-set assertion.
 
 **This is not the garbage collection §2.2 excludes.** That non-goal cites authority §7.5, which is
 terminal cleanup *after* `COMMITTED` is durable and turns on whether a live record still references a
@@ -5814,9 +6394,8 @@ Append to `tests/test_store_blobs.py`:
 def test_a_promoted_orphan_is_listed_and_removed(opened_store, store_binding):
     with opened_store.create_workspace("tx1") as workspace:
         stage(workspace, "one", b"orphaned")
-        with pytest.raises(ProtocolError):
-            with opened_store.transaction() as txn:
-                txn.promote_staging(workspace, _manifest(("one", b"orphaned")))
+        with pytest.raises(ProtocolError), opened_store.transaction() as txn:
+            txn.promote_staging(workspace, _manifest(("one", b"orphaned")))
     digest = digest_of(b"orphaned")
     assert opened_store.list_unindexed_blobs() == (digest,)
     opened_store.remove_unindexed_blob(digest)
@@ -5894,32 +6473,35 @@ def test_a_reclaimer_does_not_race_another_stores_promotion(store_on):
 
     content = b"contested"
     digest = digest_of(content)
-    with store_on() as binding:
-        with open_store(binding) as writer, open_store(binding) as reclaimer:
-            with writer.create_workspace("tx1") as workspace:
-                stage(workspace, "one", content)
-                started = threading.Event()
-                outcome: dict[str, object] = {}
+    with (
+        store_on() as binding,
+        open_store(binding) as writer,
+        open_store(binding) as reclaimer,
+    ):
+        with writer.create_workspace("tx1") as workspace:
+            stage(workspace, "one", content)
+            started = threading.Event()
+            outcome: dict[str, object] = {}
 
-                def reclaim():
-                    started.wait(5)
-                    try:
-                        for candidate in reclaimer.list_unindexed_blobs():
-                            reclaimer.remove_unindexed_blob(candidate)
-                        outcome["error"] = None
-                    except Exception as caught:  # noqa: BLE001 -- recorded, then asserted
-                        outcome["error"] = caught
+            def reclaim():
+                started.wait(5)
+                try:
+                    for candidate in reclaimer.list_unindexed_blobs():
+                        reclaimer.remove_unindexed_blob(candidate)
+                    outcome["error"] = None
+                except Exception as caught:  # noqa: BLE001 -- recorded, then asserted
+                    outcome["error"] = caught
 
-                thread = threading.Thread(target=reclaim)
-                thread.start()
-                with writer.transaction() as txn:
-                    txn.promote_staging(
-                        workspace,
-                        (StagedBlob(name="one", digest=digest, byte_len=len(content)),),
-                    )
-                    txn.insert_record("tx1", spec_referencing(content))
-                    started.set()
-                thread.join(10)
+            thread = threading.Thread(target=reclaim)
+            thread.start()
+            with writer.transaction() as txn:
+                txn.promote_staging(
+                    workspace,
+                    (StagedBlob(name="one", digest=digest, byte_len=len(content)),),
+                )
+                txn.insert_record("tx1", spec_referencing(content))
+                started.set()
+            thread.join(10)
         with open_store(binding) as store:
             record = store.read_record("tx1")
             assert record is not None
@@ -5928,13 +6510,73 @@ def test_a_reclaimer_does_not_race_another_stores_promotion(store_on):
 
 Add `from tests.store_support import spec_referencing` to the imports.
 
-Append to `tests/test_store_liveness.py`, whose module-level imports already carry `RELEASES`,
-`close_binding`, `metadata_root_snapshot`, and `release_lock` from Task 5. `RELEASES` is read at
-*decoration* time, which is why it lives in `store_support.py` rather than in one of these
-appended blocks — a name defined further down the file than the `@pytest.mark.parametrize` that
-reads it is a `NameError` at import:
+Append to `tests/store_support.py` — the surface every later assertion is stated over:
 
 ```python
+#: Design §7.1's `Store` surface: the method name and one argument tuple that reaches
+#: the liveness gate. Criterion 16 requires **every** operation to refuse after `close()`
+#: and criterion 37 requires the set to be exactly this; both read this one tuple, so a
+#: method added to `Store` and to §7.1 has to be added here or the architecture test
+#: fails, and once added it is automatically required to refuse after close.
+#:
+#: `close` is deliberately absent: it is the one operation that must *succeed* after
+#: close, and `test_close_is_idempotent` covers it.
+STORE_SURFACE: tuple[tuple[str, tuple[object, ...]], ...] = (
+    ("transaction", ()),
+    ("read_record", ("tx1",)),
+    ("read_active", ()),
+    ("open_blob", ("sha256:" + "a" * 64,)),
+    ("list_unindexed_blobs", ()),
+    ("remove_unindexed_blob", ("sha256:" + "a" * 64,)),
+    ("create_workspace", ("tx1",)),
+    ("reopen_workspace", ("tx1",)),
+    ("list_workspaces", ()),
+    ("remove_workspace", (None,)),
+)
+```
+
+Every argument tuple is **valid enough to reach the gate**: a well-formed digest, a `txid` that
+passes §5.5. An argument the grammar refuses would make the test pass on the wrong refusal.
+`remove_workspace(None)` is the exception and is safe: its first statement is `store._require_live()`,
+so liveness answers before the type check — which the message assertion below is what proves.
+
+Append to `tests/test_store_liveness.py`, whose module-level imports already carry `RELEASES`,
+`close_binding`, `metadata_root_snapshot`, and `release_lock` from Task 5; add `STORE_SURFACE` to
+that same import. Both are read at *decoration* time, which is why they live in `store_support.py`
+rather than in one of these appended blocks — a name defined further down the file than the
+`@pytest.mark.parametrize` that reads it is a `NameError` at import:
+
+```python
+@pytest.mark.parametrize(
+    ("method", "arguments"), STORE_SURFACE, ids=[case[0] for case in STORE_SURFACE]
+)
+def test_every_store_operation_after_close_raises_protocol_error(
+    opened_store, method, arguments
+):
+    """Criterion 16, over the whole surface rather than over `transaction()` alone.
+
+    The exception **type** is the assertion, not merely that something raised: after
+    `close()` the connection is closed, and pysqlite's own
+    `ProgrammingError: Cannot operate on a closed database` is a plausible enough message
+    to pass a laxer check while telling a caller to go read pysqlite's hierarchy. The
+    message assertion pins it further: the refusal must come from the liveness gate, not
+    from an argument check that happened to fire first.
+
+    Parametrized over `STORE_SURFACE`, which the architecture guard asserts *is* the
+    class's public set -- so a method added later cannot quietly skip this.
+    """
+    opened_store.close()
+    with pytest.raises(ProtocolError) as caught:
+        result = getattr(opened_store, method)(*arguments)
+        if method == "transaction":
+            # `transaction` is a @contextmanager: calling it builds the generator and
+            # runs none of the body, so its refusal happens at `__enter__` and nowhere
+            # earlier. Every other method refuses on the call itself.
+            result.__enter__()
+    assert not isinstance(caught.value, sqlite3.Error)
+    assert "closed" in str(caught.value)
+
+
 def test_the_gate_runs_before_the_orphan_unlink(store_on, monkeypatch):
     """Orphan removal hashes the leaf first, which is unbounded work."""
     from atoms.store import blobs as blobs_module
@@ -5947,14 +6589,13 @@ def test_the_gate_runs_before_the_orphan_unlink(store_on, monkeypatch):
         digest = digest_of(content)
         with store.create_workspace("tx1") as workspace:
             stage(workspace, "one", content)
-            with pytest.raises(ProtocolError):
-                with store.transaction() as txn:
-                    txn.promote_staging(
-                        workspace,
-                        (blobs_module.StagedBlob(
-                            name="one", digest=digest, byte_len=len(content)
-                        ),),
-                    )
+            with pytest.raises(ProtocolError), store.transaction() as txn:
+                txn.promote_staging(
+                    workspace,
+                    (blobs_module.StagedBlob(
+                        name="one", digest=digest, byte_len=len(content)
+                    ),),
+                )
 
         real = blobs_module.verify_leaf
 
@@ -5998,18 +6639,16 @@ def test_open_blob_is_refused_inside_this_stores_write_transaction(store_on):
 
     content = b"in flight"
     digest = digest_of(content)
-    with store_on() as binding:
-        with open_store(binding) as store:
-            with store.create_workspace("tx1") as workspace:
-                stage(workspace, "capture", content)
-                with store.transaction() as txn:
-                    txn.promote_staging(
-                        workspace,
-                        (StagedBlob(name="capture", digest=digest, byte_len=len(content)),),
-                    )
-                    txn.insert_record("tx1", spec_referencing(content))
-                    with pytest.raises(ProtocolError):
-                        store.open_blob(digest)
+    with store_on() as binding, open_store(binding) as store, store.create_workspace("tx1") as workspace:
+        stage(workspace, "capture", content)
+        with store.transaction() as txn:
+            txn.promote_staging(
+                workspace,
+                (StagedBlob(name="capture", digest=digest, byte_len=len(content)),),
+            )
+            txn.insert_record("tx1", spec_referencing(content))
+            with pytest.raises(ProtocolError):
+                store.open_blob(digest)
 
 
 def _release_after(monkeypatch, module, name, binding, occurrence, release=close_binding):
@@ -6073,15 +6712,14 @@ def test_the_gate_runs_before_promotions_staging_rmdir(store_on, monkeypatch, re
             _release_after(
                 monkeypatch, binding.backend.__class__, "flush_directory", binding, 2, release
             )
-            with pytest.raises(ProtocolError):
-                with store.transaction() as txn:
-                    txn.promote_staging(
-                        workspace,
-                        (StagedBlob(
-                            name="capture", digest=digest_of(content), byte_len=len(content)
-                        ),),
-                    )
-                    txn.insert_record("tx1", spec_referencing(content))
+            with pytest.raises(ProtocolError), store.transaction() as txn:
+                txn.promote_staging(
+                    workspace,
+                    (StagedBlob(
+                        name="capture", digest=digest_of(content), byte_len=len(content)
+                    ),),
+                )
+                txn.insert_record("tx1", spec_referencing(content))
             workspace.close()
             store.close()
             with child_dir(root_fd, "staging") as staging_fd:
@@ -6123,13 +6761,12 @@ def test_the_gate_runs_between_the_eexist_hash_and_the_source_unlink(store_on, m
             return result
 
         monkeypatch.setattr(blobs_module, "verify_leaf", release_on_the_destination_hash)
-        with pytest.raises(ProtocolError):
-            with store.transaction() as txn:
-                txn.promote_staging(
-                    workspace,
-                    (StagedBlob(name="capture", digest=digest, byte_len=len(content)),),
-                )
-                txn.insert_record("tx1", spec_referencing(content))
+        with pytest.raises(ProtocolError), store.transaction() as txn:
+            txn.promote_staging(
+                workspace,
+                (StagedBlob(name="capture", digest=digest, byte_len=len(content)),),
+            )
+            txn.insert_record("tx1", spec_referencing(content))
         assert "capture" in os.listdir(workspace._staging_fd)
         workspace.close()
         store.close()
@@ -6167,12 +6804,11 @@ def test_the_gate_runs_before_creations_openat(store_on):
     from atoms.store.connection import open_store
     from tests.store_support import metadata_root_snapshot
 
-    with store_on() as binding:
-        with metadata_root_snapshot(binding) as root_fd:
-            binding.__exit__(None, None, None)
-            with pytest.raises(ProtocolError):
-                open_store(binding)
-            assert "atoms.db" not in os.listdir(root_fd)
+    with store_on() as binding, metadata_root_snapshot(binding) as root_fd:
+        binding.__exit__(None, None, None)
+        with pytest.raises(ProtocolError):
+            open_store(binding)
+        assert "atoms.db" not in os.listdir(root_fd)
 
 
 def test_the_gate_runs_before_creations_fchmod(store_on, monkeypatch):
@@ -6187,13 +6823,12 @@ def test_the_gate_runs_before_creations_fchmod(store_on, monkeypatch):
     from atoms.store.connection import create_store
     from tests.store_support import metadata_root_snapshot
 
-    with store_on() as binding:
-        with metadata_root_snapshot(binding) as root_fd:
-            _release_after(monkeypatch, os, "open", binding, 1)
-            with pytest.raises(ProtocolError):
-                create_store(binding)
-            assert "atoms.db" in os.listdir(root_fd)
-            assert os.stat("atoms.db", dir_fd=root_fd).st_size == 0
+    with store_on() as binding, metadata_root_snapshot(binding) as root_fd:
+        _release_after(monkeypatch, os, "open", binding, 1)
+        with pytest.raises(ProtocolError):
+            create_store(binding)
+        assert "atoms.db" in os.listdir(root_fd)
+        assert os.stat("atoms.db", dir_fd=root_fd).st_size == 0
 
 
 def test_the_gate_runs_before_the_wal_transition(store_on, monkeypatch):
@@ -6259,17 +6894,16 @@ def test_the_gate_runs_before_the_repair_chmod(store_on, monkeypatch, release):
 
     previous = os.umask(0o277)
     try:
-        with store_on() as binding:
-            with metadata_root_snapshot(binding) as root_fd:
-                fd = os.open(
-                    "atoms.db", os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_RDWR, 0o400,
-                    dir_fd=root_fd,
-                )
-                os.close(fd)
-                _release_after(monkeypatch, os, "open", binding, 1, release)
-                with pytest.raises(ProtocolError):
-                    reopen_store(binding)
-                assert stat.S_IMODE(os.stat("atoms.db", dir_fd=root_fd).st_mode) == 0o400
+        with store_on() as binding, metadata_root_snapshot(binding) as root_fd:
+            fd = os.open(
+                "atoms.db", os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_RDWR, 0o400,
+                dir_fd=root_fd,
+            )
+            os.close(fd)
+            _release_after(monkeypatch, os, "open", binding, 1, release)
+            with pytest.raises(ProtocolError):
+                reopen_store(binding)
+            assert stat.S_IMODE(os.stat("atoms.db", dir_fd=root_fd).st_mode) == 0o400
     finally:
         os.umask(previous)
 ```
@@ -6301,7 +6935,14 @@ def list_unindexed_blobs(store: Store) -> tuple[str, ...]:
     """The digests whose leaf exists with no blob row (design §7.3).
 
     A deferred read is enough: the result is advisory, since removal re-checks.
+
+    Liveness first, before the enumeration rather than at the read transaction inside it.
+    `_read_transaction` would refuse a closed store eventually, but only after this had
+    already opened `blobs/sha256/` and listed it — work a closed store has no business
+    doing, and the reason criterion 16's after-close suite asserts the message rather
+    than only the type.
     """
+    store._require_live()
     parent = blobs_fd(store)
     try:
         leaves = sorted(os.listdir(parent))
@@ -6641,9 +7282,13 @@ def _module_bindings(tree: ast.Module) -> list[tuple[str, ast.expr]]:
                 for target in node.targets
                 if isinstance(target, ast.Name)
             )
-        elif isinstance(node, ast.AnnAssign) and node.value is not None:
-            if isinstance(node.target, ast.Name):
-                bindings.append((node.target.id, node.value))
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and node.value is not None
+            and isinstance(node.target, ast.Name)
+        ):
+            # One condition, not a nested `if`: ruff's SIM102 refuses the nested form.
+            bindings.append((node.target.id, node.value))
     return bindings
 
 
@@ -6752,17 +7397,71 @@ PERMITTED_SQL_LOOPS: dict[str, tuple[int, ...] | None] = {
 }
 
 
-def _literal_iterated_names(tree: ast.Module, owner, scope) -> set[str]:
+def _module_level_names(tree: ast.Module) -> set[str]:
+    """Names bound at module level: assignments and imports, nothing from a function body."""
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            names.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+        elif isinstance(node, ast.Import | ast.ImportFrom):
+            names.update((a.asname or a.name).split(".")[0] for a in node.names)
+    return names
+
+
+def _names_bound_in(scope: ast.FunctionDef) -> set[str]:
+    """Every name `scope` rebinds: parameters, assignment and loop targets, `with … as`,
+    `except … as`, walrus, comprehension targets, and function-local imports.
+
+    Checking a loop iterable's **spelling** is not resolving it. This passes a guard that
+    checks only the spelling:
+
+        def hostile(connection, SCHEMA_STATEMENTS):
+            for statement in SCHEMA_STATEMENTS:
+                connection.execute(statement)
+
+    — the iterable is named like the package's DDL tuple and is a caller-supplied
+    sequence. So a permitted loop's iterable must be a **module-level binding of this
+    file** and unshadowed in the scope that iterates it; either failing grants nothing.
+
+    Nested functions are walked too, so their bindings count as shadows of the enclosing
+    scope. That refuses marginally more than Python's scoping rules require — the safe
+    direction for a guard whose entire job is to be conservative.
+    """
+    arguments = scope.args
+    names = {
+        arg.arg
+        for group in (arguments.posonlyargs, arguments.args, arguments.kwonlyargs)
+        for arg in group
+    }
+    names.update(a.arg for a in (arguments.vararg, arguments.kwarg) if a is not None)
+    for node in ast.walk(scope):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            names.add(node.id)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            names.add(node.name)
+        elif isinstance(node, ast.alias):
+            names.add((node.asname or node.name).split(".")[0])
+    return names
+
+
+def _literal_iterated_names(
+    tree: ast.Module, owner, scope, module_level: set[str]
+) -> set[str]:
     """Names bound **inside `scope`** by iterating one of the two named module-level
-    literal structures.
+    literal structures — where the iterable **resolves** to that structure.
 
     An earlier draft admitted the target of *any* module-level literal loop anywhere in
     the module, which is not a resolution twice over: it made every loop variable in the
     file a permitted SQL source -- `name` and `expected` from the pragma tuple included
     -- and it leaked the permission across function boundaries into any parameter that
-    happened to share a name. `for x in build_them()` and `for x in cursor` were already
-    refused; this refuses the rest.
+    happened to share a name. A later one narrowed to the two named iterables but still
+    matched on spelling alone, so a parameter called `SCHEMA_STATEMENTS` carried the
+    permission with it. `for x in build_them()` and `for x in cursor` were already
+    refused; these two conditions refuse the rest.
     """
+    shadowed = _names_bound_in(scope)
     bound: set[str] = set()
     for node in ast.walk(tree):
         if not isinstance(node, ast.For) or not isinstance(node.iter, ast.Name):
@@ -6770,6 +7469,8 @@ def _literal_iterated_names(tree: ast.Module, owner, scope) -> set[str]:
         if owner.get(node) is not scope:
             continue
         if node.iter.id not in PERMITTED_SQL_LOOPS:
+            continue
+        if node.iter.id not in module_level or node.iter.id in shadowed:
             continue
         positions = PERMITTED_SQL_LOOPS[node.iter.id]
         if positions is None:
@@ -6795,6 +7496,26 @@ def test_every_permitted_sql_loop_iterable_exists():
         for name, _value in _module_bindings(_tree(path))
     }
     assert declared <= bound, sorted(declared - bound)
+
+
+SHADOWED_ITERABLE = """
+def hostile(connection, SCHEMA_STATEMENTS):
+    for statement in SCHEMA_STATEMENTS:
+        connection.execute(statement)
+"""
+
+
+def test_a_shadowed_permitted_iterable_grants_nothing():
+    """Criterion 37: the iterable must **resolve** to the module-level literal, not merely
+    be spelled like it. Here it is a caller-supplied parameter, and the loop target must
+    therefore carry no permission at all -- not even when the same name is also bound at
+    module level, which is the case the shadow check exists for.
+    """
+    tree = ast.parse(SHADOWED_ITERABLE)
+    owner = _scope_of(tree)
+    scope = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef))
+    assert _literal_iterated_names(tree, owner, scope, _module_level_names(tree)) == set()
+    assert _literal_iterated_names(tree, owner, scope, {"SCHEMA_STATEMENTS"}) == set()
 
 
 def _parameters_fed_only_constants(
@@ -6859,6 +7580,7 @@ def test_every_execute_argument_resolves_to_a_module_level_constant(path):
     """
     tree = _tree(path)
     owner = _scope_of(tree)
+    module_level = _module_level_names(tree)
     module_constants = _package_names(path)
     parameters = _parameters_fed_only_constants(tree, module_constants)
     for node in ast.walk(tree):
@@ -6878,7 +7600,7 @@ def test_every_execute_argument_resolves_to_a_module_level_constant(path):
         scope = owner.get(node)
         allowed = set(module_constants)
         if scope is not None:
-            allowed |= _literal_iterated_names(tree, owner, scope)
+            allowed |= _literal_iterated_names(tree, owner, scope, module_level)
             allowed |= parameters.get(scope.name, set())
         where = "module level" if scope is None else scope.name
         assert first.id in allowed, (
@@ -7020,14 +7742,17 @@ def test_the_store_attribute_set_is_exactly_the_documented_surface():
     enforceable": `promote_staging` being unreachable outside a transaction is a claim
     about what `Store` does *not* have, and no behavioural test can assert the absence of
     a method nobody named.
+
+    Stated over `STORE_SURFACE`, the same tuple criterion 16's after-close suite is
+    parametrized on. Written out twice, a method could be added to §7.1 and to `Store`
+    and tested nowhere for the property criterion 16 requires; written once, it cannot.
     """
     from atoms.store import Store
+    from tests.store_support import STORE_SURFACE
 
     assert {name for name in dir(Store) if not name.startswith("_")} == {
-        "transaction", "read_record", "read_active", "open_blob",
-        "list_unindexed_blobs", "remove_unindexed_blob", "create_workspace",
-        "reopen_workspace", "list_workspaces", "remove_workspace", "close",
-    }
+        name for name, _arguments in STORE_SURFACE
+    } | {"close"}
 
 
 def test_the_transaction_attribute_set_is_exactly_the_documented_surface():
@@ -7061,6 +7786,101 @@ def test_the_workspace_attribute_set_is_exactly_the_documented_surface():
     assert {name for name in dir(Workspace) if not name.startswith("_")} == {
         "txid", "staging_fd", "work_fd", "close",
     }
+
+
+def _annotations(tree: ast.Module):
+    """Every annotation expression: parameters, returns, and annotated assignments.
+
+    One `annotation` variable rather than three `yield`s, because two of the branches
+    would otherwise be identical bodies and ruff's SIM114 refuses that.
+    """
+    for node in ast.walk(tree):
+        annotation = None
+        if isinstance(node, ast.AnnAssign | ast.arg):
+            annotation = node.annotation
+        elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            annotation = node.returns
+        if annotation is not None:
+            yield annotation
+
+
+def _identifiers(tree: ast.Module) -> set[str]:
+    """Every name the module *uses* — bare names, attribute tails, import aliases, and
+    the contents of **string annotations**.
+
+    Deliberately not the source text. A docstring that explains why a name is banned
+    must not trip the ban, which is the same reason `executescript` is checked over
+    parsed calls rather than by grep.
+
+    String annotations are the case a walk over `ast.Name` alone misses: measured, this
+    passed an otherwise-complete version of this check —
+
+        def sneak(spec: "ProjectApprovedSpec") -> None: ...
+
+    — because a quoted annotation is an `ast.Constant`. They are parsed *only in
+    annotation position*; parsing every string constant would read docstrings and SQL as
+    expressions, and a docstring explaining the ban would then trip it.
+    """
+    names: set[str] = set()
+
+    def collect(node: ast.AST) -> None:
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.Name):
+                names.add(inner.id)
+            elif isinstance(inner, ast.Attribute):
+                names.add(inner.attr)
+
+    collect(tree)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import | ast.ImportFrom):
+            names.update(alias.name for alias in node.names)
+            names.update(alias.asname for alias in node.names if alias.asname)
+    for annotation in _annotations(tree):
+        for inner in ast.walk(annotation):
+            if isinstance(inner, ast.Constant) and isinstance(inner.value, str):
+                try:
+                    collect(ast.parse(inner.value, mode="eval"))
+                except SyntaxError:
+                    continue
+    return names
+
+
+@pytest.mark.parametrize("path", SOURCES, ids=lambda p: p.name)
+def test_no_module_accepts_a_project_approved_spec(path):
+    """Criterion 40, ledger #9's enforcement half.
+
+    A5a is a mechanism. It takes a `ProjectBinding` and a `TransactionSpec`; A4b-2's
+    `ProjectApprovedSpec` is the *judgment*, and A5b owns requiring it at the entry
+    points. Naming the type here at all — imported, annotated, or `isinstance`-checked —
+    would let a reader conclude the enforcement lives at this layer. It does not, and
+    ledger #9 stays open until A5b closes it. An absence is not testable behaviourally,
+    which is why it is asserted statically.
+    """
+    used = _identifiers(_tree(path))
+    assert "ProjectApprovedSpec" not in used
+    assert "approve_for_project" not in used
+
+
+def test_no_production_module_outside_the_package_imports_the_store():
+    """Criterion 41: A5a ships with no consumer, and that is asserted rather than assumed.
+
+    Until A5b lands, an `atoms.*` module importing `atoms.store` would be the composition
+    root arriving early, in a sub-plan that does not own it. Broader than criterion 38's
+    `fs`/`core` rule, which fixes the dependency *direction*; this one says nothing at all
+    depends on the package yet. Tests are consumers on purpose and are not scanned — the
+    claim is about production code.
+    """
+    root = Path(atoms.__file__).parent  # type: ignore[name-defined]
+    offenders = sorted(
+        str(path.relative_to(root))
+        for path in root.rglob("*.py")
+        if not str(path).startswith(str(PACKAGE))
+        and any(
+            name == "atoms.store" or name.startswith("atoms.store.")
+            for name in _imported_modules(_tree(path))
+        )
+    )
+    assert offenders == [], offenders
 
 
 @pytest.mark.parametrize("path", SOURCES, ids=lambda p: p.name)
@@ -7182,19 +8002,18 @@ def main(project_root: str, metadata_root: str, txid: str) -> int:
         allowlist = build_test_allowlist(lock, project_root, STORAGE)
         with bind_project_volume(
             project_root, lock, allowlist=allowlist, storage=STORAGE
-        ) as binding:
-            with open_store(binding) as store:
-                record = store.read_record(txid)
-                if record is None:
-                    raise SystemExit(f"no record for txid {txid!r}")
-                blobs = {}
-                for digest, byte_len in referenced_digests(record.spec):
-                    fd = store.open_blob(digest)
-                    try:
-                        blobs[digest] = len(os.read(fd, byte_len + 1))
-                    finally:
-                        os.close(fd)
-                active = store.read_active()
+        ) as binding, open_store(binding) as store:
+            record = store.read_record(txid)
+            if record is None:
+                raise SystemExit(f"no record for txid {txid!r}")
+            blobs = {}
+            for digest, byte_len in referenced_digests(record.spec):
+                fd = store.open_blob(digest)
+                try:
+                    blobs[digest] = len(os.read(fd, byte_len + 1))
+                finally:
+                    os.close(fd)
+            active = store.read_active()
     print(json.dumps({
         "spec": canonical_json(record.spec),
         "state": record.state.value,
@@ -7285,15 +8104,14 @@ def test_a_committed_record_never_names_a_missing_blob(store_on):
     content = b"referenced"
     digest = digest_of(content)
     with store_on() as binding:
-        with open_store(binding) as store:
-            with store.create_workspace("tx1") as workspace:
-                stage(workspace, "capture", content)
-                with store.transaction() as txn:
-                    txn.promote_staging(
-                        workspace,
-                        (StagedBlob(name="capture", digest=digest, byte_len=len(content)),),
-                    )
-                    txn.insert_record("tx1", spec_referencing(content))
+        with open_store(binding) as store, store.create_workspace("tx1") as workspace:
+            stage(workspace, "capture", content)
+            with store.transaction() as txn:
+                txn.promote_staging(
+                    workspace,
+                    (StagedBlob(name="capture", digest=digest, byte_len=len(content)),),
+                )
+                txn.insert_record("tx1", spec_referencing(content))
         with open_store(binding) as reopened:
             record = reopened.read_record("tx1")
             assert record is not None
@@ -7434,6 +8252,33 @@ results never closed.
 | The typed boundary was not total: the setters read `.value` before validating, and the diagnostic decoder accepted wrong primitives and raised raw `TypeError` on a non-iterable `journals` | `require_member` gates every enum argument first — including the `CommitDecision.COMMITTED` / `TransactionState.COMMITTED` pair the CHECK lists cannot separate — and the decoder validates every field's shape. The durable-enum half needed no code: `PRAGMA quick_check` reports a violated CHECK (measured under `ignore_check_constraints`) and runs on every reopen, so `TransactionState(state_value)` cannot meet a non-member. That is proved by a test rather than asserted (Tasks 4, 6, 7; criteria 42, 43) |
 | Task gates still could not pass: Task 1's `__init__.py` imported later modules, the fixture guard ran `del decorator_name` inside a function, and several assertions touched a closed binding | the `__init__` placeholder is unconditional and Task 12 fills it, with the reason stated (importing a submodule runs the parent package); `del decorator_name` is gone, along with the now-unused import; `raw_path` captures the path while the binding is alive and `metadata_root_snapshot` duplicates the descriptor |
 
+**What the sixteenth review found, and what changed.** Each was reproduced before it was closed.
+
+| Finding | Closure |
+| --- | --- |
+| The diagnostic codec refused its own encoder's output: `HaltDiagnostic.effect_id` is `str \| None` and `DiagnosticEntry.has_unmodeled_child` is `bool \| None`, both routed through the non-null helpers — measured, **both** builders in `every_diagnostic_shape()` fail | `_optional_text` and `_optional_flag`: null passes, everything else still goes through the strict helper, so `{"effect_id": 7}` and `{"has_unmodeled_child": "yes"}` refuse. Both are now parametrized cases (Task 6; design §6.4) |
+| The cross-row matrix covered five load corruptions and essentially one write rule, against a design that asks for every §7.6 rule to fail independently on both sides | every finding is tagged with a `RULE_*` constant, `COHERENCE_RULES` names all twelve, and `test_the_cross_row_matrix_covers_every_rule_on_both_sides` asserts the read table is total and that the write table plus `WRITE_UNREACHABLE_RULES` is. Fifteen read cases and nine write cases, each **measured to produce exactly one finding**. The two-txid rollback case is written out (Task 8; design §7.6, §11.2, criterion 23) |
+| `remove_workspace` spent neither descriptor until the whole operation succeeded, so a failure between the two `rmdir`s returned a live anchor on a directory that was gone | each half is spent at its own `rmdir`. Measured on the stale anchor: `listdir` succeeds, `fstat` gives `st_nlink == 0`, `openat(O_CREAT)` and `mkdirat` fail `ENOENT`, and the retry's `rmdir` fails `ENOENT` — a raw `FileNotFoundError` out of the store. Spending immediately leaves the work-only row of §8.3's table, which a retry finishes (Task 9; design §8.3, criterion 30) |
+| Promotion leaked raw `ELOOP`: the staged-source preflight and §8.2's `EEXIST` destination opened `O_NOFOLLOW` without translating a symlink refusal | one `open_entry_nofollow` performs the open and the translation on all four paths, `open_blob` included. Measured: `renameat2(RENAME_NOREPLACE)` onto a symlink returns `EEXIST`, so that branch is reachable, and the `O_NOFOLLOW` open then fails `ELOOP` as a bare `OSError` (Tasks 10, 11; design §8.5, criteria 25, 28) |
+| The SQL whitelist matched a permitted iterable's **spelling**, so `def hostile(connection, SCHEMA_STATEMENTS)` passed | the iterable must be a module-level binding of the file *and* unshadowed in the scope that iterates it. Re-exercised against the hostile package: **seventeen** planted defects refused — the eleven from round fifteen plus a shadowed parameter, a local rebinding, a shadowed `_CONNECTION_PRAGMAS`, and three `ProjectApprovedSpec` shapes — with the real package clean (Task 13; criterion 37) |
+| Criteria 16, 40, and 41 were unarmed: only `transaction()` was tested after `close()`, and neither architecture assertion existed | `STORE_SURFACE` lives in `store_support.py` and is read by **both** the after-close suite and the attribute-set assertion, so a method added to `Store` cannot skip either. `test_no_module_accepts_a_project_approved_spec` and `test_no_production_module_outside_the_package_imports_the_store` are written out, the first over an identifier set that parses string annotations — a hole in my own first draft, which `def sneak(spec: "ProjectApprovedSpec")` walked straight through (Tasks 12, 13; criteria 16, 40, 41) |
+| The plan's `__all__` order contradicted the design's, and the introduction said five modules while describing six | the **design** changed on both counts: its tuple failed the project's own lint gate — measured, `RUF022: __all__ is not sorted`, with ruff's fix producing the plan's order — and its §4.1 table was missing `errors.py`, which Task 2 creates. The plan's prose now says six |
+
+Three things beyond the findings as stated. `initialize_schema` and `list_unindexed_blobs` were
+repaired while adjacent code was: the first had the same COMMIT-outside-the-guard shape closed in the
+fifteenth review, the second enumerated `blobs/sha256/` before checking liveness. A rationale
+repeated in five places was measured false — an `openat` through an unlinked directory does **not**
+"produce files no path can ever name"; it fails `ENOENT`. The reason for spending a half is the
+disposition table, not that claim, and both documents now say so.
+
+And the plan would not have passed its own lint gate. Every Python fence was extracted and run
+through this project's ruff: **56 `SIM117`** (a `pytest.raises` wrapping a bare
+`with store.transaction():` — nearly every task's tests), **8 `B018`** (a `pytest.raises` body that
+only reads an anchor), and **3 `PYI034`** (`__enter__` annotated with the class name rather than
+`Self`, which the design's own sketch did too). All are fixed, the rule is recorded in the Global
+Constraints, and the extraction now leaves only `I001` — the documented transient, confirmed to be
+about `atoms.store` not existing yet rather than about the ordering this plan writes.
+
 **Placeholder scan.** Clean. Every step that says "write this" carries the code. The nine-site gate
 inventory in Task 12 was briefly a parametrized case with a `raise AssertionError` body; it is now six
 named tests with real bodies and a stated technique — release the lock *after* occurrence k of the
@@ -7461,6 +8306,24 @@ and the conditional was hiding the fact that `binding.__exit__()` never released
 - `_scope_of(tree) -> dict[ast.AST, ast.FunctionDef | None]` and
   `_parameters_fed_only_constants(tree, allowed) -> dict[str, set[str]]` in the architecture guard:
   both keyed so a resolution cannot escape the function it was computed for.
+  `_literal_iterated_names(tree, owner, scope, module_level: set[str]) -> set[str]` takes the
+  module-level binding set as its fourth argument, which is what turns a spelling match into a
+  resolution; `_module_level_names(tree)` and `_names_bound_in(scope)` supply the two halves.
+  `_identifiers(tree) -> set[str]` and `_annotations(tree)` back criterion 40, the second existing so
+  that only annotation-position strings are parsed — parsing every string constant would read
+  docstrings as expressions and make a docstring explaining the ban trip it.
+- `_optional_text(obj, key) -> str | None` and `_optional_flag(obj, key) -> bool | None` in
+  `records.py` delegate to `_text`/`_flag` for everything that is not `None`, so admitting null does
+  not admit anything else.
+- `COHERENCE_RULES: tuple[str, ...]` and the twelve `RULE_*` constants are module-level in
+  `records.py`, and `_finding(rule: str, detail: str) -> str` is the only way a finding is built.
+  Constants rather than literals at the call sites: a misspelling is then a `NameError` at import
+  rather than a tag no matcher will ever meet.
+- `Workspace._spend_work()` mirrors `_spend_staging()`; only `remove_workspace` calls it, because
+  promotion never touches that half.
+- `open_entry_nofollow(parent_fd: int, name: str, what: str) -> int` — `blobs.py`. Named for the entry
+  rather than "regular" to keep it distinct from `Backend.open_regular_nofollow`, which takes no
+  message and translates nothing.
 - `verify_leaf(fd: int, digest: str, byte_len: int | None) -> int` — `None` only from
   `remove_unindexed_blob`, where an orphan has no row to supply one.
 - `coherence_findings(connection, txid) -> tuple[str, ...]` returns findings; the two call sites raise
@@ -7482,12 +8345,18 @@ and the conditional was hiding the fact that `binding.__exit__()` never released
 - `spec_referencing(*contents: bytes)`, `child_dir`, `stage`, `digest_of`, `file_state`,
   `one_effect_spec`, `replace_spec`, `duplicate_effect_spec`, `two_length_spec`, `raw_connect`,
   `raw_path`, `release_lock`, `close_binding`, `RELEASES`, `metadata_root_snapshot`,
-  `open_descriptor_count`, `CommitFails`, `matching_diagnostic`, and `every_diagnostic_shape` all live
+  `open_descriptor_count`, `CommitFails`, `matching_diagnostic`, `every_diagnostic_shape`,
+  `non_compiling_spec`, `commit_record`, and `STORE_SURFACE` all live
   in `tests/store_support.py` and are imported by name; none carries a leading underscore, since all
   are cross-module. `spec_referencing` is variadic because promotion is a batch and a two-blob manifest
-  needs a two-reference record. `RELEASES` in particular lives there rather than in a test module
-  because `@pytest.mark.parametrize` reads it at decoration time, and two different test files
-  parametrize over it.
+  needs a two-reference record. `RELEASES` and `STORE_SURFACE` in particular live there rather than in
+  a test module because `@pytest.mark.parametrize` reads them at decoration time, and in both cases
+  two different test files read the same tuple — `STORE_SURFACE` is read by the after-close suite in
+  `test_store_liveness.py` and by the attribute-set assertion in `test_store_architecture.py`, which
+  is what keeps criteria 16 and 37 stated over one list.
+  `commit_record(store, binding, txid, spec)` inserts the `blob` rows `referenced_digests` reports
+  before committing, because a record referencing a digest with no row cannot be committed at all —
+  the barrier is the same predicate.
 
 **Import direction.** `connection.py` imports `workspace.py` and `blobs.py` for its delegating methods,
 so those two import `gate` from `connection.py` *inside function bodies*. That is deliberate and Task 9

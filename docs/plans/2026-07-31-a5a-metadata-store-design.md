@@ -160,6 +160,7 @@ capability and path resolution, and is already fourteen modules.
 | --- | --- |
 | `schema.py` | DDL text, `SCHEMA_VERSION`, `APPLICATION_ID`, the enum-derived CHECK clauses, and the expected `(type, name, tbl_name, sql)` catalog (§5.2). Pure — no I/O, no `sqlite3` connection. |
 | `connection.py` | Creation, reopen, the pinned profile and its verification, the authorizer, liveness, and transaction ownership — `_StoreTransaction` and its spent/active rules (§7). |
+| `errors.py` | `MetadataStoreInvalid`, the two result codes §9.1 translates, and the one narrow translation context manager. Its own module because `connection.py`, `records.py`, `blobs.py`, and `workspace.py` all raise it, and putting it in any of them would make the other three import that one for an exception type. |
 | `records.py` | Typed row read/write, §7.6's coherence predicate — used by both the loader and the pre-COMMIT check — and the private `HaltDiagnostic` codec. |
 | `blobs.py` | The digest-to-leaf mapping, promotion, pre-existing-blob verification, the flush sequence. |
 | `workspace.py` | The `Workspace` resource, `staging/<txid>/` and `work/<txid>/` creation, reopening, enumeration, and durable removal, and §5.5's name validation. |
@@ -691,7 +692,7 @@ the stale-object-into-a-later-transaction case.
 ### 7.1 The public surface
 
 ```python
-__all__ = ("Store", "StoredRecord", "StagedBlob", "Workspace", "open_store")
+__all__ = ("StagedBlob", "Store", "StoredRecord", "Workspace", "open_store")
 
 def open_store(binding: ProjectBinding) -> Store: ...
 
@@ -726,6 +727,11 @@ class StagedBlob:
     digest: str                                # "sha256:<64 hex>" (§5.5)
     byte_len: int
 ```
+
+`__all__` is sorted because the toolchain requires it, not as a style preference: an earlier draft
+listed `Store` first, and ruff's default rule set refuses that — `RUF022: __all__ is not sorted`,
+measured, with ruff's own fix producing exactly the tuple above. A design whose stated surface fails
+the project's lint gate is a design the plan cannot implement literally.
 
 Record *writes* live on `_StoreTransaction`, not on `Store`. That placement makes a write hard to reach
 without a transaction; the checks above make it *impossible*. `Store` keeps what is genuinely
@@ -1293,7 +1299,7 @@ directory with its digest and byte length:
    manifest — a spec whose initial surface names no file has nothing to capture, so promotion removes
    the directory without removing any source — and spending on source removal alone would leave that
    workspace holding a descriptor to an unlinked directory, which is the exact state §8.3 spends the
-   half to prevent: `openat` from it still succeeds and produces files no path can ever name. Source
+   half to prevent. Source
    removal remains the threshold on the *failure* side (criterion 26), where the `rmdir` never runs.
 5. `backend.flush_directory` on `staging/`.
 
@@ -1410,7 +1416,7 @@ class Workspace:
     def work_fd(self) -> int: ...         # BORROWED; raises if closed
 
     def close(self) -> None: ...          # idempotent; closes both descriptors
-    def __enter__(self) -> Workspace: ...
+    def __enter__(self) -> Self: ...
     def __exit__(self, *exc: object) -> None: ...   # calls close()
 
     def _spend_staging(self) -> None: ...           # PRIVATE; §8.1 step 4 only
@@ -1542,6 +1548,16 @@ Both openers validate the txid (§5.5) first. Neither infers anything from the d
   3. `flush_directory` on `staging/<txid>/`, `rmdir` it, `flush_directory` on `staging/`; then `rmdir`
      `work/<txid>/` and flush `work/`, each preceded by the same gate.
 
+  **Each half is spent the instant its own `rmdir` lands**, not once the whole operation succeeds.
+  Removal mutates twice and can fail between them — the parent flush raises, or the gate before the
+  second `rmdir` refuses a lease that ended mid-operation — and a workspace that still reports a live
+  `staging_fd` for a directory that is gone contradicts the disposition table above. It also breaks
+  the retry: the second `remove_workspace` sees a live half, lists the unlinked directory
+  successfully, and `rmdir`s a name that no longer exists, raising a raw `FileNotFoundError` from
+  inside the store. Spending immediately leaves the partial state as the work-only row of the table —
+  legal, reopenable, and finishable by a retried removal — instead of a fourth state the table does
+  not describe.
+
   Splitting it that way is what makes §8.5's promise true. Validating each entry as it is unlinked
   satisfies the letter — every entry is checked — while an invalid entry discovered *last* leaves the
   earlier captures already destroyed and preserves an almost-empty directory as its evidence. That is
@@ -1582,9 +1598,11 @@ Both openers validate the txid (§5.5) first. Neither infers anything from the d
   misuse rather than durable-state corruption.
 - **Promotion spends the staging half, on every outcome once any source has been removed** — by a
   rename or by §8.2's `EEXIST` unlink. `promote_staging` closes `_staging_fd` and marks it spent, so
-  any later use raises. On success this is because §8.1 step 4 removed the directory; an open
-  descriptor to an unlinked directory is the dangerous kind of still-valid, since `openat` from it
-  succeeds and produces files no path can ever name.
+  any later use raises. On success this is because §8.1 step 4 removed the directory, and a descriptor
+  that outlives the directory it anchors contradicts the disposition table below, which says a half
+  not on disk reads as **spent**. Measured on such a descriptor: `listdir` still succeeds and `fstat`
+  reports `st_nlink == 0`, while `openat(O_CREAT)` and `mkdirat` through it fail `ENOENT` — so a
+  retained anchor turns every later use into a failure reported far from the removal that caused it.
 
   On **failure** it is spent for a stronger reason (§8.2): the batch is not replayable, so the
   workspace is evidence rather than a resource. `work_fd` is unaffected either way, and the workspace
@@ -1865,17 +1883,38 @@ state refuses with `MetadataStoreInvalid` too, so the two operations agree about
 readable. Against the earlier specification that test fails: promotion's rename succeeded and re-created
 the leaf, healing a state `open_blob` calls corruption.
 
-Every cross-row validation of §7.6, failed one at a time **on both sides**: a `spec_json` that
-`compile_spec` refuses; a missing `effect` row and an extra one; a mismatched variant; a `blob.byte_len`
-disagreeing with the referenced `FileState`; `rollback_result` present without `ROLLED_BACK` and absent
+Every cross-row validation of §7.6, failed one at a time: a `spec_json` that does not decode, one that
+is not its own canonical encoding, and one that `compile_spec` refuses; a missing `effect` row and an
+extra one; a mismatched variant; a referenced digest with no `blob` row and one whose `byte_len`
+disagrees with the referenced `FileState`; `rollback_result` present without `ROLLED_BACK` and absent
 with it; `halt_diagnostic` present without `HALTED` and absent with it; a diagnostic whose commit
-decision or journal vector disagrees with the row. Read-side by planting the row and loading it,
-asserting **`MetadataStoreInvalid`**; write-side (§7.7) by issuing the setters and reaching the
-transaction's exit, asserting **`ProtocolError`** — the exception types are asserted, not just that
-something raised, since one predicate serving two verdicts is exactly where they could collapse into
-one. The write-side cases also assert the transaction rolled back and the pre-transaction record is
-intact. Plus the write-side case with no read-side counterpart: a transaction that touches two txids
-where only the second is incoherent must roll back **both**.
+decision or journal vector disagrees with the row; an `active` row naming no record. Read-side by
+planting the row and loading it, asserting **`MetadataStoreInvalid`**; write-side (§7.7) by issuing the
+setters and reaching the transaction's exit, asserting **`ProtocolError`** — the exception types are
+asserted, not just that something raised, since one predicate serving two verdicts is exactly where
+they could collapse into one. The write-side cases also assert the transaction rolled back and the
+pre-transaction record is intact. Plus the write-side case with no read-side counterpart: a transaction
+that touches two txids where only the second is incoherent must roll back **both**.
+
+**The matrix is proved total rather than listed.** Each finding is tagged with the rule that produced
+it, drawn from a named inventory the predicate exports, so the read-side and write-side tables can
+assert that between them they name every rule — a rule added to the predicate with no case on either
+side fails the suite, and the inventory is asserted to hold exactly the rule constants the module
+defines, so a tag no matcher can ever meet fails it too. Tagging is what makes the claim checkable: the
+fragments a test would otherwise match on — `effect`, `variant`, `byte_len` — each appear in several
+messages, so a fragment assertion goes green on the wrong rule and a missing case looks covered. Each
+case is also measured to produce exactly **one** finding against an otherwise coherent record, so no
+assertion passes on a rule that fired first.
+
+**The two sides are not symmetric, and the asymmetry is stated rather than papered over.** Five rules
+are unreachable from the public write API by construction: `insert_record` writes `canonical_json` of
+an exact `TransactionSpec`, so no caller can store text that fails to decode or fails to re-encode; the
+same method derives every `effect` row and its variant from that spec, and no setter adds, drops, or
+retypes one; and `active.txid` is a real foreign key under `foreign_keys = ON`, so `set_active` on an
+unknown txid raises from the database long before the barrier. Those five are listed once, each beside
+the test that proves the property making it unreachable, and the totality assertion is over the union.
+Requiring a write-side case for them would mean reaching past the public surface to manufacture a state
+the surface cannot produce, which proves nothing about the barrier.
 
 **A failed read leaves no transaction open** (§7.4): after a load that raises — a planted non-canonical
 `spec_json`, then a planted §7.6 violation — assert `in_transaction` is false and that a following
@@ -1956,6 +1995,16 @@ hash to its stated digest, one whose length disagrees with `byte_len`, and one t
 a symlink, or a FIFO rather than a regular file. Without these a first-time promotion published an
 unverified blob, so each test is placed on a digest **not** already present, which is the path §8.2
 never covered.
+
+**The symlink sub-case is tested on every path that opens a name, because it is the one that never
+reaches the kind check.** A directory and a FIFO open with `O_RDONLY` and are refused by `S_ISREG`; a
+symlink fails at the open itself with `ELOOP` — measured, and as a bare `OSError` rather than a named
+subclass — so an untranslated open leaks a raw exception out of a path whose contract is
+`MetadataStoreInvalid`. That is three places, not one: the staged source, the already-indexed leaf
+verified in the preflight, and §8.2's pre-existing destination reached through `EEXIST`
+(`renameat2(RENAME_NOREPLACE)` onto a symlink returns `EEXIST`, measured, so that branch is
+reachable). One helper performs the open and the translation for all of them, and `open_blob` uses it
+too, so the refusal cannot be present on some paths and missing on others.
 
 Manifest preflight (§8.1 step 1), each case asserting **nothing moved** — the staging directory still
 holds every file and `blobs/sha256/` is unchanged: a manifest that is a `list` rather than a `tuple`; an
@@ -2316,7 +2365,10 @@ table shapes, and §11 refusal vocabulary (§3.3).
 23. §7.6's predicate covers `compile_spec` acceptance, effect coverage, variant consistency, blob
     `byte_len` agreement, `rollback_result` exactly for `ROLLED_BACK`, `halt_diagnostic` exactly for
     `HALTED`, diagnostic agreement with the durable row, active-record existence, and the four
-    malformed-encoding cases — each failing independently. `byte_len` agreement is checked against
+    malformed-encoding cases — each failing independently, each finding tagged with the rule that
+    produced it, and the read-side and write-side tables asserted to name **every** rule the predicate
+    can emit between them, with the rules the public write API cannot reach listed beside the test
+    that proves each unreachable. `byte_len` agreement is checked against
     **every** reference, so a spec declaring one digest at two lengths refuses rather than being
     silently reduced to whichever reference a map happened to keep — `compile_spec` accepts that spec,
     measured, so the store is where it is caught. A finding that depends on an earlier one holding —
@@ -2363,7 +2415,9 @@ table shapes, and §11 refusal vocabulary (§3.3).
     hex, with the mapping tested in both directions.
 30. Workspace directories are created and removed through guarded traversal from the retained
     descriptor, never by absolute path; removal is durable, reachable through `Store.remove_workspace`,
-    gated on liveness, and refuses a second call rather than being silently idempotent. A closed,
+    gated on liveness, refuses a second call rather than being silently idempotent, and **spends each
+    half at its own `rmdir`** rather than at the end, so a failure between the two mutations leaves one
+    of the three legal dispositions instead of a live anchor on a directory that is gone. A closed,
     forged, or foreign-store `Workspace` is refused by every operation that takes one. Removal
     **empties `staging/<txid>/`** rather than only `rmdir`ing it, so the ordinary pre-promotion crash
     survivor — a staging directory full of captures — is actually reclaimable and not merely
@@ -2417,6 +2471,19 @@ table shapes, and §11 refusal vocabulary (§3.3).
     `statement` **parameter** share a name, and a module-wide set hands the parameter the loop's
     permission before the call-site check that would have refused it ever runs. A parameter resolves
     only when every call site in its module passes an allowed name.
+    **The permitted iterable itself resolves by the same standard**: it must be a module-level binding
+    of the file *and* unshadowed in the scope that iterates it. Matching its spelling alone admits
+
+    ```python
+    def hostile(connection, SCHEMA_STATEMENTS):
+        for statement in SCHEMA_STATEMENTS:
+            connection.execute(statement)
+    ```
+
+    where the DDL tuple's name is a caller-supplied parameter and every statement in it is the
+    caller's. A local rebinding — `SCHEMA_STATEMENTS = build_them()` — is the same hole spelled
+    differently, so parameters, assignment and loop targets, `with`/`except` bindings, walrus targets,
+    and function-local imports all count as shadows.
     The inventory the rule is stated over descends into module-level literal containers: the pragma
     statements live inside a tuple of tuples, so an inventory of names bound *directly* to a string
     would omit them, and a `blob` writer hidden there would pass resolution and appear nowhere.
