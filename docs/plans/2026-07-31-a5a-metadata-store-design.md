@@ -739,14 +739,43 @@ staged half and false of the promoted half.
 Two operations close it, both minimal:
 
 - **`list_unindexed_blobs()`** returns the digests whose leaf exists under `blobs/sha256/` with no
-  `blob` row, by one anchored `scandir` reconciled against the index inside a read transaction. Leaves
-  that are not well-formed 64-character hex are reported too, under the digest string they would
-  imply — a stray file in an engine-owned directory is a survivor to reclaim, not something to skip.
+  `blob` row, by one anchored `scandir` reconciled against the index inside a deferred read
+  transaction. Its result is advisory — removal re-checks — so it needs no isolation stronger than any
+  other read.
+
+  **A leaf that is not well-formed 64-character hex is not returned. It raises `MetadataStoreInvalid`
+  and is left in place.** An earlier draft promised to report it "under the digest string it would
+  imply," which this API cannot express: the return type is digests, `remove_unindexed_blob` validates
+  its argument against §5.5's `sha256:[0-9a-f]{64}` grammar, and no string satisfying that grammar
+  names a leaf like `tmp.part`. The enumeration would have handed back a value its own removal refuses,
+  so the malformed leaf was unreclaimable either way. Raising is also the substantively correct answer
+  rather than a retreat to the cheap one. Every leaf under `blobs/sha256/` is created by §8.1 step 2
+  from a digest that already passed §5.5, so leaf names are fixed-width hex *by construction*, and
+  authority §7.3's genuine promoted orphans therefore always have valid names. A leaf that does not is
+  not a crash survivor: it is a foreign write into an engine-owned directory, which is exactly the
+  "cannot be safely interpreted" condition authority §11 gives `MetadataStoreInvalid`, and whose stated
+  response is to stop and preserve evidence — not to unlink something A5a cannot account for.
 - **`remove_unindexed_blob(digest)`** unlinks the leaf and flushes `blobs/sha256/`. It **re-checks
-  membership inside the same read transaction that authorizes the unlink and refuses an indexed
-  digest** with `ProtocolError`. That fail-closed direction is the whole safety property: the operation
-  can only ever delete something no record names, so a caller passing a stale digest from an earlier
-  enumeration destroys nothing.
+  membership and unlinks under one `BEGIN IMMEDIATE`**, refusing an indexed digest with
+  `ProtocolError`. That fail-closed direction is the whole safety property: the operation can only ever
+  delete something no record names, so a caller passing a stale digest from an earlier enumeration
+  destroys nothing.
+
+  **The exclusion must be `IMMEDIATE`, not the deferred read every other read takes.** A deferred
+  transaction under WAL fixes its snapshot at its first query and holds no write lock, so another
+  connection — and §7.4 already establishes that two `Store` objects may share one live
+  `ProjectBinding` — can insert and commit the blob row while the recheck still reads the older
+  snapshot. Measured: the writer's `COMMIT` succeeded, and the remover's re-read inside its own open
+  transaction still returned no row, which would unlink an indexed blob and defeat §13's criterion 34
+  at precisely the point that criterion exists to guarantee. Under `BEGIN IMMEDIATE` the same
+  interleaving blocks the writer with `SQLITE_BUSY` instead — also measured — so the recheck and the
+  unlink are one interval no commit can enter.
+
+  This does not contradict §7.4's deferred rule. That rule is about *reads*, which must not block
+  A5b's writer. This operation mutates the engine-owned namespace, so it is a writer itself and takes
+  a writer's lock — the same distinction §5.4 draws when it refuses to exempt `remove_workspace` from
+  the liveness gate. For the same reason it is refused inside this store's own write transaction, by
+  §5.4's no-nesting rule, where the `BEGIN IMMEDIATE` could not be taken at all.
 
 This is not the garbage collection §2.2 excludes. That non-goal cites authority §7.5, which is
 **terminal cleanup after `COMMITTED` is durable**, and turns on whether a live `transaction_record`
@@ -1254,8 +1283,8 @@ Reuses `atoms.core.errors` unchanged except for one addition.
 distinguishing them: a failed `quick_check`, a schema that does not match its version, a foreign
 database, a non-canonical `spec_json`, a blob whose bytes do not match its digest, an indexed digest
 whose leaf is missing or not a regular file (§7.2), a `blob` row whose `byte_len` contradicts verified
-content (§8.4), a sidecar surviving without its database (§5.1), and *an unknown future
-`user_version`*. A newer store is not corrupt — it is unreadable by this build — but both mean
+content (§8.4), a leaf under `blobs/sha256/` whose name is not well-formed hex (§7.3), a sidecar
+surviving without its database (§5.1), and *an unknown future `user_version`*. A newer store is not corrupt — it is unreadable by this build — but both mean
 "stop; do not interpret this," which is one caller response and therefore one exception. Folding either
 into `ProtocolError` would tell a consumer to fix its call when the correct action is to preserve
 evidence.
@@ -1525,9 +1554,15 @@ not `EEXIST`.
 Survivor reclamation (§7.3): a promoted-but-unindexed blob is reported by `list_unindexed_blobs` and
 removed by `remove_unindexed_blob`, with `blobs/sha256/` flushed; a blob that **is** indexed is refused
 by `remove_unindexed_blob` with `ProtocolError` and still exists afterwards — the fail-closed direction,
-tested with a digest that was indexed between enumeration and removal; and a stray non-hex leaf is
-reported rather than skipped. Run across a fresh process over a crash-cut fixture, since that is the
-situation the operations exist for.
+tested with a digest that was indexed between enumeration and removal; and a stray non-hex leaf makes
+`list_unindexed_blobs` raise `MetadataStoreInvalid`, with the leaf still present afterwards. Run across
+a fresh process over a crash-cut fixture, since that is the situation the operations exist for.
+
+Removal's exclusion is armed against a **second `Store` over the same binding**, not only against a
+stale argument: the writer inserts and commits the blob row *after* the remover's transaction has
+begun, and the assertion is that the leaf survives — whether because the remover's recheck sees the row
+and refuses, or because the writer waits on the write lock. A deferred read transaction passes the
+stale-argument test and fails this one, which is why they are separate tests.
 
 Workspaces (§8.3): creation, then `remove_workspace` removing both directories durably; removal after
 promotion, where `staging/<txid>/` is already gone; removal refused when `work/<txid>/` is non-empty; a
@@ -1584,7 +1619,9 @@ exit**, asserting that `ProtocolError` escapes, that the transaction was rolled 
 committed, and that `close()` still succeeds afterwards. The same shape on the read path: the lock
 released **during a load**, after the queries and before the record is returned, asserting that no
 `StoredRecord` reaches the caller and that the read transaction was rolled back (§7.4). The exemptions
-are asserted positively: `ROLLBACK`, `close()`, and `remove_workspace` all succeed on a dead binding.
+are asserted positively, and they are exactly §5.4's three: `ROLLBACK`, `Store.close()`, and
+`Workspace.close()` each succeed on a dead binding. `remove_workspace` is **not** among them — its
+refusal is asserted above, under removal's gate.
 
 ### 11.5 Tier 5 — fresh process
 
@@ -1743,8 +1780,11 @@ table shapes, and §11 refusal vocabulary (§3.3).
     transaction.
 34. `list_unindexed_blobs` and `remove_unindexed_blob` make authority §7.3's pre-COMMIT orphan blobs
     reclaimable, so §8.2's preserved-evidence claim covers both halves of a failed batch. Removal
-    re-checks membership under the same read transaction and refuses an indexed digest, so it can never
-    delete content a record names.
+    re-checks membership and unlinks under one `BEGIN IMMEDIATE` and refuses an indexed digest, so it
+    can never delete content a record names — proved against a second `Store` that commits the row
+    after the recheck's transaction begins, an interleaving a deferred read transaction fails. A leaf
+    that is not well-formed hex is never returned as a digest: `list_unindexed_blobs` raises
+    `MetadataStoreInvalid` and preserves it.
 35. `insert_blobs` is idempotent on an identical digest and `byte_len`, and raises
     `MetadataStoreInvalid` when an existing row's `byte_len` contradicts verified content.
 36. `atoms.fs` and `atoms.core` import nothing from `atoms.store`.
