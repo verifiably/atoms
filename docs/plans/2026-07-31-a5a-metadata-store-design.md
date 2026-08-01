@@ -145,7 +145,7 @@ capability and path resolution, and is already fourteen modules.
 | `connection.py` | Creation, reopen, the pinned profile and its verification, the authorizer, liveness, and transaction ownership — `_StoreTransaction` and its spent/active rules (§7). |
 | `records.py` | Typed row read/write, §7.5's coherence predicate — used by both the loader and the pre-COMMIT check — and the private `HaltDiagnostic` codec. |
 | `blobs.py` | The digest-to-leaf mapping, promotion, pre-existing-blob verification, the flush sequence. |
-| `workspace.py` | The `Workspace` value, `staging/<txid>/` and `work/<txid>/` creation and durable removal, and §5.5's name validation. |
+| `workspace.py` | The `Workspace` resource, `staging/<txid>/` and `work/<txid>/` creation, reopening, enumeration, and durable removal, and §5.5's name validation. |
 
 The `HaltDiagnostic` codec starts as private helpers in `records.py` and is not exported. A3 owns the
 semantic value; A5a owns its durable encoding. It moves to `store/diagnostic.py` only if `records.py`
@@ -356,10 +356,15 @@ write transaction to raise faster would leave the database locked with uncommitt
 owner. For the same reason, **`ROLLBACK` and `close` remain available after the binding or lock
 dies**: they are how a dead session releases what it holds, and gating them would strand it.
 
-**Rollback and close are the only exemptions.** Reads gate too. A read taken without the lock is a
-read of a volume another process may be recovering, and A5b's whole purpose is to *act* on what it
-reads — an unlocked read that looks live is worse than a refusal, because it becomes the premise of a
-decision. So the rule is exactly: every operation gates, except the two that release.
+**Rollback and descriptor or connection close are the only exemptions.** Reads gate, and so does every
+operation that mutates the engine-owned namespace — `remove_workspace` issues `rmdir` and flushes, which
+is a durable mutation that could race the next lease owner, not a release (§8.3).
+
+A read taken without the lock is a read of a volume another process may be recovering, and A5b's whole
+purpose is to *act* on what it reads — an unlocked read that looks live is worse than a refusal, because
+it becomes the premise of a decision. So the rule is exactly: **every operation gates except `ROLLBACK`,
+`Store.close`, and `Workspace.close`** — the three that give something up rather than take or change
+something.
 
 Nested transactions are refused with `ProtocolError` rather than mapped to savepoints. A5b chooses
 one barrier per lease step; a nested `BEGIN` would mean two callers each believe they own the
@@ -561,6 +566,8 @@ class Store:                                   # context manager
     def read_active(self) -> StoredRecord | None: ...
     def open_blob(self, digest: str) -> int: ...
     def create_workspace(self, txid: str) -> Workspace: ...
+    def reopen_workspace(self, txid: str) -> Workspace: ...
+    def list_workspaces(self) -> tuple[str, ...]: ...
     def remove_workspace(self, workspace: Workspace) -> None: ...
     def promote_staging(self, workspace: Workspace,
                         manifest: tuple[StagedBlob, ...]) -> None: ...
@@ -656,15 +663,48 @@ planned blob," which is a read of blob bytes during recovery. Without an operati
 only route is to rebuild `blobs/sha256/<hex>` itself, and then the mapping is no longer private and a
 second copy of it can drift.
 
-`open_blob(digest) -> int` is the whole surface: validate the digest against §5.5, open the leaf from
-the retained `blobs/sha256/` descriptor with `O_RDONLY | O_NOFOLLOW | O_CLOEXEC`, require a regular
-file, and return the descriptor. A missing blob raises `MetadataStoreInvalid` — a record's digest
-naming no file is durable state that cannot be interpreted, not a caller error.
+`open_blob(digest) -> int` is the whole surface, and it does three things in this order.
 
-It deliberately does **not** verify the content. `open_blob` is on the hot path of a comparison that is
-itself streaming the bytes, and re-hashing every open would double that work to answer a question the
-caller is already answering. §8.2's verification exists where the decision to trust a pre-existing blob
-is actually made. A5a returns the descriptor and states the limit rather than implying a guarantee.
+**1. Index membership, before the filesystem.** The `blob` row is looked up first, and the two ways it
+can be absent are different questions with different answers:
+
+| Row | Leaf | Verdict |
+| --- | --- | --- |
+| absent | either | `ProtocolError` — the caller named content this store does not index |
+| present | absent, or not a regular file | `MetadataStoreInvalid` — the index references a blob that is not there |
+| present | present | Continue to step 2 |
+
+An earlier draft opened by digest alone and called every miss `MetadataStoreInvalid`. Both halves of
+that were wrong. A syntactically valid digest that was never stored is an invalid *request* against a
+perfectly healthy store — reporting it as a store that "cannot be safely interpreted" would send A5b
+into evidence preservation over an empty database, which is the substitution authority §11 forbids
+(§9). And opening by leaf alone would happily return an **orphan** blob: promotion precedes the COMMIT
+that references it (authority §7.3 step 4), so a crash in between leaves promoted blobs "with no
+referencing row" — the authority's words — which are scratch awaiting reclamation, not durable record
+knowledge. Membership is what separates the two, and only the index carries it.
+
+**2. Content verification, before the descriptor is trusted.** The leaf is opened from the retained
+`blobs/sha256/` descriptor with `O_RDONLY | O_NOFOLLOW | O_CLOEXEC`, `fstat`ed for kind and length
+against the row's `byte_len`, then streamed to completion and hashed; a SHA-256 that is not the digest
+raises `MetadataStoreInvalid`. The descriptor is then `lseek`'d back to zero and returned, so the
+caller reads from the start.
+
+An earlier draft skipped this on the grounds that the caller is already streaming the bytes. That does
+not hold, and it costs the engine a refusal it has promised. Authority §11 lists "a blob whose bytes do
+not match its digest" as a `MetadataStoreInvalid` condition, and A5a is the only layer positioned to
+detect it — but the caller's own read cannot substitute, because authority §10's use is a **file prefix
+relation**, which stops at the first difference or at the shorter length and never reaches EOF. A
+truncated or tampered blob whose surviving head matches the live file would pass a prefix comparison
+and be treated as an authentic preimage. Verification here is not duplicated work; it answers a
+question the caller's read structurally cannot.
+
+The cost is real and stated plainly: `open_blob` reads the blob once before the caller reads it again.
+§8.2's verification is the same check at the other end of the blob's life, where the decision to trust
+a *pre-existing* file is made; this one guards every subsequent read of it. If a future profiling
+result makes the double read unacceptable, the fix is a caller-supplied verified-stream API, not a
+silent removal of the guarantee.
+
+**3. Ownership transfers.** The returned descriptor is the caller's to close (§7.1).
 
 ### 7.3 Reads take one snapshot
 
@@ -701,9 +741,24 @@ boundary — the same reasoning as §7.6's gate before COMMIT, and the same shap
 release. A failure raises `ProtocolError` after the rollback.
 
 This does not make `read_record` a *write* path, and the transaction it opens is A5a's own, not one
-A5b may nest into — `transaction()` still refuses to nest (§5.4). A read issued while this store's own
-write transaction is open reuses that transaction's snapshot instead of opening a second one, and
-therefore neither begins nor ends a transaction it does not own.
+A5b may nest into — `transaction()` still refuses to nest (§5.4).
+
+**A public read issued while this store owns a write transaction raises `ProtocolError`.** An earlier
+draft had it reuse the open transaction's snapshot, which reads reasonably and is wrong: that snapshot
+includes the caller's own uncommitted writes, so the value returned is not durable state. Two concrete
+failures follow, and they point in opposite directions:
+
+- the setters are independent (§7.6), so mid-sequence the record is *legitimately* incoherent —
+  `ROLLED_BACK` set, its result not set yet. A read there would run §7.5's predicate over a state the
+  caller is halfway through building and report `MetadataStoreInvalid` about a store with nothing
+  wrong with it;
+- or the sequence is complete and coherent, the read returns a `StoredRecord`, and the transaction
+  then rolls back. A5b would be holding a record of something that never happened.
+
+`read_record` and `read_active` mean *what is durable*. Refusing is the smallest contract that keeps
+that true, and no consumer needs the alternative: A5b writes what it just decided, so it already knows
+it. §7.6's pre-COMMIT validation still reads inside the transaction — that is internal, it is
+explicitly checking uncommitted state, and it returns a finding rather than a `StoredRecord`.
 
 ### 7.4 Effect order is reconstructed, never queried
 
@@ -847,8 +902,17 @@ directory with its digest and byte length:
    `name` and `digest` pass §5.5, and `byte_len` is exactly `int` — not `bool`, which is an `int`
    subclass — and non-negative. Across elements, **source names are unique**: two entries naming the
    same file would rename it once and then fail `ENOENT` on the second, mid-batch. Duplicate *digests*
-   under different names are allowed and resolve through §8.2, since that is ordinary content
-   addressing rather than a malformed manifest.
+   under different names are allowed, since that is ordinary content addressing rather than a
+   malformed manifest — but they must agree on `byte_len` (§8.4), because two lengths for one digest
+   are two incompatible descriptions of a single content-addressed object.
+
+   **Completeness is checked here too, not at step 4.** One descriptor-anchored `scandir` of
+   `staging/<txid>/` yields its exact entry set, which must equal the manifest's names — no omission,
+   no entry naming a file that is not there. Deferring this to step 4's emptiness requirement was the
+   original mistake: by then every listed source has already moved, so an omitted file is discovered
+   only after the batch is half-executed and no longer replayable. The emptiness check stays as the
+   invariant it always was, but it should now be unreachable as a first detector, and §11.4 asserts
+   that the omission case fails at step 1 with the staging directory untouched.
 
    Each failure raises `ProtocolError` — the manifest is the caller's argument, not durable state.
    `insert_blobs` validates each `StagedBlob` by the same rules for the same reason: its values become
@@ -889,6 +953,32 @@ source is unlinked and promotion continues. **On a mismatch the staged source is
 `MetadataStoreInvalid` is raised — the staged bytes are the good copy, and destroying them to tidy up
 after a corrupt blob would discard the only recovery material.
 
+**A batch that fails after its first rename is not retryable, and A5a does not pretend otherwise.**
+An earlier draft promised that a failed promotion left the workspace usable, so the caller could
+resolve the mismatch and call again. That promise cannot be kept. `transfer_noclobber` is
+`renameat2(..., RENAME_NOREPLACE)` (`linux.py:54`), and replaying an entry that already moved fails
+**`ENOENT`** — the source is gone — not `EEXIST`. Measured against the repository's own backend. So a
+second call would not resume the batch; it would fail on the first already-promoted entry, with an
+errno that says nothing about what actually happened.
+
+The design follows the fact rather than patching around it. Once the first rename has run, a failure
+leaves the workspace in a **mixed** state — some blobs published, some files still staged — and:
+
+- the workspace is **spent** (§8.3), so a second `promote_staging` raises `ProtocolError` rather than
+  producing that `ENOENT`;
+- the surviving staged files and the promoted blobs are **preserved evidence**, not garbage. Neither is
+  reachable from a committed record, because promotion precedes the COMMIT that would reference it
+  (authority §7.3 step 4). This is exactly the shape the authority already names: a crash before that
+  COMMIT "leaves only mutation-free orphan scratch on the filesystem (`staging/`, `work/`, promoted
+  blobs with no referencing row)," which "recovery reclaims ... under the lock, regardless of count."
+  A failed promotion produces the same shape as a crash at the same point, so it needs no second
+  disposal mechanism — `list_workspaces` and `reopen_workspace` (§8.3) are what A5b reclaims it with.
+
+Preflighting the manifest completely (§8.1 step 1) is what keeps this rare: every failure A5a can
+foresee happens before anything moves. What remains here is the case A5a genuinely cannot foresee —
+a pre-existing blob whose bytes are wrong — and for that, stopping with the evidence intact is the
+correct outcome, not a retry.
+
 ### 8.3 Workspaces
 
 `staging/<txid>/` and `work/<txid>/` are created and removed through A4a's guarded traversal from the
@@ -906,8 +996,10 @@ record that it changed.
 class Workspace:
     """A live resource: two directory descriptors and their spent flags.
 
-    Created only by Store.create_workspace. Every descriptor it holds is OWNED;
-    the metadata_root descriptor it was opened from is borrowed and stays A4a's.
+    Created only by Store.create_workspace or Store.reopen_workspace. Both
+    descriptors it holds are OWNED by it and closed by close(); every descriptor
+    it EXPOSES is borrowed — a consumer must never close one. The metadata_root
+    descriptor it was opened from is borrowed in turn and stays A4a's.
     """
 
     __slots__ = ("_staging_fd", "_store", "_txid", "_work_fd")
@@ -917,48 +1009,124 @@ class Workspace:
     @property
     def txid(self) -> str: ...            # validated by §5.5 before either mkdirat
 
+    @property
+    def staging_fd(self) -> int: ...      # BORROWED; raises if spent or closed
+    @property
+    def work_fd(self) -> int: ...         # BORROWED; raises if closed
+
     def close(self) -> None: ...          # idempotent; closes both descriptors
     def __enter__(self) -> Workspace: ...
     def __exit__(self, *exc: object) -> None: ...   # calls close()
 ```
 
-**The descriptors are private.** A5a needs them; no caller does — the operations that use them are
-`promote_staging`, `remove_workspace`, and A6's writes through paths A5a hands out. Exposing
-`staging_fd` publicly would put a descriptor A5a closes into a caller's hands, which is the mistake
-`ProjectBinding`'s "every descriptor it exposes is BORROWED — a consumer must never close one" warns
-about, in the harder direction. `_store` is likewise private and used only for the identity check
-below. The token guard follows `ProjectBinding.__init__` (`binding.py:90`), along with its refusals of
-copy, deepcopy, and pickle: a copied workspace would duplicate descriptor ownership.
+**The descriptors are exposed, as borrowed anchors.** An earlier draft made them private on the
+reasoning that no caller needs them. That was wrong, and it made the workspace unusable for its actual
+consumers:
 
-- **`create_workspace(txid)`** validates the txid (§5.5), creates both directories, opens both
-  descriptors, and returns the `Workspace`. It is the only constructor.
+- authority §7.3 step 1 has A6 "streaming each captured file into `staging/<txid>/`", from the same
+  descriptor the file was opened through (authority §6, Guarantee 3). A5a cannot perform that write —
+  it does not know what is being captured — and A6 cannot perform it without an anchor.
+- authority §9.5 requires A7 to construct and publish `CreateDirectory.WORK` out of `work/<txid>/`, and
+  to prove it absent at `DONE`.
+
+Neither is expressible through create/remove/promote alone. A5a owns the *namespace*; the layers above
+own what goes in it, and an anchor is exactly the minimum that lets both be true. Handing back a path
+instead would defeat the point, since the whole reason these are descriptors is that a path is
+re-resolved.
+
+Ownership is the borrow contract A4a already uses, in its words: **owned by the workspace, borrowed by
+the consumer, never closed by the consumer** (`binding.py:81`). Reading a spent or closed descriptor
+raises `ProtocolError` rather than returning an integer that still indexes something. The token guard
+follows `ProjectBinding.__init__` (`binding.py:90`), with its refusals of copy, deepcopy, and pickle: a
+copied workspace would duplicate descriptor ownership. `_store` stays private — it exists only for the
+identity check below, and no consumer has a use for it.
+
+**Reopening is a separate operation from creating.** A fresh process after a crash finds
+`staging/<txid>/` and `work/<txid>/` already on disk, and until now had no way to reach them:
+`create_workspace` is the only constructor and `remove_workspace` demands a live `Workspace`, so
+authority §7.3's "recovery reclaims the scratch ... under the lock" had no mechanism under it.
+
+- **`create_workspace(txid)`** requires both directories to be **absent** and creates them. It never
+  adopts an existing one. Adoption would be the silent kind of convenient: a surviving
+  `staging/<txid>/` is evidence about a previous attempt, and quietly reusing it would bypass the
+  occupancy question ledger #7 makes A5b answer, turning a decision into a side effect of a
+  constructor.
+- **`reopen_workspace(txid)`** requires both to be **present** and opens them. It is the recovery path
+  and says so: it adopts nothing that was not already there, and creates nothing.
+- **`list_workspaces()`** returns the txids having a `staging/` or `work/` directory, read by one
+  descriptor-anchored `scandir` of each parent. It is how A5b enumerates survivors "regardless of
+  count." A5a reports what exists; **which** survivors are orphans and what becomes of them is A5b's
+  judgment, exactly as §8.3's closing paragraph says of *when*.
+
+Both openers validate the txid (§5.5) first. Neither infers anything from the directories' contents.
+
 - **`remove_workspace(workspace)`** removes both directories and flushes both parents, then closes the
   workspace. This is the method §8.3 promised and §7.1 did not have; without it "removes it when asked"
-  was unimplementable through the public surface, and a caller would have had to reach past A5a to the
-  descriptors A5a owns. `promote_staging` already removes `staging/<txid>/` (§8.1), so
-  `remove_workspace` tolerates that directory being gone and requires `work/<txid>/` to be empty —
-  refusing rather than recursing, since A5a does not know what a non-empty work directory means.
-- **Both operations verify the workspace before touching the filesystem**: it must be exactly
+  was unimplementable through the public surface. `promote_staging` already removes `staging/<txid>/`
+  (§8.1), so `remove_workspace` tolerates that directory being gone and requires `work/<txid>/` to be
+  empty — refusing rather than recursing, since A5a does not know what a non-empty work directory
+  means.
+
+  **It gates on liveness, and it is not idempotent.** An earlier draft exempted it alongside `close`,
+  on the reasoning that it releases. That conflated two different acts: `close` releases a descriptor
+  this process holds, while `remove_workspace` issues `rmdir` and directory flushes — durable
+  mutations of an engine-owned namespace. Running one after the lock is released is precisely the race
+  authority §7.1's universal lease exists to prevent, since the next lease owner may already be
+  reclaiming the same survivor. §5.4's original rule was right: **only rollback and descriptor or
+  connection close are exempt.**
+
+  Not idempotent, because the two rules cannot both hold: a removed workspace is closed, and a closed
+  workspace is refused. So a second `remove_workspace` raises `ProtocolError` — one stated behavior
+  rather than a contradiction between two bullets. `Workspace.close()` remains idempotent, which is
+  where a caller's `finally` belongs.
+- **Every operation verifies the workspace before touching the filesystem**: it must be exactly
   `Workspace`, not closed, and `workspace._store is self`. Two stores may share one binding (§7.3), so a
   workspace from another store carries descriptors into the wrong lifetime — its issuer may close them
-  underneath. A forged or closed workspace raises `ProtocolError`; a foreign one does too, since all
-  three are caller misuse rather than durable-state corruption.
-- **Promotion spends the staging half.** On success `promote_staging` closes `_staging_fd` and marks it
-  spent, because §8.1 step 4 removed the directory it refers to. An open descriptor to an unlinked
-  directory is the dangerous kind of still-valid: `openat` from it succeeds and produces files no path
-  can ever name, and `mkdirat` from it fails `ENOENT` for a reason that reads like a bug elsewhere. The
-  workspace stays usable for `work/<txid>/` alone.
-- **A second `promote_staging` on the same workspace raises `ProtocolError`**, which is the spent flag
-  doing its job. It is a plausible call — a retry after a failure that was not promotion's — and
-  without the check it would operate inside the removed directory rather than refusing.
+  underneath. A forged, closed, or foreign workspace raises `ProtocolError`, all three being caller
+  misuse rather than durable-state corruption.
+- **Promotion spends the staging half, on every outcome once the first rename has run.**
+  `promote_staging` closes `_staging_fd` and marks it spent, so any later use raises. On success this
+  is because §8.1 step 5 removed the directory; an open descriptor to an unlinked directory is the
+  dangerous kind of still-valid, since `openat` from it succeeds and produces files no path can ever
+  name.
 
-  The flag is set only on **success**. A promotion that raised left the staging directory in place by
-  §8.2's rule, and the retry that the caller then makes must be allowed to work.
-- **`close()` and `remove_workspace` are idempotent and never gate on liveness**, for §7.7's reason:
-  they release, and a workspace whose binding died must still be closable.
+  On **failure** it is spent for a stronger reason (§8.2): the batch is not replayable, so the
+  workspace is evidence rather than a resource. `work_fd` is unaffected either way, and the workspace
+  stays usable for `work/<txid>/`.
+- **`Workspace.close()` is idempotent and does not gate on liveness**, for §7.7's reason: it releases
+  descriptors this process opened, and a workspace whose binding died must still be closable.
 
 A5a creates a workspace when asked and removes it when asked. **When** either happens is A5b's, and the
 re-resolution ledger #19 requires before creating scratch is A5b's.
+
+### 8.4 Indexing a blob that is already indexed
+
+`blob.digest` is a primary key, so a plain re-insert raises `IntegrityError`. That would make the
+ordinary case an error: content addressing means two transactions capturing identical bytes produce one
+digest, and authority §7.3 step 4 says preparation inserts "any **new** `blob` index rows" — the word
+already assumes some are not new. Leaving this unstated would have pushed A5b into either catching an
+integrity error as control flow or tracking which digests it had inserted before.
+
+**`insert_blobs` is idempotent on the digest, and strict on the length.** For each entry:
+
+| Existing row | Action |
+| --- | --- |
+| none | Insert. |
+| same `byte_len` | No-op — the row already says exactly this. |
+| different `byte_len` | `MetadataStoreInvalid`. |
+
+The last row is not a caller error, which is why it is not `ProtocolError`. A SHA-256 determines its
+content, and content determines its length, so a disagreement means one of the two is not what it
+claims. A5a can tell which: the caller's `byte_len` was verified against the actual file during
+promotion (§8.1 step 2, §8.2), so it is the **stored row** that contradicts the bytes on disk. That is
+durable state that cannot be safely interpreted, and it is one of the shapes §9 already lists.
+
+Within a single manifest, repeated digests must carry the same `byte_len` too, checked in §8.1 step 1
+and raising `ProtocolError` there — that one *is* a caller error, since both descriptions arrived in
+the same argument and A5a has no basis to prefer either.
+
+Implementation is `ON CONFLICT(digest) DO NOTHING` after the length comparison, not instead of it:
+`DO NOTHING` alone would silently accept the contradicting row and discard the disagreement.
 
 ## 9. Error contract
 
@@ -967,15 +1135,16 @@ Reuses `atoms.core.errors` unchanged except for one addition.
 | Raised | When |
 | --- | --- |
 | `CapabilityUnavailable` | SQLite < 3.37; `TEMP_STORE=0`; a pinned pragma that would not take. |
-| `ProtocolError` | Caller misuse: a wrong exact type, a name or manifest failing §5.5 or §8.1, a record operation outside an explicit transaction, a spent or foreign `_StoreTransaction` or `Workspace`, a use after `close`, a rejected pre-COMMIT record (§7.6), a closed binding or released lock. |
+| `ProtocolError` | Caller misuse: a wrong exact type, a name or manifest failing §5.5 or §8.1, a record operation outside an explicit transaction, a public read while a write transaction is open (§7.3), an unindexed digest (§7.2), a spent or foreign `_StoreTransaction` or `Workspace`, a use after `close`, a rejected pre-COMMIT record (§7.6), a closed binding or released lock. |
 | `MetadataStoreInvalid` | **New.** The durable store cannot be safely interpreted. |
 | `OSError` | Propagated. No blanket handler; §11.6 extends the existing guard to the new package. |
 | `sqlite3.Error` | Narrowly translated where it means corruption; otherwise propagated (§9.1). |
 
 `MetadataStoreInvalid(AtomsError)` covers both corruption and incompatibility, with the message
 distinguishing them: a failed `quick_check`, a schema that does not match its version, a foreign
-database, a non-canonical `spec_json`, a blob whose bytes do not match its digest, a record digest
-naming no blob (§7.2), a sidecar surviving without its database (§5.1), and *an unknown future
+database, a non-canonical `spec_json`, a blob whose bytes do not match its digest, an indexed digest
+whose leaf is missing or not a regular file (§7.2), a `blob` row whose `byte_len` contradicts verified
+content (§8.4), a sidecar surviving without its database (§5.1), and *an unknown future
 `user_version`*. A newer store is not corrupt — it is unreadable by this build — but both mean
 "stop; do not interpret this," which is one caller response and therefore one exception. Folding either
 into `ProtocolError` would tell a consumer to fix its call when the correct action is to preserve
@@ -1001,8 +1170,17 @@ Translation is **narrow and by result code**, never by exception class:
 
 | Condition | Becomes |
 | --- | --- |
-| `SQLITE_CORRUPT` or `SQLITE_NOTADB`, during creation, reopen, or a load | `MetadataStoreInvalid`, with the original as `__cause__` |
+| `SQLITE_CORRUPT` or `SQLITE_NOTADB`, from **any** SQLite operation A5a issues | `MetadataStoreInvalid`, with the original as `__cause__` |
 | Everything else — `SQLITE_BUSY`, `SQLITE_READONLY`, `SQLITE_FULL`, `SQLITE_IOERR` | Propagated unchanged |
+
+**Any operation, not only the opening ones.** An earlier draft scoped this to creation, reopen, and
+loads, which contradicted its own criterion and, worse, its own definition. `SQLITE_CORRUPT` can
+surface from a setter's `UPDATE`, from a validation query inside §7.6, or from the COMMIT itself —
+SQLite discovers a damaged page when it reads or writes it, not when the file is opened. Propagating
+those raw would mean the same durable condition is `MetadataStoreInvalid` when a load finds it and a
+bare `OperationalError` when a write does. `MetadataStoreInvalid` is defined by the *state* it reports
+(§9), so the site that happens to notice cannot change the type. The COMMIT barrier is included
+explicitly, since it is where an unwritable page is most likely to be discovered.
 
 **The catch is `sqlite3.DatabaseError`, and it must be**, because that is the class SQLite raises for
 the condition being translated: reading a garbage file raises exactly `sqlite3.DatabaseError` —
@@ -1127,6 +1305,16 @@ is the one a caller retrying after an exception still holds.
 on a second connection over the same database returns a coherent record. Run against the interleaving
 that tore without a read transaction — `state` read before a commit, journal state after it.
 
+**A public read inside this store's own write transaction raises `ProtocolError`** (§7.3), tested at
+both the incoherent midpoint of a setter sequence and at a coherent one, since the two would otherwise
+fail differently — the first as a spurious `MetadataStoreInvalid`, the second by silently returning a
+record that the following rollback erases.
+
+**`insert_blobs` conflict semantics** (§8.4): re-inserting an identical digest and `byte_len` is a
+no-op leaving one row; a digest already indexed with a *different* `byte_len` raises
+`MetadataStoreInvalid`; and a single manifest carrying one digest with two lengths raises
+`ProtocolError` at §8.1's preflight.
+
 Every cross-row validation of §7.5, failed one at a time **on both sides**: a `spec_json` that
 `compile_spec` refuses; a missing `effect` row and an extra one; a mismatched variant; a `blob.byte_len`
 disagreeing with the referenced `FileState`; `rollback_result` present without `ROLLED_BACK` and absent
@@ -1155,7 +1343,10 @@ the raw query returns `a, m, z`.
 Error translation, by behavior rather than by grep (§9.1): a database truncated to garbage raising
 `MetadataStoreInvalid` — the `SQLITE_NOTADB` case, which arrives as `sqlite3.DatabaseError` itself with
 primary code 26 — and a `SQLITE_BUSY` or `SQLITE_READONLY` propagating **unchanged**, asserted on the
-exception's class *and* its `sqlite_errorcode`, not merely on "something raised." And a
+exception's class *and* its `sqlite_errorcode`, not merely on "something raised." Translation is
+covered on the **write** paths too, not only the opening ones: an injected `SQLITE_CORRUPT` from a
+setter's `UPDATE`, from a validation query, and from the COMMIT barrier itself, each yielding
+`MetadataStoreInvalid` — the assertion that would have caught the original scope error. And a
 `sqlite3.ProgrammingError`, which carries no `sqlite_errorcode`, reaching the translation site
 propagates rather than raising `AttributeError` from inside the handler.
 
@@ -1199,24 +1390,55 @@ refused before any `mkdirat` — asserted by the absence of the entry, not only 
 Manifest preflight (§8.1 step 1), each case asserting **nothing moved** — the staging directory still
 holds every file and `blobs/sha256/` is unchanged: a manifest that is a `list` rather than a `tuple`; an
 element that is not exactly `StagedBlob`; a bad name; a bad digest; a `byte_len` that is negative, a
-`bool`, or a `float`; and two entries naming the same source file. Each is placed **last** in an
-otherwise valid multi-entry manifest, since an invalid first entry would pass even without a preflight.
+`bool`, or a `float`; two entries naming the same source file; one digest given two lengths; **a
+manifest omitting a file present in the staging directory**; and one naming a file that is not there.
+Each is placed **last** in an otherwise valid multi-entry manifest, since an invalid first entry would
+pass even without a preflight. The omission case is the one that previously failed at step 4 with the
+batch already executed, so its assertion is specifically that every source file is still staged.
+
+Post-mutation failure (§8.2): a multi-entry manifest whose *last* entry hits a mismatching pre-existing
+blob. Assert the raise, that earlier entries stayed promoted and the remaining sources stayed staged,
+that the workspace is spent so a second `promote_staging` raises `ProtocolError`, and that
+`list_workspaces` reports the survivor — the reclamation path, since retry is impossible. A companion
+test pins the reason: replaying a promoted entry through `transfer_noclobber` raises `ENOENT`, not
+`EEXIST`.
 
 Workspaces (§8.3): creation, then `remove_workspace` removing both directories durably; removal after
 promotion, where `staging/<txid>/` is already gone; removal refused when `work/<txid>/` is non-empty; a
 closed workspace and a workspace belonging to a *different* `Store` over the same binding, each raising
-`ProtocolError` from both `remove_workspace` and `promote_staging`; and a forged `Workspace` refused by
-the construction token, plus refusals of copy, deepcopy, and pickle.
+`ProtocolError` from every operation that takes one; and a forged `Workspace` refused by the
+construction token, plus refusals of copy, deepcopy, and pickle.
+
+The access surface, which is what makes the workspace usable by A6 and A7: a file created and written
+through `staging_fd` lands in `staging/<txid>/` and promotes normally; a directory created through
+`work_fd` is visible under `work/<txid>/`; and reading either property after `close()`, or `staging_fd`
+after promotion, raises `ProtocolError` rather than returning a stale integer. A consumer closing a
+borrowed descriptor is out of contract and not tested — the contract is stated, as A4a states its own.
+
+Creation versus reopening: `create_workspace` refuses when either directory already exists, asserting
+it adopted nothing; `reopen_workspace` refuses when either is absent and otherwise returns working
+descriptors; `list_workspaces` reports a survivor created by a prior `Store` and, after
+`remove_workspace`, no longer reports it. The survivor case runs across a fresh process, since that is
+the situation the operations exist for.
+
+Removal's gate: `remove_workspace` after the lock is released raises `ProtocolError` and leaves both
+directories in place — the assertion that would have caught the earlier exemption — while
+`Workspace.close()` on the same dead binding still succeeds, and a second `remove_workspace` raises
+`ProtocolError` rather than being silently idempotent.
 
 Promotion's effect on the workspace: a second `promote_staging` on a promoted workspace raises
-`ProtocolError`; the staging descriptor is closed rather than left open on a removed directory; and
-after a promotion that *failed* under §8.2 the workspace is **not** spent, so the retry the caller makes
-next succeeds once the mismatch is resolved.
+`ProtocolError`, and the staging descriptor is closed rather than left open on a removed directory.
 
-Blob reading (§7.2): `open_blob` returns a readable descriptor whose bytes hash to the digest, refuses a
-digest failing §5.5 with `ProtocolError`, refuses a symlink at the leaf, and raises
-`MetadataStoreInvalid` for a digest with no blob. The caller closes the descriptor; the test asserts
-`Store.close()` does not close it, since ownership transfers (§7.1).
+Blob reading (§7.2), one test per row of its table: an unindexed digest raises `ProtocolError` **on an
+otherwise healthy store**, since that is the case the earlier draft mislabelled; an indexed digest whose
+leaf was removed, and one whose leaf is a symlink or a directory, each raise `MetadataStoreInvalid`; a
+promoted-but-unindexed orphan blob is **not** openable, which is what distinguishes membership from
+existence. A digest failing §5.5 raises `ProtocolError` before any lookup.
+
+Verification specifically: a blob truncated after indexing, and one whose bytes were substituted while
+keeping the length, both raise `MetadataStoreInvalid` — the truncation case with a **matching prefix**,
+so a prefix comparison would have accepted it. On success the returned descriptor reads from offset
+zero, and `Store.close()` does not close it, since ownership transfers (§7.1).
 
 Liveness: store operations after the binding is closed and after the lock is released, each raising
 `ProtocolError` — including `read_record` and `read_active`, since reads gate too (§5.4); and the case
@@ -1309,9 +1531,9 @@ table shapes, and §11 refusal vocabulary (§3.3).
     in the package.
 13. **Every** operation gates on `binding.backend`, reads included, and the gate runs again
     immediately before COMMIT; a lock released between the last write and the transaction's exit rolls
-    back and raises `ProtocolError`. The only exemptions are the operations that *release* — `ROLLBACK`,
-    `Store.close`, `Workspace.close`, and `remove_workspace` — each asserted to succeed after the
-    binding or lock dies.
+    back and raises `ProtocolError`. The only exemptions are `ROLLBACK`, `Store.close`, and
+    `Workspace.close`, each asserted to succeed after the binding or lock dies. `remove_workspace` is
+    **not** exempt: it mutates the engine-owned namespace and would race the next lease owner.
 14. `Store` exposes no `sqlite3.Connection`; record writes exist only on the private
     `_StoreTransaction` that `transaction()` yields, **and that object refuses use unless it is the
     store's current active transaction** — a retained object raises `ProtocolError` after both a commit
@@ -1319,7 +1541,8 @@ table shapes, and §11 refusal vocabulary (§3.3).
     raises `ProtocolError`. The exported surface is exactly `__all__`.
 15. Every read takes one SQLite snapshot, proved against a writer committing between the queries of a
     single load; every failing read rolls back before raising, leaving no open transaction, and gates
-    liveness again before returning a record.
+    liveness again before returning a record. A public read while this store owns a write transaction
+    raises `ProtocolError`, so no `StoredRecord` ever carries uncommitted state.
 16. `Store.close()` is idempotent, rolls back and spends any open transaction, and every operation
     after it raises `ProtocolError` rather than any `sqlite3` exception.
 17. Every `CHECK` enumeration is generated from its enum, asserted equal to the enum members.
@@ -1344,35 +1567,47 @@ table shapes, and §11 refusal vocabulary (§3.3).
     would persist an incoherent record rolls back and leaves the prior record intact, raising
     **`ProtocolError`** — never `MetadataStoreInvalid`, which authority §11 reserves for durable state
     that cannot be interpreted. A5a cannot commit a record its own loader would reject.
-25. `promote_staging` validates the entire manifest — element types, names, digests, exact
-    non-negative `int` lengths, and unique source names — **before the first rename**, so a rejected
-    manifest moves nothing; `insert_blobs` applies the same value rules. A manifest omitting a file
-    raises at the emptiness requirement rather than leaving an unremovable directory.
-26. Promotion returns only after `blobs/sha256/` and `staging/<txid>/` are flushed, the staging
+25. `promote_staging` validates the entire manifest **before the first rename** — element types,
+    names, digests, exact non-negative `int` lengths, unique source names, one length per digest, and
+    exact agreement with the staging directory's entry set — so a rejected manifest moves nothing. An
+    omission is caught there, not at the emptiness requirement, which stays as an invariant that
+    should never fire first. `insert_blobs` applies the same value rules.
+26. A promotion that fails after its first rename is **not** presented as retryable: the workspace is
+    spent, a second call raises `ProtocolError`, and the mixed state is reachable as preserved evidence
+    through `list_workspaces` and `reopen_workspace`. Replaying a promoted entry raises `ENOENT` under
+    `RENAME_NOREPLACE`, which is why.
+27. Promotion returns only after `blobs/sha256/` and `staging/<txid>/` are flushed, the staging
     directory is removed, and `staging/` is flushed.
-27. A pre-existing blob is verified by kind, length, and streamed SHA-256 before the staged source is
+28. A pre-existing blob is verified by kind, length, and streamed SHA-256 before the staged source is
     unlinked; on mismatch the staged source survives and `MetadataStoreInvalid` is raised.
-28. The `blob.digest` key is `sha256:<hex>` while the `blobs/sha256/` leaf is the bare 64-character
+29. The `blob.digest` key is `sha256:<hex>` while the `blobs/sha256/` leaf is the bare 64-character
     hex, with the mapping tested in both directions.
-29. Workspace directories are created and removed through guarded traversal from the retained
-    descriptor, never by absolute path; removal is durable and reachable through
-    `Store.remove_workspace`. A closed, forged, or foreign-store `Workspace` is refused by both
-    `remove_workspace` and `promote_staging`.
-30. `Workspace` is a token-guarded resource with private descriptors, not a frozen value. A successful
-    `promote_staging` closes and spends the staging half, a second promotion raises `ProtocolError`,
-    and a *failed* promotion leaves the workspace usable for the retry.
-31. `open_blob` is the only way to read a blob's bytes, so no later layer re-derives the digest-to-leaf
-    mapping; it validates the digest, refuses a symlink or non-regular leaf, raises
-    `MetadataStoreInvalid` for a missing blob, and transfers descriptor ownership to the caller.
-32. `atoms.fs` and `atoms.core` import nothing from `atoms.store`.
-33. A record committed in one process is read back identically in a fresh process.
-34. No `ProjectApprovedSpec` is accepted anywhere in `atoms.store`, so ledger #9's enforcement cannot
+30. Workspace directories are created and removed through guarded traversal from the retained
+    descriptor, never by absolute path; removal is durable, reachable through `Store.remove_workspace`,
+    gated on liveness, and refuses a second call rather than being silently idempotent. A closed,
+    forged, or foreign-store `Workspace` is refused by every operation that takes one.
+31. `Workspace` is a token-guarded resource, not a frozen value, and **exposes both directory
+    descriptors as borrowed anchors**, so A6 can stage captures and A7 can build `CreateDirectory.WORK`.
+    A spent or closed descriptor raises rather than returning a stale integer.
+32. `create_workspace` refuses an existing workspace and adopts nothing; `reopen_workspace` opens an
+    existing one and creates nothing; `list_workspaces` enumerates survivors, so a fresh process can
+    reach the scratch a crash left behind.
+33. `open_blob` is the only way to read a blob's bytes, so no later layer re-derives the digest-to-leaf
+    mapping. It requires an indexed digest — an unindexed one raises `ProtocolError` and an orphan blob
+    is not openable — verifies kind, length, and streamed SHA-256 before returning, rewinds to offset
+    zero, and transfers descriptor ownership. An indexed digest whose leaf is missing or not a regular
+    file raises `MetadataStoreInvalid`.
+34. `insert_blobs` is idempotent on an identical digest and `byte_len`, and raises
+    `MetadataStoreInvalid` when an existing row's `byte_len` contradicts verified content.
+35. `atoms.fs` and `atoms.core` import nothing from `atoms.store`.
+36. A record committed in one process is read back identically in a fresh process.
+37. No `ProjectApprovedSpec` is accepted anywhere in `atoms.store`, so ledger #9's enforcement cannot
     be satisfied at this layer by accident.
-35. No consumer of `atoms.store` exists yet, asserted rather than assumed.
-36. Every caller-supplied pathname component — txid, manifest leaf, digest — is validated against
+38. No consumer of `atoms.store` exists yet, asserted rather than assumed.
+39. Every caller-supplied pathname component — txid, manifest leaf, digest — is validated against
     §5.5 before any filesystem mutation, with exact types required and **`ProtocolError` raised**,
     never a bare `TypeError` or `SpecValidationError`.
-37. `SQLITE_CORRUPT` and `SQLITE_NOTADB` translate to `MetadataStoreInvalid` with the original as
+40. `SQLITE_CORRUPT` and `SQLITE_NOTADB` translate to `MetadataStoreInvalid` with the original as
     `__cause__`; every other `sqlite3.Error` propagates with its original class and code, asserted at
     runtime. The static guard bans `except sqlite3.Error` and bare `except:`, permits
     `except sqlite3.DatabaseError` because §9.1 requires it, and requires every such handler to
