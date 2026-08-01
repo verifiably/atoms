@@ -93,11 +93,13 @@ A5a discharges none of A5's seven. What it changes for each:
 
 Two:
 
-> **#22** — A5a's `promote_staging` returns only after the promoted blobs are durable, but nothing binds
-> that call to the `COMMIT` that references the digests. Admitted by the A5a store contract. First
-> owner: **A5b**. Required behavior: enforce authority §7.3's cross-substrate rule — every blob a record
-> references is durable on the filesystem before the COMMIT that references it — and prove it by a
-> fresh-process test that a committed record never names a missing blob. Verification: authority §13.4.
+> **#22** — A5a binds promotion to the COMMIT for blobs promoted through it (§8.1: `promote_staging` is
+> a `_StoreTransaction` method and the transaction refuses to COMMIT while a digest it promoted has no
+> row), but `insert_blobs` still accepts a digest this store never promoted, so nothing yet proves that
+> such a row's leaf exists. Admitted by the A5a store contract. First owner: **A5b**. Required behavior:
+> enforce authority §7.3's cross-substrate rule for the remaining path — every blob a record references
+> is durable on the filesystem before the COMMIT that references it — and prove it by a fresh-process
+> test that a committed record never names a missing blob. Verification: authority §13.4.
 
 > **#23** — A5a supplies `list_workspaces`, `reopen_workspace`, `remove_workspace`,
 > `list_unindexed_blobs`, and `remove_unindexed_blob`, but never invokes any of them: it holds no lease
@@ -583,11 +585,11 @@ class Store:                                   # context manager
     def reopen_workspace(self, txid: str) -> Workspace: ...
     def list_workspaces(self) -> tuple[str, ...]: ...
     def remove_workspace(self, workspace: Workspace) -> None: ...
-    def promote_staging(self, workspace: Workspace,
-                        manifest: tuple[StagedBlob, ...]) -> None: ...
     def close(self) -> None: ...
 
 class _StoreTransaction:                       # yielded by Store.transaction()
+    def promote_staging(self, workspace: Workspace,
+                        manifest: tuple[StagedBlob, ...]) -> None: ...
     def insert_record(self, txid: str, spec: TransactionSpec) -> None: ...
     def set_transaction_state(self, txid: str, state: TransactionState) -> None: ...
     def set_commit_decision(self, txid: str, decision: CommitDecision) -> None: ...
@@ -607,8 +609,14 @@ class StagedBlob:
 
 Record *writes* live on `_StoreTransaction`, not on `Store`. That placement makes a write hard to reach
 without a transaction; the checks above make it *impossible*. `Store` keeps what is genuinely
-transaction-free — open, close, reads, blob access, workspaces, and promotion, which is filesystem work
-with its own barrier (§8.1).
+transaction-free — open, close, reads, blob access, and workspace lifecycle.
+
+**`promote_staging` is on the transaction too, and an earlier draft had it on `Store`** on the
+reasoning that it is filesystem work with its own barrier. That reasoning was wrong in a way §8.1 now
+states in full: publishing a blob and inserting its `blob` row are two substrates, and any interval
+between them is a window in which the blob is on disk with nothing referencing it — indistinguishable,
+to a concurrent reclaimer, from an authority §7.3 crash orphan. Holding both inside one write
+transaction is what makes that window unobservable, and it costs no new lock.
 
 **`_StoreTransaction` is private and stays private.** It is absent from `__all__` because no caller
 constructs one or annotates against one — it is obtained only by entering `Store.transaction()`, used
@@ -754,28 +762,46 @@ Two operations close it, both minimal:
   authority §7.3's genuine promoted orphans therefore always have valid names. A leaf that does not is
   not a crash survivor: it is a foreign write into an engine-owned directory, which is exactly the
   "cannot be safely interpreted" condition authority §11 gives `MetadataStoreInvalid`, and whose stated
-  response is to stop and preserve evidence — not to unlink something A5a cannot account for.
+  response is to stop and preserve evidence — not to unlink something A5a cannot account for. §8.5
+  states the general rule this is one row of.
 - **`remove_unindexed_blob(digest)`** unlinks the leaf and flushes `blobs/sha256/`. It **re-checks
   membership and unlinks under one `BEGIN IMMEDIATE`**, refusing an indexed digest with
   `ProtocolError`. That fail-closed direction is the whole safety property: the operation can only ever
   delete something no record names, so a caller passing a stale digest from an earlier enumeration
   destroys nothing.
 
-  **The exclusion must be `IMMEDIATE`, not the deferred read every other read takes.** A deferred
-  transaction under WAL fixes its snapshot at its first query and holds no write lock, so another
-  connection — and §7.4 already establishes that two `Store` objects may share one live
-  `ProjectBinding` — can insert and commit the blob row while the recheck still reads the older
-  snapshot. Measured: the writer's `COMMIT` succeeded, and the remover's re-read inside its own open
-  transaction still returned no row, which would unlink an indexed blob and defeat §13's criterion 34
-  at precisely the point that criterion exists to guarantee. Under `BEGIN IMMEDIATE` the same
-  interleaving blocks the writer with `SQLITE_BUSY` instead — also measured — so the recheck and the
-  unlink are one interval no commit can enter.
+  **The exclusion must be `IMMEDIATE`, not the deferred read every other read takes — and `IMMEDIATE`
+  here is necessary without being sufficient.** A deferred transaction under WAL fixes its snapshot at
+  its first query and holds no write lock, so another connection — and §7.4 already establishes that
+  two `Store` objects may share one live `ProjectBinding` — can insert and commit the blob row while
+  the recheck still reads the older snapshot. Measured: the writer's `COMMIT` succeeded and the
+  remover's re-read inside its own open transaction still returned no row.
+
+  Escalating to `BEGIN IMMEDIATE` blocks that writer, but blocking is not excluding. If the writer had
+  already promoted the leaf and was waiting only to index it, the remover still sees no row, unlinks,
+  commits, and the writer then commits the row — measured as `writer_committed=True`, row present,
+  leaf absent. **What actually closes it is §8.1**: promotion moved inside the writer's own write
+  transaction, so no writer can be *between* publishing a leaf and indexing it while some other
+  connection holds the write lock. The two rules are one mechanism seen from its two ends, which is why
+  neither is sufficient alone, and why §11.4 tests the interleaving rather than the isolation level.
 
   This does not contradict §7.4's deferred rule. That rule is about *reads*, which must not block
   A5b's writer. This operation mutates the engine-owned namespace, so it is a writer itself and takes
   a writer's lock — the same distinction §5.4 draws when it refuses to exempt `remove_workspace` from
   the liveness gate. For the same reason it is refused inside this store's own write transaction, by
   §5.4's no-nesting rule, where the `BEGIN IMMEDIATE` could not be taken at all.
+
+  **The leaf is verified before it is unlinked, and an unverifiable one is preserved** (§8.5). It runs
+  §7.2's verification — the shared helper, not the public `open_blob`, which refuses inside a write
+  transaction and would refuse an unindexed digest anyway — with the one difference that an orphan has
+  no row to supply a `byte_len`, so the check is kind plus streamed SHA-256 against the name, and the
+  length follows from the hash. A well-formed name is not enough: a symlink, a directory, or a regular
+  file whose bytes do not
+  hash to its name is as impossible a product of promotion as a name that is not hex, and unlinking it
+  would destroy the only evidence of a foreign write. `MetadataStoreInvalid`, leaf intact. Refusing the
+  name while accepting any content under it was the asymmetry an earlier draft left. A leaf that is
+  already gone raises `ProtocolError` rather than `ENOENT` or a silent success, matching
+  `remove_workspace`'s non-idempotence (§8.3): the argument is stale and the caller re-enumerates.
 
 This is not the garbage collection §2.2 excludes. That non-goal cites authority §7.5, which is
 **terminal cleanup after `COMMITTED` is durable**, and turns on whether a live `transaction_record`
@@ -908,6 +934,15 @@ the still-open transaction. A failure **rolls back** and raises; nothing partial
 of touched txids is accumulated by the setters themselves, so the cost is proportional to what was
 written rather than to the store.
 
+**One more check runs in the same slot: every digest this transaction promoted must have a `blob` row**
+(§8.1). It is not a §7.6 rule — §7.6 is about rows agreeing with each other, and this is about the
+filesystem agreeing with the index — but it belongs at the same barrier for the same reason, and it is
+cheap: the transaction already knows which digests it promoted. Without it, a caller could promote in
+one transaction and index in the next, restoring exactly the observable promoted-but-unindexed steady
+state §8.1 exists to eliminate. Failing it raises `ProtocolError` and rolls back, which leaves the
+promoted blobs on disk as reclaimable orphans (§7.3) — the same disposition a crash at that point
+produces, rather than a second one.
+
 **The exit sequence is gate → validate → gate → COMMIT**, and the second gate is adjacent to the COMMIT
 with nothing between them. Validation runs `compile_spec` over every touched spec and re-reads rows; on
 a large transaction that is unbounded work, and a single gate *before* it would prove the lock was held
@@ -971,6 +1006,31 @@ rollback and that the retained object is spent; and each public method after clo
 Promotion is a **batch over a complete manifest**, not a per-file call. A singular `promote()` cannot
 honor authority §7.3 step 3: after the first file moves, `staging/<txid>/` still holds the others, so the call
 cannot remove the directory it promised to remove.
+
+**Promotion runs inside the caller's write transaction**, as a `_StoreTransaction` method, and the
+transaction refuses to COMMIT while any digest it promoted has no `blob` row (§7.7). Both halves of
+that rule exist for one reason: a promoted blob with no row is exactly authority §7.3's crash-orphan
+shape, so any *steady state* in which one exists is a state a concurrent reclaimer is entitled to
+delete.
+
+An earlier draft left promotion on `Store`, outside any transaction, and tried to close the resulting
+race inside §7.3 by escalating the reclaimer to `BEGIN IMMEDIATE`. That only moves the window. The
+promoting writer is blocked on the lock rather than excluded from the sequence, so the reclaimer's
+recheck still sees no row, unlinks the leaf, commits, and *then* the writer proceeds to commit the row
+it was holding. Measured, with the writer blocked mid-flight: `writer_committed=True`, the row present,
+the leaf gone — a committed record naming a blob that no longer exists, which is the single worst state
+this store can reach. `IMMEDIATE` on the reclaimer alone cannot fix it, because the defect is not in the
+reclaimer: it is that publication and indexing were two intervals.
+
+With promotion inside the write transaction they are one. The reclaimer's own `BEGIN IMMEDIATE` (§7.3)
+now genuinely excludes it: the reclaimer either runs entirely before the promotion, and sees no leaf, or
+entirely after the COMMIT, and sees a leaf with a row. The only way to observe a promoted-but-unindexed
+blob is a crash or a rollback between the two — which is precisely the case the authority says recovery
+reclaims, and which no live writer can be in the middle of.
+
+The cost is that the SQLite write lock is held across renames and directory flushes. Under authority
+§7.1's universal lease there is no second legitimate writer to delay, so this is a cost on paper only —
+and it is the same cost §7.3's removal already pays.
 
 `promote_staging(workspace, manifest)` where the manifest names every file in the workspace's staging
 directory with its digest and byte length:
@@ -1194,16 +1254,48 @@ authority §7.3's "recovery reclaims the scratch ... under the lock" had no mech
 - **`list_workspaces()`** returns the txids having a `staging/` or `work/` directory, read by one
   descriptor-anchored `scandir` of each parent. It is how A5b enumerates survivors "regardless of
   count." A5a reports what exists; **which** survivors are orphans and what becomes of them is A5b's
-  judgment, exactly as §8.3's closing paragraph says of *when*.
+  judgment, exactly as this section's closing paragraph says of *when*.
+
+  **An entry that is not a directory, or whose name fails §5.5's txid rule, raises
+  `MetadataStoreInvalid` and is left in place** (§8.5). Both alternatives are worse and in opposite
+  directions: returning it breaks the enumeration's own guarantee that every txid it reports is one
+  `reopen_workspace` accepts — the exact defect the three-disposition table was added to fix — while
+  skipping it leaves unaccounted debris in an engine-owned directory that nothing will ever look at
+  again. Every child of `staging/` and `work/` is created by `create_workspace`, whose txid passed
+  §5.5 and whose `mkdirat` makes it a directory, so neither shape can be a survivor of A5a's own work.
 
 Both openers validate the txid (§5.5) first. Neither infers anything from the directories' contents.
 
 - **`remove_workspace(workspace)`** removes whichever directories are present and flushes their
-  parents, then closes the workspace. This is the method §8.3 promised and §7.1 did not have; without
-  it "removes it when asked" was unimplementable through the public surface. It tolerates either side
-  being absent, for the same three-state reason `reopen_workspace` does, and requires `work/<txid>/` to
-  be empty — refusing rather than recursing, since A5a does not know what a non-empty work directory
-  means.
+  parents, then closes the workspace. This is the method this section promised and §7.1 did not have;
+  without it "removes it when asked" was unimplementable through the public surface. It tolerates
+  either side being absent, for the same three-state reason `reopen_workspace` does.
+
+  **`staging/<txid>/` is emptied, not merely `rmdir`ed.** An earlier draft specified `rmdir` alone,
+  which reclaims only a staging directory that happens to be empty — and the ordinary pre-promotion
+  crash leaves it full. Authority §7.3 step 3 has A6 stream every captured file into `staging/<txid>/`
+  and step 4 promote them only "once the complete initial surface has been captured and verified," so
+  a crash anywhere across a multi-file capture leaves exactly the state `rmdir` cannot remove. The
+  earlier tests hid it by proving only that such a workspace is *enumerated*; enumerating a survivor
+  nothing can remove is not reclamation. So removal unlinks each entry from the held `staging_fd`,
+  flushes `staging/<txid>/`, then `rmdir`s it and flushes `staging/`.
+
+  Deleting them needs no judgment, and that is what makes it A5a's to do. A staged file is
+  **mutation-free scratch** in the authority's own words — it "stays mutation-free scratch until"
+  promotion, and promotion is what moves it out of `staging/` — so no durable record can reference one,
+  whatever state the transaction was in. There is no classification to get wrong. Each entry must be a
+  regular file (§8.5); anything else raises `MetadataStoreInvalid` and the whole staging directory is
+  preserved, since A6's capture writes regular files and nothing else.
+
+  **`work/<txid>/` is the opposite case and stays a refusal.** Removal still requires it empty and
+  refuses rather than recursing, and the reason is not that A5a lacks a recursive delete — it is that
+  authority §9.5 gives a `work/` survivor a *classifier*: a staging directory whose inode matches the
+  live directory means the publication landed and its old-name removal was not yet durable, while a
+  different, foreign inode proves publication did not land, and the two dispositions differ. That
+  judgment is A7's and A5b's, not a storage mechanism's, and it must run before the directory is
+  emptied. Once it has, `work/<txid>/` is empty and this method removes it. The asymmetry is exactly
+  the difference between scratch that cannot be referenced and scratch whose meaning depends on the
+  live filesystem.
 
   **It gates on liveness, and it is not idempotent.** An earlier draft exempted it alongside `close`,
   on the reasoning that it releases. That conflated two different acts: `close` releases a descriptor
@@ -1267,6 +1359,37 @@ the same argument and A5a has no basis to prefer either.
 Implementation is `ON CONFLICT(digest) DO NOTHING` after the length comparison, not instead of it:
 `DO NOTHING` alone would silently accept the contradicting row and discard the disagreement.
 
+### 8.5 A reclaimer refuses whatever A5a could not have created
+
+§7.3 and §8.3 both enumerate an engine-owned directory and delete what they find, and each was written
+with its own ad-hoc handling of a surprising entry. They are one rule, and stating it once is what keeps
+the two from drifting apart:
+
+> **A5a creates every entry in its own namespace, so for each directory it knows the exact shape an
+> entry can have. An entry that A5a's own operations could not have produced is not a survivor to
+> reclaim — it is a foreign write into the engine's namespace. Every reclaimer raises
+> `MetadataStoreInvalid` and leaves it exactly where it is.**
+
+| Directory | An entry A5a could have created | Enforced by |
+| --- | --- | --- |
+| `blobs/sha256/` | A regular file named with 64 hex characters whose bytes hash to that name — §8.1 step 1 verified the source and step 2 renamed it under the extracted digest. | §7.3 |
+| `staging/`, `work/` | A directory whose name passes §5.5's txid rule — `create_workspace` validated it and `mkdirat` made it a directory. | §8.3 |
+| `staging/<txid>/` | A regular file — authority §7.3 step 3 has A6 stream captured file bodies here and nothing else. | §8.3 |
+| `work/<txid>/` | Not A5a's to judge: authority §9.5 classifies these by inode against the live filesystem, so removal refuses a non-empty one outright (§8.3). | §8.3 |
+
+The verdict is `MetadataStoreInvalid` rather than `ProtocolError` because the condition is a fact about
+durable state, not about the call — §9's rule, applied. And preservation rather than deletion is the
+same choice the type itself encodes: authority §11 pairs corruption with "stop and preserve evidence,"
+and an unexplained entry in an engine-owned directory is the one thing an operator will need to look at.
+
+The alternative that keeps suggesting itself is to skip such an entry and carry on. It is wrong on both
+sides. Skipping leaves debris that no later pass will revisit, since every reclaimer skips it again;
+deleting destroys the evidence. Refusing is the only one of the three that neither loses information
+nor accumulates it — and it is loud, which is what a foreign write into `metadata_root` deserves.
+
+This does not widen §2.2's non-goal. A5a is not scanning for corruption; each check runs on an entry a
+reclaimer was already about to delete, which is the moment it must know what the entry is.
+
 ## 9. Error contract
 
 Reuses `atoms.core.errors` unchanged except for one addition.
@@ -1283,8 +1406,9 @@ Reuses `atoms.core.errors` unchanged except for one addition.
 distinguishing them: a failed `quick_check`, a schema that does not match its version, a foreign
 database, a non-canonical `spec_json`, a blob whose bytes do not match its digest, an indexed digest
 whose leaf is missing or not a regular file (§7.2), a `blob` row whose `byte_len` contradicts verified
-content (§8.4), a leaf under `blobs/sha256/` whose name is not well-formed hex (§7.3), a sidecar
-surviving without its database (§5.1), and *an unknown future `user_version`*. A newer store is not corrupt — it is unreadable by this build — but both mean
+content (§8.4), **any entry in an engine-owned directory that A5a's own operations could not have
+created** (§8.5), a sidecar surviving without its database (§5.1), and *an unknown future
+`user_version`*. A newer store is not corrupt — it is unreadable by this build — but both mean
 "stop; do not interpret this," which is one caller response and therefore one exception. Folding either
 into `ProtocolError` would tell a consumer to fix its call when the correct action is to preserve
 evidence.
@@ -1554,21 +1678,44 @@ not `EEXIST`.
 Survivor reclamation (§7.3): a promoted-but-unindexed blob is reported by `list_unindexed_blobs` and
 removed by `remove_unindexed_blob`, with `blobs/sha256/` flushed; a blob that **is** indexed is refused
 by `remove_unindexed_blob` with `ProtocolError` and still exists afterwards — the fail-closed direction,
-tested with a digest that was indexed between enumeration and removal; and a stray non-hex leaf makes
-`list_unindexed_blobs` raise `MetadataStoreInvalid`, with the leaf still present afterwards. Run across
-a fresh process over a crash-cut fixture, since that is the situation the operations exist for.
+tested with a digest that was indexed between enumeration and removal. Removing a leaf that is already
+gone raises `ProtocolError`. Run across a fresh process over a crash-cut fixture, since that is the
+situation the operations exist for.
 
-Removal's exclusion is armed against a **second `Store` over the same binding**, not only against a
-stale argument: the writer inserts and commits the blob row *after* the remover's transaction has
-begun, and the assertion is that the leaf survives — whether because the remover's recheck sees the row
-and refuses, or because the writer waits on the write lock. A deferred read transaction passes the
-stale-argument test and fails this one, which is why they are separate tests.
+Removal's exclusion is armed against a **second `Store` over the same binding**, in the interleaving
+that defeated the earlier draft: one store promotes and indexes inside a write transaction while the
+other reclaims, with the reclaimer's transaction opened after the promotion's renames and before its
+COMMIT. The assertion is the pair — no committed record ever names a missing leaf, and no leaf is
+unlinked while a row for it commits. The earlier arrangement, with promotion outside a transaction and
+only the reclaimer escalated to `BEGIN IMMEDIATE`, is asserted to be what this test rejects: it produces
+`writer_committed` with the row present and the leaf gone. A companion test pins the narrower half —
+a deferred reclaimer transaction fails even the stale-argument case.
+
+Promotion's transaction binding (§8.1, §7.7): a transaction that promotes a manifest and does **not**
+insert the rows raises `ProtocolError` at exit, the transaction rolls back, and the promoted blobs are
+then reported by `list_unindexed_blobs` — the rollback disposition, identical to a crash at the same
+point. `promote_staging` outside a transaction is unreachable through the surface, asserted against
+`__all__` and the `Store` attribute set.
 
 Workspaces (§8.3): creation, then `remove_workspace` removing both directories durably; removal after
 promotion, where `staging/<txid>/` is already gone; removal refused when `work/<txid>/` is non-empty; a
 closed workspace and a workspace belonging to a *different* `Store` over the same binding, each raising
 `ProtocolError` from every operation that takes one; and a forged `Workspace` refused by the
 construction token, plus refusals of copy, deepcopy, and pickle.
+
+**Removal of a non-empty `staging/<txid>/`**, which is the ordinary pre-promotion crash and which the
+earlier `rmdir`-only draft could not perform: a fresh process reopens a workspace holding several
+capture files, `remove_workspace` succeeds, and both `staging/<txid>/` and its entries are gone with
+`staging/` flushed. The negative that pins it is that the earlier specification fails this test with
+`ENOTEMPTY`. Enumeration alone is asserted to be insufficient — `list_workspaces` reporting the
+survivor is checked *and* the removal is checked, since the earlier tests proved only the first.
+
+§8.5's refusals, one per row, each asserting that the entry is still present afterwards: a
+`blobs/sha256/` leaf that is a symlink, a directory, and a regular file with a valid hex name whose
+bytes hash to something else; a child of `staging/` and of `work/` that is a regular file, and one whose
+name fails §5.5; and a non-regular entry inside `staging/<txid>/`, which makes `remove_workspace` refuse
+and leave the whole staging directory intact. The valid-name-wrong-content blob is the case a name check
+alone accepts, so it is the one that distinguishes §8.5 from its predecessor.
 
 The access surface, which is what makes the workspace usable by A6 and A7: a file created and written
 through `staging_fd` lands in `staging/<txid>/` and promotes normally; a directory created through
@@ -1754,7 +1901,10 @@ table shapes, and §11 refusal vocabulary (§3.3).
     `reopen_workspace` for the staged files and `list_unindexed_blobs` for the promoted ones. Replaying
     a promoted entry raises `ENOENT` under `RENAME_NOREPLACE`, which is why.
 27. Promotion returns only after `blobs/sha256/` and `staging/<txid>/` are flushed, the staging
-    directory is removed, and `staging/` is flushed.
+    directory is removed, and `staging/` is flushed. It is a `_StoreTransaction` method, so publishing
+    a blob and inserting its row occupy one write-lock interval, and the transaction refuses to COMMIT
+    while a digest it promoted has no `blob` row. A promoted-but-unindexed blob is therefore reachable
+    only through a crash or a rollback, never as a steady state another connection can observe.
 28. A pre-existing blob is verified by kind, length, and streamed SHA-256 before the staged source is
     unlinked; on mismatch the staged source survives and `MetadataStoreInvalid` is raised.
 29. The `blob.digest` key is `sha256:<hex>` while the `blobs/sha256/` leaf is the bare 64-character
@@ -1762,7 +1912,11 @@ table shapes, and §11 refusal vocabulary (§3.3).
 30. Workspace directories are created and removed through guarded traversal from the retained
     descriptor, never by absolute path; removal is durable, reachable through `Store.remove_workspace`,
     gated on liveness, and refuses a second call rather than being silently idempotent. A closed,
-    forged, or foreign-store `Workspace` is refused by every operation that takes one.
+    forged, or foreign-store `Workspace` is refused by every operation that takes one. Removal
+    **empties `staging/<txid>/`** rather than only `rmdir`ing it, so the ordinary pre-promotion crash
+    survivor — a staging directory full of captures — is actually reclaimable and not merely
+    enumerable. `work/<txid>/` stays a refusal when non-empty, because authority §9.5 classifies its
+    contents against the live filesystem and that judgment is not a storage mechanism's.
 31. `Workspace` is a token-guarded resource, not a frozen value, and **exposes both directory
     descriptors as borrowed anchors**, so A6 can stage captures and A7 can build `CreateDirectory.WORK`.
     Each anchor read gates on the binding as well as on spend and close, since handing one out grants
@@ -1781,21 +1935,27 @@ table shapes, and §11 refusal vocabulary (§3.3).
 34. `list_unindexed_blobs` and `remove_unindexed_blob` make authority §7.3's pre-COMMIT orphan blobs
     reclaimable, so §8.2's preserved-evidence claim covers both halves of a failed batch. Removal
     re-checks membership and unlinks under one `BEGIN IMMEDIATE` and refuses an indexed digest, so it
-    can never delete content a record names — proved against a second `Store` that commits the row
-    after the recheck's transaction begins, an interleaving a deferred read transaction fails. A leaf
-    that is not well-formed hex is never returned as a digest: `list_unindexed_blobs` raises
-    `MetadataStoreInvalid` and preserves it.
-35. `insert_blobs` is idempotent on an identical digest and `byte_len`, and raises
+    can never delete content a record names. `IMMEDIATE` alone does not establish that — it blocks a
+    promoting writer instead of excluding it, and the blocked writer commits its row after the leaf is
+    gone — so criterion 27's transaction binding is what completes it, and the pair is proved against a
+    second `Store` reclaiming across another's promotion. Removing an already-absent leaf raises
+    `ProtocolError`.
+35. Every reclaimer refuses an entry A5a's own operations could not have created and leaves it in
+    place, raising `MetadataStoreInvalid` (§8.5): in `blobs/sha256/` a name that is not 64 hex
+    characters **and** a valid-named leaf that is not a regular file or whose bytes hash to something
+    else; in `staging/` and `work/` a non-directory or an invalid txid; and in `staging/<txid>/` a
+    non-regular entry, which preserves the whole staging directory.
+36. `insert_blobs` is idempotent on an identical digest and `byte_len`, and raises
     `MetadataStoreInvalid` when an existing row's `byte_len` contradicts verified content.
-36. `atoms.fs` and `atoms.core` import nothing from `atoms.store`.
-37. A record committed in one process is read back identically in a fresh process.
-38. No `ProjectApprovedSpec` is accepted anywhere in `atoms.store`, so ledger #9's enforcement cannot
+37. `atoms.fs` and `atoms.core` import nothing from `atoms.store`.
+38. A record committed in one process is read back identically in a fresh process.
+39. No `ProjectApprovedSpec` is accepted anywhere in `atoms.store`, so ledger #9's enforcement cannot
     be satisfied at this layer by accident.
-39. No consumer of `atoms.store` exists yet, asserted rather than assumed.
-40. Every caller-supplied pathname component — txid, manifest leaf, digest — is validated against
+40. No consumer of `atoms.store` exists yet, asserted rather than assumed.
+41. Every caller-supplied pathname component — txid, manifest leaf, digest — is validated against
     §5.5 before any filesystem mutation, with exact types required and **`ProtocolError` raised**,
     never a bare `TypeError` or `SpecValidationError`.
-41. `SQLITE_CORRUPT` and `SQLITE_NOTADB` translate to `MetadataStoreInvalid` with the original as
+42. `SQLITE_CORRUPT` and `SQLITE_NOTADB` translate to `MetadataStoreInvalid` with the original as
     `__cause__`; every other `sqlite3.Error` propagates with its original class and code, asserted at
     runtime. The static guard bans `except sqlite3.Error` and bare `except:`, permits
     `except sqlite3.DatabaseError` because §9.1 requires it, and requires every such handler to
