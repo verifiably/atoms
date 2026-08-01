@@ -1158,17 +1158,25 @@ directory with its digest and byte length:
    Step 1 streams and hashes every staged file and every already-indexed destination, which is unbounded
    work proportional to the capture, and the lock can be released during it.
 2. For each entry, **re-run the §5.4 gate**, then no-clobber rename `staging/<txid>/<name>` →
-   `blobs/sha256/<hex>`. `EEXIST` is handled in §8.2. The gate is per entry, not per batch: a
-   thousand-file capture is a thousand mutations, and one gate before the first proves only that the
-   lease was held when the loop started. Releasing the lock after entry one leaves the remaining
-   renames racing the next lease owner, which is the same defect a single entry gate had, moved one
-   level in. It is an attribute read against a live object, so per-syscall is affordable; the batch
-   already pays a full hash per file.
+   `blobs/sha256/<hex>`. `EEXIST` is handled in §8.2, which unlinks the staged source **behind its own
+   gate**, since it hashes the destination first and that hash is unbounded. The gate is per entry, not
+   per batch: a thousand-file capture is a thousand mutations, and one gate before the first proves only
+   that the lease was held when the loop started. Releasing the lock after entry one leaves the
+   remaining renames racing the next lease owner, which is the same defect a single entry gate had,
+   moved one level in. It is an attribute read against a live object, so per-syscall is affordable; the
+   batch already pays a full hash per file.
 3. `backend.flush_directory` on `blobs/sha256/` **and** `staging/<txid>/`. Flushing only the blob
    directory could leave both the blob and its staging source name durable after power loss,
    resurrecting preparation-only staging — authority §7.3's stated reason.
-4. Require `staging/<txid>/` to be empty, then `rmdir` it.
+4. Require `staging/<txid>/` to be empty, **gate**, then `rmdir` it.
 5. `backend.flush_directory` on `staging/`.
+
+   Steps 2 and 4 both carry the gate because both mutate the namespace, and §5.4's rule is about
+   syscalls rather than about loops — a rule that reached only the rename loop would leave the last
+   directory removal in a batch as the one unauthorized mutation. The flushes in steps 3 and 5 are not
+   gated: `fsync` on a descriptor this process holds changes no name, and gating a durability barrier
+   would risk abandoning a half-flushed publication to raise faster, which is the failure §5.4 already
+   refuses for `ROLLBACK`.
 6. Insert the `blob` rows from the manifest, `ON CONFLICT(digest) DO NOTHING` — the disagreement that
    conflict could hide was already refused in step 1 (§8.4). This is last on purpose: the index is
    written only over content that is durable on the filesystem, so authority §7.3's cross-substrate
@@ -1199,8 +1207,9 @@ not the content on disk: a pre-existing blob may be truncated by a previous cras
 externally substituted.
 
 Before the staged source is unlinked, the existing blob is opened `O_NOFOLLOW` and must be a regular
-file whose length equals `byte_len` and whose streamed SHA-256 equals `digest`. On a match the staged
-source is unlinked and promotion continues. **On a mismatch the staged source is left in place** and
+file whose length equals `byte_len` and whose streamed SHA-256 equals `digest`. On a match the §5.4 gate
+runs — the hash just performed is unbounded, and the unlink that follows is a mutation like any other —
+the staged source is unlinked, and promotion continues. **On a mismatch the staged source is left in place** and
 `MetadataStoreInvalid` is raised — the staged bytes are the good copy, and destroying them to tidy up
 after a corrupt blob would discard the only recovery material.
 
@@ -1929,6 +1938,13 @@ post-mutation failure rather than a new one: the staging half spent, the mixed s
 `list_workspaces` and `list_unindexed_blobs`. Gating once before the loop passes every other liveness
 test in this tier and fails this one.
 
+The two mutations that are neither a rename nor an unlink in a loop get their own cases, since a rule
+enforced only where it was first noticed is not enforced: the lock released **during §8.2's `EEXIST`
+destination hash**, asserting the staged source is still present afterwards; and released **after step
+3's flushes and before step 4's `rmdir`**, asserting `staging/<txid>/` survives. The second is the last
+mutation of a successful batch, and an implementation that gates only inside loops leaves exactly it
+unauthorized.
+
 ### 11.5 Tier 5 — fresh process
 
 A record written and committed in one process is read back identically in a new one. This is the
@@ -1953,17 +1969,29 @@ different whitespace or case all pass it. Since ledger #22 now rests on this str
 to be about *statements*, not substrings.
 
 It is built on a property A5a can enforce cheaply: **every SQL string the package issues is a
-module-level constant**, none assembled at the call site. §11.6 asserts that first — an AST walk over
-`atoms.store` finds no f-string, `%`, `+`, `.format`, or `.join` producing a string passed to `execute`
-or `executemany` — because a statement built at runtime is one no static check can classify. Parameter
-placeholders are unaffected; they are values, not statement text.
+module-level constant**. §11.6 asserts that as a *positive* resolution rather than as a list of banned
+spellings — the first argument of every `execute` and `executemany` call in `atoms.store` must be a
+`Name` or `Attribute` that resolves to a module-level `str` assignment. Enumerating forbidden
+constructions instead (f-string, `%`, `+`, `.format`, `.join`) is the version that fails quietly: a local
+assigned from a helper, a dict lookup, or a `str` subclass all pass it while still producing text no
+static check can classify. `executescript` is permitted **only** for the schema DDL constant in
+`schema.py`, by name, and its text is parsed by the same rules; anywhere else it fails, because it takes
+arbitrary multi-statement text and would be the obvious way around everything above. Parameter
+placeholders are unaffected — they are values, not statement text.
 
 With that, the inventory is finite and enumerable. Each constant is parsed for its statement kind and
 target table, and the rule is stated over the parse, not the text: **exactly one statement in the
 package writes `blob`, it is an `INSERT`, and it is the one promotion's step 6 issues.** Any other
-`INSERT`, `REPLACE`, `UPDATE`, or `DELETE` targeting `blob` fails, whatever its spelling. The schema DDL
-is checked separately for the same property: no trigger in §6.1 names `blob` as its target, so no write
-to another table can reach it indirectly.
+`INSERT`, `REPLACE`, `UPDATE`, or `DELETE` targeting `blob` fails, whatever its spelling.
+
+**Triggers are checked by their bodies, not their subject tables.** An earlier draft asserted that no
+trigger names `blob` as its target, which a trigger declared `ON transaction_record` whose body runs
+`INSERT INTO blob` satisfies while writing the table on every record write — the indirect path the check
+existed to close. So every `CREATE TRIGGER` in the schema has each statement in its `BEGIN ... END` body
+parsed for its own target, and `blob` may not appear as the target of any of them. The schema currently
+has one trigger, whose body is a single `RAISE(ABORT, ...)` (§6.1); the check is written for the schema
+that comes later, since a trigger is exactly the kind of indirection added without revisiting an
+architecture test.
 
 This is the static half of ledger #22, and it is the half that carries the weight: §8.1's ordering —
 verify, publish, flush, then index — is worth exactly nothing if a second site can write a row without
@@ -2041,8 +2069,10 @@ table shapes, and §11 refusal vocabulary (§3.3).
     in the package.
 13. **Every** operation gates on `binding.backend`, reads included, and the gate runs again
     immediately before each barrier — the COMMIT, and **every** mutating syscall of promotion, orphan
-    removal, and workspace removal, per rename and per unlink rather than once per batch, since each
-    verifies unbounded content first and a batch is many mutations (§5.4); a lock released between the last write and the transaction's exit rolls
+    removal, and workspace removal, per rename, per unlink, and per `rmdir` rather than once per batch
+    or once per loop, since each verifies unbounded content first and a batch is many mutations. §8.2's
+    `EEXIST` unlink and promotion's step 4 `rmdir` are covered by name, being the two that sit outside
+    a rename loop (§5.4); a lock released between the last write and the transaction's exit rolls
     back and raises `ProtocolError`. The only exemptions are `ROLLBACK`, `Store.close`, and
     `Workspace.close`, each asserted to succeed after the binding or lock dies. `remove_workspace` is
     **not** exempt: it mutates the engine-owned namespace and would race the next lease owner.
@@ -2150,12 +2180,14 @@ table shapes, and §11 refusal vocabulary (§3.3).
 36. Promotion's indexing is idempotent on an identical digest and `byte_len`, and raises
     `MetadataStoreInvalid` when an existing row's `byte_len` contradicts verified content — at the
     preflight, before any source moves.
-37. Every SQL string the package issues is a module-level constant, with no statement text assembled at
-    the call site, so the inventory is finite. Over that inventory, **exactly one statement writes
-    `blob`** — promotion's step 6 `INSERT` — with any other `INSERT`, `REPLACE`, `UPDATE`, or `DELETE`
-    targeting `blob` refused by statement kind and target table rather than by spelling, and no trigger
-    naming `blob`. A fresh process resolves every digest a committed record references through
-    `open_blob`. These are the two halves of ledger #22, one static and one behavioral.
+37. Every `execute` and `executemany` argument resolves to a module-level SQL constant, and
+    `executescript` is used only for the schema DDL, so the statement inventory is finite. Over that
+    inventory, **exactly one statement writes `blob`** — promotion's step 6 `INSERT` — with any other
+    `INSERT`, `REPLACE`, `UPDATE`, or `DELETE` targeting `blob` refused by statement kind and target
+    table rather than by spelling, and with every trigger checked by the targets **inside its body**
+    rather than by its subject table. A fresh process resolves every digest a committed record
+    references through `open_blob`. These are the two halves of ledger #22, one static and one
+    behavioral.
 38. `atoms.fs` and `atoms.core` import nothing from `atoms.store`.
 39. A record committed in one process is read back identically in a fresh process.
 40. No `ProjectApprovedSpec` is accepted anywhere in `atoms.store`, so ledger #9's enforcement cannot
