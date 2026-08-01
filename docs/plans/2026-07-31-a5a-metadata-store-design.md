@@ -219,6 +219,17 @@ cooperating processes, and `O_EXCL` makes it structural rather than assumed.
 5. In **one explicit transaction**: the complete DDL, `PRAGMA user_version = SCHEMA_VERSION`, and
    `PRAGMA application_id = APPLICATION_ID`; then COMMIT.
 
+   **The DDL is a tuple of single-statement constants executed one by one, never an `executescript`.**
+   `sqlite3.Connection.executescript` issues a `COMMIT` before it runs, which under the pinned
+   `isolation_level=None` (§5.3) silently ends the transaction opened above: measured, `in_transaction`
+   goes from `True` to `False` across the call, and the `application_id` written before it stays durable
+   afterwards. Using it here would destroy the exact property this step is for — an interrupted
+   initialization would leave a half-built schema with a committed `application_id`, which is neither
+   the completed shape nor the `(0, 0, empty)` resumable one, and §5.2 would refuse the store forever.
+   The atomicity claim below is only true because every statement goes through `execute` inside the
+   transaction; §11.6 forbids `executescript` in the package outright rather than carving out an
+   exception for this site.
+
 `PRAGMA user_version` and `application_id` **are** transactional: set inside an explicit transaction,
 both revert with a `ROLLBACK`, measured on SQLite 3.50.4. Initialization is therefore atomic in the
 strong sense — an interrupted step 5 leaves a database with an empty schema, `user_version = 0`, and
@@ -230,12 +241,23 @@ mutation of the database file, not a connection setting: on a database created i
 `PRAGMA journal_mode=WAL` leaves it in `wal` mode for every later opener, measured. Reopen therefore
 never sets it on a store it recognizes as complete (§5.2).
 
-**Resumable initialization spans steps 3 through 5, and every one of them can be cut.** A crash between
-step 3 and step 4 leaves a published, zero-length, still-`delete`-mode file; a crash between step 4 and
-step 5 leaves a WAL-mode file with an empty schema. Both are `(application_id 0, user_version 0, empty
-schema)`, and a zero-length file reports `journal_mode = delete`, measured. §5.2 must therefore
-recognize the resumable shape **without** having already required WAL, and must resume from whichever
-cut it finds by re-running steps 4–5.
+**Resumable initialization spans steps 2 through 5, and every one of them can be cut.** A crash between
+step 2 and step 3 leaves the file created but not yet published — the mode is whatever the umask left
+and the directory entry is not yet flushed; a crash between step 3 and step 4 leaves a published,
+zero-length, still-`delete`-mode file; a crash between step 4 and step 5 leaves a WAL-mode file with an
+empty schema. All are `(application_id 0, user_version 0, empty schema)`, and a zero-length file reports
+`journal_mode = delete`, measured. §5.2 must therefore recognize the resumable shape **without** having
+already required WAL, and must resume by re-running steps **3–5**.
+
+Steps 3–5, not 4–5, and the earlier draft's omission was not cosmetic. Step 2's `openat` mode is a
+*request* the umask reduces, and step 3 is where the mode is made exact and where the directory entry
+becomes durable at all — the one thing SQLite's own contract never covers, since SQLite did not create
+that entry. Resuming at step 4 would leave a store whose entry was never flushed and whose mode was
+never corrected, permanently, because the resumable shape is consumed once and never revisited. Every
+part of step 3 is idempotent — `fchmod` to an exact mode, two flushes — so re-running it on a cut that
+already completed it costs two `fsync`s and asserts nothing was lost. On the resume path the descriptor
+comes from opening `atoms.db` through the same guarded traversal rather than from step 2, and step 3
+runs before any connection is opened, exactly as in the uninterrupted order.
 
 ### 5.2 Reopen
 
@@ -290,9 +312,11 @@ metadata root's identity and returns a pathname; it inspects no leaf (`bootstrap
    - **Completed store:** query `journal_mode`; it must already be `wal`. Never set it. A completed
      store not in WAL was not written by this engine's creation protocol, and converting it would
      rewrite a database on the strength of a guess.
-   - **Resumable initialization:** set WAL and re-run §5.1 steps 4–5 — the profile *and* the DDL,
-     `user_version`, and `application_id` transaction. Applying the profile alone would leave the
-     database exactly as unfinished as it was found, and the next reopen would resume it again forever.
+   - **Resumable initialization:** re-run §5.1 steps **3–5** — the durable publication of the entry,
+     then the profile including WAL, then the DDL, `user_version`, and `application_id` transaction.
+     Applying the profile alone would leave the database exactly as unfinished as it was found, and the
+     next reopen would resume it again forever; starting at step 4 would skip the publication and mode
+     correction permanently, since the resumable shape is consumed exactly once (§5.1).
 5. `PRAGMA quick_check` and `PRAGMA foreign_key_check`, both of which must be clean, then the
    **connection-local** pragmas of §5.3, set and read back.
 
@@ -454,7 +478,10 @@ engine-owned — A5b will pass a txid that A4b regenerated (#7) and a manifest A
 
 Each `CHECK` list below is written out for review, but in the source it is **generated** from its enum
 (§6.2) — these are the values `TransactionState`, `CommitDecision`, `RollbackResult`, `EffectVariant`,
-and `JournalState` currently hold.
+and `JournalState` currently hold. The block below is one listing for reading; in the source it is a
+**tuple of single-statement constants**, executed one at a time inside §5.1 step 5's transaction. That
+is not a style choice: `executescript` would commit that transaction out from under the protocol
+(§5.1), and a per-statement inventory is what §11.6's blob-writer rule is stated over.
 
 ```sql
 CREATE TABLE transaction_record (
@@ -1324,8 +1351,11 @@ and why §8.3 hands the descriptor out per use rather than caching it in the cal
 `create_workspace` is the only constructor and `remove_workspace` demands a live `Workspace`, so
 authority §7.3's "recovery reclaims the scratch ... under the lock" had no mechanism under it.
 
-- **`create_workspace(txid)`** requires both directories to be **absent** and creates them. It never
-  adopts an existing one. Adoption would be the silent kind of convenient: a surviving
+- **`create_workspace(txid)`** requires both directories to be **absent** and creates them, **gating
+  before each `mkdirat`** (§5.4). Two `mkdir`s are two mutations, and the lock can be released between
+  them: the first would then create `staging/<txid>/` under a live lease and the second would create
+  `work/<txid>/` after it ended — while the next lease owner is already reclaiming the staging-only
+  survivor the first left. It never adopts an existing one. Adoption would be the silent kind of convenient: a surviving
   `staging/<txid>/` is evidence about a previous attempt, and quietly reusing it would bypass the
   occupancy question ledger #7 makes A5b answer, turning a decision into a side effect of a
   constructor.
@@ -1758,14 +1788,25 @@ fails on reopen. A non-canonical `spec_json`.
 **Every crash cut in creation resumes**, one test per cut, each by running §5.1 to that point and then
 reopening:
 
+- **after step 2** (created but not published), run under a `0o277` umask so the requested `0o600` is
+  actually reduced. Assert the resumed store ends at the exact intended mode, which is the assertion
+  that fails if reopen resumes at step 4 — the mode is never revisited, because the resumable shape is
+  consumed once;
 - after step 3 (published, zero-length, `journal_mode` still `delete`) — the cut that a WAL-first
   reopen refuses. Assert it resumes and yields a usable store, since this is the state the protocol
   exists to recover;
 - after step 4 (WAL set, schema still empty);
 - interrupted inside step 5 (rolled back, so empty schema and both versions zero).
 
-All three present as `(0, 0, empty)` and must reach the same completed store; a fourth test asserts the
-resumed store is byte-for-byte equivalent in schema and version to one created without interruption.
+All four present as `(0, 0, empty)` and must reach the same completed store; a fifth test asserts the
+resumed store is byte-for-byte equivalent in schema **and mode** to one created without interruption,
+which is where the step-2 cut is actually caught.
+
+**Initialization is atomic against an interrupted step 5**, asserted directly rather than inferred from
+the pragma measurement: the transaction is cut after some of the DDL statements have run, and the
+reopened database must hold an empty schema with both versions zero — never a partial schema with a
+committed `application_id`. That is the state `executescript` produces, so the test is written to fail
+against it (§5.1 step 5).
 
 The reopen-does-not-mutate guarantee: a **non-empty** `delete`-mode database is refused **and is still
 in `delete` mode afterwards**, which is the assertion that would have caught the original defect. A
@@ -1938,12 +1979,21 @@ post-mutation failure rather than a new one: the staging half spent, the mixed s
 `list_workspaces` and `list_unindexed_blobs`. Gating once before the loop passes every other liveness
 test in this tier and fails this one.
 
-The two mutations that are neither a rename nor an unlink in a loop get their own cases, since a rule
-enforced only where it was first noticed is not enforced: the lock released **during §8.2's `EEXIST`
-destination hash**, asserting the staged source is still present afterwards; and released **after step
-3's flushes and before step 4's `rmdir`**, asserting `staging/<txid>/` survives. The second is the last
-mutation of a successful batch, and an implementation that gates only inside loops leaves exactly it
-unauthorized.
+The mutations that are neither a rename nor an unlink in a loop get their own cases, since a rule
+enforced only where it was first noticed is not enforced. The inventory is exhaustive against §5.4, one
+test per site, each releasing the lock immediately before the syscall in question and asserting that
+**that** syscall did not happen:
+
+- during §8.2's `EEXIST` destination hash — the staged source is still present;
+- after promotion's step 3 flushes and before step 4's `rmdir` — `staging/<txid>/` survives. This is the
+  last mutation of a successful batch, and an implementation that gates only inside loops leaves
+  exactly it unauthorized;
+- between `create_workspace`'s two `mkdirat`s — `work/<txid>/` was not created, and the staging-only
+  survivor left behind is one `reopen_workspace` accepts and `remove_workspace` clears, so the refusal
+  costs the next lease owner nothing;
+- before `remove_workspace`'s `rmdir` of `staging/<txid>/`, and before its `rmdir` of `work/<txid>/` —
+  each directory survives. Both gates were specified and neither was exercised; the tier named only
+  promotion's `rmdir`, which is how a specified-but-unarmed gate stays that way.
 
 ### 11.5 Tier 5 — fresh process
 
@@ -1974,10 +2024,14 @@ spellings — the first argument of every `execute` and `executemany` call in `a
 `Name` or `Attribute` that resolves to a module-level `str` assignment. Enumerating forbidden
 constructions instead (f-string, `%`, `+`, `.format`, `.join`) is the version that fails quietly: a local
 assigned from a helper, a dict lookup, or a `str` subclass all pass it while still producing text no
-static check can classify. `executescript` is permitted **only** for the schema DDL constant in
-`schema.py`, by name, and its text is parsed by the same rules; anywhere else it fails, because it takes
-arbitrary multi-statement text and would be the obvious way around everything above. Parameter
-placeholders are unaffected — they are values, not statement text.
+static check can classify. Parameter placeholders are unaffected — they are values, not statement text.
+
+**`executescript` does not appear in the package at all.** An earlier draft carved out the schema DDL
+for it, which was the one exception that made this guard awkward — and §5.1 step 5 now records that the
+exception was a defect in its own right: the call commits the open transaction before running, which
+destroys the atomicity the initialization protocol depends on. Forbidding it outright is both simpler
+and required, and the schema becomes a tuple of single-statement constants like everything else in the
+inventory.
 
 With that, the inventory is finite and enumerable. Each constant is parsed for its statement kind and
 target table, and the rule is stated over the parse, not the text: **exactly one statement in the
@@ -2047,7 +2101,10 @@ table shapes, and §11 refusal vocabulary (§3.3).
    `atoms.db`, leaving that sidecar in place. `O_EXCL` covers only `atoms.db`.
 3. Creation `fchmod`s the file to its exact mode, then flushes the file and `metadata_root`
    **before** SQLite opens it, and writes the DDL, `user_version`, and `application_id` in one
-   explicit transaction. A5a created the directory entry, so no SQLite COMMIT publishes it.
+   explicit transaction, statement by statement — `executescript` commits the open transaction before
+   it runs, so it appears nowhere in the package. A5a created the directory entry, so no SQLite COMMIT
+   publishes it. A step 5 cut leaves an empty schema with both versions zero, never a partial schema
+   with a committed `application_id`.
 4. Every fsync in the package goes through `Backend.flush_file` or `Backend.flush_directory`; no raw
    `os.fsync` call appears in `atoms.store`.
 5. Reopen refuses a symlink at `atoms.db`, `atoms.db-wal`, `atoms.db-shm`, or `atoms.db-journal`
@@ -2055,8 +2112,11 @@ table shapes, and §11 refusal vocabulary (§3.3).
 6. Reopen determines identity, version, and schema from reads **before** applying any journal-mode
    rule; the only *application-issued* metadata write on the reopen path is the resumable
    `(0, 0, empty)` case. Every row of §5.2's version table produces its stated verdict.
-7. Each of the three creation crash cuts — including the one still in `delete` mode — is recognized
-   as resumable and completes to a store equivalent to an uninterrupted creation.
+7. Each of the **four** creation crash cuts — from after step 2 onward, including the one still in
+   `delete` mode — is recognized as resumable, and resuming re-runs steps **3–5**, so the resumed store
+   matches an uninterrupted creation in schema, version, **and mode**. Resuming at step 4 would leave
+   the entry unpublished and the umask-reduced mode uncorrected forever, since the resumable shape is
+   consumed once.
 8. On a completed store `journal_mode` is queried and never set; a non-empty `delete`-mode database is
    refused and is still in `delete` mode afterwards.
 9. The schema catalog is compared as `(type, name, tbl_name, sql)` over every `sqlite_schema` row
@@ -2069,10 +2129,11 @@ table shapes, and §11 refusal vocabulary (§3.3).
     in the package.
 13. **Every** operation gates on `binding.backend`, reads included, and the gate runs again
     immediately before each barrier — the COMMIT, and **every** mutating syscall of promotion, orphan
-    removal, and workspace removal, per rename, per unlink, and per `rmdir` rather than once per batch
-    or once per loop, since each verifies unbounded content first and a batch is many mutations. §8.2's
-    `EEXIST` unlink and promotion's step 4 `rmdir` are covered by name, being the two that sit outside
-    a rename loop (§5.4); a lock released between the last write and the transaction's exit rolls
+    removal, and workspace creation and removal, per rename, per unlink, per `mkdir`, and per `rmdir`
+    rather than once per batch or once per loop, since each verifies unbounded content first and a batch
+    is many mutations. The sites outside a loop are covered by name and each independently armed:
+    §8.2's `EEXIST` unlink, promotion's step 4 `rmdir`, `create_workspace`'s two `mkdirat`s, and
+    `remove_workspace`'s two `rmdir`s (§5.4); a lock released between the last write and the transaction's exit rolls
     back and raises `ProtocolError`. The only exemptions are `ROLLBACK`, `Store.close`, and
     `Workspace.close`, each asserted to succeed after the binding or lock dies. `remove_workspace` is
     **not** exempt: it mutates the engine-owned namespace and would race the next lease owner.
@@ -2180,9 +2241,10 @@ table shapes, and §11 refusal vocabulary (§3.3).
 36. Promotion's indexing is idempotent on an identical digest and `byte_len`, and raises
     `MetadataStoreInvalid` when an existing row's `byte_len` contradicts verified content — at the
     preflight, before any source moves.
-37. Every `execute` and `executemany` argument resolves to a module-level SQL constant, and
-    `executescript` is used only for the schema DDL, so the statement inventory is finite. Over that
-    inventory, **exactly one statement writes `blob`** — promotion's step 6 `INSERT` — with any other
+37. Every `execute` and `executemany` argument resolves to a module-level SQL constant, so the
+    statement inventory is finite. Over that
+    inventory, and with **`executescript` absent from the package**, **exactly one statement writes
+    `blob`** — promotion's step 6 `INSERT` — with any other
     `INSERT`, `REPLACE`, `UPDATE`, or `DELETE` targeting `blob` refused by statement kind and target
     table rather than by spelling, and with every trigger checked by the targets **inside its body**
     rather than by its subject table. A fresh process resolves every digest a committed record
