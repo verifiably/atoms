@@ -1108,6 +1108,30 @@ when the exit began rather than when the barrier ran — reopening the exact win
 gate to close, just wider than the original. The first gate is still worth running: it refuses before
 doing the work, rather than after.
 
+**A mutating method that raises poisons the transaction.** The barrier reads bookkeeping the methods
+themselves maintain, so it can only be as complete as they are, and every one of them registers what it
+touched *after* its last statement succeeds — the only order that does not register writes that never
+happened. That leaves a hole a caller can walk through: SQLite rolls back the failing *statement*, not
+the transaction. Measured — inside `BEGIN IMMEDIATE`, an `INSERT` that violates a `UNIQUE` constraint
+raises, `in_transaction` is still true, the earlier `INSERT` of the same method is still visible, and
+the `COMMIT` makes it durable. So a caller that catches `insert_record`'s failure inside the `with`
+block and continues commits a `transaction_record` whose `effect` rows are missing, with the barrier
+never told the txid existed.
+
+The fix is not to register earlier — that would trade this hole for rows registered for statements that
+never ran. It is that **any `_StoreTransaction` method which raises marks the transaction poisoned, and
+the exit rolls back and re-raises rather than committing**, whatever the caller did with the exception
+in between. Catching an A5a exception and carrying on cannot be made to mean "the write did not
+happen", because in SQLite's semantics it does not.
+
+**Every exit closes the SQLite transaction, including a `COMMIT` that fails.** A failed `COMMIT` leaves
+the transaction open: measured, a deferred constraint violation raises at `COMMIT`, `in_transaction` is
+still true afterwards, and the next `BEGIN IMMEDIATE` raises `cannot start a transaction within a
+transaction`. A store that spends its `_StoreTransaction` and clears its slot on that path looks
+recovered and is not — every later `transaction()` on it fails, reporting a caller error for a condition
+A5a created. The exit rolls back whatever is still open on *any* failing path and re-raises the original
+exception, never masking it with the rollback's own.
+
 **A refused write raises `ProtocolError`, not `MetadataStoreInvalid`.** The transaction rolled back, so
 the durable store is exactly as valid as it was — nothing about it "cannot be safely interpreted," and
 the correct response is for the caller to fix its call, not to stop and preserve evidence. Authority §11
@@ -1264,7 +1288,13 @@ directory with its digest and byte length:
 3. `backend.flush_directory` on `blobs/sha256/` **and** `staging/<txid>/`. Flushing only the blob
    directory could leave both the blob and its staging source name durable after power loss,
    resurrecting preparation-only staging — authority §7.3's stated reason.
-4. Require `staging/<txid>/` to be empty, **gate**, then `rmdir` it.
+4. Require `staging/<txid>/` to be empty, **gate**, then `rmdir` it. **The staging half is spent the
+   moment that `rmdir` succeeds**, not the moment a source is removed. The two differ on an empty
+   manifest — a spec whose initial surface names no file has nothing to capture, so promotion removes
+   the directory without removing any source — and spending on source removal alone would leave that
+   workspace holding a descriptor to an unlinked directory, which is the exact state §8.3 spends the
+   half to prevent: `openat` from it still succeeds and produces files no path can ever name. Source
+   removal remains the threshold on the *failure* side (criterion 26), where the `rmdir` never runs.
 5. `backend.flush_directory` on `staging/`.
 
    Steps 2 and 4 both carry the gate because both mutate the namespace, and §5.4's rule is about
@@ -1430,6 +1460,18 @@ authority §7.3's "recovery reclaims the scratch ... under the lock" had no mech
   constructor.
 - **`reopen_workspace(txid)`** opens whichever of the two directories exist. It is the recovery path
   and says so: it adopts nothing that was not already there, and creates nothing.
+
+  **Both halves are opened `O_NOFOLLOW | O_DIRECTORY`.** `list_workspaces` already classifies each
+  child by `fstatat` with `follow_symlinks=False` and refuses a non-directory under §8.5 — but
+  `reopen_workspace` is reachable without ever running that enumeration, since A5b arrives holding a
+  txid read out of a record. The check therefore belongs in the open itself, not in the listing that
+  usually precedes it. Without the flag the call hands back a descriptor to whatever the symlink points
+  at: reproduced with these exact flags, `staging/<txid>` pointing outside `metadata_root` opened
+  cleanly and listed the target's contents, and that descriptor is a *borrowed mutation anchor* — A6
+  would stage captures through it, into a directory the engine does not own. With the flag both the
+  symlink and the regular-file case fail `ENOTDIR` on Linux (measured; `O_DIRECTORY` pre-empts the
+  `ELOOP` that `O_NOFOLLOW` alone documents), and A5a raises `MetadataStoreInvalid` for the §8.5
+  reason: `create_workspace` is the only permitted producer here and it makes directories.
 
   Requiring *both* — as an earlier draft did — refuses the most ordinary survivor there is. A
   successful promotion removes `staging/<txid>/` and leaves `work/<txid>/` (§8.1 step 4), so a crash
@@ -2236,8 +2278,9 @@ table shapes, and §11 refusal vocabulary (§3.3).
     single load; every failing read rolls back before raising, leaving no open transaction, and gates
     liveness again before returning a record. A public read while this store owns a write transaction
     raises `ProtocolError`, so no `StoredRecord` ever carries uncommitted state.
-16. `Store.close()` is idempotent, rolls back and spends any open transaction, and every operation
-    after it raises `ProtocolError` rather than any `sqlite3` exception.
+16. `Store.close()` is idempotent, rolls back and spends any open transaction, closes every
+    `Workspace` it issued that is still open, and every operation after it raises `ProtocolError`
+    rather than any `sqlite3` exception.
 17. Every `CHECK` enumeration is generated from its enum, asserted equal to the enum members.
 18. All tables are `STRICT`, tested with values SQLite cannot losslessly coerce.
 19. `spec_json` is written from `canonical_json`, and a read that does not re-encode to the stored text
@@ -2254,12 +2297,21 @@ table shapes, and §11 refusal vocabulary (§3.3).
 23. §7.6's predicate covers `compile_spec` acceptance, effect coverage, variant consistency, blob
     `byte_len` agreement, `rollback_result` exactly for `ROLLED_BACK`, `halt_diagnostic` exactly for
     `HALTED`, diagnostic agreement with the durable row, active-record existence, and the four
-    malformed-encoding cases — each failing independently.
+    malformed-encoding cases — each failing independently. `byte_len` agreement is checked against
+    **every** reference, so a spec declaring one digest at two lengths refuses rather than being
+    silently reduced to whichever reference a map happened to keep — `compile_spec` accepts that spec,
+    measured, so the store is where it is caught. A finding that depends on an earlier one holding —
+    the diagnostic's journal vector, which is indexed by the effect rows — is skipped once that
+    earlier finding fires, so a malformed record reports its findings instead of raising `KeyError`.
 24. That same predicate runs over every touched txid **before every COMMIT**, in the order
     gate → validate → gate → COMMIT with the second gate adjacent to the barrier. A transaction that
     would persist an incoherent record rolls back and leaves the prior record intact, raising
     **`ProtocolError`** — never `MetadataStoreInvalid`, which authority §11 reserves for durable state
-    that cannot be interpreted. A5a cannot commit a record its own loader would reject.
+    that cannot be interpreted. A5a cannot commit a record its own loader would reject. A mutating
+    method that raises **poisons** the transaction, so a caller that catches the failure inside the
+    `with` block still cannot commit the partial write SQLite left behind — statement rollback is not
+    transaction rollback, measured. Every exit closes the SQLite transaction, **including a `COMMIT`
+    that fails**, so a store is never left with an open transaction its own bookkeeping says is gone.
 25. `promote_staging` validates the entire manifest **before anything moves** — element types, names,
     digests, exact non-negative `int` lengths, unique source names, one length per digest, exact
     agreement with the staging directory's entry set, and **each staged source's kind, length, and
@@ -2275,7 +2327,8 @@ table shapes, and §11 refusal vocabulary (§3.3).
 27. Promotion returns only after `blobs/sha256/` and `staging/<txid>/` are flushed, the staging
     directory is removed, `staging/` is flushed, and the `blob` rows are written from the same verified
     manifest. It is a `_StoreTransaction` method, so publishing a blob and indexing it occupy one
-    write-lock interval, and there is **no separate `insert_blobs`** — the digest and `byte_len` in the
+    write-lock interval, and the staging half is spent once step 4's `rmdir` succeeds, including for a
+    manifest with no entries. There is **no separate `insert_blobs`** — the digest and `byte_len` in the
     index are the ones step 1 verified against the staged file, so no row can contradict its bytes or
     name a leaf that does not exist. A promoted-but-unindexed blob is therefore reachable only through
     a crash or a rollback, never as a steady state another connection can observe. The transaction also
@@ -2305,8 +2358,11 @@ table shapes, and §11 refusal vocabulary (§3.3).
 32. `create_workspace` refuses an existing workspace and adopts nothing. `reopen_workspace` opens
     whichever directories exist, accepting all three legal dispositions — both, staging-only, and
     work-only, the last being what a successful promotion leaves — with the missing half spent, and
-    refuses only when neither exists. Every txid `list_workspaces` reports is one `reopen_workspace`
-    accepts.
+    refuses only when neither exists. Both halves are opened `O_NOFOLLOW | O_DIRECTORY`, so a symlink
+    or a regular file at `staging/<txid>` raises `MetadataStoreInvalid` rather than yielding a mutation
+    anchor onto whatever it names; this is tested through `reopen_workspace` directly, because the
+    enumeration that would otherwise have caught it is not on that path. Every txid `list_workspaces`
+    reports is one `reopen_workspace` accepts.
 33. `open_blob` is the only way to read a blob's bytes, so no later layer re-derives the digest-to-leaf
     mapping. It requires an indexed digest — an unindexed one raises `ProtocolError` and an orphan blob
     is not openable — verifies kind, length, and streamed SHA-256 before returning, rewinds to offset
@@ -2331,10 +2387,14 @@ table shapes, and §11 refusal vocabulary (§3.3).
 36. Promotion's indexing is idempotent on an identical digest and `byte_len`, and raises
     `MetadataStoreInvalid` when an existing row's `byte_len` contradicts verified content — at the
     preflight, before any source moves.
-37. Every `execute` and `executemany` argument resolves to a module-level SQL constant, so the
-    statement inventory is finite. Over that
-    inventory, and with **`executescript` absent from the package**, **exactly one statement writes
-    `blob`** — promotion's step 6 `INSERT` — with any other
+37. Every `execute` and `executemany` argument **resolves by name** to a module-level string constant
+    of the package — bound in that module or imported from another `atoms.store` module — with the
+    single loop binding over `SCHEMA_STATEMENTS` permitted by naming that iterable and every other
+    form refused, attribute access included. A guard that accepts any attribute, or any name that
+    happens to be some loop's target, is not a resolution and does not make the inventory finite. Over
+    that inventory, and with **`executescript` absent as a call** — proved over parsed calls, not over
+    source text, so the docstrings explaining the ban do not have to lie about it — **exactly one
+    statement writes `blob`** — promotion's step 6 `INSERT` — with any other
     `INSERT`, `REPLACE`, `UPDATE`, or `DELETE` targeting `blob` refused by statement kind and target
     table rather than by spelling, and with every trigger checked by the targets **inside its body**
     rather than by its subject table. A fresh process resolves every digest a committed record

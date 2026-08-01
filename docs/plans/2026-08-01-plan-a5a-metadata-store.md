@@ -42,10 +42,14 @@ over both.
 - **No raw `os.fsync` anywhere in `atoms/store/`.** Every durability barrier goes through
   `Backend.flush_file` or `Backend.flush_directory` (design §5.1 step 3, §8.1).
 - **No blanket `OSError` handler**, extending the existing guard to the new package.
-- **`executescript` appears nowhere in the package** (design §5.1 step 5). It issues a `COMMIT` before
+- **`executescript` is never called in the package** (design §5.1 step 5). It issues a `COMMIT` before
   running, which under `isolation_level=None` ends the explicit transaction initialization depends on.
+  Task 13 proves this over *parsed calls*, not over source text, so the docstrings that explain the ban
+  are allowed to name it.
 - **Every SQL string is a module-level constant.** The first argument of every `execute`/`executemany`
-  call must be a `Name` or `Attribute` resolving to a module-level `str` assignment (design §11.6).
+  call must be a bare `Name` that resolves to a module-level `str` assignment — in that module or
+  imported from another `atoms.store` module — with one exception, the loop variable of the `for` over
+  `SCHEMA_STATEMENTS` (design §11.6, criterion 37). Attribute access is not a resolution and is refused.
 - **Exactly one statement in the package writes `blob`**: promotion's step 6 `INSERT`.
 - **SQLite >= 3.37** required; a lower version and a `TEMP_STORE=0` build both raise
   `CapabilityUnavailable`.
@@ -77,6 +81,7 @@ over both.
 | `tests/test_store_blobs.py` | **Create.** Tier 4 — promotion, blob reading, reclamation. |
 | `tests/test_store_liveness.py` | **Create.** Tier 4 — the gate inventory, one case per site. |
 | `tests/test_store_process.py` | **Create.** Tier 5 — fresh-process durability. |
+| `tests/store_child.py` | **Create.** The subprocess tier 5 reads from: binds the volume itself and prints what a fresh process sees. |
 | `tests/test_store_architecture.py` | **Create.** Tier 6 — import direction, surface, SQL inventory, guards. |
 | `docs/deferred-obligation-ledger.md` | **Modify.** Ledger #22 discharge record. |
 | `AGENTS.md` | **Modify.** A5 status line. |
@@ -705,10 +710,11 @@ import os
 import sqlite3
 
 from atoms.core.effects import CreateFileNoClobber, ReplaceFile
-from atoms.core.fingerprint import FileState
+from atoms.core.fingerprint import ABSENT, FileState
 from atoms.core.spec import build_spec
 
 DATABASE_ENTRIES = ("atoms.db", "atoms.db-wal", "atoms.db-shm", "atoms.db-journal")
+SHARED_DIGEST = "sha256:" + "a" * 64
 
 
 def file_state(content: bytes, mode: int = 0o644) -> FileState:
@@ -729,7 +735,7 @@ def one_effect_spec(effect_id: str = "e1", content: bytes = b"after"):
     return build_spec(
         consumer_tag="test",
         intent_digest="sha256:" + "0" * 64,
-        initial_surface={"a.txt": __import__("atoms.core.fingerprint", fromlist=["ABSENT"]).ABSENT},
+        initial_surface={"a.txt": ABSENT},
         final_surface={"a.txt": post},
         effects=[CreateFileNoClobber(effect_id=effect_id, path="a.txt", post=post)],
     )
@@ -743,6 +749,49 @@ def replace_spec(effect_id: str = "e1", before: bytes = b"before", after: bytes 
         initial_surface={"a.txt": pre},
         final_surface={"a.txt": post},
         effects=[ReplaceFile(effect_id=effect_id, path="a.txt", pre=pre, post=post)],
+    )
+
+
+def duplicate_effect_spec():
+    """Two effects sharing one effect_id, for design §7.7's poison rule.
+
+    build_spec does not validate and insert_record does not compile, so the `effect`
+    PRIMARY KEY is what refuses -- on the *second* INSERT, after the record row and the
+    first effect row of the same method have already been written. That is the shape the
+    poison rule exists for.
+    """
+    post = file_state(b"after")
+    return build_spec(
+        consumer_tag="test",
+        intent_digest="sha256:" + "2" * 64,
+        initial_surface={"a.txt": ABSENT, "b.txt": ABSENT},
+        final_surface={"a.txt": post, "b.txt": post},
+        effects=[
+            CreateFileNoClobber(effect_id="dup", path="a.txt", post=post),
+            CreateFileNoClobber(effect_id="dup", path="b.txt", post=post),
+        ],
+    )
+
+
+def two_length_spec():
+    """One digest declared at two byte_lens across the initial surface.
+
+    compile_spec accepts this -- measured -- because it never compares two paths'
+    fingerprints to each other. A hash and a length are both properties of the same
+    bytes, so the store refuses it under §7.6.
+    """
+    pre_a = FileState(content_hash=SHARED_DIGEST, mode=0o644, byte_len=5)
+    pre_b = FileState(content_hash=SHARED_DIGEST, mode=0o644, byte_len=6)
+    post_a, post_b = file_state(b"one"), file_state(b"two")
+    return build_spec(
+        consumer_tag="test",
+        intent_digest="sha256:" + "3" * 64,
+        initial_surface={"a.txt": pre_a, "b.txt": pre_b},
+        final_surface={"a.txt": post_a, "b.txt": post_b},
+        effects=[
+            ReplaceFile(effect_id="e1", path="a.txt", pre=pre_a, post=post_a),
+            ReplaceFile(effect_id="e2", path="b.txt", pre=pre_b, post=post_b),
+        ],
     )
 
 
@@ -1578,8 +1627,15 @@ git commit -m "feat(store): resume an interrupted initialization from any of its
 - Consumes: Task 3/4's `create_store`, `open_database`, `gate`, `DATABASE_NAME`.
 - Produces: `open_store(binding: ProjectBinding) -> Store`; `Store` with `transaction()`, `close()`,
   `__enter__`/`__exit__`, and the internal `_require_live()`, `_require_no_transaction()`,
-  `_connection`; `_StoreTransaction` with `_require_current()`, `_spend()`, and the empty barrier hook
-  `_run_barrier()` that Task 8 fills in.
+  `_connection`; `_StoreTransaction` with `_require_current()`, `_mutating()`, `_poison()`,
+  `_require_not_poisoned()`, `_spend()`, and the empty barrier hook `_run_barrier()` that Task 8
+  fills in.
+
+**This task's tests use only this task's surface.** `_StoreTransaction` has no public method until
+Task 7, so ownership is asserted through `_require_current()` — which *is* this task's deliverable —
+and reads through `read_active()` arrive with the reader in Task 8, which extends this same file. The
+gate below therefore runs the whole file with no `-k` filter: a filter that hides tests calling methods
+that do not exist yet is a gate that cannot fail for the reason it was written.
 
 **`_StoreTransaction` is private and stays private.** No caller constructs one or annotates against
 one — it is obtained only by entering `Store.transaction()`, used inside that block, and dead after.
@@ -1590,7 +1646,7 @@ Task 13 asserts the exported surface is exactly `__all__`.
 Create `tests/test_store_liveness.py`:
 
 ```python
-"""Design §5.4 and §7.8 -- the liveness gate, transaction ownership, and close."""
+"""Design §5.4, §7.7, and §7.8 -- the liveness gate, transaction ownership, and close."""
 
 from __future__ import annotations
 
@@ -1603,9 +1659,11 @@ from atoms.store.connection import open_store
 def test_open_store_creates_then_reopens(store_on):
     with store_on() as binding:
         with open_store(binding) as store:
-            assert store.read_active() is None
+            with store.transaction():
+                pass
         with open_store(binding) as store:
-            assert store.read_active() is None
+            with store.transaction():
+                pass
 
 
 def test_a_nested_transaction_is_refused(opened_store):
@@ -1620,7 +1678,7 @@ def test_a_retained_transaction_is_dead_after_commit(opened_store):
     with opened_store.transaction() as txn:
         pass
     with pytest.raises(ProtocolError):
-        txn.set_active(None)
+        txn._require_current()
 
 
 def test_a_retained_transaction_is_dead_after_rollback(opened_store):
@@ -1628,7 +1686,7 @@ def test_a_retained_transaction_is_dead_after_rollback(opened_store):
         with opened_store.transaction() as txn:
             raise RuntimeError("caller failure")
     with pytest.raises(ProtocolError):
-        txn.set_active(None)
+        txn._require_current()
 
 
 def test_a_stale_transaction_cannot_write_into_a_later_one(opened_store):
@@ -1636,8 +1694,26 @@ def test_a_stale_transaction_cannot_write_into_a_later_one(opened_store):
         pass
     with opened_store.transaction():
         with pytest.raises(ProtocolError) as caught:
-            first.set_active(None)
+            first._require_current()
     assert "spent" in str(caught.value).lower() or "current" in str(caught.value).lower()
+
+
+def test_a_poisoned_transaction_refuses_to_commit(opened_store):
+    """Design §7.7. The mechanism here; Task 7 proves it end to end through a real
+    mutating method whose failure the caller catches."""
+    with pytest.raises(ProtocolError) as caught:
+        with opened_store.transaction() as txn:
+            txn._poison(RuntimeError("a mutating method raised"))
+    assert "poison" in str(caught.value).lower()
+    assert isinstance(caught.value.__cause__, RuntimeError)
+
+
+def test_a_poisoned_transaction_leaves_no_open_transaction(opened_store):
+    with pytest.raises(ProtocolError):
+        with opened_store.transaction() as txn:
+            txn._poison(RuntimeError("a mutating method raised"))
+    with opened_store.transaction():
+        pass
 
 
 def test_close_is_idempotent(opened_store):
@@ -1650,13 +1726,11 @@ def test_close_rolls_back_and_spends_an_open_transaction(opened_store):
     txn = entered.__enter__()
     opened_store.close()
     with pytest.raises(ProtocolError):
-        txn.set_active(None)
+        txn._require_current()
 
 
-def test_every_operation_after_close_raises_protocol_error_not_sqlite(opened_store):
+def test_a_transaction_after_close_raises_protocol_error_not_sqlite(opened_store):
     opened_store.close()
-    with pytest.raises(ProtocolError):
-        opened_store.read_active()
     with pytest.raises(ProtocolError):
         with opened_store.transaction():
             pass
@@ -1672,7 +1746,8 @@ def test_a_released_lock_refuses_every_operation(store_on):
     with store_on() as binding:
         store = open_store(binding)
     with pytest.raises(ProtocolError):
-        store.read_active()
+        with store.transaction():
+            pass
     store.close()
 
 
@@ -1722,7 +1797,7 @@ class _StoreTransaction:
     cannot'.
     """
 
-    __slots__ = ("_spent", "_store", "_touched")
+    __slots__ = ("_poisoned_by", "_spent", "_store", "_touched")
 
     def __init__(self, store: Store, *, _construction_token: object | None = None) -> None:
         if _construction_token is not _STORE_TOKEN:
@@ -1730,6 +1805,7 @@ class _StoreTransaction:
         self._store = store
         self._spent = False
         self._touched: set[str] = set()
+        self._poisoned_by: BaseException | None = None
 
     def _require_current(self) -> Store:
         if self._spent:
@@ -1743,6 +1819,41 @@ class _StoreTransaction:
             )
         store._require_live()
         return store
+
+    def _poison(self, cause: BaseException) -> None:
+        """Record that a mutating method failed after SQLite may already have written.
+
+        First cause wins: the one that broke the transaction explains it better than
+        whatever the caller did next.
+        """
+        if self._poisoned_by is None:
+            self._poisoned_by = cause
+
+    def _require_not_poisoned(self) -> None:
+        cause = self._poisoned_by
+        if cause is not None:
+            raise ProtocolError(
+                "this transaction is poisoned: a write raised "
+                f"{type(cause).__name__} and was caught inside the transaction block. "
+                "SQLite rolls back the failing statement, not the transaction, so "
+                "whatever ran before it is still there; committing would make a "
+                "partial write durable"
+            ) from cause
+
+    @contextmanager
+    def _mutating(self) -> Iterator[Store]:
+        """Every public method of this class runs its work inside this.
+
+        Two rules in one place instead of thirteen: the object is the store's current
+        transaction, and a failure poisons what is left. Task 13 asserts every public
+        method opens with it, so the rule is checked rather than remembered.
+        """
+        store = self._require_current()
+        try:
+            yield store
+        except BaseException as caught:
+            self._poison(caught)
+            raise
 
     def _spend(self) -> None:
         self._spent = True
@@ -1798,14 +1909,23 @@ class Store:
         self._active_transaction = txn
         try:
             yield txn
+            txn._require_not_poisoned()
             txn._run_barrier()
             gate(self._binding)
-        except BaseException:
-            self._connection.execute(_ROLLBACK)
-            raise
-        else:
             with translated("committing"):
                 self._connection.execute(_COMMIT)
+        except BaseException:
+            # Reached from four places: the caller's body, the poison check, the
+            # barrier, and a COMMIT that failed. The last is why this is a state test
+            # rather than an `else:` branch -- a failed COMMIT leaves the transaction
+            # OPEN (measured: `in_transaction` is still true afterwards and the next
+            # BEGIN IMMEDIATE raises "cannot start a transaction within a
+            # transaction"), so a store that spent its transaction object and cleared
+            # its slot on that path would refuse every later transaction, reporting a
+            # caller error for a condition it created itself.
+            if self._connection.in_transaction:
+                self._connection.execute(_ROLLBACK)
+            raise
         finally:
             txn._spend()
             self._active_transaction = None
@@ -1849,9 +1969,9 @@ def open_store(binding: ProjectBinding) -> Store:
 ```
 
 Add `from contextlib import contextmanager` and `from collections.abc import Iterator` to
-the imports. `Store.read_active` and `Store.read_record` arrive in Task 8; until then the
-two liveness tests that call `read_active` will fail — that is expected, and Step 5 below
-runs only the subset that does not need them.
+the imports. `Store.read_active` and `Store.read_record` arrive in Task 8, which extends this same
+test file with the read-side liveness cases; nothing in this task's tests calls them, so this task's
+gate runs the file whole.
 
 **The `except sqlite3.Error: pass` inside `close()` is the one swallow in the package**, and
 it is bounded: a rollback on a connection whose transaction SQLite already ended has nothing
@@ -1861,7 +1981,7 @@ allows it by name and nothing else.
 - [ ] **Step 5: Run the tests and the gates**
 
 ```bash
-uv run pytest tests/test_store_liveness.py -v -k "not read_active and not every_operation"
+uv run pytest tests/test_store_liveness.py -v
 uv run ruff check src/atoms/store/connection.py tests/test_store_liveness.py
 uv run pyright
 ```
@@ -2114,6 +2234,30 @@ def every_diagnostic_shape() -> tuple[HaltDiagnostic, ...]:
         operator_action=OperatorAction.INSPECT_PRESERVED_EVIDENCE,
     )
     return (populated, empty)
+
+
+def matching_diagnostic(effect_id: str = "only") -> HaltDiagnostic:
+    """A diagnostic that AGREES with a one_effect_spec record's durable rows.
+
+    §7.6 compares a stored diagnostic's commit_decision and journal vector against the
+    record row and the effect rows, so a diagnostic assembled at random cannot be
+    committed at all. A test that needs a *coherent* HALTED record on disk -- to then
+    break one specific thing about it -- needs this one.
+    """
+    return HaltDiagnostic(
+        pre_halt_state=TransactionState.PREPARED,
+        commit_decision=CommitDecision.UNCOMMITTED,
+        journals=(EffectJournalState(effect_id=effect_id, state=JournalState.PENDING),),
+        projected_transaction_state=TransactionState.HALTED,
+        projected_journals=(),
+        effect_id=effect_id,
+        paths=("a.txt",),
+        expected=(),
+        observed=(),
+        identity_relations=(),
+        reason=HaltReason.DIRECTORY_NOT_EMPTY,
+        operator_action=OperatorAction.INSPECT_PRESERVED_EVIDENCE,
+    )
 ```
 
 - [ ] **Step 3: Run the tests to verify they fail**
@@ -2398,10 +2542,17 @@ one would make the order a second fact to keep in agreement with the spec.
 Append to `tests/test_store_records.py`:
 
 ```python
+import sqlite3
+
 from atoms.core.canonical import canonical_json
 from atoms.core.errors import ProtocolError
 from atoms.core.recovery.model import RollbackResult
-from tests.store_support import one_effect_spec, raw_connect, replace_spec
+from tests.store_support import (
+    duplicate_effect_spec,
+    one_effect_spec,
+    raw_connect,
+    replace_spec,
+)
 
 
 def test_insert_record_stores_the_canonical_encoding(opened_store, store_binding):
@@ -2450,6 +2601,39 @@ def test_a_duplicate_txid_is_refused(opened_store):
     with pytest.raises(Exception):
         with opened_store.transaction() as txn:
             txn.insert_record("tx1", one_effect_spec())
+
+
+def test_a_caught_write_failure_cannot_be_committed(opened_store, store_binding):
+    """Design §7.7's poison rule, end to end.
+
+    The duplicate effect_id fails the *second* INSERT INTO effect. By then the record
+    row and the first effect row -- written by the same method call -- are already in
+    the transaction, and SQLite rolls back only the failing statement: measured,
+    `in_transaction` stays true, the earlier rows stay visible, and the COMMIT makes
+    them durable. A caller that catches the failure inside the block and carries on must
+    not be able to commit that half-written record.
+    """
+    with pytest.raises(ProtocolError) as caught:
+        with opened_store.transaction() as txn:
+            with pytest.raises(sqlite3.IntegrityError):
+                txn.insert_record("tx1", duplicate_effect_spec())
+    assert "poison" in str(caught.value).lower()
+    raw = raw_connect(store_binding)
+    try:
+        assert raw.execute("SELECT count(*) FROM transaction_record").fetchone()[0] == 0
+        assert raw.execute("SELECT count(*) FROM effect").fetchone()[0] == 0
+    finally:
+        raw.close()
+
+
+def test_a_caught_write_failure_does_not_break_the_next_transaction(opened_store):
+    """The poisoned transaction rolls back cleanly, so the store is still usable."""
+    with pytest.raises(ProtocolError):
+        with opened_store.transaction() as txn:
+            with pytest.raises(sqlite3.IntegrityError):
+                txn.insert_record("tx1", duplicate_effect_spec())
+    with opened_store.transaction() as txn:
+        txn.insert_record("tx1", one_effect_spec())
 
 
 @pytest.mark.parametrize("bad", [3, None, b"tx", "../escape", "", "x" * 65])
@@ -2609,40 +2793,40 @@ Append to `src/atoms/store/connection.py`, inside `_StoreTransaction`:
 
 ```python
     def insert_record(self, txid: str, spec: TransactionSpec) -> None:
-        store = self._require_current()
-        require_identifier("txid", txid)
-        if type(spec) is not TransactionSpec:
-            raise ProtocolError(
-                f"spec must be exactly TransactionSpec, got {type(spec).__name__}"
-            )
-        with translated("inserting a record"):
-            store._connection.execute(
-                INSERT_RECORD,
-                (
-                    txid,
-                    canonical_json(spec),
-                    TransactionState.PREPARED.value,
-                    CommitDecision.UNCOMMITTED.value,
-                ),
-            )
-            for effect in spec.effects:
-                store._connection.execute(
-                    INSERT_EFFECT,
-                    (txid, effect.effect_id, variant_of(effect).value,
-                     JournalState.PENDING.value),
+        with self._mutating() as store:
+            require_identifier("txid", txid)
+            if type(spec) is not TransactionSpec:
+                raise ProtocolError(
+                    f"spec must be exactly TransactionSpec, got {type(spec).__name__}"
                 )
-        self._touched.add(txid)
+            with translated("inserting a record"):
+                store._connection.execute(
+                    INSERT_RECORD,
+                    (
+                        txid,
+                        canonical_json(spec),
+                        TransactionState.PREPARED.value,
+                        CommitDecision.UNCOMMITTED.value,
+                    ),
+                )
+                for effect in spec.effects:
+                    store._connection.execute(
+                        INSERT_EFFECT,
+                        (txid, effect.effect_id, variant_of(effect).value,
+                         JournalState.PENDING.value),
+                    )
+            self._touched.add(txid)
 
     def _set_column(self, statement: str, txid: str, value: object) -> None:
-        store = self._require_current()
-        require_identifier("txid", txid)
-        with translated("updating a record"):
-            cursor = store._connection.execute(statement, (value, txid))
-        if cursor.rowcount != 1:
-            raise ProtocolError(
-                f"no transaction_record row for txid {txid!r}"
-            )
-        self._touched.add(txid)
+        with self._mutating() as store:
+            require_identifier("txid", txid)
+            with translated("updating a record"):
+                cursor = store._connection.execute(statement, (value, txid))
+            if cursor.rowcount != 1:
+                raise ProtocolError(
+                    f"no transaction_record row for txid {txid!r}"
+                )
+            self._touched.add(txid)
 
     def set_transaction_state(self, txid: str, state: TransactionState) -> None:
         self._set_column(UPDATE_STATE, txid, state.value)
@@ -2657,30 +2841,36 @@ Append to `src/atoms/store/connection.py`, inside `_StoreTransaction`:
         self._set_column(UPDATE_HALT_DIAGNOSTIC, txid, encode_diagnostic(diagnostic))
 
     def set_journal_state(self, txid: str, effect_id: str, state: JournalState) -> None:
-        store = self._require_current()
-        require_identifier("txid", txid)
-        require_identifier("effect_id", effect_id)
-        with translated("updating a journal state"):
-            cursor = store._connection.execute(
-                UPDATE_JOURNAL_STATE, (state.value, txid, effect_id)
-            )
-        if cursor.rowcount != 1:
-            raise ProtocolError(
-                f"no effect row for txid {txid!r} effect_id {effect_id!r}"
-            )
-        self._touched.add(txid)
+        with self._mutating() as store:
+            require_identifier("txid", txid)
+            require_identifier("effect_id", effect_id)
+            with translated("updating a journal state"):
+                cursor = store._connection.execute(
+                    UPDATE_JOURNAL_STATE, (state.value, txid, effect_id)
+                )
+            if cursor.rowcount != 1:
+                raise ProtocolError(
+                    f"no effect row for txid {txid!r} effect_id {effect_id!r}"
+                )
+            self._touched.add(txid)
 
     def set_active(self, txid: str | None) -> None:
-        store = self._require_current()
-        if txid is None:
-            with translated("clearing the active transaction"):
-                store._connection.execute(DELETE_ACTIVE)
-            return
-        require_identifier("txid", txid)
-        with translated("setting the active transaction"):
-            store._connection.execute(UPSERT_ACTIVE, (txid,))
-        self._touched.add(txid)
+        with self._mutating() as store:
+            if txid is None:
+                with translated("clearing the active transaction"):
+                    store._connection.execute(DELETE_ACTIVE)
+                return
+            require_identifier("txid", txid)
+            with translated("setting the active transaction"):
+                store._connection.execute(UPSERT_ACTIVE, (txid,))
+            self._touched.add(txid)
 ```
+
+**Every method above opens with `with self._mutating() as store:`** and none calls `_require_current`
+directly. That context manager is design §7.7's poison rule (Task 5): it checks ownership on the way in
+and, on the way out, records the first exception that escaped so the transaction cannot commit even if
+the caller swallows it. The four one-line setters delegate to `_set_column`, which opens it for them;
+Task 13's guard accepts exactly that shape and nothing looser.
 
 Add the corresponding imports to `connection.py`: `TransactionSpec`, `TransactionState`,
 `CommitDecision`, `JournalState`, `RollbackResult`, `HaltDiagnostic`, `canonical_json`, and
@@ -2895,6 +3085,47 @@ def test_the_barrier_validates_only_structure_not_transition_legality(opened_sto
     assert record.state is TransactionState.APPLIED
 
 
+def test_one_digest_declared_at_two_lengths_refuses(opened_store, store_binding):
+    """Design §7.6, criterion 23. compile_spec accepts a spec whose initial surface
+    declares one digest at two byte_lens -- measured -- so the store is where it is
+    caught, and only if referenced_digests keeps both references. Collapsed into a
+    mapping, whichever reference the dict kept would agree with the row and the other
+    would vanish."""
+    raw = raw_connect(store_binding)
+    try:
+        raw.execute(
+            "INSERT INTO blob (digest, byte_len) VALUES (?, ?)", (SHARED_DIGEST, 6)
+        )
+    finally:
+        raw.close()
+    with pytest.raises(ProtocolError) as caught:
+        with opened_store.transaction() as txn:
+            txn.insert_record("tx1", two_length_spec())
+    assert "byte_len" in str(caught.value)
+
+
+def test_a_halted_record_missing_an_effect_row_reports_findings(
+    opened_store, store_binding
+):
+    """Design §7.6: a finding that depends on an earlier one is skipped once that one
+    fires. The diagnostic's journal vector is indexed by every effect_id in spec_json,
+    so comparing it against effect rows that no longer cover spec_json raises KeyError
+    -- out of the very function whose job is to report the finding, as an exception type
+    the store does not promise."""
+    with opened_store.transaction() as txn:
+        txn.insert_record("tx1", one_effect_spec(effect_id="only"))
+        txn.set_transaction_state("tx1", TransactionState.HALTED)
+        txn.set_halt_diagnostic("tx1", matching_diagnostic("only"))
+    raw = raw_connect(store_binding)
+    try:
+        raw.execute("DELETE FROM effect WHERE txid = 'tx1'")
+    finally:
+        raw.close()
+    with pytest.raises(MetadataStoreInvalid) as caught:
+        opened_store.read_record("tx1")
+    assert "effect row missing for effect_id 'only'" in str(caught.value)
+
+
 def test_a_read_inside_a_write_transaction_is_refused(opened_store):
     with opened_store.transaction() as txn:
         txn.insert_record("tx1", one_effect_spec())
@@ -2917,21 +3148,52 @@ def test_a_failed_read_leaves_no_open_transaction(opened_store, store_binding):
 
 
 def test_a_read_takes_one_snapshot_across_a_concurrent_commit(store_on):
-    """Two Store objects may share one live ProjectBinding -- nothing in A5a or A5b
-    forbids it -- and each holds its own connection (design §7.4)."""
+    """Design §7.4, criterion 15: one snapshot per read, proved against a writer that
+    commits **between the queries of a single load** -- not before it and not after it.
+
+    Reading once, committing, and reading again proves only that a later read sees later
+    data, which an unwrapped read also does. What has to be excluded is the torn read: a
+    load whose record row predates the commit and whose effect rows postdate it. The
+    commit is injected from sqlite3's trace callback on the reader's own connection,
+    which fires immediately before each statement, so the interleaving is deterministic
+    rather than a race the test hopes to win.
+
+    Measured against this exact shape: inside a deferred BEGIN the load returns
+    (prepared, pending) and a later read returns (applying, started); with the same
+    injection and no read transaction the load returns (prepared, **started**) -- the
+    torn pair. Two Store objects may share one live ProjectBinding, and each holds its
+    own connection.
+    """
     from atoms.store.connection import open_store
 
     with store_on() as binding:
         with open_store(binding) as writer, open_store(binding) as reader:
             with writer.transaction() as txn:
                 txn.insert_record("tx1", one_effect_spec(effect_id="e1"))
-            before = reader.read_record("tx1")
-            with writer.transaction() as txn:
-                txn.set_journal_state("tx1", "e1", JournalState.STARTED)
-                txn.set_transaction_state("tx1", TransactionState.APPLYING)
+
+            fired: list[str] = []
+
+            def commit_between(statement: str) -> None:
+                # The trace callback receives the EXPANDED statement -- 'txid = ''tx1'''
+                # rather than 'txid = ?' (measured), so this matches the table, not the
+                # constant. Fire once: the load queries `effect` more than once.
+                if "FROM effect" not in statement or fired:
+                    return
+                fired.append(statement)
+                with writer.transaction() as inner:
+                    inner.set_journal_state("tx1", "e1", JournalState.STARTED)
+                    inner.set_transaction_state("tx1", TransactionState.APPLYING)
+
+            reader._connection.set_trace_callback(commit_between)
+            try:
+                during = reader.read_record("tx1")
+            finally:
+                reader._connection.set_trace_callback(None)
+            assert fired, "the trace callback never saw the effect query"
             after = reader.read_record("tx1")
-    assert before is not None and after is not None
-    assert (before.state, before.journals[0].state) == (
+
+    assert during is not None and after is not None
+    assert (during.state, during.journals[0].state) == (
         TransactionState.PREPARED, JournalState.PENDING
     )
     assert (after.state, after.journals[0].state) == (
@@ -3027,8 +3289,8 @@ class StoredRecord:
     journals: tuple[EffectJournalState, ...]
 
 
-def referenced_digests(spec: TransactionSpec) -> dict[str, int]:
-    """The content hashes this record needs a blob for, with their declared lengths.
+def referenced_digests(spec: TransactionSpec) -> tuple[tuple[str, int], ...]:
+    """Every (digest, byte_len) this record needs a blob for, deduplicated but not merged.
 
     The **initial** surface only. Blobs are rollback material: authority §7.3 step 3 has
     A6 stream the captured *pre*-state of each path into staging and step 4 promote it.
@@ -3036,13 +3298,20 @@ def referenced_digests(spec: TransactionSpec) -> dict[str, int]:
     exists or should -- including it here would make every record refuse until something
     promoted a blob for content that does not exist yet.
 
+    **Pairs, not a mapping.** A hash and a length are both properties of the same bytes,
+    so two paths carrying one digest must carry one length -- but compile_spec accepts a
+    spec where they do not (measured: two initial entries at digest X with byte_len 5 and
+    6 compile clean). Keyed by digest, the second reference silently overwrites the first
+    and §7.6 then checks the blob row against whichever survived. As pairs both survive,
+    at most one can match the row, and the disagreement refuses with no special case.
+
     Public rather than private because connection.py's pre-COMMIT barrier reads it too.
     """
-    return {
-        entry.state.content_hash: entry.state.byte_len
+    return tuple(sorted({
+        (entry.state.content_hash, entry.state.byte_len)
         for entry in spec.initial_surface
         if isinstance(entry.state, FileState)
-    }
+    }))
 
 
 def coherence_findings(connection: Any, txid: str) -> tuple[str, ...]:
@@ -3079,6 +3348,7 @@ def coherence_findings(connection: Any, txid: str) -> tuple[str, ...]:
     rows = connection.execute(SELECT_EFFECTS, (txid,)).fetchall()
     stored = {effect_id: (variant, journal) for effect_id, variant, journal in rows}
     declared = {effect.effect_id: variant_of(effect).value for effect in spec.effects}
+    covered = set(declared) == set(stored)
     for effect_id in sorted(set(declared) - set(stored)):
         findings.append(f"effect row missing for effect_id {effect_id!r}")
     for effect_id in sorted(set(stored) - set(declared)):
@@ -3090,7 +3360,7 @@ def coherence_findings(connection: Any, txid: str) -> tuple[str, ...]:
                 f"spec_json says {declared[effect_id]!r}"
             )
 
-    for digest, byte_len in sorted(referenced_digests(spec).items()):
+    for digest, byte_len in referenced_digests(spec):
         blob = connection.execute(SELECT_BLOB, (digest,)).fetchone()
         if blob is None:
             findings.append(f"no blob row for referenced digest {digest!r}")
@@ -3116,10 +3386,19 @@ def coherence_findings(connection: Any, txid: str) -> tuple[str, ...]:
             findings.append(
                 "the diagnostic's commit_decision disagrees with the durable row"
             )
-        vector = _journal_vector(spec, stored)
-        if diagnostic.journals != vector:
+        # Only when coverage holds. _journal_vector indexes `stored` by every effect_id
+        # in spec_json, so on a record that is already missing an effect row it would
+        # raise KeyError -- turning a reported finding into an exception of a type the
+        # store does not promise, out of the loader that exists to report findings.
+        if covered:
+            if diagnostic.journals != _journal_vector(spec, stored):
+                findings.append(
+                    "the diagnostic's journal vector disagrees with the durable rows"
+                )
+        else:
             findings.append(
-                "the diagnostic's journal vector disagrees with the durable rows"
+                "the diagnostic's journal vector cannot be compared: the effect rows do "
+                "not cover spec_json"
             )
 
     active = connection.execute(SELECT_ACTIVE).fetchone()
@@ -3242,7 +3521,7 @@ Fill in `_StoreTransaction._run_barrier`:
                     f"the record for txid {txid!r} would not be coherent: "
                     + "; ".join(findings)
                 )
-        for digest in sorted(self._promoted):
+        for digest in sorted(digest for digests in self._promoted.values() for digest in digests):
             if store._connection.execute(SELECT_BLOB, (digest,)).fetchone() is None:
                 raise ProtocolError(
                     f"digest {digest!r} was promoted in this transaction but has no "
@@ -3250,11 +3529,17 @@ Fill in `_StoreTransaction._run_barrier`:
                 )
 ```
 
-`self._promoted` is a second `set[str]` on `_StoreTransaction`, initialized to `set()` beside
-`_touched`. Task 11 populates it. The second loop is written now so that Task 11 adds no code
-to the barrier — but note that with promotion writing its own rows (Task 11), the loop can
-never fire; it is retained only as the barrier's statement of the invariant and Task 11
-replaces it with the *record-reference* check the design actually requires. Do not leave both.
+`self._promoted` is a `dict[str, set[str]]` on `_StoreTransaction` — **workspace txid to the digests
+promoted from it** — initialized to `{}` beside `_touched`, with `"_promoted"` added to that class's
+`__slots__`. Task 11 populates it. It is keyed by txid
+rather than flat because criterion 27 binds each promoted digest to *the record for that workspace's
+txid*: against one merged set, a blob promoted from `tx1`'s workspace would be justified by a record
+`tx2` written in the same transaction, which is a different claim and a weaker one.
+
+The loop above is written now so that Task 11 adds no code to the barrier — but note that with
+promotion writing its own rows (Task 11), it can never fire; it is retained only as the barrier's
+statement of the invariant, and Task 11 replaces it with the *record-reference* check the design
+actually requires. Do not leave both.
 
 - [ ] **Step 4: Run the tests and the gates**
 
@@ -3265,10 +3550,11 @@ uv run pyright
 ```
 Expected: PASS, `All checks passed!`, `0 errors`.
 
-Two tests in `test_store_records.py` reference blob rows that no task has written yet —
-`test_a_record_round_trips_through_the_store` uses `replace_spec`, whose `FileState`s carry
-content hashes with no `blob` row, so `coherence_findings` reports "no blob row for referenced
-digest". **Insert the rows directly** in those tests for now:
+**Every test in `test_store_records.py` that commits a `replace_spec` record** now needs a `blob`
+row that no task has written yet — `replace_spec`'s `pre` is a `FileState` whose content hash has no
+row, so `coherence_findings` reports "no blob row for referenced digest" and the barrier refuses.
+Run the file, take the list from the failures rather than from this paragraph, and **insert the rows
+directly** in each for now:
 
 ```python
     raw = raw_connect(store_binding)
@@ -3334,7 +3620,21 @@ The missing half is modeled as **spent** rather than as a different kind of work
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `tests/test_store_workspace.py`:
+First add the descriptor helper to `tests/store_support.py` — every test from here on that opens
+`staging`, `work`, or `blobs/sha256` directly uses it, and a bare `os.open` in an assertion leaks the
+descriptor for the rest of the session. Add `from contextlib import contextmanager` to that file:
+
+```python
+@contextmanager
+def child_dir(root_fd: int, name: str):
+    fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=root_fd)
+    try:
+        yield fd
+    finally:
+        os.close(fd)
+```
+
+Then create `tests/test_store_workspace.py`:
 
 ```python
 """Tier 4 -- workspaces over a real ext4 metadata root (design §8.3, §8.5)."""
@@ -3350,14 +3650,15 @@ import pytest
 from atoms.core.errors import ProtocolError
 from atoms.store.errors import MetadataStoreInvalid
 from atoms.store.workspace import Workspace
-from tests.store_support import stage
+from tests.store_support import child_dir, stage
 
 
 def test_creation_makes_both_directories(opened_store, store_binding):
     with opened_store.create_workspace("tx1") as workspace:
         assert workspace.txid == "tx1"
-        assert os.path.isdir(f"staging/tx1", dir_fd=store_binding.metadata_root_fd) or True
-        assert "tx1" in os.listdir(os.open("staging", os.O_RDONLY, dir_fd=store_binding.metadata_root_fd))
+        for parent in ("staging", "work"):
+            with child_dir(store_binding.metadata_root_fd, parent) as parent_fd:
+                assert "tx1" in os.listdir(parent_fd)
 
 
 def test_creation_refuses_when_either_directory_exists(opened_store):
@@ -3415,6 +3716,50 @@ def test_reopen_refuses_when_neither_directory_exists(opened_store):
         opened_store.reopen_workspace("tx1")
 
 
+def test_reopen_refuses_a_symlink_at_a_workspace_name(opened_store, store_binding, tmp_path):
+    """Design §8.3. reopen is reachable without the enumeration that would have caught
+    this -- A5b arrives holding a txid read out of a record -- so the check has to be in
+    the open. Reproduced with the flags this call would otherwise use: the symlink opened
+    cleanly and listed the target's contents, and that descriptor is a mutation anchor A6
+    stages captures through.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "someone-elses-file").write_bytes(b"x")
+    with child_dir(store_binding.metadata_root_fd, "staging") as parent_fd:
+        os.symlink(str(outside), "tx1", dir_fd=parent_fd)
+    with pytest.raises(MetadataStoreInvalid) as caught:
+        opened_store.reopen_workspace("tx1")
+    assert "not a directory" in str(caught.value)
+    with child_dir(store_binding.metadata_root_fd, "staging") as parent_fd:
+        assert "tx1" in os.listdir(parent_fd)
+    assert (outside / "someone-elses-file").exists()
+
+
+def test_reopen_refuses_a_regular_file_at_a_workspace_name(opened_store, store_binding):
+    with child_dir(store_binding.metadata_root_fd, "work") as parent_fd:
+        os.close(os.open("tx1", os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600, dir_fd=parent_fd))
+    with pytest.raises(MetadataStoreInvalid):
+        opened_store.reopen_workspace("tx1")
+
+
+def test_close_closes_every_workspace_the_store_issued(opened_store):
+    """Design §7.8: close() closes the connection A5a opened and any Workspace
+    descriptors still outstanding. A store that tracks none leaves them open for the
+    process's lifetime, holding directories the next lease owner may be reclaiming."""
+    first = opened_store.create_workspace("tx1")
+    second = opened_store.create_workspace("tx2")
+    second.close()
+    opened_store.close()
+    # The ProtocolError alone would pass on a store that tracks nothing -- the anchor
+    # property gates on the store being live. The descriptors are the claim.
+    assert first._closed
+    assert (first._staging_fd, first._work_fd) == (None, None)
+    with pytest.raises(ProtocolError):
+        first.staging_fd
+    first.close()
+
+
 def test_every_txid_list_workspaces_reports_is_one_reopen_accepts(opened_store, store_binding):
     opened_store.create_workspace("tx1").close()
     opened_store.create_workspace("tx2").close()
@@ -3433,8 +3778,8 @@ def test_removal_empties_a_non_empty_staging_directory(opened_store, store_bindi
             stage(workspace, name, name.encode())
         opened_store.remove_workspace(workspace)
     assert opened_store.list_workspaces() == ()
-    root = store_binding.metadata_root_fd
-    assert "tx1" not in os.listdir(os.open("staging", os.O_RDONLY, dir_fd=root))
+    with child_dir(store_binding.metadata_root_fd, "staging") as parent_fd:
+        assert "tx1" not in os.listdir(parent_fd)
 
 
 def test_removal_refuses_a_non_empty_work_directory(opened_store):
@@ -3556,6 +3901,7 @@ Create `src/atoms/store/workspace.py`:
 
 from __future__ import annotations
 
+import errno
 import os
 import stat
 from typing import TYPE_CHECKING, Never
@@ -3669,12 +4015,25 @@ class Workspace:
                 os.close(fd)
         self._staging_fd = None
         self._work_fd = None
+        self._store._workspaces.discard(self)
 
     def __enter__(self) -> Workspace:
         return self
 
     def __exit__(self, *exc: object) -> None:
         self.close()
+
+
+def _issue(store: Store, workspace: Workspace) -> Workspace:
+    """Register a workspace with the store that issued it (design §7.8).
+
+    `close()` closes "the connection A5a opened and any Workspace descriptors still
+    outstanding" -- which it can only do if it knows about them. `Workspace.close()`
+    removes itself again, so a long-lived store that creates and closes many workspaces
+    does not accumulate them.
+    """
+    store._workspaces.add(workspace)
+    return workspace
 
 
 def _parent_fd(store: Store, name: str) -> int:
@@ -3684,11 +4043,36 @@ def _parent_fd(store: Store, name: str) -> int:
     )
 
 
-def _open_child(parent_fd: int, txid: str) -> int | None:
+def _open_child(parent_fd: int, parent: str, txid: str) -> int | None:
+    """Design §8.3 -- `O_NOFOLLOW`, and the refusal that goes with it.
+
+    `list_workspaces` classifies each child by `fstatat` with `follow_symlinks=False`,
+    but `reopen_workspace` is reachable without ever running it: A5b arrives holding a
+    txid read out of a record. So the kind check belongs in the open. Without the flag
+    this call hands back a descriptor to whatever a symlink names -- reproduced with the
+    flags it would otherwise use, opening a directory outside metadata_root and listing
+    it -- and that descriptor is a borrowed mutation anchor A6 stages captures through.
+
+    On Linux both the symlink and the regular-file case fail ENOTDIR, measured;
+    `O_DIRECTORY` pre-empts the ELOOP that `O_NOFOLLOW` alone documents, and ELOOP is
+    named here because the flag's contract is what this depends on, not one kernel's
+    choice between two errnos.
+    """
     try:
-        return os.open(txid, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=parent_fd)
+        return os.open(
+            txid,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=parent_fd,
+        )
     except FileNotFoundError:
         return None
+    except OSError as caught:
+        if caught.errno not in (errno.ENOTDIR, errno.ELOOP):
+            raise
+        raise MetadataStoreInvalid(
+            f"{parent}/{txid} is not a directory; create_workspace is the only "
+            "permitted producer here and it makes directories"
+        ) from caught
 
 
 def _require_permitted_children(parent_fd: int, parent: str) -> tuple[str, ...]:
@@ -3748,13 +4132,13 @@ def create_workspace(store: Store, txid: str) -> Workspace:
         os.mkdir(txid, 0o700, dir_fd=work_parent)
         store._binding.backend.flush_directory(staging_parent)
         store._binding.backend.flush_directory(work_parent)
-        return Workspace(
+        return _issue(store, Workspace(
             store=store,
             txid=txid,
-            staging_fd=_open_child(staging_parent, txid),
-            work_fd=_open_child(work_parent, txid),
+            staging_fd=_open_child(staging_parent, STAGING_PARENT, txid),
+            work_fd=_open_child(work_parent, WORK_PARENT, txid),
             _construction_token=_WORKSPACE_TOKEN,
-        )
+        ))
     finally:
         os.close(staging_parent)
         os.close(work_parent)
@@ -3774,14 +4158,14 @@ def reopen_workspace(store: Store, txid: str) -> Workspace:
     staging_parent = _parent_fd(store, STAGING_PARENT)
     work_parent = _parent_fd(store, WORK_PARENT)
     try:
-        staging_fd = _open_child(staging_parent, txid)
-        work_fd = _open_child(work_parent, txid)
+        staging_fd = _open_child(staging_parent, STAGING_PARENT, txid)
+        work_fd = _open_child(work_parent, WORK_PARENT, txid)
         if staging_fd is None and work_fd is None:
             raise ProtocolError(f"no workspace on disk for txid {txid!r}")
-        return Workspace(
+        return _issue(store, Workspace(
             store=store, txid=txid, staging_fd=staging_fd, work_fd=work_fd,
             _construction_token=_WORKSPACE_TOKEN,
-        )
+        ))
     finally:
         os.close(staging_parent)
         os.close(work_parent)
@@ -3859,6 +4243,33 @@ def remove_workspace(store: Store, workspace: Workspace) -> None:
     workspace.close()
 ```
 
+Add the workspace registry to `Store` in `connection.py` — design §7.8's promise that `close()`
+closes "any `Workspace` descriptors still outstanding". Extend `__slots__`:
+
+```python
+    __slots__ = (
+        "_active_transaction", "_binding", "_closed", "_connection", "_workspaces",
+    )
+```
+
+add the last line of `__init__`:
+
+```python
+        self._workspaces: set[Workspace] = set()
+```
+
+and close them in `close()`, between spending the transaction and closing the connection:
+
+```python
+        for workspace in tuple(self._workspaces):
+            workspace.close()   # discards itself from the set; iterate a copy
+        self._connection.close()
+```
+
+`Workspace` is unhashable-by-value and hashable by identity — it defines no `__eq__` — so a plain
+`set` is the right container. The references are strong on purpose: a workspace the caller dropped
+without closing is exactly the one whose descriptors `close()` has to reach.
+
 Append the four delegating methods to `Store`:
 
 ```python
@@ -3888,24 +4299,6 @@ uv run ruff check src/atoms/store tests/test_store_workspace.py
 uv run pyright
 ```
 Expected: PASS, `All checks passed!`, `0 errors`.
-
-`test_creation_makes_both_directories` as written leaks a descriptor from
-`os.open("staging", ...)`; rewrite its assertion using a `with` around a helper in
-`store_support.py`:
-
-```python
-@contextmanager
-def child_dir(root_fd: int, name: str):
-    fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY, dir_fd=root_fd)
-    try:
-        yield fd
-    finally:
-        os.close(fd)
-```
-
-and use it in every test that opens `staging`, `work`, or `blobs/sha256` directly. Add
-`from contextlib import contextmanager` to `store_support.py`. Tasks 10 through 13 all import
-`child_dir` from there, so it must land in this task.
 
 - [ ] **Step 5: Commit**
 
@@ -4317,11 +4710,43 @@ digest that was never promoted. One operation owning the whole publication remov
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `tests/test_store_blobs.py`:
+First add the record builder every promotion test now needs, to `tests/store_support.py`. The
+barrier requires the record for the workspace's txid to reference every digest the transaction
+promoted, so `one_effect_spec` — which starts from `ABSENT` and references nothing — can no longer
+follow a promotion:
+
+```python
+def spec_referencing(*contents: bytes):
+    """A spec whose INITIAL surface declares one FileState per content.
+
+    The promoted blobs are that record's rollback material, which is exactly what the
+    §7.7 barrier checks for. Putting the hashes in the final surface would not work:
+    referenced_digests walks the initial surface only (Task 8), because a final-surface
+    hash names content the transaction has not produced yet.
+    """
+    names = [f"f{index}.txt" for index in range(len(contents))]
+    pre = {n: file_state(c) for n, c in zip(names, contents, strict=True)}
+    post = {n: file_state(c + b"!") for n, c in zip(names, contents, strict=True)}
+    return build_spec(
+        consumer_tag="test",
+        intent_digest="sha256:" + "5" * 64,
+        initial_surface=pre,
+        final_surface=post,
+        effects=[
+            ReplaceFile(effect_id=f"e{index}", path=name, pre=pre[name], post=post[name])
+            for index, name in enumerate(names)
+        ],
+    )
+```
+
+No leading underscore: it is imported across modules, and a private name would trip ruff's
+private-member rules at every call site.
+
+Then append to `tests/test_store_blobs.py`:
 
 ```python
 from atoms.core.recovery.model import TransactionState
-from tests.store_support import one_effect_spec
+from tests.store_support import one_effect_spec, spec_referencing
 
 
 def _manifest(*entries: tuple[str, bytes]) -> tuple[StagedBlob, ...]:
@@ -4340,13 +4765,13 @@ def test_promotion_publishes_indexes_and_removes_the_staging_directory(
         manifest = _manifest(("one", b"first"), ("two", b"second"))
         with opened_store.transaction() as txn:
             txn.promote_staging(workspace, manifest)
-            txn.insert_record("tx1", one_effect_spec())
+            txn.insert_record("tx1", spec_referencing(b"first", b"second"))
     with child_dir(store_binding.metadata_root_fd, "blobs/sha256") as blobs_fd:
         assert set(os.listdir(blobs_fd)) == {digest_to_leaf(b.digest) for b in manifest}
-    assert "tx1" not in [
-        txid for txid in opened_store.list_workspaces()
-        if txid == "tx1" and False
-    ] or True
+    with child_dir(store_binding.metadata_root_fd, "staging") as staging_fd:
+        assert os.listdir(staging_fd) == []
+    # Only the staging half went; work/tx1 is what a successful promotion leaves behind.
+    assert opened_store.list_workspaces() == ("tx1",)
     for entry in manifest:
         fd = opened_store.open_blob(entry.digest)
         os.close(fd)
@@ -4357,12 +4782,41 @@ def test_promotion_spends_the_staging_half(opened_store):
         stage(workspace, "one", b"first")
         with opened_store.transaction() as txn:
             txn.promote_staging(workspace, _manifest(("one", b"first")))
-            txn.insert_record("tx1", one_effect_spec())
+            txn.insert_record("tx1", spec_referencing(b"first"))
         with pytest.raises(ProtocolError):
             workspace.staging_fd
         with pytest.raises(ProtocolError):
             with opened_store.transaction() as txn:
                 txn.promote_staging(workspace, _manifest(("one", b"first")))
+
+
+def test_an_empty_manifest_still_spends_the_staging_half(opened_store, store_binding):
+    """A spec whose initial surface names no file has nothing to capture, so the
+    directory is removed with no source removed. Spending on the first source removal
+    would leave this workspace holding a descriptor to an unlinked directory -- openat
+    from it still works and produces files no path can name (design §8.1 step 4)."""
+    with opened_store.create_workspace("tx1") as workspace:
+        with opened_store.transaction() as txn:
+            txn.promote_staging(workspace, ())
+            txn.insert_record("tx1", one_effect_spec())
+        with pytest.raises(ProtocolError):
+            workspace.staging_fd
+    with child_dir(store_binding.metadata_root_fd, "staging") as staging_fd:
+        assert os.listdir(staging_fd) == []
+
+
+def test_a_promoted_digest_the_records_workspace_does_not_reference_refuses(opened_store):
+    """Criterion 27 binds each promoted digest to the record for **that workspace's**
+    txid. A union over every touched record would let tx2's record justify a blob
+    promoted from tx1's workspace, leaving tx1's own record naming nothing."""
+    with opened_store.create_workspace("tx1") as first:
+        stage(first, "one", b"shared")
+        with pytest.raises(ProtocolError) as caught:
+            with opened_store.transaction() as txn:
+                txn.promote_staging(first, _manifest(("one", b"shared")))
+                txn.insert_record("tx1", one_effect_spec())
+                txn.insert_record("tx2", spec_referencing(b"shared"))
+    assert "tx1" in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -4449,14 +4903,14 @@ def test_a_matching_pre_existing_blob_unlinks_the_source_and_continues(
         stage(first, "one", b"shared")
         with opened_store.transaction() as txn:
             txn.promote_staging(first, _manifest(("one", b"shared")))
-            txn.insert_record("tx1", one_effect_spec())
+            txn.insert_record("tx1", spec_referencing(b"shared"))
     with opened_store.create_workspace("tx2") as second:
         stage(second, "again", b"shared")
         with opened_store.transaction() as txn:
             txn.promote_staging(second, (
                 StagedBlob(name="again", digest=digest_of(b"shared"), byte_len=6),
             ))
-            txn.insert_record("tx2", one_effect_spec(effect_id="e2"))
+            txn.insert_record("tx2", spec_referencing(b"shared"))
     with child_dir(store_binding.metadata_root_fd, "blobs/sha256") as blobs_fd:
         assert len(os.listdir(blobs_fd)) == 1
 
@@ -4713,6 +5167,10 @@ def promote_staging(
     try:
         gate(store._binding)
         os.rmdir(workspace.txid, dir_fd=staging_parent)
+        # The directory is gone, so the half is spent even if no source was removed --
+        # an empty manifest is a real case (a spec whose initial surface names no file
+        # has nothing to capture), and it reaches here with `spent` still False.
+        workspace.spend_staging()
         backend.flush_directory(staging_parent)
     finally:
         os.close(staging_parent)
@@ -4723,10 +5181,18 @@ def promote_staging(
 
 Add `from atoms.store.workspace import STAGING_PARENT, Workspace` to the imports.
 
-**`workspace.spend_staging()` is called on every outcome once any source has been removed** —
-by a rename or by §8.2's `EEXIST` unlink. The threshold is the **first source removal**, not
-the first rename: `EEXIST` on a matching pre-existing blob unlinks the staged source and
-continues without any rename succeeding, so a batch can lose sources through that route alone.
+**Two thresholds, because the success and failure paths are answering different questions.**
+
+- On the **failure** path, `workspace.spend_staging()` runs once *any source has been removed* — by a
+  rename or by §8.2's `EEXIST` unlink. The threshold is the first source removal, not the first
+  rename: `EEXIST` on a matching pre-existing blob unlinks the staged source and continues without any
+  rename succeeding, so a batch can lose sources through that route alone. That is criterion 26 — the
+  staging half is no longer a complete capture, so it is not retryable.
+- On the **success** path, the half is spent when step 4's `rmdir` succeeds, which is strictly more
+  cases: an **empty manifest removes the directory without removing any source**. Spending on source
+  removal alone would leave that workspace holding an open descriptor to an unlinked directory —
+  `openat` from it still succeeds and produces files no path can ever name, which is the exact state
+  `spend_staging` exists to prevent (design §8.1 step 4).
 
 Append to `_StoreTransaction`:
 
@@ -4734,30 +5200,45 @@ Append to `_StoreTransaction`:
     def promote_staging(
         self, workspace: Workspace, manifest: tuple[StagedBlob, ...]
     ) -> None:
-        store = self._require_current()
-        promote_staging(store, workspace, manifest)
-        self._promoted.update(entry.digest for entry in manifest)
+        with self._mutating() as store:
+            promote_staging(store, workspace, manifest)
+            # Design §7.7: register both the txid -- so §7.6's predicate runs for it,
+            # which promotion alone would not have caused -- and the digests, under
+            # that txid.
+            self._touched.add(workspace.txid)
+            self._promoted.setdefault(workspace.txid, set()).update(
+                entry.digest for entry in manifest
+            )
 ```
 
 Replace the second loop of `_run_barrier` with the record-reference check:
 
 ```python
-        if self._promoted:
-            referenced: set[str] = set()
-            for txid in self._touched:
-                row = store._connection.execute(SELECT_RECORD, (txid,)).fetchone()
-                if row is None:
-                    continue
-                referenced.update(referenced_digests(from_canonical_json(row[0])))
-            unreferenced = sorted(self._promoted - referenced)
+        for txid, promoted in sorted(self._promoted.items()):
+            row = store._connection.execute(SELECT_RECORD, (txid,)).fetchone()
+            referenced = (
+                set()
+                if row is None
+                else {
+                    digest
+                    for digest, _ in referenced_digests(from_canonical_json(row[0]))
+                }
+            )
+            unreferenced = sorted(promoted - referenced)
             if unreferenced:
                 raise ProtocolError(
-                    "this transaction promoted digests no record it wrote references: "
-                    + ", ".join(unreferenced)
+                    f"this transaction promoted digests the record for txid {txid!r} "
+                    "does not reference: " + ", ".join(unreferenced)
                     + ". A committed blob row with no reference is invisible to both "
                     "reclaimers and would be stranded permanently"
                 )
 ```
+
+**The lookup is per workspace txid, not a union over everything the transaction touched** (criterion
+27). Unioning would let a blob promoted from `tx1`'s workspace be justified by a record for `tx2`
+written in the same transaction — which satisfies "some record references it" while leaving `tx1`'s
+own record naming nothing, and leaves the blob stranded the moment `tx2` is the one that gets
+reclaimed.
 
 - [ ] **Step 4: Rewrite the `promoted_blob` fixture to promote**
 
@@ -4768,7 +5249,7 @@ Replace the fixture body in `tests/conftest.py`:
 def promoted_blob(opened_store):
     """A store holding one promoted, indexed blob, with its digest and bytes."""
     from atoms.store.blobs import StagedBlob
-    from tests.store_support import digest_of, one_effect_spec, stage
+    from tests.store_support import digest_of, spec_referencing, stage
 
     content = b"the blob's bytes"
     digest = digest_of(content)
@@ -4783,28 +5264,9 @@ def promoted_blob(opened_store):
     return opened_store, digest, content
 ```
 
-Add `spec_referencing(content)` to `tests/store_support.py` — a spec whose **initial**
-surface declares a `FileState` with that content's hash and length, so the promoted blob is
-the record's rollback material and the barrier's reference check passes. Putting it in the
-final surface would not: `referenced_digests` walks the initial surface only (Task 8).
+`spec_referencing` is the helper Step 1 added to `tests/store_support.py`.
 
-```python
-def spec_referencing(content: bytes):
-    pre = file_state(content)
-    post = file_state(content + b"!")
-    return build_spec(
-        consumer_tag="test",
-        intent_digest="sha256:" + "3" * 64,
-        initial_surface={"a.txt": pre},
-        final_surface={"a.txt": post},
-        effects=[ReplaceFile(effect_id="e1", path="a.txt", pre=pre, post=post)],
-    )
-```
-
-No leading underscore: it is imported across modules, and a private name would trip ruff's
-private-member rules at every call site.
-
-Then delete the two direct `INSERT INTO blob` blocks from `tests/test_store_records.py` that
+Then delete the direct `INSERT INTO blob` blocks from `tests/test_store_records.py` that
 Task 8 marked `# Task 11: promote instead`, and route those tests through `promoted_blob` or a
 promotion of their own.
 
@@ -4968,7 +5430,7 @@ def test_a_reclaimer_does_not_race_another_stores_promotion(store_on):
                         workspace,
                         (StagedBlob(name="one", digest=digest, byte_len=len(content)),),
                     )
-                    txn.insert_record("tx1", _spec_referencing(content))
+                    txn.insert_record("tx1", spec_referencing(content))
                     started.set()
                 thread.join(10)
         with open_store(binding) as store:
@@ -5409,6 +5871,7 @@ git commit -m "feat(store): reclaim a promoted blob nothing references, fail-clo
 **Files:**
 - Create: `tests/test_store_architecture.py`
 - Create: `tests/test_store_process.py`
+- Create: `tests/store_child.py`
 - Modify: `tests/test_fs_architecture.py`
 - Modify: `docs/deferred-obligation-ledger.md`
 - Modify: `AGENTS.md`
@@ -5551,56 +6014,186 @@ def test_every_database_error_handler_contains_a_bare_raise(path):
 
 
 @pytest.mark.parametrize("path", SOURCES, ids=lambda p: p.name)
-def test_no_executescript_attach_or_vacuum_appears(path):
-    source = path.read_text(encoding="utf-8")
-    assert "executescript" not in source, f"{path.name} uses executescript"
-    for statement in ("ATTACH", "DETACH", "VACUUM"):
-        assert not re.search(rf"\b{statement}\b", source), (
-            f"{path.name} spells {statement}"
-        )
+def test_executescript_is_never_called(path):
+    """Over parsed calls, not over source text.
+
+    `executescript` issues a COMMIT before running, which under `isolation_level=None`
+    ends the explicit transaction initialization depends on -- so several docstrings in
+    the package say exactly that, by name. A guard that greps the source would force
+    those docstrings to lie about what they are explaining.
+    """
+    for node in ast.walk(_tree(path)):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            assert node.func.attr != "executescript", f"{path.name} calls executescript"
+
+
+def _module_bindings(tree: ast.Module) -> list[tuple[str, ast.expr]]:
+    """Every module-level `NAME = value` and `NAME: T = value`, as (name, value node).
+
+    AnnAssign matters: `SCHEMA_STATEMENTS: tuple[str, ...] = (...)` is one, and a helper
+    that walked only `ast.Assign` would silently not see the package's largest constant.
+    """
+    bindings: list[tuple[str, ast.expr]] = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and node.value is not None:
+            bindings.extend(
+                (target.id, node.value)
+                for target in node.targets
+                if isinstance(target, ast.Name)
+            )
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            if isinstance(node.target, ast.Name):
+                bindings.append((node.target.id, node.value))
+    return bindings
+
+
+def _string_value(node: ast.expr) -> str | None:
+    try:
+        value = ast.literal_eval(node)
+    except (ValueError, SyntaxError, TypeError):
+        return None
+    return value if isinstance(value, str) else None
 
 
 def _sql_constants() -> dict[str, str]:
-    """Every module-level `NAME = "...sql..."` assignment in the package."""
+    """Every module-level name in the package bound to a string literal."""
     constants: dict[str, str] = {}
     for path in SOURCES:
-        for node in _tree(path).body:
-            if not isinstance(node, ast.Assign):
-                continue
-            value = node.value
-            text = None
-            if isinstance(value, ast.Constant) and isinstance(value.value, str):
-                text = value.value
-            elif isinstance(value, ast.JoinedStr) or isinstance(value, ast.BinOp):
-                try:
-                    text = ast.literal_eval(value)
-                except (ValueError, SyntaxError):
-                    text = None
-            if not isinstance(text, str):
-                continue
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    constants[f"{path.stem}.{target.id}"] = text
+        for name, value in _module_bindings(_tree(path)):
+            text = _string_value(value)
+            if text is not None:
+                constants[f"{path.stem}.{name}"] = text
     return constants
+
+
+def _is_literal(node: ast.expr) -> bool:
+    try:
+        ast.literal_eval(node)
+    except (ValueError, SyntaxError, TypeError):
+        return False
+    return True
+
+
+def _is_string(node: ast.expr) -> bool:
+    return _string_value(node) is not None
+
+
+def _is_nonstring_literal(node: ast.expr) -> bool:
+    return _string_value(node) is None and _is_literal(node)
+
+
+def _local_names(tree: ast.Module, accept) -> set[str]:
+    return {name for name, value in _module_bindings(tree) if accept(value)}
+
+
+def _package_names(path, accept) -> set[str]:
+    """Names this module binds to a matching module-level constant, **including ones it
+    imports from another `atoms.store` module**.
+
+    The import route is not optional: `connection.py` issues `INSERT_RECORD`, which
+    `records.py` owns, and a guard that walked only local assignments would either fail
+    on the package's own code or be widened until it proved nothing.
+    """
+    tree = _tree(path)
+    names = _local_names(tree, accept)
+    for node in tree.body:
+        if not isinstance(node, ast.ImportFrom) or not (node.module or "").startswith(
+            "atoms.store."
+        ):
+            continue
+        source = PACKAGE / f"{node.module.rsplit('.', 1)[-1]}.py"
+        if not source.exists():
+            continue
+        exported = _local_names(_tree(source), accept)
+        names.update(
+            alias.asname or alias.name for alias in node.names if alias.name in exported
+        )
+    return names
+
+
+def _literal_iterated_names(tree: ast.Module, iterables: set[str]) -> set[str]:
+    """Names bound by iterating a module-level LITERAL constant.
+
+    Two loops in the package do this -- the DDL statements and the pinned pragmas, the
+    second unpacking a tuple -- and in both the SQL comes out of a module-level constant
+    structure, which is the property the rule is about. `for x in build_them()` and
+    `for x in cursor` are not resolutions and are not admitted.
+    """
+    bound: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.For) or not isinstance(node.iter, ast.Name):
+            continue
+        if node.iter.id not in iterables:
+            continue
+        if isinstance(node.target, ast.Name):
+            bound.add(node.target.id)
+        elif isinstance(node.target, ast.Tuple):
+            bound.update(e.id for e in node.target.elts if isinstance(e, ast.Name))
+    return bound
+
+
+def _parameters_fed_only_constants(tree: ast.Module, allowed: set[str]) -> set[str]:
+    """Parameters that receive an allowed name at **every** call site in the module.
+
+    `_set_column(UPDATE_STATE, txid, value)` is the shape: four public setters share one
+    body and each passes its own constant. Resolving that means reading the call sites,
+    which is a complete argument here because the helper is private to this module. A
+    parameter fed a constant at one site and a runtime value at another resolves to
+    neither -- verified against exactly that pair.
+    """
+    by_name: dict[str, list[ast.FunctionDef]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            by_name.setdefault(node.name, []).append(node)
+    calls: dict[str, list[ast.Call]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = (
+            node.func.attr
+            if isinstance(node.func, ast.Attribute)
+            else node.func.id if isinstance(node.func, ast.Name) else None
+        )
+        if name in by_name:
+            calls.setdefault(name, []).append(node)
+    resolved: set[str] = set()
+    refused: set[str] = set()
+    for name, definitions in by_name.items():
+        sites = calls.get(name, [])
+        for function in definitions:
+            positional = [arg.arg for arg in function.args.args]
+            offset = 1 if positional and positional[0] == "self" else 0
+            for index, parameter in enumerate(positional[offset:]):
+                values: list[ast.expr] = []
+                for call in sites:
+                    if index < len(call.args):
+                        values.append(call.args[index])
+                    else:
+                        values.extend(
+                            k.value for k in call.keywords if k.arg == parameter
+                        )
+                target = (
+                    resolved
+                    if values
+                    and all(isinstance(v, ast.Name) and v.id in allowed for v in values)
+                    else refused
+                )
+                target.add(parameter)
+    return resolved - refused
 
 
 @pytest.mark.parametrize("path", SOURCES, ids=lambda p: p.name)
 def test_every_execute_argument_resolves_to_a_module_level_constant(path):
     """A positive resolution, not a list of banned spellings: a local assigned from a
-    helper, a dict lookup, or a str subclass all walk past a ban on f-strings and %."""
+    helper, a dict lookup, an attribute off some holder, or a str subclass all walk past
+    a ban on f-strings and `%`. Only a bare name this module can be shown to bind to a
+    constant passes."""
     tree = _tree(path)
-    module_names = {
-        target.id
-        for node in tree.body
-        if isinstance(node, ast.Assign)
-        for target in node.targets
-        if isinstance(target, ast.Name)
-    }
-    loop_names = {
-        node.target.id
-        for node in ast.walk(tree)
-        if isinstance(node, ast.For) and isinstance(node.target, ast.Name)
-    }
+    allowed = _package_names(path, _is_string)
+    allowed |= _literal_iterated_names(
+        tree, _package_names(path, _is_nonstring_literal)
+    )
+    allowed |= _parameters_fed_only_constants(tree, allowed)
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -5610,16 +6203,94 @@ def test_every_execute_argument_resolves_to_a_module_level_constant(path):
         if not node.args:
             pytest.fail(f"{path.name}: execute() with no statement")
         first = node.args[0]
-        if isinstance(first, ast.Name):
-            assert first.id in module_names or first.id in loop_names, (
-                f"{path.name}: execute({first.id}) does not resolve to a module constant"
-            )
-        elif isinstance(first, ast.Attribute):
-            continue
-        else:
+        if not isinstance(first, ast.Name):
             pytest.fail(
-                f"{path.name}: execute() takes {ast.dump(first)[:60]}, not a constant"
+                f"{path.name}: execute({ast.unparse(first)}) is not a bare name; only a "
+                "name resolving to a module-level SQL constant is permitted"
             )
+        assert first.id in allowed, (
+            f"{path.name}: execute({first.id}) does not resolve to a module-level SQL "
+            "constant of the package"
+        )
+
+
+def test_no_statement_in_the_package_attaches_or_vacuums():
+    """Over the statement inventory rather than the source text (criterion 12).
+
+    The test above makes that inventory total, so this covers everything the package can
+    execute -- and unlike a grep it does not fire on a docstring or on the authorizer's
+    own `sqlite3.SQLITE_ATTACH` constant, which is the code that enforces the rule.
+    """
+    from atoms.store.schema import SCHEMA_STATEMENTS
+
+    inventory = dict(_sql_constants())
+    inventory.update(
+        (f"schema.SCHEMA_STATEMENTS[{index}]", text)
+        for index, text in enumerate(SCHEMA_STATEMENTS)
+    )
+    for label, text in inventory.items():
+        for banned in ("ATTACH", "DETACH", "VACUUM"):
+            assert not re.search(rf"\b{banned}\b", text, re.IGNORECASE), (
+                f"{label} spells {banned}"
+            )
+
+
+def test_every_public_transaction_method_poisons_on_failure():
+    """Design §7.7's poison rule, as a structural property rather than a convention.
+
+    A method that talks to the connection without going through `_mutating` leaves a
+    failure the caller can catch and commit around -- the defect the rule exists for --
+    and it fails silently, since the happy path is identical.
+    """
+    tree = _tree(PACKAGE / "connection.py")
+    body = next(
+        node.body
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef) and node.name == "_StoreTransaction"
+    )
+    methods = {
+        node.name: node
+        for node in body
+        if isinstance(node, ast.FunctionDef)
+    }
+
+    def opens_mutating(node: ast.FunctionDef) -> bool:
+        first = next((s for s in node.body if not _is_docstring(s)), None)
+        return (
+            isinstance(first, ast.With)
+            and any(
+                isinstance(item.context_expr, ast.Call)
+                and isinstance(item.context_expr.func, ast.Attribute)
+                and item.context_expr.func.attr == "_mutating"
+                for item in first.items
+            )
+        )
+
+    def delegates_to_a_mutating_helper(node: ast.FunctionDef) -> bool:
+        statements = [s for s in node.body if not _is_docstring(s)]
+        if len(statements) != 1:
+            return False
+        call = statements[0].value if isinstance(statements[0], ast.Expr) else None
+        if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
+            return False
+        target = methods.get(call.func.attr)
+        return target is not None and opens_mutating(target)
+
+    for name, node in sorted(methods.items()):
+        if name.startswith("_"):
+            continue
+        assert opens_mutating(node) or delegates_to_a_mutating_helper(node), (
+            f"_StoreTransaction.{name} does not run inside _mutating(), so a failure "
+            "inside it would not poison the transaction"
+        )
+
+
+def _is_docstring(statement: ast.stmt) -> bool:
+    return (
+        isinstance(statement, ast.Expr)
+        and isinstance(statement.value, ast.Constant)
+        and isinstance(statement.value.value, str)
+    )
 
 
 def test_exactly_one_statement_in_the_package_writes_blob():
@@ -5681,24 +6352,107 @@ def test_a5_status_is_synchronized_across_authority_documents():
 
 - [ ] **Step 2: Write the fresh-process tier**
 
-Create `tests/test_store_process.py`:
+Design §11.5 and criterion 39 say **a fresh process**, and that is not a figure of speech: closing
+and reopening in the same process shares the page cache, the loaded SQLite library, and — the part
+that actually matters — the already-held project lock. A second process has to acquire that lock
+itself, and everything A5a persists has to survive being read by code that watched none of it being
+written. So the reader is a real subprocess.
+
+Create `tests/store_child.py` — the other process:
+
+```python
+"""The reader half of design §11.5's tier-5 claim.
+
+Run as `python -m tests.store_child <project_root> <metadata_root> <txid>`; prints one
+JSON object describing what a fresh process reads back. A module rather than an inline
+`-c` string because it re-runs the whole bind, including acquiring the project lock,
+which is precisely the part a same-process reopen skips.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+
+from atoms.core.canonical import canonical_json
+from atoms.fs.binding import bind_project_volume
+from atoms.fs.linux import LinuxBackend
+from atoms.fs.lock import acquire_project_lock
+from atoms.fs.volume import StorageProfile
+from atoms.store.connection import open_store
+from atoms.store.records import referenced_digests
+from tests.fs_support import build_test_allowlist
+
+STORAGE = StorageProfile(profile_id="atoms-test-profile")
+
+
+def main(project_root: str, metadata_root: str, txid: str) -> int:
+    with acquire_project_lock(LinuxBackend(), metadata_root) as lock:
+        allowlist = build_test_allowlist(lock, project_root, STORAGE)
+        with bind_project_volume(
+            project_root, lock, allowlist=allowlist, storage=STORAGE
+        ) as binding:
+            with open_store(binding) as store:
+                record = store.read_record(txid)
+                if record is None:
+                    raise SystemExit(f"no record for txid {txid!r}")
+                blobs = {}
+                for digest, byte_len in referenced_digests(record.spec):
+                    fd = store.open_blob(digest)
+                    try:
+                        blobs[digest] = len(os.read(fd, byte_len + 1))
+                    finally:
+                        os.close(fd)
+                active = store.read_active()
+    print(json.dumps({
+        "spec": canonical_json(record.spec),
+        "state": record.state.value,
+        "journals": [[j.effect_id, j.state.value] for j in record.journals],
+        "blobs": blobs,
+        "active": None if active is None else active.txid,
+    }))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(*sys.argv[1:4]))
+```
+
+`STORAGE` must equal the `test_storage_profile` fixture's profile — the allowlist match is keyed on
+it. If that fixture's `profile_id` differs in this checkout, take the value from
+`grep -n "def test_storage_profile" -A 3 tests/conftest.py` and use it here.
+
+Then create `tests/test_store_process.py`:
 
 ```python
 """Tier 5 -- the durability claim A5a actually makes (design §11.5)."""
 
 from __future__ import annotations
 
+import json
 import os
+import subprocess
+import sys
+from pathlib import Path
 
+from atoms.core.canonical import canonical_json
 from atoms.store.blobs import StagedBlob
 from atoms.store.connection import open_store
+from atoms.store.records import referenced_digests
 from tests.store_support import digest_of, spec_referencing, stage
 
+ROOT = Path(__file__).resolve().parents[1]
 
-def test_a_committed_record_reads_back_identically_in_a_new_store(store_on):
+
+def test_a_committed_record_reads_back_identically_in_a_fresh_process(store_on):
     content = b"durable bytes"
     digest = digest_of(content)
     with store_on() as binding:
+        # Read the two roots back off the live descriptors: this works whatever the
+        # underlying volume fixture is named in this checkout.
+        project_root = os.readlink(f"/proc/self/fd/{binding.project_root_fd}")
+        metadata_root = os.readlink(f"/proc/self/fd/{binding.metadata_root_fd}")
         with open_store(binding) as store:
             with store.create_workspace("tx1") as workspace:
                 stage(workspace, "capture", content)
@@ -5710,15 +6464,34 @@ def test_a_committed_record_reads_back_identically_in_a_new_store(store_on):
                     txn.insert_record("tx1", spec_referencing(content))
                     txn.set_active("tx1")
             written = store.read_record("tx1")
-        with open_store(binding) as reopened:
-            assert reopened.read_record("tx1") == written
-            assert reopened.read_active() == written
+        assert written is not None
+        expected = {
+            "spec": canonical_json(written.spec),
+            "state": written.state.value,
+            "journals": [[j.effect_id, j.state.value] for j in written.journals],
+            "blobs": {digest: len(content)},
+            "active": "tx1",
+        }
+    # The binding -- and with it the project lock -- is released here. A second process
+    # cannot acquire it while this one holds it, which is exactly why the assertion
+    # below means something that a reopen in this process would not.
+    result = subprocess.run(
+        [sys.executable, "-m", "tests.store_child", project_root, metadata_root, "tx1"],
+        cwd=str(ROOT), capture_output=True, text=True, check=True,
+    )
+    assert json.loads(result.stdout) == expected, result.stderr
 
 
 def test_a_committed_record_never_names_a_missing_blob(store_on):
     """Ledger #22's behavioural half: promote_staging is the sole writer of a blob row,
     it writes only verified digests over flushed leaves, and §7.6 requires every
-    referenced digest to have one."""
+    referenced digest to have one.
+
+    Walk `referenced_digests`, not a surface. The final surface names content the
+    transaction will produce, for which no blob exists or should -- iterating it either
+    finds nothing (proving nothing) or asks open_blob for a digest that was never
+    promoted.
+    """
     content = b"referenced"
     digest = digest_of(content)
     with store_on() as binding:
@@ -5734,10 +6507,10 @@ def test_a_committed_record_never_names_a_missing_blob(store_on):
         with open_store(binding) as reopened:
             record = reopened.read_record("tx1")
             assert record is not None
-            for entry in record.spec.final_surface:
-                state = entry.state
-                if hasattr(state, "content_hash"):
-                    os.close(reopened.open_blob(state.content_hash))
+            resolved = [d for d, _ in referenced_digests(record.spec)]
+            assert resolved == [digest]
+            for entry in resolved:
+                os.close(reopened.open_blob(entry))
 ```
 
 Cross-process WAL exclusion is **not** re-tested: A4a's `certify_sqlite_wal` proves it at bind
@@ -5757,8 +6530,10 @@ discharged table, carrying every original column through "Verification" unchange
 the three discharge columns the A4b-2 record uses. Its evidence is
 `tests/test_store_architecture.py::test_exactly_one_statement_in_the_package_writes_blob`,
 `::test_no_trigger_body_writes_blob`,
-`::test_every_execute_argument_resolves_to_a_module_level_constant`, and
-`tests/test_store_process.py::test_a_committed_record_never_names_a_missing_blob`.
+`::test_every_execute_argument_resolves_to_a_module_level_constant`,
+`::test_executescript_is_never_called`, and, for the behavioural half,
+`tests/test_store_process.py::test_a_committed_record_never_names_a_missing_blob` and
+`::test_a_committed_record_reads_back_identically_in_a_fresh_process`.
 
 **#23 stays open and unchanged.** A5a supplies `list_workspaces`, `reopen_workspace`,
 `remove_workspace`, `list_unindexed_blobs`, and `remove_unindexed_blob` and invokes none of
@@ -5829,12 +6604,31 @@ git commit -m "test(store): guard the package boundary and discharge ledger #22"
 `TEMP_STORE=MEMORY` does not cover every SQLite transient, and the ownerless-directory threat model is
 inherited from A4a. There is nothing to build; the ledger paragraph it belongs to is already written.
 
-**One gap the review found and this plan closes.** `referenced_digests` originally walked both
-surfaces, which would have made every record refuse at the barrier: a final-surface hash names content
-the transaction is about to *produce*, for which no blob exists or should. Blobs are rollback material —
-authority §7.3 step 3 captures the *pre*-state — so the predicate walks the initial surface only. This
-changed `spec_referencing`, the temporary blob rows in Task 8, and made `one_effect_spec` (which starts
-from `ABSENT`) need no blob at all, which is why most record tests commit without one.
+**One gap the first self-review found and this plan closes.** `referenced_digests` originally walked
+both surfaces, which would have made every record refuse at the barrier: a final-surface hash names
+content the transaction is about to *produce*, for which no blob exists or should. Blobs are rollback
+material — authority §7.3 step 3 captures the *pre*-state — so the predicate walks the initial surface
+only. This changed `spec_referencing`, the temporary blob rows in Task 8, and made `one_effect_spec`
+(which starts from `ABSENT`) need no blob at all, which is why most record tests commit without one.
+
+**What the fourteenth review found, and what changed.** Each was reproduced before it was closed.
+
+| Finding | Closure |
+| --- | --- |
+| `reopen_workspace` followed symlinks — the plan's flags opened a symlink to an outside directory and listed it | `_open_child` opens `O_NOFOLLOW \| O_DIRECTORY` and maps `ENOTDIR`/`ELOOP` to `MetadataStoreInvalid`; tested through `reopen_workspace` directly, since the enumeration is not on that path (Task 9; design §8.3, criterion 32) |
+| A caught mid-method failure could be committed — measured: statement rollback is not transaction rollback, and the surviving rows commit | `_StoreTransaction._mutating()` poisons on any escape; the exit refuses to COMMIT; Task 13 asserts every public method uses it (Tasks 5, 7, 11, 13; design §7.7, criterion 24) |
+| The promotion barrier unioned references across every touched record | `_promoted` is keyed by workspace txid and checked against *that* record (Task 11; criterion 27) |
+| `referenced_digests` collapsed a digest declared at two lengths — `compile_spec` accepts that spec, measured | it returns deduplicated `(digest, byte_len)` **pairs**, so both references are checked (Task 8; criterion 23) |
+| A failed `COMMIT` left the transaction open — measured, and the next `BEGIN IMMEDIATE` then fails | one exit path with an `in_transaction` test, so every failure closes the transaction (Task 5; design §7.7) |
+| `Store.close()` tracked no workspaces, contradicting §7.8; an empty manifest never spent the staging half | a `_workspaces` registry closed by `Store.close()`; the half is spent when step 4's `rmdir` succeeds (Tasks 9, 11; design §8.1 step 4, criterion 16) |
+| A malformed halted record escaped as `KeyError` out of the loader | the journal-vector comparison is skipped once effect coverage fails, and reports a finding instead (Task 8; criterion 23) |
+| Three claims were unarmed: the snapshot test never committed *between* queries, "fresh process" was a same-process reopen, and ledger #22's test walked the final surface | the snapshot test injects the commit from a trace callback (measured: `(prepared, pending)` inside the read transaction, `(prepared, **started**)` without it); tier 5 runs a real subprocess that acquires the lock itself; the #22 test walks `referenced_digests` (Tasks 8, 13; criteria 15, 37, 39) |
+| The SQL inventory guard admitted any attribute and any loop variable — and would have *failed* on the package's own cross-module constants | positive resolution: a bare name bound to a module-level string here or imported from another `atoms.store` module, the target of a loop over a module-level literal, or a parameter fed an allowed name at every call site. Exercised against a hostile module — `holder.sql`, `for row in cursor`, and a helper fed a constant at one site and a runtime value at another are all refused (Task 13; criterion 37) |
+| Task gates could not pass: Task 5 ran tests using methods from Task 7, promotion tests inserted a record referencing nothing, and the architecture guard banned the word `executescript` while docstrings use it | Task 5's tests use only Task 5's surface and the `-k` filter is gone; promotion tests use `spec_referencing`; `executescript` is checked over parsed calls, and `ATTACH`/`DETACH`/`VACUUM` over the statement inventory |
+
+Three test bodies that were true but vacuous went with them: a `list_workspaces` assertion of the form
+`... or True`, an `os.path.isdir(..., dir_fd=...)` call the stdlib does not accept, and two `os.open`
+results never closed.
 
 **Placeholder scan.** Clean. Every step that says "write this" carries the code. The nine-site gate
 inventory in Task 12 was briefly a parametrized case with a `raise AssertionError` body; it is now six
@@ -5857,8 +6651,13 @@ differs (Task 1 Step 5). Each names the command that settles it.
   `remove_unindexed_blob`, where an orphan has no row to supply one.
 - `coherence_findings(connection, txid) -> tuple[str, ...]` returns findings; the two call sites raise
   `MetadataStoreInvalid` (load) and `ProtocolError` (barrier) from the same tuple.
-- `referenced_digests(spec) -> dict[str, int]` is public in `records.py` because `connection.py`'s
-  barrier reads it; nothing else imports it.
+- `referenced_digests(spec) -> tuple[tuple[str, int], ...]` is public in `records.py` because
+  `connection.py`'s barrier and `tests/store_child.py` both read it. Pairs rather than a mapping, so a
+  digest declared at two lengths keeps both references (§7.6).
+- `_StoreTransaction._mutating() -> AbstractContextManager[Store]`, `_poison(cause: BaseException)`,
+  `_require_not_poisoned() -> None`; `_touched: set[str]` and `_promoted: dict[str, set[str]]`.
+- `_open_child(parent_fd: int, parent: str, txid: str) -> int | None` — `parent` is only for the
+  refusal message, and the third argument is the name, which is the order `_parent_fd` reads in.
 - `Workspace._store` is `Store | None`, and `_anchor` raises rather than dereferencing `None`.
 - `Store.list_workspaces()`, `Store.list_unindexed_blobs()` both return `tuple[str, ...]`;
   `Store.open_blob()` returns `int` and transfers ownership.
@@ -5866,9 +6665,11 @@ differs (Task 1 Step 5). Each names the command that settles it.
   on the transaction. The module function lost an unused `transaction` parameter during this review.
 - `StagedBlob.name`/`.digest` are `str`, `.byte_len` is `int` — and `bool` is refused explicitly,
   because it is an `int` subclass that would pass a naive check.
-- `spec_referencing`, `child_dir`, `stage`, `digest_of`, `file_state`, `one_effect_spec`,
-  `replace_spec`, `raw_connect`, and `every_diagnostic_shape` all live in `tests/store_support.py` and
-  are imported by name; none carries a leading underscore, since all are cross-module.
+- `spec_referencing(*contents: bytes)`, `child_dir`, `stage`, `digest_of`, `file_state`,
+  `one_effect_spec`, `replace_spec`, `duplicate_effect_spec`, `two_length_spec`, `raw_connect`,
+  `matching_diagnostic`, and `every_diagnostic_shape` all live in `tests/store_support.py` and are
+  imported by name; none carries a leading underscore, since all are cross-module. `spec_referencing`
+  is variadic because promotion is a batch and a two-blob manifest needs a two-reference record.
 
 **Import direction.** `connection.py` imports `workspace.py` and `blobs.py` for its delegating methods,
 so those two import `gate` from `connection.py` *inside function bodies*. That is deliberate and Task 9
