@@ -8,9 +8,9 @@ import stat
 from collections.abc import Iterator
 from contextlib import contextmanager
 from enum import Enum
-from typing import Self
+from typing import TYPE_CHECKING, Self
 
-from atoms.core.canonical import canonical_json
+from atoms.core.canonical import canonical_json, from_canonical_json
 from atoms.core.errors import CapabilityUnavailable, ProtocolError
 from atoms.core.recovery.model import (
     CommitDecision,
@@ -27,7 +27,7 @@ from atoms.store.records import (
     INSERT_EFFECT,
     INSERT_RECORD,
     SELECT_ACTIVE,
-    SELECT_BLOB,
+    SELECT_RECORD,
     UPDATE_COMMITTED,
     UPDATE_HALT_DIAGNOSTIC,
     UPDATE_JOURNAL_STATE,
@@ -38,6 +38,7 @@ from atoms.store.records import (
     coherence_findings,
     encode_diagnostic,
     load_record,
+    referenced_digests,
     require_identifier,
     require_member,
 )
@@ -55,6 +56,9 @@ from atoms.store.workspace import (
     remove_workspace,
     reopen_workspace,
 )
+
+if TYPE_CHECKING:
+    from atoms.store.blobs import StagedBlob
 
 DATABASE_NAME = "atoms.db"
 SIDECAR_NAMES = ("atoms.db-wal", "atoms.db-shm", "atoms.db-journal")
@@ -535,13 +539,37 @@ class _StoreTransaction:
                     f"the record for txid {txid!r} would not be coherent: "
                     + "; ".join(findings)
                 )
-        for digests in self._promoted.values():
-            for digest in sorted(digests):
-                store._require_live()
-                if store._connection.execute(SELECT_BLOB, (digest,)).fetchone() is None:
-                    raise ProtocolError(
-                        f"digest {digest!r} was promoted in this transaction but has no blob row"
-                    )
+        for txid, promoted in sorted(self._promoted.items()):
+            row = store._connection.execute(SELECT_RECORD, (txid,)).fetchone()
+            referenced = (
+                set()
+                if row is None
+                else {
+                    digest
+                    for digest, _byte_len in referenced_digests(from_canonical_json(row[0]))
+                }
+            )
+            unreferenced = sorted(promoted - referenced)
+            if unreferenced:
+                raise ProtocolError(
+                    f"this transaction promoted digests the record for txid {txid!r} "
+                    "does not reference: "
+                    + ", ".join(unreferenced)
+                    + ". A committed blob row with no reference is invisible to both "
+                    "reclaimers and would be stranded permanently"
+                )
+
+    def promote_staging(
+        self, workspace: Workspace, manifest: tuple[StagedBlob, ...]
+    ) -> None:
+        from atoms.store.blobs import promote_staging
+
+        with self._mutating() as store:
+            promote_staging(store, workspace, manifest)
+            self._touched.add(workspace.txid)
+            self._promoted.setdefault(workspace.txid, set()).update(
+                entry.digest for entry in manifest
+            )
 
     def insert_record(self, txid: str, spec: TransactionSpec) -> None:
         with self._mutating() as store:

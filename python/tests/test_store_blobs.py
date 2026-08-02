@@ -9,8 +9,20 @@ import pytest
 
 from atoms.core.errors import ProtocolError
 from atoms.store.blobs import StagedBlob, digest_to_leaf, leaf_to_digest, require_component
+from atoms.store.connection import open_store
 from atoms.store.errors import MetadataStoreInvalid
-from tests.store_support import child_dir, open_descriptor_count
+from tests.store_support import (
+    RELEASES,
+    child_dir,
+    digest_of,
+    metadata_root_snapshot,
+    one_effect_spec,
+    open_descriptor_count,
+    raw_connect,
+    release_lock,
+    spec_referencing,
+    stage,
+)
 
 HEX = "a" * 64
 
@@ -209,3 +221,507 @@ def test_a_liveness_loss_during_verification_refuses_before_descriptor_handoff(
 def test_staged_blob_is_an_ordinary_dataclass():
     """A6 builds manifests, so a construction token would block the intended caller."""
     assert StagedBlob(name="a", digest=f"sha256:{HEX}", byte_len=1).byte_len == 1
+
+
+def _manifest(*entries: tuple[str, bytes]) -> tuple[StagedBlob, ...]:
+    return tuple(
+        StagedBlob(name=name, digest=digest_of(content), byte_len=len(content))
+        for name, content in entries
+    )
+
+
+def test_promotion_publishes_indexes_and_removes_the_staging_directory(
+    opened_store, store_binding
+):
+    with opened_store.create_workspace("tx1") as workspace:
+        stage(workspace, "one", b"first")
+        stage(workspace, "two", b"second")
+        manifest = _manifest(("one", b"first"), ("two", b"second"))
+        with opened_store.transaction() as txn:
+            txn.promote_staging(workspace, manifest)
+            txn.insert_record("tx1", spec_referencing(b"first", b"second"))
+    with child_dir(store_binding.metadata_root_fd, "blobs/sha256") as blobs_fd:
+        assert set(os.listdir(blobs_fd)) == {digest_to_leaf(entry.digest) for entry in manifest}
+    with child_dir(store_binding.metadata_root_fd, "staging") as staging_fd:
+        assert os.listdir(staging_fd) == []
+    assert opened_store.list_workspaces() == ("tx1",)
+    for entry in manifest:
+        fd = opened_store.open_blob(entry.digest)
+        os.close(fd)
+
+
+def test_promotion_spends_the_staging_half(opened_store):
+    with opened_store.create_workspace("tx1") as workspace:
+        stage(workspace, "one", b"first")
+        with opened_store.transaction() as txn:
+            txn.promote_staging(workspace, _manifest(("one", b"first")))
+            txn.insert_record("tx1", spec_referencing(b"first"))
+        with pytest.raises(ProtocolError):
+            _ = workspace.staging_fd
+        with pytest.raises(ProtocolError), opened_store.transaction() as txn:
+            txn.promote_staging(workspace, _manifest(("one", b"first")))
+
+
+def test_an_empty_manifest_still_spends_the_staging_half(opened_store, store_binding):
+    with opened_store.create_workspace("tx1") as workspace:
+        with opened_store.transaction() as txn:
+            txn.promote_staging(workspace, ())
+            txn.insert_record("tx1", one_effect_spec())
+        with pytest.raises(ProtocolError):
+            _ = workspace.staging_fd
+    with child_dir(store_binding.metadata_root_fd, "staging") as staging_fd:
+        assert os.listdir(staging_fd) == []
+
+
+def test_a_promoted_digest_must_be_referenced_by_its_workspaces_record(opened_store):
+    with opened_store.create_workspace("tx1") as workspace:
+        stage(workspace, "one", b"shared")
+        with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
+            txn.promote_staging(workspace, _manifest(("one", b"shared")))
+            txn.insert_record("tx1", one_effect_spec())
+            txn.insert_record("tx2", spec_referencing(b"shared"))
+    assert "tx1" in str(caught.value)
+
+
+def test_a_final_surface_reference_does_not_justify_promotion(opened_store):
+    with opened_store.create_workspace("tx1") as workspace:
+        stage(workspace, "one", b"after")
+        with pytest.raises(ProtocolError), opened_store.transaction() as txn:
+            txn.promote_staging(workspace, _manifest(("one", b"after")))
+            txn.insert_record("tx1", one_effect_spec(content=b"after"))
+
+
+@pytest.mark.parametrize(
+    "manifest",
+    [
+        [StagedBlob(name="one", digest="not-a-digest", byte_len=1)],
+        [StagedBlob(name="../escape", digest=f"sha256:{HEX}", byte_len=1)],
+        [StagedBlob(name="one", digest=f"sha256:{HEX}", byte_len=True)],
+        [StagedBlob(name="one", digest=f"sha256:{HEX}", byte_len=-1)],
+    ],
+)
+def test_a_malformed_manifest_moves_nothing(opened_store, manifest):
+    with opened_store.create_workspace("tx1") as workspace:
+        stage(workspace, "one", b"first")
+        with pytest.raises(ProtocolError), opened_store.transaction() as txn:
+            txn.promote_staging(workspace, tuple(manifest))
+        assert set(os.listdir(workspace.staging_fd)) == {"one"}
+
+
+def test_the_entire_manifest_is_validated_before_the_first_transfer(
+    opened_store, store_binding, monkeypatch
+):
+    with opened_store.create_workspace("tx1") as workspace:
+        stage(workspace, "one", b"first")
+        stage(workspace, "two", b"second")
+        called = False
+
+        def armed(*_args):
+            nonlocal called
+            called = True
+            raise AssertionError("preflight mutated before validating the final entry")
+
+        monkeypatch.setattr(store_binding.backend, "transfer_noclobber", armed)
+        manifest = (
+            *_manifest(("one", b"first")),
+            StagedBlob(name="two", digest="bad", byte_len=6),
+        )
+        with pytest.raises(ProtocolError), opened_store.transaction() as txn:
+            txn.promote_staging(workspace, manifest)
+        assert not called
+        assert set(os.listdir(workspace.staging_fd)) == {"one", "two"}
+
+
+def test_manifest_and_entries_require_exact_types(opened_store):
+    class DerivedBlob(StagedBlob):
+        pass
+
+    with opened_store.create_workspace("tx1") as workspace:
+        stage(workspace, "one", b"first")
+        entry = StagedBlob("one", digest_of(b"first"), 5)
+        with pytest.raises(ProtocolError) as manifest_error, opened_store.transaction() as txn:
+            txn.promote_staging(workspace, [entry])
+        assert "exactly tuple" in str(manifest_error.value)
+        with pytest.raises(ProtocolError) as entry_error, opened_store.transaction() as txn:
+            txn.promote_staging(workspace, (DerivedBlob("one", entry.digest, 5),))
+        assert "exactly StagedBlob" in str(entry_error.value)
+
+
+def test_duplicate_source_names_are_refused_before_anything_moves(opened_store):
+    with opened_store.create_workspace("tx1") as workspace:
+        stage(workspace, "one", b"first")
+        manifest = _manifest(("one", b"first"), ("one", b"first"))
+        with pytest.raises(ProtocolError), opened_store.transaction() as txn:
+            txn.promote_staging(workspace, manifest)
+        assert set(os.listdir(workspace.staging_fd)) == {"one"}
+
+
+def test_duplicate_digests_must_agree_on_length(opened_store):
+    with opened_store.create_workspace("tx1") as workspace:
+        stage(workspace, "one", b"first")
+        stage(workspace, "two", b"first")
+        manifest = (
+            StagedBlob("one", digest_of(b"first"), 5),
+            StagedBlob("two", digest_of(b"first"), 4),
+        )
+        with pytest.raises(ProtocolError), opened_store.transaction() as txn:
+            txn.promote_staging(workspace, manifest)
+        assert set(os.listdir(workspace.staging_fd)) == {"one", "two"}
+
+
+def test_duplicate_digests_with_the_same_length_are_promoted_once(opened_store):
+    with opened_store.create_workspace("tx1") as workspace:
+        stage(workspace, "one", b"first")
+        stage(workspace, "two", b"first")
+        with opened_store.transaction() as txn:
+            txn.promote_staging(
+                workspace, _manifest(("one", b"first"), ("two", b"first"))
+            )
+            txn.insert_record("tx1", spec_referencing(b"first"))
+
+
+def test_the_staging_set_must_equal_the_manifest(opened_store):
+    with opened_store.create_workspace("tx1") as workspace:
+        stage(workspace, "one", b"first")
+        stage(workspace, "two", b"second")
+        with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
+            txn.promote_staging(workspace, _manifest(("one", b"first")))
+        assert "two" in str(caught.value)
+        assert set(os.listdir(workspace.staging_fd)) == {"one", "two"}
+
+
+@pytest.mark.parametrize("corrupt", ["length", "content", "kind", "symlink"])
+def test_every_staged_source_is_verified_before_anything_moves(opened_store, corrupt):
+    with opened_store.create_workspace("tx1") as workspace:
+        stage(workspace, "first", b"valid")
+        if corrupt == "kind":
+            os.mkdir("last", dir_fd=workspace.staging_fd)
+        elif corrupt == "symlink":
+            os.symlink("elsewhere", "last", dir_fd=workspace.staging_fd)
+        else:
+            stage(workspace, "last", b"wrong")
+        declared = b"wrong" if corrupt == "length" else b"right"
+        length = 99 if corrupt == "length" else len(declared)
+        manifest = (
+            *_manifest(("first", b"valid")),
+            StagedBlob("last", digest_of(declared), length),
+        )
+        with pytest.raises(MetadataStoreInvalid), opened_store.transaction() as txn:
+            txn.promote_staging(workspace, manifest)
+        assert set(os.listdir(workspace.staging_fd)) == {"first", "last"}
+
+
+def test_a_matching_indexed_destination_unlinks_the_source(opened_store, promoted_blob):
+    store, digest, content = promoted_blob
+    with store.create_workspace("tx2") as workspace:
+        stage(workspace, "again", content)
+        with store.transaction() as txn:
+            txn.promote_staging(workspace, (StagedBlob("again", digest, len(content)),))
+            txn.insert_record("tx2", spec_referencing(content))
+
+
+def test_a_matching_orphan_destination_unlinks_the_source(opened_store, store_binding):
+    content = b"good"
+    digest = digest_of(content)
+    with child_dir(store_binding.metadata_root_fd, "blobs/sha256") as blobs_fd:
+        fd = os.open(digest_to_leaf(digest), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600,
+                     dir_fd=blobs_fd)
+        os.write(fd, content)
+        os.close(fd)
+    with opened_store.create_workspace("tx1") as workspace:
+        stage(workspace, "one", content)
+        with opened_store.transaction() as txn:
+            txn.promote_staging(workspace, (StagedBlob("one", digest, len(content)),))
+            txn.insert_record("tx1", spec_referencing(content))
+
+
+@pytest.mark.parametrize("kind", ["content", "symlink"])
+def test_a_mismatching_orphan_destination_preserves_the_source(
+    opened_store, store_binding, kind
+):
+    content = b"good"
+    digest = digest_of(content)
+    with child_dir(store_binding.metadata_root_fd, "blobs/sha256") as blobs_fd:
+        leaf = digest_to_leaf(digest)
+        if kind == "symlink":
+            os.symlink("elsewhere", leaf, dir_fd=blobs_fd)
+        else:
+            fd = os.open(leaf, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600, dir_fd=blobs_fd)
+            os.write(fd, b"bad!")
+            os.close(fd)
+    with opened_store.create_workspace("tx1") as workspace:
+        stage(workspace, "one", content)
+        with pytest.raises(MetadataStoreInvalid), opened_store.transaction() as txn:
+            txn.promote_staging(workspace, (StagedBlob("one", digest, len(content)),))
+        assert os.listdir(workspace.staging_fd) == ["one"]
+
+
+@pytest.mark.parametrize("corrupt", ["missing", "length", "content", "symlink"])
+def test_an_indexed_leaf_is_fully_verified_during_preflight(
+    opened_store, store_binding, promoted_blob, corrupt
+):
+    store, digest, content = promoted_blob
+    with child_dir(store_binding.metadata_root_fd, "blobs/sha256") as blobs_fd:
+        leaf = digest_to_leaf(digest)
+        os.unlink(leaf, dir_fd=blobs_fd)
+        if corrupt == "symlink":
+            os.symlink("elsewhere", leaf, dir_fd=blobs_fd)
+        elif corrupt != "missing":
+            fd = os.open(leaf, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600, dir_fd=blobs_fd)
+            replacement = b"x" if corrupt == "length" else bytes(len(content))
+            os.write(fd, replacement)
+            os.close(fd)
+    with store.create_workspace("tx9") as workspace:
+        stage(workspace, "again", content)
+        with pytest.raises(MetadataStoreInvalid), store.transaction() as txn:
+            txn.promote_staging(workspace, (StagedBlob("again", digest, len(content)),))
+        assert os.listdir(workspace.staging_fd) == ["again"]
+
+
+def test_an_indexed_row_disagreeing_with_verified_content_refuses(
+    opened_store, store_binding, promoted_blob
+):
+    store, digest, content = promoted_blob
+    raw = raw_connect(store_binding)
+    try:
+        raw.execute("UPDATE blob SET byte_len = 999 WHERE digest = ?", (digest,))
+    finally:
+        raw.close()
+    with store.create_workspace("tx9") as workspace:
+        stage(workspace, "again", content)
+        with pytest.raises(MetadataStoreInvalid) as caught, store.transaction() as txn:
+            txn.promote_staging(workspace, (StagedBlob("again", digest, len(content)),))
+        assert "stored row" in str(caught.value)
+        assert os.listdir(workspace.staging_fd) == ["again"]
+
+
+def test_a_failed_second_transfer_spends_staging_after_the_first_rename(
+    opened_store, store_binding, monkeypatch
+):
+    backend = store_binding.backend
+    real = backend.transfer_noclobber
+    calls = 0
+
+    def fail_second(*args):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected")
+        real(*args)
+
+    monkeypatch.setattr(backend, "transfer_noclobber", fail_second)
+    with opened_store.create_workspace("tx1") as workspace:
+        stage(workspace, "one", b"first")
+        stage(workspace, "two", b"second")
+        with pytest.raises(OSError), opened_store.transaction() as txn:
+            txn.promote_staging(workspace, _manifest(("one", b"first"), ("two", b"second")))
+        with pytest.raises(ProtocolError) as caught:
+            _ = workspace.staging_fd
+        assert "spent" in str(caught.value)
+
+
+def test_a_failed_second_transfer_spends_staging_after_an_eexist_unlink(
+    opened_store, store_binding, monkeypatch
+):
+    first = b"first"
+    digest = digest_of(first)
+    with child_dir(store_binding.metadata_root_fd, "blobs/sha256") as blobs_fd:
+        fd = os.open(digest_to_leaf(digest), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600,
+                     dir_fd=blobs_fd)
+        os.write(fd, first)
+        os.close(fd)
+    backend = store_binding.backend
+    real = backend.transfer_noclobber
+    calls = 0
+
+    def fail_second(*args):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected")
+        real(*args)
+
+    monkeypatch.setattr(backend, "transfer_noclobber", fail_second)
+    with opened_store.create_workspace("tx1") as workspace:
+        stage(workspace, "one", first)
+        stage(workspace, "two", b"second")
+        with pytest.raises(OSError), opened_store.transaction() as txn:
+            txn.promote_staging(workspace, _manifest(("one", first), ("two", b"second")))
+        with pytest.raises(ProtocolError):
+            _ = workspace.staging_fd
+
+
+@pytest.mark.parametrize("release", RELEASES, ids=("closed_binding", "released_lock"))
+def test_each_transfer_has_a_late_gate_after_an_earlier_mutation(
+    store_on, monkeypatch, release
+):
+    with store_on() as binding, metadata_root_snapshot(binding) as root:
+        store = open_store(binding)
+        workspace = store.create_workspace("tx1")
+        stage(workspace, "one", b"first")
+        stage(workspace, "two", b"second")
+        backend = binding.backend
+        real = backend.transfer_noclobber
+        calls = 0
+
+        def release_after_first(*args):
+            nonlocal calls
+            real(*args)
+            calls += 1
+            if calls == 1:
+                release(binding)
+
+        monkeypatch.setattr(backend, "transfer_noclobber", release_after_first)
+        with pytest.raises(ProtocolError) as caught, store.transaction() as txn:
+            txn.promote_staging(workspace, _manifest(("one", b"first"), ("two", b"second")))
+        assert ("closed" if release.__name__ == "close_binding" else "lock") in str(caught.value)
+        assert calls == 1
+        with child_dir(root, "staging") as staging, child_dir(staging, "tx1") as tx_staging:
+            assert os.listdir(tx_staging) == ["two"]
+        store.close()
+
+
+def test_eexist_source_unlink_has_its_own_late_gate(
+    store_on, monkeypatch
+):
+    with store_on() as binding, metadata_root_snapshot(binding) as root:
+        store = open_store(binding)
+        workspace = store.create_workspace("tx1")
+        stage(workspace, "one", b"first")
+        digest = digest_of(b"first")
+        with child_dir(root, "blobs/sha256") as blobs_fd:
+            fd = os.open(digest_to_leaf(digest), os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                         0o600, dir_fd=blobs_fd)
+            os.write(fd, b"first")
+            os.close(fd)
+        backend = binding.backend
+        real = backend.transfer_noclobber
+
+        def release_on_eexist(*args):
+            try:
+                real(*args)
+            except FileExistsError:
+                release_lock(binding)
+                raise
+
+        monkeypatch.setattr(backend, "transfer_noclobber", release_on_eexist)
+        with pytest.raises(ProtocolError) as caught, store.transaction() as txn:
+            txn.promote_staging(workspace, _manifest(("one", b"first")))
+        assert "lock" in str(caught.value)
+        with child_dir(root, "staging") as staging, child_dir(staging, "tx1") as tx_staging:
+            assert os.listdir(tx_staging) == ["one"]
+        store.close()
+
+
+def test_flushes_continue_on_held_descriptors_then_rmdir_has_a_late_gate(
+    store_on, monkeypatch
+):
+    with store_on() as binding, metadata_root_snapshot(binding) as root:
+        store = open_store(binding)
+        workspace = store.create_workspace("tx1")
+        stage(workspace, "one", b"first")
+        backend = binding.backend
+        real_transfer = backend.transfer_noclobber
+        real_flush = backend.flush_directory
+        flushes: list[int] = []
+
+        def release_after_transfer(*args):
+            real_transfer(*args)
+            release_lock(binding)
+
+        def record_flush(fd):
+            flushes.append(os.fstat(fd).st_ino)
+            real_flush(fd)
+
+        monkeypatch.setattr(backend, "transfer_noclobber", release_after_transfer)
+        monkeypatch.setattr(backend, "flush_directory", record_flush)
+        with pytest.raises(ProtocolError), store.transaction() as txn:
+            txn.promote_staging(workspace, _manifest(("one", b"first")))
+        assert len(flushes) == 2
+        with child_dir(root, "staging") as staging:
+            assert "tx1" in os.listdir(staging)
+        store.close()
+
+
+def test_successful_promotion_flushes_blob_staging_and_staging_parent_in_order(
+    opened_store, store_binding, monkeypatch
+):
+    workspace = opened_store.create_workspace("tx1")
+    stage(workspace, "one", b"first")
+    with child_dir(store_binding.metadata_root_fd, "blobs/sha256") as blobs_fd:
+        blobs_inode = os.fstat(blobs_fd).st_ino
+    staging_inode = os.fstat(workspace.staging_fd).st_ino
+    with child_dir(store_binding.metadata_root_fd, "staging") as staging_fd:
+        parent_inode = os.fstat(staging_fd).st_ino
+    backend = store_binding.backend
+    real = backend.flush_directory
+    flushes: list[int] = []
+
+    def record(fd):
+        flushes.append(os.fstat(fd).st_ino)
+        real(fd)
+
+    monkeypatch.setattr(backend, "flush_directory", record)
+    with opened_store.transaction() as txn:
+        txn.promote_staging(workspace, _manifest(("one", b"first")))
+        txn.insert_record("tx1", spec_referencing(b"first"))
+    assert flushes == [blobs_inode, staging_inode, parent_inode]
+
+
+def test_promoting_without_a_record_rolls_back_index_but_leaves_the_orphan(
+    opened_store, store_binding
+):
+    with opened_store.create_workspace("tx1") as workspace:
+        stage(workspace, "one", b"first")
+        with pytest.raises(ProtocolError), opened_store.transaction() as txn:
+            txn.promote_staging(workspace, _manifest(("one", b"first")))
+    raw = raw_connect(store_binding)
+    try:
+        assert raw.execute("SELECT count(*) FROM blob").fetchone() == (0,)
+    finally:
+        raw.close()
+    with child_dir(store_binding.metadata_root_fd, "blobs/sha256") as blobs_fd:
+        assert os.listdir(blobs_fd) == [digest_to_leaf(digest_of(b"first"))]
+
+
+def test_promotion_refuses_a_workspace_from_another_store(store_binding, opened_store):
+    other = open_store(store_binding)
+    try:
+        workspace = other.create_workspace("tx1")
+        stage(workspace, "one", b"first")
+        with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
+            txn.promote_staging(workspace, _manifest(("one", b"first")))
+        assert "different Store" in str(caught.value)
+    finally:
+        other.close()
+
+
+def test_promotion_refuses_a_value_that_is_not_exactly_workspace(opened_store):
+    with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
+        txn.promote_staging(object(), ())
+    assert "expected exactly Workspace" in str(caught.value)
+
+
+def test_promotion_refuses_a_closed_workspace_at_its_staging_anchor(opened_store):
+    workspace = opened_store.create_workspace("tx1")
+    workspace.close()
+    with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
+        txn.promote_staging(workspace, ())
+    assert "workspace is closed" in str(caught.value)
+
+
+def test_a_retained_transaction_cannot_promote_into_a_later_transaction(opened_store):
+    with opened_store.transaction() as stale:
+        pass
+    with (
+        opened_store.create_workspace("tx1") as workspace,
+        opened_store.transaction(),
+        pytest.raises(ProtocolError) as caught,
+    ):
+        stale.promote_staging(workspace, ())
+    assert "spent" in str(caught.value)
+
+
+def test_promotion_is_only_a_transaction_operation(opened_store):
+    assert not hasattr(opened_store, "promote_staging")
+    assert not hasattr(opened_store, "insert_blobs")

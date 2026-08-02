@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 from atoms.core.errors import ProtocolError
 from atoms.store.errors import MetadataStoreInvalid
 from atoms.store.records import SELECT_BLOB
+from atoms.store.workspace import STAGING_PARENT, Workspace
 
 if TYPE_CHECKING:
     from atoms.store.connection import Store
@@ -20,6 +21,10 @@ if TYPE_CHECKING:
 BLOBS_PARENT = "blobs/sha256"
 DIGEST_PATTERN = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
 _READ_CHUNK = 1 << 20
+INSERT_BLOB = (
+    "INSERT INTO blob (digest, byte_len) VALUES (?, ?) "
+    "ON CONFLICT(digest) DO NOTHING"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,3 +135,147 @@ def open_blob(store: Store, digest: str) -> int:
         os.close(fd)
         raise
     return fd
+
+
+def _preflight(store: Store, workspace: Workspace, manifest: tuple[StagedBlob, ...]) -> None:
+    """Validate the complete batch before the first irreversible transfer."""
+    if type(manifest) is not tuple:
+        raise ProtocolError(f"the manifest must be exactly tuple, got {type(manifest).__name__}")
+    lengths: dict[str, int] = {}
+    names: set[str] = set()
+    for entry in manifest:
+        if type(entry) is not StagedBlob:
+            raise ProtocolError(
+                "every manifest element must be exactly StagedBlob, got "
+                f"{type(entry).__name__}"
+            )
+        require_component("a manifest name", entry.name)
+        require_digest(entry.digest)
+        if type(entry.byte_len) is not int:
+            raise ProtocolError(
+                f"byte_len must be exactly int, got {type(entry.byte_len).__name__}; "
+                "bool is an int subclass and is refused"
+            )
+        if entry.byte_len < 0:
+            raise ProtocolError(f"byte_len {entry.byte_len} is negative")
+        if entry.name in names:
+            raise ProtocolError(
+                f"manifest name {entry.name!r} appears twice; the second rename would "
+                "fail ENOENT mid-batch"
+            )
+        names.add(entry.name)
+        previous = lengths.setdefault(entry.digest, entry.byte_len)
+        if previous != entry.byte_len:
+            raise ProtocolError(
+                f"digest {entry.digest} carries byte_len {previous} and {entry.byte_len} "
+                "in one manifest; both descriptions arrived in the same argument"
+            )
+
+    staging_fd = workspace.staging_fd
+    present = set(os.listdir(staging_fd))
+    if present != names:
+        raise ProtocolError(
+            f"the manifest does not describe staging/{workspace.txid}/ exactly: "
+            f"missing {sorted(present - names)}, absent {sorted(names - present)}"
+        )
+
+    for entry in manifest:
+        fd = open_entry_nofollow(
+            staging_fd, entry.name, f"staging/{workspace.txid}/{entry.name}"
+        )
+        try:
+            verify_leaf(fd, entry.digest, entry.byte_len)
+        finally:
+            os.close(fd)
+
+    parent = _blobs_fd(store)
+    try:
+        for digest in sorted(lengths):
+            row = store._connection.execute(SELECT_BLOB, (digest,)).fetchone()
+            if row is None:
+                continue
+            if row[0] != lengths[digest]:
+                raise MetadataStoreInvalid(
+                    f"the stored row for {digest} says byte_len {row[0]}, the verified "
+                    f"content is {lengths[digest]}"
+                )
+            try:
+                fd = open_entry_nofollow(
+                    parent, digest_to_leaf(digest), f"the leaf for {digest}"
+                )
+            except FileNotFoundError as caught:
+                raise MetadataStoreInvalid(
+                    f"{digest} is indexed but its leaf is gone; promotion does not "
+                    "silently re-create a blob open_blob calls unreadable"
+                ) from caught
+            try:
+                verify_leaf(fd, digest, row[0])
+            finally:
+                os.close(fd)
+    finally:
+        os.close(parent)
+
+
+def promote_staging(
+    store: Store, workspace: Workspace, manifest: tuple[StagedBlob, ...]
+) -> None:
+    """Publish and index one complete staging manifest."""
+    from atoms.store.connection import gate
+
+    if type(workspace) is not Workspace:
+        raise ProtocolError(f"expected exactly Workspace, got {type(workspace).__name__}")
+    if workspace._store is not store:
+        raise ProtocolError("this workspace belongs to a different Store")
+    _preflight(store, workspace, manifest)
+    gate(store._binding)
+
+    backend = store._binding.backend
+    staging_fd = workspace.staging_fd
+    parent = _blobs_fd(store)
+    spent = False
+    try:
+        for entry in manifest:
+            gate(store._binding)
+            leaf = digest_to_leaf(entry.digest)
+            try:
+                backend.transfer_noclobber(staging_fd, entry.name, parent, leaf)
+                spent = True
+            except FileExistsError:
+                existing = open_entry_nofollow(
+                    parent, leaf, f"the existing leaf for {entry.digest}"
+                )
+                try:
+                    verify_leaf(existing, entry.digest, entry.byte_len)
+                finally:
+                    os.close(existing)
+                gate(store._binding)
+                os.unlink(entry.name, dir_fd=staging_fd)
+                spent = True
+        backend.flush_directory(parent)
+        backend.flush_directory(staging_fd)
+        remaining = os.listdir(staging_fd)
+        if remaining:
+            raise ProtocolError(
+                f"staging/{workspace.txid}/ still holds {sorted(remaining)} after the "
+                "rename loop; step 1's entry-set comparison and the loop disagree"
+            )
+    finally:
+        if spent:
+            workspace._spend_staging()
+        os.close(parent)
+
+    staging_parent = os.open(
+        STAGING_PARENT,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+        dir_fd=store._binding.metadata_root_fd,
+    )
+    try:
+        gate(store._binding)
+        os.rmdir(workspace.txid, dir_fd=staging_parent)
+        workspace._spend_staging()
+        backend.flush_directory(staging_parent)
+    finally:
+        os.close(staging_parent)
+
+    for entry in manifest:
+        store._connection.execute(INSERT_BLOB, (entry.digest, entry.byte_len))

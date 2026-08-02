@@ -63,6 +63,26 @@ def one_effect_spec(effect_id: str = "e1", content: bytes = b"after"):
     )
 
 
+def spec_referencing(*contents: bytes):
+    """A spec whose initial surface declares one FileState per content."""
+    names = [f"f{index}.txt" for index in range(len(contents))]
+    pre = {name: file_state(content) for name, content in zip(names, contents, strict=True)}
+    post = {
+        name: file_state(content + b"!")
+        for name, content in zip(names, contents, strict=True)
+    }
+    return build_spec(
+        consumer_tag="test",
+        intent_digest="sha256:" + "5" * 64,
+        initial_surface=pre,
+        final_surface=post,
+        effects=[
+            ReplaceFile(effect_id=f"e{index}", path=name, pre=pre[name], post=post[name])
+            for index, name in enumerate(names)
+        ],
+    )
+
+
 def replace_spec(effect_id: str = "e1", before: bytes = b"before", after: bytes = b"after"):
     pre, post = file_state(before), file_state(after)
     return build_spec(

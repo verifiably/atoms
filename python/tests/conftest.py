@@ -571,30 +571,18 @@ def store_binding(request):
 
 @pytest.fixture
 def promoted_blob(opened_store):
-    """A store holding one promoted, indexed blob, with its digest and bytes.
-
-    Task 11 replaces the direct INSERT with a real promotion; tests use the tuple rather
-    than how it got there.
-    """
-    from atoms.store.blobs import digest_to_leaf
-    from tests.store_support import child_dir, digest_of
+    """A store holding one promoted, indexed blob, with its digest and bytes."""
+    from atoms.store.blobs import StagedBlob
+    from tests.store_support import digest_of, spec_referencing, stage
 
     content = b"the blob's bytes"
     digest = digest_of(content)
-    binding = opened_store._binding
-    with child_dir(binding.metadata_root_fd, "blobs/sha256") as blobs_fd:
-        fd = os.open(
-            digest_to_leaf(digest),
-            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-            0o600,
-            dir_fd=blobs_fd,
-        )
-        try:
-            os.write(fd, content)
-        finally:
-            os.close(fd)
-    with opened_store.transaction() as txn:
-        txn._store._connection.execute(
-            "INSERT INTO blob (digest, byte_len) VALUES (?, ?)", (digest, len(content))
-        )
+    with opened_store.create_workspace("fixture") as workspace:
+        stage(workspace, "capture", content)
+        with opened_store.transaction() as txn:
+            txn.promote_staging(
+                workspace,
+                (StagedBlob(name="capture", digest=digest, byte_len=len(content)),),
+            )
+            txn.insert_record("fixture", spec_referencing(content))
     return opened_store, digest, content
