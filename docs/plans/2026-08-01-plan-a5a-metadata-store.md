@@ -2400,39 +2400,62 @@ def test_every_path_state_variant_round_trips_inside_a_diagnostic_entry(state):
 
 
 @pytest.mark.parametrize(
-    "mutate",
+    ("mutate", "names"),
     [
-        lambda obj: obj.pop("reason"),
-        lambda obj: obj.update({"reason": "no_such_reason"}),
-        lambda obj: obj.update({"unexpected": 1}),
-        lambda obj: obj.update({"pre_halt_state": "not_a_state"}),
-        lambda obj: obj.update({"journals": [{"effect_id": "e1"}]}),
+        (
+            lambda obj: obj.pop("reason"),
+            # `_require_keys` is the only check that can catch a missing field, so there is
+            # no field-specific path underneath it to mask -- but the assertion still has to
+            # prove *reason specifically* went missing, not merely that some key did. The
+            # `got` list is the complete, alphabetically sorted set of the other 11 fields
+            # with `reason` absent; pinned whole, it cannot be produced by any other case's
+            # mutation (verified: absent from all 12 other real messages).
+            (
+                "got ['commit_decision', 'effect_id', 'expected', 'identity_relations', "
+                "'journals', 'observed', 'operator_action', 'paths', 'pre_halt_state', "
+                "'projected_journals', 'projected_transaction_state']"
+            ),
+        ),
+        (lambda obj: obj.update({"reason": "no_such_reason"}), "HaltReason"),
+        (lambda obj: obj.update({"unexpected": 1}), "unexpected"),
+        (lambda obj: obj.update({"pre_halt_state": "not_a_state"}), "TransactionState"),
+        (
+            lambda obj: obj.update({"journals": [{"effect_id": "e1"}]}),
+            "expected keys ['effect_id', 'state'], got ['effect_id']",
+        ),
         # Shapes that reached a *raw* exception before the field checks existed.
         # `journals: 5` left as `TypeError: 'int' object is not iterable`; `paths` as a
         # string decoded character by character and refused nothing; `effect_id: 7` was
         # copied straight through into a HaltDiagnostic A3 would later choke on.
-        lambda obj: obj.update({"journals": 5}),
-        lambda obj: obj.update({"paths": "a.txt"}),
-        lambda obj: obj.update({"paths": ["a.txt", 7]}),
-        lambda obj: obj.update({"effect_id": 7}),
-        lambda obj: obj.update({"expected": {"slot": "a"}}),
-        lambda obj: obj["journals"][0].update({"effect_id": None}),
+        (lambda obj: obj.update({"journals": 5}), "journals must be an array"),
+        (lambda obj: obj.update({"paths": "a.txt"}), "paths must be an array"),
+        (lambda obj: obj.update({"paths": ["a.txt", 7]}), "paths[1]"),
+        (lambda obj: obj.update({"effect_id": 7}), "effect_id must be a string"),
+        (lambda obj: obj.update({"expected": {"slot": "a"}}), "expected must be an array"),
+        (lambda obj: obj["journals"][0].update({"effect_id": None}), "NoneType"),
         # The two nullable fields: null is a value, but only null. A helper that admits
         # `None` must not thereby admit everything else.
-        lambda obj: obj["expected"][0].update({"has_unmodeled_child": "yes"}),
-        lambda obj: obj.update({"effect_id": False}),
+        (lambda obj: obj["expected"][0].update({"has_unmodeled_child": "yes"}), "has_unmodeled_child"),
+        (lambda obj: obj.update({"effect_id": False}), "effect_id must be a string, got bool"),
     ],
 )
-def test_a_malformed_diagnostic_payload_refuses(mutate):
+def test_a_malformed_diagnostic_payload_refuses(mutate, names):
     """A missing field, an extra one, an unknown enum member, and a field of the wrong
     primitive type all refuse -- design §9 lists a malformed payload as a
     MetadataStoreInvalid shape, and `halt_diagnostic` is the one column with no CHECK
-    behind it, so this decoder is its entire boundary."""
+    behind it, so this decoder is its entire boundary.
+
+    Asserting only `MetadataStoreInvalid` proves *something* refused, not that it refused
+    for the stated reason: a regression that let an unrelated, over-eager check fire first
+    would still raise the right exception type while masking a broken field-specific path.
+    So each case also asserts the field or member name its own refusal must name.
+    """
     diagnostic = every_diagnostic_shape()[0]
     obj = json.loads(encode_diagnostic(diagnostic))
     mutate(obj)
-    with pytest.raises(MetadataStoreInvalid):
+    with pytest.raises(MetadataStoreInvalid) as caught:
         decode_diagnostic(json.dumps(obj))
+    assert names in str(caught.value)
 
 
 def test_a_duplicate_key_in_the_payload_refuses():
@@ -2442,6 +2465,17 @@ def test_a_duplicate_key_in_the_payload_refuses():
     with pytest.raises(MetadataStoreInvalid):
         decode_diagnostic(doubled)
 ```
+
+**Why each malformed case pins the failure kind and not just the field name.** `_require_keys`
+enumerates all twelve valid field names in its own message, so `"journals"`, `"paths"`,
+`"expected"`, and `"effect_id"` each appear in a refusal that fired for the **wrong** reason. That
+is not a worry, it is measured: forcing the top-level key check to fire unconditionally and
+re-running the suite left **eight of thirteen** cases green. With the values above — field *and*
+kind — the same experiment fails eleven of thirteen. The two that still pass are cases 0 and 2,
+whose correct refusal *is* the key check, so that experiment cannot perturb them; case 0 is closed
+instead by pinning a `got` list no other single-field mutation can produce, and case 2 by asserting
+a key (`unexpected`) that is not one of the twelve. Asserting only `MetadataStoreInvalid` would
+prove that something refused, which is the one thing this boundary already cannot fail to do.
 
 - [ ] **Step 2: Add the diagnostic builders**
 
