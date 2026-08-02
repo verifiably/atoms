@@ -9,7 +9,20 @@ import sqlite3
 from typing import Any
 
 from atoms.core.effects import CreateFileNoClobber, ReplaceFile
-from atoms.core.fingerprint import ABSENT, FileState
+from atoms.core.fingerprint import ABSENT, AbsentState, DirectoryState, FileState, SymlinkState
+from atoms.core.recovery.model import (
+    CommitDecision,
+    DiagnosticEntry,
+    DiagnosticIdentityRelation,
+    EffectJournalState,
+    FileBuildRelation,
+    HaltDiagnostic,
+    HaltReason,
+    IdentityRelation,
+    JournalState,
+    OperatorAction,
+    TransactionState,
+)
 from atoms.core.spec import build_spec
 
 DATABASE_ENTRIES = ("atoms.db", "atoms.db-wal", "atoms.db-shm", "atoms.db-journal")
@@ -212,3 +225,85 @@ class CommitFails:
 
     def __getattr__(self, name: str):
         return getattr(self._connection, name)
+
+
+def every_diagnostic_shape() -> tuple[HaltDiagnostic, ...]:
+    """One diagnostic per structurally distinct shape: empty tuples, populated tuples,
+    a null effect_id, and every optional field on both settings."""
+    populated = HaltDiagnostic(
+        pre_halt_state=TransactionState.APPLYING,
+        commit_decision=CommitDecision.COMMITTED,
+        journals=(
+            EffectJournalState(effect_id="e1", state=JournalState.DONE),
+            EffectJournalState(effect_id="e2", state=JournalState.UNDO_STARTED),
+        ),
+        projected_transaction_state=TransactionState.HALTED,
+        projected_journals=(EffectJournalState(effect_id="e1", state=JournalState.DONE),),
+        effect_id="e2",
+        paths=("a.txt", "dir/b.txt"),
+        expected=(
+            DiagnosticEntry(
+                slot="pre", state=file_state(b"x"), has_unmodeled_child=False,
+                file_build_relation=FileBuildRelation.EXACT,
+            ),
+        ),
+        observed=(
+            DiagnosticEntry(
+                slot="post", state=DirectoryState(mode=0o750), has_unmodeled_child=True,
+                file_build_relation=None,
+            ),
+            DiagnosticEntry(
+                slot="link", state=SymlinkState(target="x", mode=0o777),
+                has_unmodeled_child=None, file_build_relation=FileBuildRelation.DIVERGED,
+            ),
+        ),
+        identity_relations=(
+            DiagnosticIdentityRelation(
+                left_slot="pre", right_slot="post", relation=IdentityRelation.SAME
+            ),
+        ),
+        reason=HaltReason.EFFECT_TUPLE_UNATTRIBUTABLE,
+        operator_action=OperatorAction.REPAIR_DURABLE_METADATA,
+    )
+    empty = HaltDiagnostic(
+        pre_halt_state=TransactionState.ROLLING_BACK,
+        commit_decision=CommitDecision.UNCOMMITTED,
+        journals=(),
+        projected_transaction_state=TransactionState.HALTED,
+        projected_journals=(),
+        effect_id=None,
+        paths=(),
+        expected=(DiagnosticEntry(
+            slot="only", state=AbsentState(), has_unmodeled_child=None,
+            file_build_relation=None,
+        ),),
+        observed=(),
+        identity_relations=(),
+        reason=HaltReason.DIRECTORY_NOT_EMPTY,
+        operator_action=OperatorAction.INSPECT_PRESERVED_EVIDENCE,
+    )
+    return (populated, empty)
+
+
+def matching_diagnostic(effect_id: str = "only") -> HaltDiagnostic:
+    """A diagnostic that AGREES with a one_effect_spec record's durable rows.
+
+    §7.6 compares a stored diagnostic's commit_decision and journal vector against the
+    record row and the effect rows, so a diagnostic assembled at random cannot be
+    committed at all. A test that needs a *coherent* HALTED record on disk -- to then
+    break one specific thing about it -- needs this one.
+    """
+    return HaltDiagnostic(
+        pre_halt_state=TransactionState.PREPARED,
+        commit_decision=CommitDecision.UNCOMMITTED,
+        journals=(EffectJournalState(effect_id=effect_id, state=JournalState.PENDING),),
+        projected_transaction_state=TransactionState.HALTED,
+        projected_journals=(),
+        effect_id=effect_id,
+        paths=("a.txt",),
+        expected=(),
+        observed=(),
+        identity_relations=(),
+        reason=HaltReason.DIRECTORY_NOT_EMPTY,
+        operator_action=OperatorAction.INSPECT_PRESERVED_EVIDENCE,
+    )
