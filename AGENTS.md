@@ -39,12 +39,17 @@ Plan B is written only after Plan A's interfaces settle.
   is complete; enforcement at the future A5–A8 entry points remains open.
   It admits #21, the txid binding, owned by A5.
   A4b-1 approves only non-casefold ext4; XFS, Btrfs, and casefold directories fail closed.
-- **A5 — durable metadata store and recovery lease: A5a implemented on 2026-08-01, A5b not yet
-  designed.** `python/src/atoms/store/` holds the SQLite-WAL store as a mechanism — creation and
+- **A5 — durable metadata store and recovery lease: A5a implemented on 2026-08-01, A5b designed on
+  2026-08-02 and unimplemented.** `python/src/atoms/store/` holds the SQLite-WAL store as a mechanism — creation and
   reopen under the verified `metadata_root`, the pinned connection profile, the schema, typed
   record read/write, guarded blob promotion of both preimages and planned postimages bound to the
   COMMIT that references them, and per-txid workspaces. It discharges ledger #22 and admits #23. A5b composes it into the recovery-resolve
   lease and owns entries #7, #9's enforcement half, #12, #17, #18, #19's part, #21, and #23.
+  Its design is [`docs/plans/2026-08-02-a5b-recovery-lease-design.md`](docs/plans/2026-08-02-a5b-recovery-lease-design.md):
+  a new `atoms/coordinator/` package holding the lease, the admission gate, preparation, and A3
+  transition persistence. Because A6 supplies no observations and A7 no executor yet, a live record at
+  lease entry raises a temporary build-stage trap, so #12 and #17 will land as their write and lease
+  halves only.
 
 Work lives under `python/` (`uv run pytest`, `uv run ruff check`, `uv run pyright`, all from
 `python/`).

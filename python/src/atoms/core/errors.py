@@ -23,7 +23,12 @@ class ProjectApprovalRefused(AtomsError):
 
 
 class PreconditionRefused(AtomsError):
-    """Concurrent drift was detected; the transaction refuses cleanly."""
+    """External state prevents clean execution; the transaction refuses cleanly.
+
+    Concurrent drift is one case. Pre-existing external occupancy of an
+    engine-derived scratch leaf is another, and need not be concurrent — such a
+    leaf may predate this attempt (design §11).
+    """
 
 
 class CapabilityUnavailable(AtomsError):

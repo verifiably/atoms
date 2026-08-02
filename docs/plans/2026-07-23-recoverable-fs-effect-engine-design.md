@@ -1256,9 +1256,12 @@ staging swap during rollback cannot be laundered into a false restoration.
 
 ## 11. Refusal and failure semantics
 
-- **`PreconditionRefused`** — concurrent drift was detected: during approval, when two observations of
+- **`PreconditionRefused`** — external state prevents clean execution; the transaction refuses cleanly.
+  Concurrent drift is one case: during approval, when two observations of
   one directory or entry disagree within a single approval; at capture; or by validating an atomically
-  displaced entry. Approval holds no transaction record and has mutated nothing, so it refuses
+  displaced entry. Pre-existing external occupancy of an engine-derived scratch leaf is another, and
+  need not be concurrent — such a leaf may predate this attempt. Approval holds no transaction record
+  and has mutated nothing, so it refuses
   directly. Once mutation may have begun, the executor returns this refusal only after the current
   effect and every earlier effect have been restored; inability to prove that restoration becomes
   `TransactionHalted`.

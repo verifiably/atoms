@@ -1285,9 +1285,13 @@ def test_the_fixture_guard_understands_parametrized_arguments():
 def test_a5_status_is_synchronized_across_authority_documents():
     agents = (Path(__file__).parents[2] / "AGENTS.md").read_text(encoding="utf-8")
     assert "A5a is implemented; A5b–A8 remain unimplemented" in agents
-    assert "A5a implemented on 2026-08-01, A5b not yet" in agents
+    assert "A5a implemented on 2026-08-01, A5b designed on" in agents
+    assert "2026-08-02 and unimplemented" in agents
     assert "A5a designed and unimplemented" not in agents
     assert "A5–A8 remain unimplemented" not in agents
+    # A5b's design landed 2026-08-02; the implementation has not.
+    assert "A5b not yet designed" not in agents
+    assert "A5b implemented" not in agents
 
 
 def _plant_store_package(
