@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-from atoms.core.errors import ProtocolError
+from atoms.core.canonical import canonical_json, from_canonical_json
+from atoms.core.compiler import compile_spec
+from atoms.core.errors import ProtocolError, SpecValidationError
 from atoms.core.fingerprint import (
     AbsentState,
     DirectoryState,
@@ -15,6 +18,7 @@ from atoms.core.fingerprint import (
     SymlinkState,
 )
 from atoms.core.identifiers import is_valid_identifier
+from atoms.core.spec import TransactionSpec
 from atoms.core.recovery.model import (
     CommitDecision,
     DiagnosticEntry,
@@ -29,6 +33,7 @@ from atoms.core.recovery.model import (
     TransactionState,
 )
 from atoms.store.errors import MetadataStoreInvalid
+from atoms.store.schema import variant_of
 
 _DIAGNOSTIC_FIELDS = (
     "pre_halt_state",
@@ -362,3 +367,134 @@ def require_member(label: str, value: Enum, enum_type: type[Enum]) -> str:
             f"{label} must be exactly {enum_type.__name__}, got {type(value).__name__}"
         )
     return value.value
+
+
+RULE_SPEC_DECODES = "spec_json_decodes"
+RULE_SPEC_CANONICAL = "spec_json_canonical"
+RULE_SPEC_COMPILES = "spec_json_compiles"
+RULE_EFFECT_COVERAGE = "effect_coverage"
+RULE_EFFECT_VARIANT = "effect_variant"
+RULE_BLOB_ROW_PRESENT = "blob_row_present"
+RULE_BLOB_BYTE_LEN = "blob_byte_len"
+RULE_ROLLBACK_RESULT = "rollback_result_exactly"
+RULE_HALT_DIAGNOSTIC = "halt_diagnostic_exactly"
+RULE_DIAGNOSTIC_DECISION = "diagnostic_commit_decision"
+RULE_DIAGNOSTIC_JOURNALS = "diagnostic_journal_vector"
+RULE_ACTIVE_RECORD = "active_record_exists"
+COHERENCE_RULES: tuple[str, ...] = (
+    RULE_SPEC_DECODES, RULE_SPEC_CANONICAL, RULE_SPEC_COMPILES, RULE_EFFECT_COVERAGE,
+    RULE_EFFECT_VARIANT, RULE_BLOB_ROW_PRESENT, RULE_BLOB_BYTE_LEN,
+    RULE_ROLLBACK_RESULT, RULE_HALT_DIAGNOSTIC, RULE_DIAGNOSTIC_DECISION,
+    RULE_DIAGNOSTIC_JOURNALS, RULE_ACTIVE_RECORD,
+)
+SELECT_RECORD = "SELECT spec_json, state, committed, rollback_result, halt_diagnostic FROM transaction_record WHERE txid = ?"
+SELECT_EFFECTS = "SELECT effect_id, variant, journal_state FROM effect WHERE txid = ?"
+SELECT_BLOB = "SELECT byte_len FROM blob WHERE digest = ?"
+SELECT_ACTIVE = "SELECT txid FROM active"
+
+
+@dataclass(frozen=True, slots=True)
+class StoredRecord:
+    txid: str
+    spec: TransactionSpec
+    state: TransactionState
+    committed: CommitDecision
+    rollback_result: RollbackResult | None
+    halt_diagnostic: HaltDiagnostic | None
+    journals: tuple[EffectJournalState, ...]
+
+
+def _finding(rule: str, detail: str) -> str:
+    return f"{rule}: {detail}"
+
+
+def referenced_digests(spec: TransactionSpec) -> tuple[tuple[str, int], ...]:
+    return tuple(sorted({
+        (entry.state.content_hash, entry.state.byte_len)
+        for entry in spec.initial_surface if isinstance(entry.state, FileState)
+    }))
+
+
+def journal_vector(
+    spec: TransactionSpec, rows: dict[str, tuple[str, str]]
+) -> tuple[EffectJournalState, ...]:
+    return tuple(
+        EffectJournalState(effect.effect_id, JournalState(rows[effect.effect_id][1]))
+        for effect in spec.effects
+    )
+
+
+def coherence_findings(connection: Any, txid: str) -> tuple[str, ...]:
+    row = connection.execute(SELECT_RECORD, (txid,)).fetchone()
+    if row is None:
+        return ()
+    spec_json, state_value, committed_value, rollback_value, diagnostic_text = row
+    try:
+        spec = from_canonical_json(spec_json)
+    except (SpecValidationError, ValueError) as caught:
+        return (_finding(RULE_SPEC_DECODES, f"spec_json does not decode: {caught}"),)
+    findings: list[str] = []
+    if canonical_json(spec) != spec_json:
+        findings.append(_finding(RULE_SPEC_CANONICAL, "spec_json is not canonical"))
+    try:
+        compile_spec(spec)
+    except SpecValidationError as caught:
+        findings.append(_finding(RULE_SPEC_COMPILES, f"spec_json is a spec A2 would refuse: {caught}"))
+    stored = {
+        effect_id: (variant, journal)
+        for effect_id, variant, journal in connection.execute(SELECT_EFFECTS, (txid,))
+    }
+    declared = {effect.effect_id: variant_of(effect).value for effect in spec.effects}
+    covered = set(declared) == set(stored)
+    for effect_id in sorted(set(declared) - set(stored)):
+        findings.append(_finding(RULE_EFFECT_COVERAGE, f"effect row missing for effect_id {effect_id!r}"))
+    for effect_id in sorted(set(stored) - set(declared)):
+        findings.append(_finding(RULE_EFFECT_COVERAGE, f"effect row {effect_id!r} is not in spec_json"))
+    for effect_id in sorted(set(declared) & set(stored)):
+        if stored[effect_id][0] != declared[effect_id]:
+            findings.append(_finding(RULE_EFFECT_VARIANT, f"effect {effect_id!r} has variant {stored[effect_id][0]!r}, spec_json says {declared[effect_id]!r}"))
+    for digest, byte_len in referenced_digests(spec):
+        blob = connection.execute(SELECT_BLOB, (digest,)).fetchone()
+        if blob is None:
+            findings.append(_finding(RULE_BLOB_ROW_PRESENT, f"no blob row for referenced digest {digest!r}"))
+        elif blob[0] != byte_len:
+            findings.append(_finding(RULE_BLOB_BYTE_LEN, f"blob {digest!r} has byte_len {blob[0]}, the record declares {byte_len}"))
+    state = TransactionState(state_value)
+    if (state is TransactionState.ROLLED_BACK) != (rollback_value is not None):
+        findings.append(_finding(RULE_ROLLBACK_RESULT, "rollback_result must be present exactly when state is rolled_back"))
+    if (state is TransactionState.HALTED) != (diagnostic_text is not None):
+        findings.append(_finding(RULE_HALT_DIAGNOSTIC, "halt_diagnostic must be present exactly when state is halted"))
+    if diagnostic_text is not None:
+        diagnostic = decode_diagnostic(diagnostic_text)
+        if diagnostic.commit_decision.value != committed_value:
+            findings.append(_finding(RULE_DIAGNOSTIC_DECISION, "the diagnostic's commit_decision disagrees with the durable row"))
+        if covered:
+            if diagnostic.journals != journal_vector(spec, stored):
+                findings.append(_finding(RULE_DIAGNOSTIC_JOURNALS, "the diagnostic's journal vector disagrees with the durable rows"))
+        else:
+            findings.append(_finding(RULE_DIAGNOSTIC_JOURNALS, "the diagnostic's journal vector cannot be compared: the effect rows do not cover spec_json"))
+    active = connection.execute(SELECT_ACTIVE).fetchone()
+    if active is not None and connection.execute(SELECT_RECORD, (active[0],)).fetchone() is None:
+        findings.append(_finding(RULE_ACTIVE_RECORD, f"active names txid {active[0]!r}, which has no record"))
+    return tuple(findings)
+
+
+def load_record(connection: Any, txid: str) -> StoredRecord | None:
+    row = connection.execute(SELECT_RECORD, (txid,)).fetchone()
+    if row is None:
+        return None
+    findings = coherence_findings(connection, txid)
+    if findings:
+        raise MetadataStoreInvalid(f"the record for txid {txid!r} cannot be interpreted: " + "; ".join(findings))
+    spec_json, state_value, committed_value, rollback_value, diagnostic_text = row
+    spec = from_canonical_json(spec_json)
+    rows = {
+        effect_id: (variant, journal)
+        for effect_id, variant, journal in connection.execute(SELECT_EFFECTS, (txid,))
+    }
+    return StoredRecord(
+        txid, spec, TransactionState(state_value), CommitDecision(committed_value),
+        None if rollback_value is None else RollbackResult(rollback_value),
+        None if diagnostic_text is None else decode_diagnostic(diagnostic_text),
+        journal_vector(spec, rows),
+    )

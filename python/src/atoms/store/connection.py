@@ -32,7 +32,12 @@ from atoms.store.records import (
     UPDATE_ROLLBACK_RESULT,
     UPDATE_STATE,
     UPSERT_ACTIVE,
+    SELECT_ACTIVE,
+    SELECT_BLOB,
+    StoredRecord,
+    coherence_findings,
     encode_diagnostic,
+    load_record,
     require_identifier,
     require_member,
 )
@@ -53,6 +58,7 @@ DATABASE_MODE = 0o600
 _SET_USER_VERSION = f"PRAGMA user_version = {SCHEMA_VERSION}"
 _SET_APPLICATION_ID = f"PRAGMA application_id = {APPLICATION_ID}"
 _BEGIN_IMMEDIATE = "BEGIN IMMEDIATE"
+_BEGIN_DEFERRED = "BEGIN"
 _COMMIT = "COMMIT"
 _ROLLBACK = "ROLLBACK"
 _READ_APPLICATION_ID = "PRAGMA application_id"
@@ -444,7 +450,7 @@ class _StoreTransaction:
     cannot'.
     """
 
-    __slots__ = ("_poisoned_by", "_spent", "_store", "_touched")
+    __slots__ = ("_poisoned_by", "_promoted", "_spent", "_store", "_touched")
 
     def __init__(self, store: Store, *, _construction_token: object | None = None) -> None:
         if _construction_token is not _STORE_TOKEN:
@@ -452,6 +458,7 @@ class _StoreTransaction:
         self._store = store
         self._spent = False
         self._touched: set[str] = set()
+        self._promoted: dict[str, set[str]] = {}
         self._poisoned_by: BaseException | None = None
 
     def _require_current(self) -> Store:
@@ -512,8 +519,22 @@ class _StoreTransaction:
         self._spent = True
 
     def _run_barrier(self) -> None:
-        """The pre-COMMIT barrier. Task 8 fills this in; here it is deliberately empty so
-        that Task 5's transaction semantics can be reviewed on their own."""
+        store = self._require_current()
+        for txid in sorted(self._touched):
+            store._require_live()
+            findings = coherence_findings(store._connection, txid)
+            if findings:
+                raise ProtocolError(
+                    f"the record for txid {txid!r} would not be coherent: "
+                    + "; ".join(findings)
+                )
+        for digests in self._promoted.values():
+            for digest in sorted(digests):
+                store._require_live()
+                if store._connection.execute(SELECT_BLOB, (digest,)).fetchone() is None:
+                    raise ProtocolError(
+                        f"digest {digest!r} was promoted in this transaction but has no blob row"
+                    )
 
     def insert_record(self, txid: str, spec: TransactionSpec) -> None:
         with self._mutating() as store:
@@ -640,6 +661,38 @@ class Store:
                 "barrier per lease step, and a nested BEGIN would mean two callers each "
                 "believe they own the boundary"
             )
+
+    @contextmanager
+    def _read_transaction(self) -> Iterator[sqlite3.Connection]:
+        self._require_live()
+        if self._active_transaction is not None:
+            raise ProtocolError(
+                "a public read while this store owns a write transaction would report as "
+                "durable a row a rollback erases"
+            )
+        with translated("beginning a read"):
+            self._connection.execute(_BEGIN_DEFERRED)
+        try:
+            yield self._connection
+            with translated("ending a read"):
+                self._connection.execute(_COMMIT)
+        except BaseException:
+            _rollback_quietly(self._connection)
+            raise
+
+    def read_record(self, txid: str) -> StoredRecord | None:
+        require_identifier("txid", txid)
+        with self._read_transaction() as connection:
+            record = load_record(connection, txid)
+        self._require_live()
+        return record
+
+    def read_active(self) -> StoredRecord | None:
+        with self._read_transaction() as connection:
+            row = connection.execute(SELECT_ACTIVE).fetchone()
+            record = None if row is None else load_record(connection, row[0])
+        self._require_live()
+        return record
 
     @contextmanager
     def transaction(self) -> Iterator[_StoreTransaction]:
