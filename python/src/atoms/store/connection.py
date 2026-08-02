@@ -562,9 +562,9 @@ class _StoreTransaction:
     def promote_staging(
         self, workspace: Workspace, manifest: tuple[StagedBlob, ...]
     ) -> None:
-        from atoms.store.blobs import promote_staging
-
         with self._mutating() as store:
+            from atoms.store.blobs import promote_staging
+
             promote_staging(store, workspace, manifest)
             self._touched.add(workspace.txid)
             self._promoted.setdefault(workspace.txid, set()).update(
