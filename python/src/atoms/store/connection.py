@@ -774,6 +774,11 @@ class Store:
     def remove_workspace(self, workspace: Workspace) -> None:
         remove_workspace(self, workspace)
 
+    def open_blob(self, digest: str) -> int:
+        from atoms.store.blobs import open_blob
+
+        return open_blob(self, digest)
+
     def __enter__(self) -> Self:
         return self
 
