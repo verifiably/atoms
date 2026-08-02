@@ -839,39 +839,69 @@ size, and content — for every path under the root:
 
 ```python
 def _project_state(project_root: str) -> dict[str, tuple[object, ...]]:
-    """Every path under the project root, with the durable state of each.
+    """The project root and every path under it, with the state a mutation would move.
 
-    Content is hashed rather than compared inline so a failure message stays readable,
-    and `lstat` is used throughout so a symlink is compared as a symlink.
+    Three things beyond kind/mode/content, each closing a hole the others leave open:
+
+    * `st_dev` and `st_ino`, because a path replaced by an inode of identical kind,
+      mode, and content is otherwise invisible. These are already how A4b states path
+      identity, so this is the project's own vocabulary rather than a new one.
+    * the root itself, keyed `"."`, because nothing under it records a `chmod` on it --
+      and against an empty root, nothing under it records anything at all.
+    * `lstat` throughout, so a symlink is compared as a symlink rather than followed.
+
+    Content is hashed rather than compared inline so a failure message stays readable.
     """
     state: dict[str, tuple[object, ...]] = {}
+
+    def record(full: str) -> None:
+        info = os.lstat(full)
+        if stat.S_ISLNK(info.st_mode):
+            payload: object = os.readlink(full)
+        elif stat.S_ISDIR(info.st_mode):
+            payload = None
+        else:
+            payload = hashlib.sha256(Path(full).read_bytes()).hexdigest()
+        state[os.path.relpath(full, project_root)] = (
+            stat.S_IFMT(info.st_mode),
+            stat.S_IMODE(info.st_mode),
+            info.st_dev,
+            info.st_ino,
+            info.st_size,
+            payload,
+        )
+
+    record(project_root)
     for directory, directories, files in os.walk(project_root):
         directories.sort()
         for name in sorted(directories) + sorted(files):
-            full = os.path.join(directory, name)
-            info = os.lstat(full)
-            if stat.S_ISLNK(info.st_mode):
-                payload: object = os.readlink(full)
-            elif stat.S_ISDIR(info.st_mode):
-                payload = None
-            else:
-                payload = hashlib.sha256(Path(full).read_bytes()).hexdigest()
-            state[os.path.relpath(full, project_root)] = (
-                stat.S_IFMT(info.st_mode),
-                stat.S_IMODE(info.st_mode),
-                info.st_size,
-                payload,
-            )
+            record(os.path.join(directory, name))
     return state
 
 
 def _trapping_lease(coordinator_on, leased):
-    """Ingredients whose metadata root already holds a live record, so re-entering
-    `_recovery_lease` over them reaches `_resolve` and traps."""
+    """Ingredients whose project root holds a real file and whose metadata root holds a
+    live record, so re-entering `_recovery_lease` over them reaches `_resolve` and traps.
+
+    The file is not incidental: a state comparison over an empty tree has almost nothing
+    to compare, and two of the mutations below need an existing path to move.
+    """
+    from tests.coordinator_support import make_child_directory
     from tests.store_support import one_effect_spec
 
     ingredients = coordinator_on()
     with leased(ingredients) as lease:
+        make_child_directory(lease)
+        fd = os.open(
+            "d/f.txt",
+            os.O_CREAT | os.O_WRONLY,
+            0o644,
+            dir_fd=lease._binding.project_root_fd,
+        )
+        try:
+            os.write(fd, b"pre-existing")
+        finally:
+            os.close(fd)
         with lease._store.transaction() as txn:
             txn.insert_record("tx1", one_effect_spec())
             txn.set_active("tx1")
@@ -932,23 +962,43 @@ def test_the_trap_releases_the_project_lock(coordinator_on, leased):
 
 Add `import hashlib` and `import stat` to the module's import block.
 
-**Three mutations, each of which must keep the trap firing.** Deleting `_resolve`'s call site would
-make all three tests fail at `pytest.raises` before reaching a single property assertion, which proves
-only that the trap exists — something the earlier tests already prove. Each mutation below is one line
-inserted into `_recovery_lease` immediately **before** `_resolve(store)`, where `binding` and `lock`
-are both in scope, so the trap still raises and the property is the only thing that changes:
+**Five mutations, each of which must keep the trap firing.** Deleting `_resolve`'s call site would make
+all three tests fail at `pytest.raises` before reaching a single property assertion, which proves only
+that the trap exists — something the earlier tests already prove. Each mutation below is inserted into
+`_recovery_lease` immediately **before** `_resolve(store)`, where `binding` and `lock` are both in
+scope, so the trap still raises and the property is the only thing that changes:
 
-| Mutation | Must fail | Must still pass |
-| --- | --- | --- |
-| `os.open("mutant", os.O_CREAT \| os.O_WRONLY, 0o600, dir_fd=binding.project_root_fd)` | `test_the_trap_mutates_no_project_path` | the other two |
-| `os.dup(binding.project_root_fd)` | `test_the_trap_leaks_no_descriptor` | the other two |
-| `os.dup(lock._lock_fd)` | `test_the_trap_releases_the_project_lock` **and** `test_the_trap_leaks_no_descriptor` | `test_the_trap_mutates_no_project_path` |
+| # | Mutation | Must fail | Must still pass |
+| --- | --- | --- | --- |
+| 1 | `os.close(os.open("mutant", os.O_CREAT \| os.O_WRONLY, 0o600, dir_fd=binding.project_root_fd))` | `test_the_trap_mutates_no_project_path` | the other two |
+| 2 | `os.fchmod(binding.project_root_fd, 0o701)` | `test_the_trap_mutates_no_project_path`, on the `"."` entry alone | the other two |
+| 3 | the inode swap below | `test_the_trap_mutates_no_project_path`, on `st_ino` alone | the other two |
+| 4 | `os.dup(binding.project_root_fd)` | `test_the_trap_leaks_no_descriptor` | the other two |
+| 5 | `os.dup(lock._lock_fd)` | `test_the_trap_releases_the_project_lock` **and** `test_the_trap_leaks_no_descriptor` | `test_the_trap_mutates_no_project_path` |
 
-The third failing two tests is expected, not a defect in the split: `flock` is held by the open file
+**Mutation 1 must close what it opens.** A bare `os.open` also leaks its descriptor and would fail
+`test_the_trap_leaks_no_descriptor` too, which would say nothing about whether the project-state
+comparison works.
+
+**Mutation 2** must use a mode the root does not already have; if `0o701` happens to be its mode,
+pick another and say which.
+
+**Mutation 3** replaces `d/f.txt` with a byte-identical file at a fresh inode, so names, mode, size,
+and content hash are all unchanged and `st_ino` is the only field that moves:
+
+```text
+            fd = os.open("copy", os.O_CREAT | os.O_WRONLY, 0o644,
+                         dir_fd=binding.project_root_fd)
+            os.write(fd, b"pre-existing"); os.close(fd)
+            os.rename("copy", "d/f.txt", src_dir_fd=binding.project_root_fd,
+                      dst_dir_fd=binding.project_root_fd)
+```
+
+Mutation 5 failing two tests is expected, not a defect in the split: `flock` is held by the open file
 description, so a duplicated lock descriptor keeps the lock alive past the original's close *and* is
-itself a leaked descriptor. What the pair shows is that the lock assertion is not vacuous — the first
-two mutations leave it green and the third does not. Restore after each, confirm
-`git status --porcelain` is empty, and report all four observed failures.
+itself a leaked descriptor. What the pair shows is that the lock assertion is not vacuous — mutations
+1–4 leave it green and 5 does not. Restore after each, confirm `git status --porcelain` is empty, and
+report all six observed failures.
 
 - [ ] **Step 9: Run the gates and commit**
 
@@ -3209,6 +3259,11 @@ field it meant to test. Each case uses the cursor at which the prefix already pr
 | rollback result | metadata-only | **2** | `ROLLED_BACK` + `RESTORED`, still active | new, below |
 | halt diagnostic | halt | **1** | `HALTED` + the plan's own diagnostic | new, below |
 | journals | remove-scratch | 0 | `APPLYING` + `STARTED` | new, below |
+| active status | metadata-only | **3** | `DetachActive` applied — a detached transaction | new, below |
+
+`test_no_active_record_refuses` does **not** cover the last row. It exits at the "no active record"
+gate, before `_require_projection_matches` is called at all, so deleting the `if not expected.active`
+branch leaves it — and every other case here — green.
 
 Read the measured step vectors at the top of this plan to confirm the two shifted cursors: the
 metadata-only plan's step 2 is `DetachActive`, so reducing to 2 has applied both transitions but not
@@ -3284,7 +3339,38 @@ def test_a_record_whose_journals_disagree_refuses(leased):
             persist_plan_prefix(lease, approved, plan, 0)
 
         assert "journals" in str(caught.value)
+
+
+def test_a_record_still_active_past_its_detach_refuses(leased):
+    """Cursor 3: the whole metadata-only plan, `DetachActive` included, so the prefix
+    projects a detached transaction. The record is walked to the same terminal state but
+    left active, which makes active status the only field that can disagree.
+
+    Nothing else in this module reaches that branch: `test_no_active_record_refuses`
+    exits at the earlier "no active record" gate, before the projection check runs.
+    """
+    from atoms.coordinator.transitions import persist_plan_prefix
+
+    with leased() as lease:
+        approved, plan = prepared_metadata_only(lease)
+        assert type(plan.steps[2]) is DetachActive
+
+        with lease._store.transaction() as txn:
+            txn.set_transaction_state(approved.txid, TransactionState.ROLLING_BACK)
+        with lease._store.transaction() as txn:
+            txn.set_transaction_state(approved.txid, TransactionState.ROLLED_BACK)
+            txn.set_rollback_result(approved.txid, RollbackResult.RESTORED)
+        # set_active is deliberately NOT called: that is the whole disagreement.
+
+        with pytest.raises(ProtocolError) as caught:
+            persist_plan_prefix(lease, approved, plan, len(plan.steps))
+
+        assert "projects a detached transaction" in str(caught.value)
 ```
+
+`start=3` is in range — `test_a_start_outside_the_step_range_refuses` shows the bound is
+`len(plan.steps) + 1` — and the walk from there does nothing, so without this branch the call would
+return `3` and report success over a record that should already have been detached.
 
 `matching_diagnostic` is `tests/store_support.py:352` and exists precisely so a coherent HALTED record
 can be written before something about it is broken. Measured: `coherence_findings` compares a stored
@@ -3293,12 +3379,25 @@ diagnostic's `commit_decision` and `journals` against the durable rows and nothi
 this spec — does not block the write. It is that mismatch in every *other* field which makes it a
 different diagnostic from the plan's.
 
-Then delete each field's row from the comparison tuple in turn, re-run, and confirm **only that
-field's own test fails**. A deletion that breaks two tests means two cases are firing the same gate and
-one of them is not proving what it claims. Do the same for the `canonical_json` spec comparison and for
-the `topology` equality above. Restore after each and report the seven observed failures.
+Then sweep every comparison in `_require_projection_matches`, deleting one at a time, re-running, and
+confirming **only that comparison's own test fails**. A deletion that breaks two tests means two cases
+are firing the same gate and one of them is not proving what it claims. Nine deletions:
 
-Run: `uv run pytest tests/test_coordinator_transitions.py -v`. Expected: PASS, 16 tests.
+| Deleted | Expected sole failure |
+| --- | --- |
+| `snapshot.compiled != approved.compiled` | `test_a_plan_bound_to_another_compiled_spec_refuses` |
+| `snapshot.topology != approved.topology` | `test_a_plan_bound_to_another_topology_refuses` |
+| the `canonical_json` spec comparison | `test_a_record_whose_spec_disagrees_with_the_prefix_refuses` |
+| tuple row: transaction state | `test_the_first_halt_diagnostic_wins` |
+| tuple row: commit decision | `test_a_record_disagreeing_with_the_reduced_prefix_refuses` |
+| tuple row: rollback result | `test_a_record_whose_rollback_result_disagrees_refuses` |
+| tuple row: halt diagnostic | `test_a_record_whose_halt_diagnostic_disagrees_refuses` |
+| tuple row: journals | `test_a_record_whose_journals_disagree_refuses` |
+| `if not expected.active` | `test_a_record_still_active_past_its_detach_refuses` |
+
+Restore after each and report the nine observed failures.
+
+Run: `uv run pytest tests/test_coordinator_transitions.py -v`. Expected: PASS, 17 tests.
 
 - [ ] **Step 9: Prove one barrier per writable step**
 
@@ -3340,7 +3439,7 @@ on the nested-transaction error rather than on this test's assertion, and would 
 barrier granularity. The assertion above is the proof: a single shared transaction would have rolled
 back the first step's write along with the second's.
 
-Run: `uv run pytest tests/test_coordinator_transitions.py -v`. Expected: PASS, 17 tests.
+Run: `uv run pytest tests/test_coordinator_transitions.py -v`. Expected: PASS, 18 tests.
 
 - [ ] **Step 10: Commit**
 
@@ -3594,14 +3693,20 @@ def test_the_coordinator_exports_nothing():
     assert not hasattr(package, "_recovery_lease")
 
 
-def _coordinator_importers(source_root: Path) -> list[str]:
-    """Modules outside the coordinator that import the coordinator package at all.
+#: What outsiders may not reach: the lease type and the composition root. NOT the whole
+#: package -- design §4.1 scopes the restriction to `Lease` and `_recovery_lease`, and
+#: A6's and A7's sibling packages will legitimately import `admission`, `prepare`, and
+#: `transitions`. Forbidding `atoms.coordinator` wholesale would block those seams.
+_PRIVATE_COORDINATOR_MODULES = ("atoms.coordinator.lease", "atoms.coordinator.root")
+
+
+def _private_coordinator_importers(source_root: Path) -> list[str]:
+    """Modules outside the coordinator that import `lease` or `root`.
 
     A substring scan for `"coordinator.lease"` misses `from atoms.coordinator import
-    lease`, whose text never contains that spelling, and misses
-    `import atoms.coordinator as c` entirely. Resolving each import target catches every
-    spelling, and the package boundary -- not the `lease` module alone -- is what the
-    DAG actually forbids crossing inward.
+    lease`, whose text never contains that spelling. Resolving each import target
+    catches every spelling: that form yields `atoms.coordinator.lease` as a target
+    because the imported name is appended to the module it came from.
     """
     offenders = []
     for path in sorted(source_root.rglob("*.py")):
@@ -3611,34 +3716,38 @@ def _coordinator_importers(source_root: Path) -> list[str]:
         package = ".".join(("atoms", *parts[:-1]))
         tree = ast.parse(path.read_text(encoding="utf-8"))
         if any(
-            name == "atoms.coordinator" or name.startswith("atoms.coordinator.")
+            name == private or name.startswith(f"{private}.")
             for name in _resolved_imports(tree, package=package)
+            for private in _PRIVATE_COORDINATOR_MODULES
         ):
             offenders.append(str(path.relative_to(source_root)))
     return offenders
 
 
-def test_no_module_outside_the_coordinator_imports_it():
+def test_no_module_outside_the_coordinator_imports_the_lease_or_the_root():
     """Absence from __all__ is not enforcement -- `atoms.coordinator.root` is still
     importable. The underscore states the contract; this guard covers the population it
     can speak for: in-tree callers."""
-    assert _coordinator_importers(SOURCE_ROOT) == []
+    assert _private_coordinator_importers(SOURCE_ROOT) == []
 
 
-def test_the_coordinator_import_scanner_finds_a_planted_offender(tmp_path):
-    """The four spellings the replaced substring scan would have split on."""
+def test_the_private_coordinator_scanner_finds_a_planted_offender(tmp_path):
+    """Three spellings the replaced substring scan would have split on, plus the two
+    imports that must stay legal: the coordinator importing itself, and a sibling
+    package reaching a public seam."""
     root = tmp_path / "atoms"
     for relative, source in (
         ("fs/leak.py", "from atoms.coordinator import lease\n"),
         ("core/leak.py", "from atoms.coordinator.root import _recovery_lease\n"),
         ("store/leak.py", "import atoms.coordinator.lease\n"),
         ("coordinator/root.py", "from atoms.coordinator.lease import Lease\n"),
+        ("capture/reader.py", "from atoms.coordinator.prepare import open_workspace\n"),
     ):
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(source, encoding="utf-8")
 
-    assert _coordinator_importers(root) == [
+    assert _private_coordinator_importers(root) == [
         "core/leak.py",
         "fs/leak.py",
         "store/leak.py",
@@ -4005,11 +4114,12 @@ stack, exactly as design §4.1 says, and tests reach the protocol by patching
 `root.CERTIFIED_ALLOWLIST`. There is no `_lease` and no allowlist parameter, so `_production_bind_callers`
 has exactly one member to find.
 
-**One addition to the design, flagged for the author's ruling.** Design §6.4's table says the `WorkRoot`
-branch "never enters `observe_child`" and must "re-resolve `metadata_root/work` against
-`approved.work_base`", but names no mechanism. This plan adds `observe_work_child(binding, leaf)` beside
-`observe_child` rather than putting metadata-space syscalls in the coordinator. The design is amended in
-the same commit as this plan, per the authority-order rule.
+**One addition to the design, approved.** Design §6.4's table said the `WorkRoot` branch "never enters
+`observe_child`" and must "re-resolve `metadata_root/work` against `approved.work_base`", but named no
+mechanism. This plan adds `observe_work_child(binding, leaf)` beside `observe_child` rather than putting
+metadata-space syscalls in the coordinator — separate project-space and metadata-space entry points over
+one shared observation core. The design was amended in the same commit as this plan, per the
+authority-order rule.
 
 **Type consistency.** `Lease._binding` / `Lease._store` are spelled identically in every task.
 `_require_admitted` is defined once in `admission.py` and called by all three entry points.
