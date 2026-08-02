@@ -157,9 +157,10 @@ def test_lock_released_before_commit_rolls_back(store_on, release):
     with store_on() as binding:
         path = raw_path(binding)
         store = open_store(binding)
-        with pytest.raises(ProtocolError), store.transaction() as txn:
+        with pytest.raises(ProtocolError) as caught, store.transaction() as txn:
             txn.insert_record("tx1", one_effect_spec())
             release(binding)
+        assert ("closed" if release.__name__ == "close_binding" else "lock") in str(caught.value).lower()
         store.close()
         raw = sqlite3.connect(path, isolation_level=None)
         try:
@@ -184,8 +185,9 @@ def test_lock_released_during_a_load_returns_no_record(store_on, monkeypatch, re
             return real(connection, txid)
 
         monkeypatch.setattr(records_module, "coherence_findings", release_then_check)
-        with pytest.raises(ProtocolError):
+        with pytest.raises(ProtocolError) as caught:
             store.read_record("tx1")
+        assert ("closed" if release.__name__ == "close_binding" else "lock") in str(caught.value).lower()
         store.close()
 
 

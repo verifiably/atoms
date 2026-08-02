@@ -629,6 +629,19 @@ def test_the_cross_row_matrix_covers_every_rule_on_both_sides():
     assert written | set(WRITE_UNREACHABLE_RULES) == set(COHERENCE_RULES)
 
 
+RULE_INVENTORY = (
+    RULE_SPEC_DECODES, RULE_SPEC_CANONICAL, RULE_SPEC_COMPILES,
+    RULE_EFFECT_COVERAGE, RULE_EFFECT_VARIANT, RULE_BLOB_ROW_PRESENT,
+    RULE_BLOB_BYTE_LEN, RULE_ROLLBACK_RESULT, RULE_HALT_DIAGNOSTIC,
+    RULE_DIAGNOSTIC_DECISION, RULE_DIAGNOSTIC_JOURNALS, RULE_ACTIVE_RECORD,
+)
+
+
+def test_every_rule_constant_is_listed_in_coherence_rules():
+    assert set(RULE_INVENTORY) == set(COHERENCE_RULES)
+    assert len(RULE_INVENTORY) == len(COHERENCE_RULES) == 12
+
+
 def test_the_journal_vector_follows_spec_order_not_row_order(opened_store):
     from atoms.core.effects import CreateFileNoClobber
     from atoms.core.fingerprint import ABSENT
