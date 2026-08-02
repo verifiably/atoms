@@ -5,11 +5,17 @@ from __future__ import annotations
 import os
 import sqlite3
 import stat
+from enum import Enum
 
 from atoms.core.errors import CapabilityUnavailable
 from atoms.fs.binding import ProjectBinding
 from atoms.store.errors import MetadataStoreInvalid, translated
-from atoms.store.schema import APPLICATION_ID, SCHEMA_STATEMENTS, SCHEMA_VERSION
+from atoms.store.schema import (
+    APPLICATION_ID,
+    EXPECTED_CATALOG,
+    SCHEMA_STATEMENTS,
+    SCHEMA_VERSION,
+)
 
 DATABASE_NAME = "atoms.db"
 SIDECAR_NAMES = ("atoms.db-wal", "atoms.db-shm", "atoms.db-journal")
@@ -255,3 +261,145 @@ def initialize_schema(binding: ProjectBinding, connection: sqlite3.Connection) -
     except BaseException:
         _rollback_quietly(connection)
         raise
+
+
+class Verdict(Enum):
+    COMPLETED = "completed"
+    RESUMABLE = "resumable"
+
+
+def repair_unpublished(binding: ProjectBinding) -> None:
+    """Design §5.2 step 2 -- re-run §5.1 step 3 before SQLite is involved at all.
+
+    Ordering this after classification made it unreachable: at 0o400 SQLite falls back to
+    a read-only open, so the classification reads succeed and the first write of the
+    resume fails 'attempt to write a readonly database'; at 0o000 nothing opens at all.
+    Three failures, one cause -- the repair was issued from a position that could no
+    longer carry it out.
+
+    O_PATH is the only open that succeeds at mode 0o000, and fchmod on it fails EBADF, so
+    the chmod goes through /proc/self/fd. That is race-free for the reason it exists: the
+    descriptor pins the inode step 1 stat'd, so nothing between the two can substitute a
+    symlink or a different file.
+
+    The gate sits **immediately before the chmod**, not before the O_PATH open. The open
+    is not a mutation, and gating in front of it would prove the lease was held when the
+    repair began rather than when it changed a mode -- §5.4's exact complaint about a
+    single gate at the front of an operation, in miniature.
+    """
+    path_fd = os.open(
+        DATABASE_NAME,
+        os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC,
+        dir_fd=binding.metadata_root_fd,
+    )
+    try:
+        gate(binding)
+        os.chmod(f"/proc/self/fd/{path_fd}", DATABASE_MODE)
+    finally:
+        os.close(path_fd)
+    fd = os.open(
+        DATABASE_NAME,
+        os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
+        dir_fd=binding.metadata_root_fd,
+    )
+    try:
+        publish_entry(binding, fd)
+    finally:
+        os.close(fd)
+
+
+def _integrity_findings(connection: sqlite3.Connection) -> tuple[str, ...]:
+    with translated("checking integrity"):
+        quick = tuple(row[0] for row in connection.execute(_QUICK_CHECK))
+        foreign = tuple(str(row) for row in connection.execute(_FOREIGN_KEY_CHECK))
+    return tuple(finding for finding in quick if finding != "ok") + foreign
+
+
+def _catalog(connection: sqlite3.Connection) -> frozenset[tuple[str, str, str, str | None]]:
+    with translated("reading the catalog"):
+        rows = connection.execute(_READ_CATALOG).fetchall()
+    return frozenset(
+        (kind, name, tbl, None if sql is None else sql.rstrip().rstrip(";"))
+        for kind, name, tbl, sql in rows
+    )
+
+
+def classify(connection: sqlite3.Connection) -> Verdict:
+    """Identity, version, and schema -- from reads alone (design §5.2 step 4)."""
+    with translated("reading identity"):
+        application_id = connection.execute(_READ_APPLICATION_ID).fetchone()[0]
+        user_version = connection.execute(_READ_USER_VERSION).fetchone()[0]
+    catalog = _catalog(connection)
+
+    if application_id == APPLICATION_ID:
+        if user_version != SCHEMA_VERSION:
+            raise MetadataStoreInvalid(
+                f"incompatible store version {user_version}; this build knows "
+                f"{SCHEMA_VERSION}. A newer store is not corrupt -- it is unreadable by "
+                "this build -- and both mean stop, do not interpret this"
+            )
+        if catalog != EXPECTED_CATALOG:
+            missing = EXPECTED_CATALOG - catalog
+            extra = catalog - EXPECTED_CATALOG
+            raise MetadataStoreInvalid(
+                f"schema does not match version {SCHEMA_VERSION}: missing "
+                f"{sorted(name for _k, name, _t, _s in missing)}, unexpected "
+                f"{sorted(name for _k, name, _t, _s in extra)}"
+            )
+        return Verdict.COMPLETED
+
+    if application_id == 0 and user_version == 0 and not catalog:
+        return Verdict.RESUMABLE
+
+    if application_id == 0:
+        raise MetadataStoreInvalid(
+            "version zero with a non-empty schema is not an initialization this engine "
+            f"interrupted: user_version={user_version}, {len(catalog)} schema objects"
+        )
+    raise MetadataStoreInvalid(
+        f"application_id {application_id} is not this engine's ({APPLICATION_ID})"
+    )
+
+
+def open_database(binding: ProjectBinding) -> sqlite3.Connection:
+    """Design §5.2, steps 1 through 6."""
+    require_platform(binding)
+    seen = _preflight_entries(binding, require_absent=False)
+    if DATABASE_NAME not in seen:
+        raise MetadataStoreInvalid(
+            f"{DATABASE_NAME} is absent under metadata_root; "
+            f"surviving entries {sorted(seen)}"
+        )
+    if seen[DATABASE_NAME].st_size == 0:
+        repair_unpublished(binding)
+
+    connection = _connect(binding)
+    try:
+        verdict = classify(connection)
+        if verdict is Verdict.RESUMABLE:
+            apply_persistent_profile(binding, connection)
+            apply_connection_profile(connection)
+            initialize_schema(binding, connection)
+        else:
+            with translated("reading journal_mode"):
+                mode = connection.execute(_READ_JOURNAL_MODE).fetchone()[0]
+            if mode != "wal":
+                raise MetadataStoreInvalid(
+                    f"a completed store must already be in WAL; this one reports "
+                    f"{mode!r}. Converting it would rewrite a database on a guess"
+                )
+            apply_connection_profile(connection)
+        findings = _integrity_findings(connection)
+        if findings:
+            raise MetadataStoreInvalid(
+                "integrity check failed: " + "; ".join(findings)
+            )
+    except BaseException:
+        connection.close()
+        raise
+    return connection
+
+
+def reopen_store(binding: ProjectBinding) -> sqlite3.Connection:
+    """Alias naming the caller's intent; `open_database` is the shared implementation."""
+    return open_database(binding)

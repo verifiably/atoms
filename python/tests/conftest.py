@@ -1,6 +1,7 @@
 """Explicit recovery-model fixture registry."""
 
 import contextlib
+import itertools
 import os
 import tempfile
 from pathlib import Path
@@ -525,6 +526,21 @@ def approval_context(ext4_bound_volume):
 
 
 @pytest.fixture
-def store_on(ext4_bound_volume):
-    """A bound ext4 volume with an empty metadata root, ready for store creation."""
-    return ext4_bound_volume
+def store_on(ext4_volume, ext4_project_root, test_storage_profile):
+    """A bound ext4 volume with an empty metadata root, ready for store creation.
+
+    Each call binds a *fresh* metadata root under the same ext4 volume, rather than
+    the one `ext4_metadata_root` fixture instance every other consumer shares. A test
+    that cuts a creation sequence and then opens a second, uninterrupted store for
+    comparison needs the second store_on() to see an empty metadata root, not the
+    first call's surviving `atoms.db`.
+    """
+    counter = itertools.count()
+
+    def bind(withhold=frozenset()):
+        metadata_root = ext4_volume / f"metadata-{next(counter)}"
+        return make_bound_volume(
+            make_fake_backend(), ext4_project_root, metadata_root, test_storage_profile
+        )(withhold=withhold)
+
+    return bind
