@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+from enum import Enum
 from typing import Any
 
+from atoms.core.errors import ProtocolError
 from atoms.core.fingerprint import (
     AbsentState,
     DirectoryState,
@@ -12,6 +14,7 @@ from atoms.core.fingerprint import (
     PathState,
     SymlinkState,
 )
+from atoms.core.identifiers import is_valid_identifier
 from atoms.core.recovery.model import (
     CommitDecision,
     DiagnosticEntry,
@@ -290,3 +293,72 @@ def decode_diagnostic(text: str) -> HaltDiagnostic:
         reason=_member(HaltReason, obj["reason"], "HaltReason"),
         operator_action=_member(OperatorAction, obj["operator_action"], "OperatorAction"),
     )
+
+
+INSERT_RECORD = (
+    "INSERT INTO transaction_record "
+    "(txid, spec_json, state, committed, rollback_result, halt_diagnostic) "
+    "VALUES (?, ?, ?, ?, NULL, NULL)"
+)
+INSERT_EFFECT = (
+    "INSERT INTO effect (txid, effect_id, variant, journal_state) VALUES (?, ?, ?, ?)"
+)
+UPDATE_STATE = "UPDATE transaction_record SET state = ? WHERE txid = ?"
+UPDATE_COMMITTED = "UPDATE transaction_record SET committed = ? WHERE txid = ?"
+UPDATE_ROLLBACK_RESULT = "UPDATE transaction_record SET rollback_result = ? WHERE txid = ?"
+UPDATE_HALT_DIAGNOSTIC = "UPDATE transaction_record SET halt_diagnostic = ? WHERE txid = ?"
+UPDATE_JOURNAL_STATE = (
+    "UPDATE effect SET journal_state = ? WHERE txid = ? AND effect_id = ?"
+)
+UPSERT_ACTIVE = (
+    "INSERT INTO active (singleton, txid) VALUES (0, ?) "
+    "ON CONFLICT(singleton) DO UPDATE SET txid = excluded.txid"
+)
+DELETE_ACTIVE = "DELETE FROM active"
+
+
+def require_identifier(label: str, value: object) -> str:
+    """Design §5.5, in two steps and in this order.
+
+    `require_valid_identifier` raises SpecValidationError for '../x' and a raw TypeError
+    for 3, None, and b'tx' -- measured for all four -- because it hands its argument
+    straight to a compiled pattern. A TypeError from inside a validator is
+    indistinguishable from a bug in A5a's own code, and it is the response to the exact
+    input a hostile caller supplies. So A5a reuses A1's *predicate* and supplies its own
+    refusal.
+
+    Step 1 is what makes step 2 total: is_valid_identifier is only safe to call once the
+    argument is known to be a str. Exact type, per the A4b precedent at approval.py:96 --
+    a str subclass passes an isinstance gate and can then behave differently at the
+    syscall.
+    """
+    if type(value) is not str:
+        raise ProtocolError(
+            f"{label} must be exactly str, got {type(value).__name__}"
+        )
+    if not is_valid_identifier(value):
+        raise ProtocolError(
+            f"{label} {value!r} is not 1-64 characters of [A-Za-z0-9_-]"
+        )
+    return value
+
+
+def require_member(label: str, value: Enum, enum_type: type[Enum]) -> str:
+    """The exact-type gate for every enum a caller hands in, returning the stored value.
+
+    Reading `.value` first is what made this necessary: `set_transaction_state(txid,
+    "applied")` raised `AttributeError: 'str' object has no attribute 'value'` before any
+    check ran, and §9's table is explicit that a wrong exact type is `ProtocolError` --
+    caller misuse -- not a stray attribute error from inside the store. `type(...) is not`
+    rather than `isinstance`, matching every other exact-type gate here: a subclass of
+    `TransactionState` is not one of A3's members, and `IntEnum`-style coercions are
+    exactly what STRICT columns exist to refuse.
+
+    Returning the value rather than the member is what keeps the call site one line and
+    leaves no second place to forget the check.
+    """
+    if type(value) is not enum_type:
+        raise ProtocolError(
+            f"{label} must be exactly {enum_type.__name__}, got {type(value).__name__}"
+        )
+    return value.value

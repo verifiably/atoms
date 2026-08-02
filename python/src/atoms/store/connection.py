@@ -10,14 +10,38 @@ from contextlib import contextmanager
 from enum import Enum
 from typing import Self
 
+from atoms.core.canonical import canonical_json
 from atoms.core.errors import CapabilityUnavailable, ProtocolError
+from atoms.core.recovery.model import (
+    CommitDecision,
+    HaltDiagnostic,
+    JournalState,
+    RollbackResult,
+    TransactionState,
+)
+from atoms.core.spec import TransactionSpec
 from atoms.fs.binding import ProjectBinding
 from atoms.store.errors import MetadataStoreInvalid, translated
+from atoms.store.records import (
+    DELETE_ACTIVE,
+    INSERT_EFFECT,
+    INSERT_RECORD,
+    UPDATE_COMMITTED,
+    UPDATE_HALT_DIAGNOSTIC,
+    UPDATE_JOURNAL_STATE,
+    UPDATE_ROLLBACK_RESULT,
+    UPDATE_STATE,
+    UPSERT_ACTIVE,
+    encode_diagnostic,
+    require_identifier,
+    require_member,
+)
 from atoms.store.schema import (
     APPLICATION_ID,
     EXPECTED_CATALOG,
     SCHEMA_STATEMENTS,
     SCHEMA_VERSION,
+    variant_of,
 )
 
 DATABASE_NAME = "atoms.db"
@@ -490,6 +514,89 @@ class _StoreTransaction:
     def _run_barrier(self) -> None:
         """The pre-COMMIT barrier. Task 8 fills this in; here it is deliberately empty so
         that Task 5's transaction semantics can be reviewed on their own."""
+
+    def insert_record(self, txid: str, spec: TransactionSpec) -> None:
+        with self._mutating() as store:
+            require_identifier("txid", txid)
+            if type(spec) is not TransactionSpec:
+                raise ProtocolError(
+                    f"spec must be exactly TransactionSpec, got {type(spec).__name__}"
+                )
+            with translated("inserting a record"):
+                store._connection.execute(
+                    INSERT_RECORD,
+                    (
+                        txid,
+                        canonical_json(spec),
+                        TransactionState.PREPARED.value,
+                        CommitDecision.UNCOMMITTED.value,
+                    ),
+                )
+                for effect in spec.effects:
+                    store._connection.execute(
+                        INSERT_EFFECT,
+                        (txid, effect.effect_id, variant_of(effect).value,
+                         JournalState.PENDING.value),
+                    )
+            self._touched.add(txid)
+
+    def _set_column(self, statement: str, txid: str, value: object) -> None:
+        with self._mutating() as store:
+            require_identifier("txid", txid)
+            with translated("updating a record"):
+                cursor = store._connection.execute(statement, (value, txid))
+            if cursor.rowcount != 1:
+                raise ProtocolError(
+                    f"no transaction_record row for txid {txid!r}"
+                )
+            self._touched.add(txid)
+
+    def set_transaction_state(self, txid: str, state: TransactionState) -> None:
+        self._set_column(UPDATE_STATE, txid, require_member("state", state, TransactionState))
+
+    def set_commit_decision(self, txid: str, decision: CommitDecision) -> None:
+        self._set_column(
+            UPDATE_COMMITTED, txid, require_member("decision", decision, CommitDecision)
+        )
+
+    def set_rollback_result(self, txid: str, result: RollbackResult) -> None:
+        self._set_column(
+            UPDATE_ROLLBACK_RESULT, txid, require_member("result", result, RollbackResult)
+        )
+
+    def set_halt_diagnostic(self, txid: str, diagnostic: HaltDiagnostic) -> None:
+        if type(diagnostic) is not HaltDiagnostic:
+            raise ProtocolError(
+                f"diagnostic must be exactly HaltDiagnostic, got "
+                f"{type(diagnostic).__name__}"
+            )
+        self._set_column(UPDATE_HALT_DIAGNOSTIC, txid, encode_diagnostic(diagnostic))
+
+    def set_journal_state(self, txid: str, effect_id: str, state: JournalState) -> None:
+        with self._mutating() as store:
+            require_identifier("txid", txid)
+            require_identifier("effect_id", effect_id)
+            value = require_member("state", state, JournalState)
+            with translated("updating a journal state"):
+                cursor = store._connection.execute(
+                    UPDATE_JOURNAL_STATE, (value, txid, effect_id)
+                )
+            if cursor.rowcount != 1:
+                raise ProtocolError(
+                    f"no effect row for txid {txid!r} effect_id {effect_id!r}"
+                )
+            self._touched.add(txid)
+
+    def set_active(self, txid: str | None) -> None:
+        with self._mutating() as store:
+            if txid is None:
+                with translated("clearing the active transaction"):
+                    store._connection.execute(DELETE_ACTIVE)
+                return
+            require_identifier("txid", txid)
+            with translated("setting the active transaction"):
+                store._connection.execute(UPSERT_ACTIVE, (txid,))
+            self._touched.add(txid)
 
 
 class Store:

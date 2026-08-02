@@ -557,3 +557,13 @@ def opened_store(store_on):
             yield store
         finally:
             store.close()
+
+
+@pytest.fixture
+def store_binding(request):
+    """The ProjectBinding behind `opened_store`, for asserting on durable rows directly.
+
+    Depends on the same fixture instance rather than building a second volume, so the two
+    always name one store.
+    """
+    return request.getfixturevalue("opened_store")._binding

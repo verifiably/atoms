@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 
 import pytest
 
+from atoms.core.canonical import canonical_json
+from atoms.core.errors import ProtocolError
 from atoms.core.fingerprint import AbsentState, DirectoryState, FileState, SymlinkState
 from atoms.core.recovery.model import (
     CommitDecision,
@@ -22,7 +25,13 @@ from atoms.core.recovery.model import (
 )
 from atoms.store.errors import MetadataStoreInvalid
 from atoms.store.records import decode_diagnostic, encode_diagnostic
-from tests.store_support import every_diagnostic_shape
+from tests.store_support import (
+    duplicate_effect_spec,
+    every_diagnostic_shape,
+    one_effect_spec,
+    raw_connect,
+    replace_spec,
+)
 
 
 @pytest.mark.parametrize("diagnostic", every_diagnostic_shape(), ids=lambda d: d.reason.value)
@@ -169,3 +178,195 @@ def test_a_duplicate_key_in_the_payload_refuses():
     doubled = text[:-1] + ', "reason": "directory_not_empty"}'
     with pytest.raises(MetadataStoreInvalid):
         decode_diagnostic(doubled)
+
+
+def test_insert_record_stores_the_canonical_encoding(opened_store, store_binding):
+    spec = one_effect_spec()
+    with opened_store.transaction() as txn:
+        txn.insert_record("tx1", spec)
+    raw = raw_connect(store_binding)
+    try:
+        stored = raw.execute(
+            "SELECT spec_json, state, committed FROM transaction_record WHERE txid = ?",
+            ("tx1",),
+        ).fetchone()
+    finally:
+        raw.close()
+    assert stored == (canonical_json(spec), "prepared", "uncommitted")
+
+
+def test_insert_record_derives_every_effect_row_from_the_spec(opened_store, store_binding):
+    with opened_store.transaction() as txn:
+        txn.insert_record("tx1", one_effect_spec(effect_id="only"))
+    raw = raw_connect(store_binding)
+    try:
+        rows = raw.execute(
+            "SELECT effect_id, variant, journal_state FROM effect WHERE txid = ?", ("tx1",)
+        ).fetchall()
+    finally:
+        raw.close()
+    assert rows == [("only", "create_file_no_clobber", "pending")]
+
+
+def test_spec_json_is_write_once_at_the_database(opened_store, store_binding):
+    with opened_store.transaction() as txn:
+        txn.insert_record("tx1", one_effect_spec())
+    raw = raw_connect(store_binding)
+    try:
+        with pytest.raises(Exception) as caught:
+            raw.execute("UPDATE transaction_record SET spec_json = '{}' WHERE txid = 'tx1'")
+        assert "write-once" in str(caught.value)
+    finally:
+        raw.close()
+
+
+def test_a_duplicate_txid_is_refused(opened_store):
+    with opened_store.transaction() as txn:
+        txn.insert_record("tx1", one_effect_spec())
+    with pytest.raises(Exception), opened_store.transaction() as txn:  # noqa: B017
+        txn.insert_record("tx1", one_effect_spec())
+
+
+def test_a_caught_write_failure_cannot_be_committed(opened_store, store_binding):
+    """Design §7.7's poison rule, end to end.
+
+    The duplicate effect_id fails the *second* INSERT INTO effect. By then the record
+    row and the first effect row -- written by the same method call -- are already in
+    the transaction, and SQLite rolls back only the failing statement: measured,
+    `in_transaction` stays true, the earlier rows stay visible, and the COMMIT makes
+    them durable. A caller that catches the failure inside the block and carries on must
+    not be able to commit that half-written record.
+    """
+    with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
+        # `try`/`except` rather than a nested `pytest.raises`: this is literally the
+        # shape under test -- a caller that catches A5a's failure and carries on -- and
+        # ruff's SIM117 refuses the nested `with` anyway.
+        try:
+            txn.insert_record("tx1", duplicate_effect_spec())
+        except sqlite3.IntegrityError:
+            pass
+        else:
+            raise AssertionError("the duplicate effect_id did not raise")
+    assert "poison" in str(caught.value).lower()
+    raw = raw_connect(store_binding)
+    try:
+        assert raw.execute("SELECT count(*) FROM transaction_record").fetchone()[0] == 0
+        assert raw.execute("SELECT count(*) FROM effect").fetchone()[0] == 0
+    finally:
+        raw.close()
+
+
+def test_a_caught_write_failure_does_not_break_the_next_transaction(opened_store):
+    """The poisoned transaction rolls back cleanly, so the store is still usable."""
+    with pytest.raises(ProtocolError), opened_store.transaction() as txn:
+        try:
+            txn.insert_record("tx1", duplicate_effect_spec())
+        except sqlite3.IntegrityError:
+            pass
+        else:
+            raise AssertionError("the duplicate effect_id did not raise")
+    with opened_store.transaction() as txn:
+        txn.insert_record("tx1", one_effect_spec())
+
+
+@pytest.mark.parametrize("bad", [3, None, b"tx", "../escape", "", "x" * 65])
+def test_every_setter_validates_the_txid(opened_store, bad):
+    with pytest.raises(ProtocolError), opened_store.transaction() as txn:
+        txn.set_transaction_state(bad, TransactionState.APPLYING)
+
+
+@pytest.mark.parametrize(
+    ("method", "bad"),
+    [
+        ("set_transaction_state", "applied"),
+        ("set_transaction_state", CommitDecision.COMMITTED),
+        ("set_commit_decision", "committed"),
+        ("set_commit_decision", TransactionState.COMMITTED),
+        ("set_rollback_result", 0),
+        ("set_halt_diagnostic", "{}"),
+    ],
+)
+def test_a_wrong_exact_type_refuses_with_protocol_error(opened_store, method, bad):
+    """§9's table: a wrong exact type is caller misuse, `ProtocolError`, never a raw
+    `AttributeError` from inside the store.
+
+    The four one-line setters read `.value` in their argument list, so before
+    `require_member` existed `set_transaction_state(txid, "applied")` left as
+    `AttributeError: 'str' object has no attribute 'value'` -- a message about the store's
+    internals for a mistake the caller made.
+
+    The enum-of-the-wrong-kind pairs are the ones the CHECK constraints cannot catch.
+    `CommitDecision.COMMITTED` and `TransactionState.COMMITTED` both carry the value
+    `"committed"`, so each passes the *other* column's generated CHECK list: without an
+    exact-type gate the write succeeds and the record ends up in a state its author never
+    named. A wrong enum whose value happens not to collide would raise `IntegrityError`
+    from the CHECK instead -- correct by accident, and only until someone adds a member.
+    """
+    with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
+        getattr(txn, method)("tx1", bad)
+    assert "exactly" in str(caught.value)
+
+
+def test_setting_a_journal_state_updates_exactly_one_row(opened_store, store_binding):
+    with opened_store.transaction() as txn:
+        txn.insert_record("tx1", one_effect_spec(effect_id="only"))
+        txn.set_journal_state("tx1", "only", JournalState.STARTED)
+    raw = raw_connect(store_binding)
+    try:
+        assert raw.execute(
+            "SELECT journal_state FROM effect WHERE txid = 'tx1'"
+        ).fetchone() == ("started",)
+    finally:
+        raw.close()
+
+
+def test_setting_a_journal_state_for_an_unknown_effect_refuses(opened_store):
+    with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
+        txn.insert_record("tx1", one_effect_spec(effect_id="only"))
+        txn.set_journal_state("tx1", "ghost", JournalState.STARTED)
+    assert "ghost" in str(caught.value)
+
+
+def test_set_active_enforces_the_single_active_row(opened_store, store_binding):
+    with opened_store.transaction() as txn:
+        txn.insert_record("tx1", one_effect_spec())
+        txn.insert_record("tx2", replace_spec())
+        txn.set_active("tx1")
+        txn.set_active("tx2")
+    raw = raw_connect(store_binding)
+    try:
+        assert raw.execute("SELECT singleton, txid FROM active").fetchall() == [(0, "tx2")]
+    finally:
+        raw.close()
+
+
+def test_set_active_none_clears_the_row(opened_store, store_binding):
+    with opened_store.transaction() as txn:
+        txn.insert_record("tx1", one_effect_spec())
+        txn.set_active("tx1")
+        txn.set_active(None)
+    raw = raw_connect(store_binding)
+    try:
+        assert raw.execute("SELECT count(*) FROM active").fetchone() == (0,)
+    finally:
+        raw.close()
+
+
+def test_set_active_refuses_a_transaction_that_does_not_exist(opened_store):
+    """foreign_keys=ON makes active.txid a real reference, so `active` can never name a
+    transaction that does not exist -- the shape authority §7.3 promises recovery will
+    never see (design §6.2)."""
+    with pytest.raises(Exception), opened_store.transaction() as txn:  # noqa: B017
+        txn.set_active("never-inserted")
+
+
+@pytest.mark.parametrize("value", [42.5, "abc", b"x"])
+def test_strict_typing_refuses_a_value_that_cannot_convert(opened_store, store_binding, value):
+    """STRICT coerces losslessly -- '42' and 42.0 both store as integer 42 -- so the test
+    uses the values that actually raise (design §6.2)."""
+    raw = raw_connect(store_binding)
+    try:
+        with pytest.raises(Exception):  # noqa: B017
+            raw.execute("INSERT INTO blob (digest, byte_len) VALUES (?, ?)", ("sha256:" + "a" * 64, value))
+    finally:
+        raw.close()
