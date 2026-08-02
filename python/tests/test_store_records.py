@@ -561,6 +561,20 @@ def test_the_cross_row_matrix_covers_every_rule_on_read_side():
     assert {case[0] for case in CROSS_ROW_CASES} == set(COHERENCE_RULES)
 
 
+def test_reading_a_ghost_active_reference_refuses(opened_store, store_binding):
+    commit_record(opened_store, store_binding, "tx1", _only_spec())
+    raw = raw_connect(store_binding)
+    try:
+        raw.execute("DELETE FROM effect WHERE txid = 'tx1'")
+        raw.execute("DELETE FROM transaction_record WHERE txid = 'tx1'")
+        raw.execute("INSERT INTO active VALUES (0, 'ghost')")
+    finally:
+        raw.close()
+    with pytest.raises(MetadataStoreInvalid) as caught:
+        opened_store.read_active()
+    assert RULE_ACTIVE_RECORD in str(caught.value)
+
+
 def test_a_cross_row_violation_is_protocol_error_before_commit(opened_store):
     with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
         txn.insert_record("tx1", one_effect_spec())

@@ -428,6 +428,9 @@ def journal_vector(
 def coherence_findings(connection: Any, txid: str) -> tuple[str, ...]:
     row = connection.execute(SELECT_RECORD, (txid,)).fetchone()
     if row is None:
+        active = connection.execute(SELECT_ACTIVE).fetchone()
+        if active is not None and connection.execute(SELECT_RECORD, (active[0],)).fetchone() is None:
+            return (_finding(RULE_ACTIVE_RECORD, f"active names txid {active[0]!r}, which has no record"),)
         return ()
     spec_json, state_value, committed_value, rollback_value, diagnostic_text = row
     try:
@@ -481,12 +484,12 @@ def coherence_findings(connection: Any, txid: str) -> tuple[str, ...]:
 
 
 def load_record(connection: Any, txid: str) -> StoredRecord | None:
-    row = connection.execute(SELECT_RECORD, (txid,)).fetchone()
-    if row is None:
-        return None
     findings = coherence_findings(connection, txid)
     if findings:
         raise MetadataStoreInvalid(f"the record for txid {txid!r} cannot be interpreted: " + "; ".join(findings))
+    row = connection.execute(SELECT_RECORD, (txid,)).fetchone()
+    if row is None:
+        return None
     spec_json, state_value, committed_value, rollback_value, diagnostic_text = row
     spec = from_canonical_json(spec_json)
     rows = {

@@ -675,7 +675,7 @@ class Store:
         try:
             yield self._connection
             with translated("ending a read"):
-                self._connection.execute(_COMMIT)
+                self._connection.execute(_ROLLBACK)
         except BaseException:
             _rollback_quietly(self._connection)
             raise

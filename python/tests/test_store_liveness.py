@@ -187,3 +187,18 @@ def test_lock_released_during_a_load_returns_no_record(store_on, monkeypatch, re
         with pytest.raises(ProtocolError):
             store.read_record("tx1")
         store.close()
+
+
+def test_a_successful_read_ends_with_rollback(opened_store):
+    from tests.store_support import one_effect_spec
+
+    with opened_store.transaction() as txn:
+        txn.insert_record("tx1", one_effect_spec())
+    statements: list[str] = []
+    opened_store._connection.set_trace_callback(statements.append)
+    try:
+        assert opened_store.read_record("tx1") is not None
+    finally:
+        opened_store._connection.set_trace_callback(None)
+    assert any(statement == "ROLLBACK" for statement in statements)
+    assert not any(statement == "COMMIT" for statement in statements)
