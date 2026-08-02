@@ -40,6 +40,11 @@ implementation, stop and report it — do not adapt around it silently.**
 | `TransitionTransactionState(from_state, to_state, rollback_result, halt_diagnostic)`; `TransitionEffectState(effect_id, from_state, to_state)`. There is no `.state`. | `plan.py:60-74` |
 | `_TRANSACTION_RECOVERY_EDGES` excludes `(HALTED, HALTED)`, and `_transition_transaction` refuses a step whose `from_state` is not the current state — so the reduced prefix rejects a second halt. | `reducer.py:210-247` |
 | `one_effect_spec` is a **function in `tests/store_support.py`**, not a fixture. | `store_support.py:54` |
+| `PathResolver._NAMESPACE_CONTRADICTIONS` has **one** use inside the class — `self._NAMESPACE_CONTRADICTIONS` at `resolve.py:207`. | `resolve.py:144`, `:207` |
+| `OBSERVED_ABSENT`, `EntryIdentity`, and `FileBuildRelation` are all re-exported by `atoms.core.recovery`. | package `__init__` |
+| `promote_staging` renames each blob into `blobs/` and flushes it **before** `INSERT_BLOB` runs in the SQLite transaction. A rolled-back transaction therefore leaves a real unindexed blob — the only way to produce one. | probe: rollback left one digest in `list_unindexed_blobs()` |
+| `bind_project_volume` with the shipping empty allowlist raises `CapabilityUnavailable("volume configuration is not on the supplied durability allowlist: …")`. | probe, 2026-08-02 |
+| `metadata_root/probe/` exists after the first successful bind, so `reclaim_probe_survivors` has somewhere to reclaim from on a later entry. | probe: entries were `blobs, lock, probe, staging, work` |
 | `coherence_findings` requires a `blob` row for every referenced digest, and requires `rollback_result` present exactly when `ROLLED_BACK` and `halt_diagnostic` present exactly when `HALTED`. | `records.py:472-483` |
 | For `CreateFileNoClobber("e1", "d/f.txt")` with `d` existing: parent node is `TopologyDirectory(node_id=0)` (**not** `PersistentNode`), scratch leaf is `.#~<txid>.e1.staging`, `work_base` is `None`. | probe, 2026-08-02 |
 | For `CreateDirectory("e1", "d")` + `CreateFileNoClobber("e2", "d/f.txt")`: `directories` holds `ApprovedExistingDirectory(ProjectRoot())`, `ApprovedPlannedDirectory(PersistentNode('d'))`, `ApprovedPlannedDirectory(WorkRoot())`; `work_base` is populated. All three §6.4 branches come from this one spec. | probe, 2026-08-02 |
@@ -219,8 +224,8 @@ def leased(coordinator_on, monkeypatch):
     from tests.fs_support import build_test_allowlist
 
     @contextlib.contextmanager
-    def enter():
-        backend, project_root, metadata_root, storage = coordinator_on()
+    def enter(ingredients=None):
+        backend, project_root, metadata_root, storage = ingredients or coordinator_on()
         with acquire_project_lock(backend, metadata_root) as probe:
             allowlist = build_test_allowlist(probe, project_root, storage)
         monkeypatch.setattr(root, "CERTIFIED_ALLOWLIST", allowlist)
@@ -235,6 +240,11 @@ def leased(coordinator_on, monkeypatch):
 The probe lock is acquired and released before the lease: `build_test_allowlist` needs a
 `HeldProjectLock` to reach the backend, and `flock` is released on exit, so the lease's own
 acquisition is uncontended.
+
+`enter(ingredients)` takes the optional tuple because `coordinator_on()` names a **fresh** metadata
+root per call. Two `leased()` calls therefore model two projects, never a restart of one. A test that
+needs a second entry over the *same* project calls `coordinator_on()` itself and passes the tuple to
+both — Task 3's trap-release cases and Task 9's process tier both need that.
 
 - [ ] **Step 2: Write the failing test**
 
@@ -507,35 +517,45 @@ def test_reclamation_removes_orphans_and_spares_referenced_scratch(leased):
         assert lease._store.list_workspaces() == ("kept1",)
 
 
-def test_reclamation_removes_an_unindexed_blob(leased, promoted_blob_digest):
+def test_reclamation_removes_an_unindexed_blob(leased):
+    """A blob is unindexed exactly when it is on disk with no `blob` row.
+
+    `promote_staging` renames each blob into `blobs/` and flushes it BEFORE its
+    `INSERT_BLOB` runs, so a transaction that rolls back leaves precisely that. This is
+    the only way to produce one, and asserting reclamation drains an empty list would
+    prove nothing.
+    """
+    from atoms.store.blobs import StagedBlob
+
     from atoms.coordinator.lease import _reclaim_orphans
+    from tests.store_support import digest_of, spec_referencing, stage
+
+    content = b"orphaned by a cut before COMMIT"
+    digest = digest_of(content)
 
     with leased() as lease:
-        assert lease._store.list_unindexed_blobs() == ()
-```
+        with lease._store.create_workspace("orphan2") as workspace:
+            stage(workspace, "b0", content)
+            with pytest.raises(RuntimeError), lease._store.transaction() as txn:
+                txn.promote_staging(
+                    workspace,
+                    (StagedBlob(name="b0", digest=digest, byte_len=len(content)),),
+                )
+                txn.insert_record("orphan2", spec_referencing(content))
+                raise RuntimeError("cut before COMMIT")
 
-`promoted_blob_digest` does not exist — delete that second test and instead cover the blob half
-concretely, because a blob is unindexed exactly when it is on disk with no `blob` row, which the store
-only produces by a crash cut. Replace it with:
-
-```python
-def test_reclamation_reports_both_kinds_of_orphan(leased):
-    """`list_unindexed_blobs` already means 'no blob row', so nothing a durable record
-    references can appear in it; the helper's contract is to drain whatever it returns."""
-    from atoms.coordinator.lease import _reclaim_orphans
-
-    with leased() as lease:
-        lease._store.create_workspace("orphan1").close()
+        assert lease._store.list_unindexed_blobs() == (digest,)
 
         workspaces, blobs = _reclaim_orphans(lease._store)
 
-        assert workspaces == ("orphan1",)
-        assert blobs == ()
-        assert lease._store.list_workspaces() == ()
+        assert workspaces == ("orphan2",)
+        assert blobs == (digest,)
         assert lease._store.list_unindexed_blobs() == ()
 ```
 
-The blob path is proved end-to-end in Task 9's process tier, where a real cut leaves one behind.
+`pytest.raises` is **outer** in that `with`, per the Global Constraints: the body calls a mutating store
+method, so an inner `pytest.raises` would let `transaction()`'s generator resume past its `yield` and
+raise a second `ProtocolError` outside every `raises` scope.
 
 - [ ] **Step 3: Run to verify failure**
 
@@ -737,7 +757,105 @@ def test_the_lease_holds_the_lock_for_its_whole_duration(leased):
 Add `import os`, `import subprocess`, `import sys`, and `from pathlib import Path` to the module's
 import block.
 
-- [ ] **Step 7: Run the gates and commit**
+- [ ] **Step 7: Prove reclamation runs even when binding then refuses**
+
+Ledger #17 says *every* lease entry reclaims probe survivors, which holds only if reclamation precedes
+the first thing that can refuse. `bind_project_volume` reaches its own reclamation at step 4, after
+checks that can refuse first — and the shipping empty allowlist makes it refuse every time, which is
+exactly the early refusal this must survive.
+
+```python
+def test_probe_survivors_are_reclaimed_before_an_early_bind_refusal(
+    coordinator_on, leased, monkeypatch
+):
+    from atoms.core.errors import CapabilityUnavailable
+    from atoms.coordinator import root
+    from atoms.fs.volume import DurabilityAllowlist
+
+    ingredients = coordinator_on()
+    backend, project_root, metadata_root, storage = ingredients
+
+    # One successful entry, so metadata_root/probe/ exists to be reclaimed from.
+    with leased(ingredients):
+        pass
+    probe_dir = Path(metadata_root) / "probe"
+    assert probe_dir.is_dir()
+    (probe_dir / "survivor.db").write_text("debris", encoding="utf-8")
+
+    # The real shipping constant: binding refuses every volume until A8 certifies one.
+    monkeypatch.setattr(
+        root, "CERTIFIED_ALLOWLIST", DurabilityAllowlist(entries=frozenset())
+    )
+    with pytest.raises(CapabilityUnavailable) as caught:
+        with root._recovery_lease(backend, project_root, metadata_root, storage):
+            pass
+
+    assert "durability allowlist" in str(caught.value)
+    assert list(probe_dir.iterdir()) == []
+```
+
+Then move `reclaim_probe_survivors(lock)` to *after* the `bind_project_volume` line, re-run, and confirm
+this test fails on `list(probe_dir.iterdir()) == []`. Restore and report the observed failure.
+
+- [ ] **Step 8: Prove the trap mutates no project path and releases everything**
+
+The process tier cannot prove release: a child exiting frees its descriptors and its `flock` whether or
+not the context managers unwound correctly. These two properties are therefore same-process only.
+
+```python
+def _project_tree(project_root: str) -> list[tuple[str, list[str], list[str]]]:
+    return [
+        (root_dir, sorted(dirs), sorted(files))
+        for root_dir, dirs, files in sorted(os.walk(project_root))
+    ]
+
+
+def test_the_trap_mutates_no_project_path(coordinator_on, leased):
+    from atoms.coordinator import root
+    from tests.store_support import one_effect_spec
+
+    ingredients = coordinator_on()
+    backend, project_root, metadata_root, storage = ingredients
+    with leased(ingredients) as lease:
+        with lease._store.transaction() as txn:
+            txn.insert_record("tx1", one_effect_spec())
+            txn.set_active("tx1")
+
+    before = _project_tree(project_root)
+    with pytest.raises(NotImplementedError):
+        with root._recovery_lease(backend, project_root, metadata_root, storage):
+            pass
+
+    assert _project_tree(project_root) == before
+
+
+def test_the_trap_releases_the_lock_and_every_descriptor(coordinator_on, leased):
+    """The trap raises from inside `_recovery_lease`'s generator, before its `yield`,
+    so both `with` blocks unwind. Nothing may be left holding the lock or a fd."""
+    from atoms.coordinator import root
+    from tests.store_support import one_effect_spec
+
+    ingredients = coordinator_on()
+    backend, project_root, metadata_root, storage = ingredients
+    with leased(ingredients) as lease:
+        with lease._store.transaction() as txn:
+            txn.insert_record("tx1", one_effect_spec())
+            txn.set_active("tx1")
+
+    open_fds = sorted(os.listdir("/proc/self/fd"))
+    with pytest.raises(NotImplementedError):
+        with root._recovery_lease(backend, project_root, metadata_root, storage):
+            pass
+
+    assert len(sorted(os.listdir("/proc/self/fd"))) == len(open_fds)
+    assert _contend(metadata_root) == 0
+```
+
+The descriptor count covers the lock fd, both root descriptors, and SQLite's own handles in one
+assertion — a leak of any of them moves the count. Then delete `_resolve`'s call site so the trap never
+fires, re-run, and confirm both tests fail rather than silently passing. Restore and report.
+
+- [ ] **Step 9: Run the gates and commit**
 
 ```bash
 uv run ruff check && uv run pyright && uv run pytest -q
@@ -892,10 +1010,9 @@ _NAMESPACE_CONTRADICTIONS = frozenset(
 )
 ```
 
-Then in `PathResolver`, replace the class-attribute assignment with
-`_NAMESPACE_CONTRADICTIONS = _NAMESPACE_CONTRADICTIONS` — no: delete the class attribute entirely and
-change its two uses inside the class to the module name. Run the full `tests/test_fs_resolve_*.py`
-suite after this edit and before writing anything new; it must stay green.
+Delete the class attribute at `resolve.py:144` and change its **one** use inside the class —
+`self._NAMESPACE_CONTRADICTIONS` at `resolve.py:207` — to the module-level name. Run the full
+`tests/test_fs_resolve_*.py` suite after this edit and before writing anything new; it must stay green.
 
 - [ ] **Step 4: Implement the observation core**
 
@@ -1563,6 +1680,160 @@ def test_an_unmapped_parent_node_is_a_protocol_error(leased):
         assert "no parent path" in str(caught.value)
 ```
 
+Design §10's mismatch matrix needs one independent case per comparand, not one case that happens to
+trip identity first. Identity is covered above; these are the rest.
+
+```python
+def _observation_like(observed, **changes):
+    from atoms.fs.resolve import ChildObservation
+
+    fields = {
+        "parent_identity": observed.parent_identity,
+        "parent_constraints": observed.parent_constraints,
+        "present": observed.present,
+    }
+    return ChildObservation(**{**fields, **changes})
+
+
+def test_a_changed_name_max_refuses_naming_constraints(leased, monkeypatch):
+    """NAME_MAX is half of DirectoryConstraints, and it cannot be changed by any
+    syscall a test may issue -- so the comparison is driven directly."""
+    from atoms.fs.lookup import DirectoryConstraints
+    from atoms.coordinator import admission
+
+    with leased() as lease:
+        approved = admission.admit(lease, compiled_for(lease))
+        entry = next(
+            item
+            for item in approved.directories
+            if type(item).__name__ == "ApprovedExistingDirectory"
+            and item.node == approved.scratch[0].parent_node
+        )
+        shrunk = DirectoryConstraints(
+            lookup_proof=entry.constraints.lookup_proof,
+            name_max=entry.constraints.name_max - 1,
+        )
+        real = admission.observe_child
+        monkeypatch.setattr(
+            admission,
+            "observe_child",
+            lambda binding, parent, leaf: _observation_like(
+                real(binding, parent, leaf), parent_constraints=shrunk
+            ),
+        )
+
+        with pytest.raises(PreconditionRefused) as caught:
+            admission._occupied_scratch(lease, approved)
+
+        assert "changed lookup constraints since approval" in str(caught.value)
+
+
+def test_a_changed_lookup_proof_refuses_naming_constraints(leased, monkeypatch):
+    """The other half. A directory that became casefold has an unreproducible lookup
+    relation, so every approved name under it is meaningless -- but the observed
+    NAME_MAX is unchanged, so a test that only moved NAME_MAX would not cover it."""
+    from atoms.fs.lookup import DirectoryConstraints, LookupProof
+    from atoms.coordinator import admission
+
+    with leased() as lease:
+        approved = admission.admit(lease, compiled_for(lease))
+        real = admission.observe_child
+
+        def folded(binding, parent, leaf):
+            observed = real(binding, parent, leaf)
+            return _observation_like(
+                observed,
+                parent_constraints=DirectoryConstraints(
+                    lookup_proof=LookupProof.UNREPRODUCIBLE_CASEFOLD,
+                    name_max=observed.parent_constraints.name_max,
+                ),
+            )
+
+        monkeypatch.setattr(admission, "observe_child", folded)
+
+        with pytest.raises(PreconditionRefused) as caught:
+            admission._occupied_scratch(lease, approved)
+
+        message = str(caught.value)
+        assert "changed lookup constraints since approval" in message
+        assert "unreproducible_casefold" in message
+
+
+def test_a_parent_that_moved_across_mounts_refuses(leased, monkeypatch):
+    """Mount membership. `open_child_directory` carries RESOLVE_NO_XDEV, so a parent
+    that became a mount point raises EXDEV; A5b's obligation is that the EXDEV reaches
+    the caller as drift rather than as a bare OSError. Injected because mounting
+    requires privileges this suite does not assume."""
+    import errno
+
+    from atoms.fs.linux import LinuxBackend
+    from atoms.coordinator import admission
+
+    with leased() as lease:
+        approved = admission.admit(lease, compiled_for(lease))
+        real = LinuxBackend.open_child_directory
+
+        def crosses(self, parent_fd, name):
+            if name == "d":
+                raise OSError(errno.EXDEV, "Invalid cross-device link")
+            return real(self, parent_fd, name)
+
+        monkeypatch.setattr(LinuxBackend, "open_child_directory", crosses)
+
+        with pytest.raises(PreconditionRefused) as caught:
+            admission._occupied_scratch(lease, approved)
+
+        message = str(caught.value)
+        assert "no longer resolves at component 'd'" in message
+
+
+def test_a_capability_refusal_during_re_resolution_becomes_drift(leased, monkeypatch):
+    """The second declared resolver refusal type. §9 requires both to arrive as
+    PreconditionRefused once a proof exists, and one type proves only one branch."""
+    from atoms.core.errors import CapabilityUnavailable
+    from atoms.coordinator import admission
+
+    with leased() as lease:
+        approved = admission.admit(lease, compiled_for(lease))
+
+        def unavailable(*_args, **_kwargs):
+            raise CapabilityUnavailable("synthetic capability refusal")
+
+        monkeypatch.setattr(admission, "observe_child", unavailable)
+
+        with pytest.raises(PreconditionRefused) as caught:
+            admission._occupied_scratch(lease, approved)
+
+        message = str(caught.value)
+        assert "post-approval drift during re-resolution" in message
+        assert "synthetic capability refusal" in message
+
+
+def test_an_approve_for_project_refusal_is_never_translated(leased, monkeypatch):
+    """The translation covers re-resolution only. Approval's own refusals are genuine
+    approval refusals and must reach the caller with their type intact -- wrapping them
+    would tell a caller that external state drifted when the spec was simply refused."""
+    from atoms.core.errors import ProjectApprovalRefused
+    from atoms.coordinator import admission
+
+    with leased() as lease:
+        compiled = compiled_for(lease)
+
+        def refuse(*_args, **_kwargs):
+            raise ProjectApprovalRefused("synthetic approval refusal")
+
+        monkeypatch.setattr(admission, "approve_for_project", refuse)
+
+        with pytest.raises(ProjectApprovalRefused) as caught:
+            admission.admit(lease, compiled)
+
+        assert "synthetic approval refusal" in str(caught.value)
+```
+
+The last case is the reason `_translated_resolution` wraps only the `_occupied_scratch` body and never
+the `approve_for_project` call above it; move the `with` to enclose the whole loop and this test turns
+`PreconditionRefused`, which is Step 9's mutation.
+
 - [ ] **Step 3: Run to verify failure**
 
 Run: `uv run pytest tests/test_coordinator_admission.py -v`
@@ -1800,7 +2071,15 @@ run `test_every_candidate_owned_by_a_record_exhausts_the_bound`, and confirm it 
 `"scratch occupied" not in message`. Restore, confirm `git status --porcelain` is empty, and re-run.
 Report the observed failure message.
 
-- [ ] **Step 9: Prove the planned branch never compares a planned identity**
+- [ ] **Step 9: Prove the translation's scope and the planned branch's restraint**
+
+Two mutations, both one line:
+
+1. Move `with _translated_resolution():` out of `_occupied_scratch` and around `admit`'s loop body so
+   it also encloses `approve_for_project`. Re-run
+   `test_an_approve_for_project_refusal_is_never_translated` and confirm it fails with
+   `PreconditionRefused` where `ProjectApprovalRefused` was expected. Restore.
+2. Prove the planned branch never compares a planned identity:
 
 Add an assertion that the planned refusal is reached without touching
 `_require_matches_approval` on the planned node itself: temporarily change
@@ -1918,22 +2197,33 @@ def test_preparation_publishes_the_record_in_one_commit(leased):
         assert record.committed is CommitDecision.UNCOMMITTED
 
 
-def test_nothing_is_durable_until_the_publication_commit(leased):
-    """The single barrier authority §7.3 step 4 requires: a body that raises before the
-    COMMIT leaves no record, no effect rows, and no active pointer."""
-    from atoms.coordinator.prepare import open_workspace
+def test_nothing_is_durable_until_the_publication_commit(leased, monkeypatch):
+    """The single barrier authority §7.3 step 4 requires.
+
+    The cut is driven THROUGH `prepare_transaction`, not by repeating its body: a test
+    that re-implements the transaction stays green when the production function's own
+    ordering is wrong, which is the whole thing this asserts. Patching the last call
+    inside the body is the smallest cut that leaves the earlier writes staged.
+    """
+    from atoms.store.connection import _StoreTransaction
+
+    from atoms.coordinator.prepare import open_workspace, prepare_transaction
 
     with leased() as lease:
         approved = admission_for(lease)
         workspace = open_workspace(lease, approved)
         manifest = stage_manifest(workspace)
 
-        with pytest.raises(RuntimeError), lease._store.transaction() as txn:
-            txn.promote_staging(workspace, manifest)
-            txn.insert_record(approved.txid, approved.compiled.spec)
-            raise RuntimeError("cut before set_active")
+        def cut(self, txid):
+            raise RuntimeError("cut inside prepare_transaction, before COMMIT")
+
+        monkeypatch.setattr(_StoreTransaction, "set_active", cut)
+
+        with pytest.raises(RuntimeError) as caught:
+            prepare_transaction(lease, approved, workspace, manifest)
 
         workspace.close()
+        assert "before COMMIT" in str(caught.value)
         assert lease._store.read_record(approved.txid) is None
         assert lease._store.read_active() is None
 
@@ -2136,6 +2426,7 @@ def snapshot_for(
     live: ObservedEntry,
     staged: ObservedEntry,
     relation: FileBuildRelation | None = None,
+    path: str = "d/f.txt",
 ) -> RecoverySnapshot:
     """A snapshot over the PROOF's compiled spec and topology.
 
@@ -2156,7 +2447,7 @@ def snapshot_for(
         halt_diagnostic=None,
         active=True,
         journals=(EffectJournalState("e1", journal),),
-        persistent_observations=(PersistentObservation("d/f.txt", live),),
+        persistent_observations=(PersistentObservation(path, live),),
         scratch_observations=(
             ScratchObservation("e1", ScratchRole.STAGING, staged, relation),
         ),
@@ -2196,6 +2487,33 @@ def prepared_with(
 
 def observed_file(content: bytes = AFTER) -> ObservedFile:
     return ObservedFile(file_state(content), EntryIdentity())
+
+
+def other_file_spec() -> TransactionSpec:
+    """A second spec over the same existing parent, for the record-spec mismatch case."""
+    return build_spec(
+        consumer_tag="test",
+        intent_digest="sha256:" + "3" * 64,
+        initial_surface={"d/g.txt": ABSENT},
+        final_surface={"d/g.txt": POST},
+        effects=[CreateFileNoClobber(effect_id="e1", path="d/g.txt", post=POST)],
+    )
+
+
+def reapproved_under(
+    lease: Lease, txid: str, compiled: CompiledSpec
+) -> ProjectApprovedSpec:
+    """A second proof for a chosen txid.
+
+    `approve_for_project` takes the txid from its `ProjectContext`, so two proofs can
+    name one transaction while describing different specs. That is the only way to make
+    the durable record's spec disagree with the plan prefix while every other field --
+    txid, state, commit decision, journals -- still matches, which is what isolates the
+    spec comparison from its neighbours.
+    """
+    from atoms.fs.approval import ProjectContext, approve_for_project
+
+    return approve_for_project(compiled, ProjectContext(lease._binding, txid))
 ```
 
 Named wrappers, one per measured plan shape:
@@ -2241,8 +2559,11 @@ Add to the imports:
 
 ```python
 from atoms.core.recovery import (
+    OBSERVED_ABSENT,
     CommitDecision,
     EffectJournalState,
+    EntryIdentity,
+    FileBuildRelation,
     JournalState,
     ObservedEntry,
     ObservedFile,
@@ -2254,17 +2575,12 @@ from atoms.core.recovery import (
     build_recovery_snapshot,
     classify_recovery,
 )
-from atoms.core.recovery.model import (
-    OBSERVED_ABSENT,
-    EntryIdentity,
-    FileBuildRelation,
-)
 from atoms.core.recovery.plan import RecoveryPlan
 ```
 
-Verify each of these names is exported where the import says before relying on it; `OBSERVED_ABSENT`,
-`EntryIdentity`, and `FileBuildRelation` live in `atoms.core.recovery.model`
-(`model.py:99-107`) and may or may not be re-exported from the package `__init__`. Report what you find.
+`OBSERVED_ABSENT`, `EntryIdentity`, and `FileBuildRelation` are all re-exported by
+`atoms.core.recovery`, so they belong in the single import above rather than reaching into
+`atoms.core.recovery.model`.
 
 - [ ] **Step 2: Write the failing tests**
 
@@ -2416,17 +2732,82 @@ def test_a_record_disagreeing_with_the_reduced_prefix_refuses(leased):
         assert "commit decision" in str(caught.value)
 
 
-def test_a_plan_bound_to_another_spec_refuses(leased):
+def test_a_plan_bound_to_another_compiled_spec_refuses(leased):
+    """The plan and the proof must describe one transaction before the record is even
+    consulted. Same lease, same txid, different spec -- so the binding and txid gates
+    both pass and this check is the only one left to fire."""
+    from atoms.core.compiler import compile_spec
     from atoms.coordinator.transitions import persist_plan_prefix
+    from tests.coordinator_support import (
+        other_file_spec,
+        reapproved_under,
+        snapshot_for,
+    )
+    from atoms.core.recovery import (
+        OBSERVED_ABSENT,
+        JournalState,
+        TransactionState,
+        classify_recovery,
+    )
 
-    with leased() as first, leased() as second:
-        approved, _ = prepared_metadata_only(first)
-        _, foreign_plan = prepared_metadata_only(second)
+    with leased() as lease:
+        approved, _ = prepared_metadata_only(lease)
+        other = reapproved_under(lease, approved.txid, compile_spec(other_file_spec()))
+        foreign_plan = classify_recovery(
+            snapshot_for(
+                other,
+                state=TransactionState.PREPARED,
+                journal=JournalState.PENDING,
+                live=OBSERVED_ABSENT,
+                staged=OBSERVED_ABSENT,
+                path="d/g.txt",
+            )
+        )
 
         with pytest.raises(ProtocolError) as caught:
-            persist_plan_prefix(first, approved, foreign_plan, 0)
+            persist_plan_prefix(lease, approved, foreign_plan, 0)
 
-        assert "compiled spec" in str(caught.value) or "topology" in str(caught.value)
+        assert "different compiled spec" in str(caught.value)
+
+
+def test_a_record_whose_spec_disagrees_with_the_prefix_refuses(leased):
+    """The spec comparison in isolation: the plan and the proof agree with each other,
+    and every other durable field matches, but the record on disk was published from a
+    different spec."""
+    from atoms.core.compiler import compile_spec
+    from atoms.coordinator.transitions import persist_plan_prefix
+    from tests.coordinator_support import (
+        other_file_spec,
+        reapproved_under,
+        snapshot_for,
+    )
+    from atoms.core.recovery import (
+        OBSERVED_ABSENT,
+        JournalState,
+        TransactionState,
+        classify_recovery,
+    )
+
+    with leased() as lease:
+        published, _ = prepared_metadata_only(lease)
+        other = reapproved_under(
+            lease, published.txid, compile_spec(other_file_spec())
+        )
+        plan = classify_recovery(
+            snapshot_for(
+                other,
+                state=TransactionState.PREPARED,
+                journal=JournalState.PENDING,
+                live=OBSERVED_ABSENT,
+                staged=OBSERVED_ABSENT,
+                path="d/g.txt",
+            )
+        )
+
+        with pytest.raises(ProtocolError) as caught:
+            persist_plan_prefix(lease, other, plan, 0)
+
+        assert "spec disagrees with the plan prefix" in str(caught.value)
 
 
 def test_no_active_record_refuses(leased):
@@ -2582,6 +2963,17 @@ def _require_projection_matches(
 `canonical_json` is used for the spec rather than `==` because the record's spec was decoded from
 durable JSON; comparing the canonical encodings is the same comparison A5a's own coherence rules make.
 
+**The topology check needs an independent case or it must go.** `test_a_plan_bound_to_another_compiled_spec_refuses`
+trips the compiled comparison first, and for one compiled spec on one volume A4b's resolution is
+deterministic — so two proofs that agree on `compiled` appear to agree on `topology` as well. Try to
+build a `RecoverySnapshot` that pairs `approved.compiled` with a structurally valid but *different*
+`RecoveryTopology` (`tests/recovery_support.py:77`'s `create_topology` hand-builds one, so
+`build_recovery_snapshot` accepts hand-made topologies when they cover the spec). If such a snapshot
+can be built, add the case and assert `"different topology"`. **If it cannot, delete the topology
+comparison** and say so in the task report: the compiled equality already pins the spec, and shipping a
+guard no test can fail is the failure mode this project's review has caught repeatedly. Do not leave it
+in unproved.
+
 - [ ] **Step 6: Implement the barrier discipline**
 
 One SQLite barrier per writable step (authority §7.4):
@@ -2641,21 +3033,32 @@ Expected: PASS, 11 tests.
 
 - [ ] **Step 8: Prove the projection check is complete, field by field**
 
-For each of the five labelled fields, force a disagreement and confirm the refusal names **that**
-field, not a neighbour:
+**The cursor matters here.** The comparison runs in order — transaction state, commit decision,
+rollback result, halt diagnostic, journals — so a case that sets the record to `ROLLED_BACK` or
+`HALTED` and then calls with `start=0` reports a *transaction-state* mismatch and never reaches the
+field it meant to test. Each case must use the cursor at which the prefix already projects that state:
 
-| Field | How to force it |
-| --- | --- |
-| transaction state | already covered by `test_the_first_halt_diagnostic_wins` |
-| commit decision | already covered by `test_a_record_disagreeing_with_the_reduced_prefix_refuses` |
-| rollback result | `txn.set_rollback_result(txid, RollbackResult.EXTERNAL_DRIFT_PRESERVED)` after advancing state to `ROLLED_BACK`, then persist with `start=0` |
-| halt diagnostic | `txn.set_halt_diagnostic(txid, matching_diagnostic("e1"))` after advancing state to `HALTED` |
-| journals | `txn.set_journal_state(txid, "e1", JournalState.DONE)` against a `PENDING` prefix |
+| Field | Plan | `start` | What the prefix projects there | How to force the mismatch |
+| --- | --- | --- | --- | --- |
+| transaction state | halt | 0 | `PREPARED` | covered by `test_the_first_halt_diagnostic_wins` |
+| commit decision | metadata-only | 0 | `UNCOMMITTED` | covered by `test_a_record_disagreeing_with_the_reduced_prefix_refuses` |
+| rollback result | metadata-only | **2** | `ROLLED_BACK` + `RESTORED`, still active | advance the record to `ROLLED_BACK` with `RollbackResult.EXTERNAL_DRIFT_PRESERVED` |
+| halt diagnostic | halt | **1** | `HALTED` + the plan's own diagnostic | advance the record to `HALTED` with `matching_diagnostic("e1")` |
+| journals | metadata-only | 0 | `PENDING` | `txn.set_journal_state(txid, "e1", JournalState.DONE)` |
+| spec | — | 0 | — | covered by `test_a_record_whose_spec_disagrees_with_the_prefix_refuses` |
+
+Read the measured step vectors at the top of this plan to confirm those two cursors: the metadata-only
+plan's step 2 is `DetachActive`, so reducing to 2 has applied both transitions but not the detach; the
+halt plan has exactly one step, so reducing to 1 has applied it.
 
 `matching_diagnostic` is `tests/store_support.py:352` and exists precisely so a coherent HALTED record
-can be written before something about it is broken. Add a test for each of the last three. Then delete
-that field's row from the comparison tuple, re-run, and confirm only its own test fails. Restore after
-each and report the five observed failures.
+can be written before something about it is broken — A5a's coherence barrier refuses a HALTED row whose
+diagnostic disagrees with its durable rows, so an arbitrary diagnostic could not be committed at all.
+
+Write the three new cases, then delete each field's row from the comparison tuple in turn, re-run, and
+confirm **only that field's own test fails**. A deletion that breaks two tests means two cases are
+firing the same gate and one of them is not proving what it claims. Restore after each and report the
+six observed failures.
 
 - [ ] **Step 9: Prove one barrier per writable step**
 
@@ -2688,10 +3091,14 @@ def test_each_writable_step_commits_before_the_next_begins(leased, monkeypatch):
         assert record.rollback_result is None
 ```
 
-The first step's COMMIT survived a failure during the second. Then merge the first two steps into one
-transaction by hand — wrap the `while` body's `_persist_one` calls in a single outer
-`with lease._store.transaction()` — re-run, and confirm this test fails because the record is still
-`PREPARED`. Restore and report.
+The first step's COMMIT survived a failure during the second — which is only possible if each step
+opened and closed its own transaction.
+
+**Do not try to mutate this by wrapping the walk in one outer transaction.** A5a's
+`_require_no_transaction` refuses a nested `BEGIN` outright (`connection.py:703`), so that edit fails
+on the nested-transaction error rather than on this test's assertion, and would prove nothing about
+barrier granularity. The assertion above is the proof: a single shared transaction would have rolled
+back the first step's write along with the second's.
 
 - [ ] **Step 10: Commit**
 
@@ -2976,44 +3383,86 @@ Create `tests/coordinator_child.py`:
 ```python
 """The fresh-process half of A5b's #17 and #23 claims.
 
-Run as `python -m tests.coordinator_child <project_root> <metadata_root>`; enters the
-production lease with `CERTIFIED_ALLOWLIST` replaced for the test volume and prints one
+Run as `python -m tests.coordinator_child <project_root> <metadata_root>`; prints one
 JSON object describing what a second process sees. A module rather than an inline `-c`
 string because it re-runs the whole entry order, including lock acquisition and
 reclamation, which is precisely the part a same-process re-entry skips.
+
+Two phases, because the lease traps on a live record and therefore cannot itself report
+what that record contains:
+
+1. Enter the production lease with `CERTIFIED_ALLOWLIST` replaced for the test volume.
+   Report reclamation's outcome, or the trap if one fired.
+2. Release it, then bind and open the store directly to report the durable state. This
+   phase makes no A5b claim -- it is the observer for the publication cut, and it is
+   the same plain bind/open `tests/store_child.py` already uses.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import sys
 
 from atoms.coordinator import root
+from atoms.fs.binding import bind_project_volume
 from atoms.fs.linux import LinuxBackend
 from atoms.fs.lock import acquire_project_lock
 from atoms.fs.volume import StorageProfile
+from atoms.store.connection import open_store
+from atoms.store.records import referenced_digests
 from tests.fs_support import build_test_allowlist
 
 STORAGE = StorageProfile(profile_id="atoms-test-profile")
 
 
-def main(project_root: str, metadata_root: str) -> int:
-    backend = LinuxBackend()
-    with acquire_project_lock(backend, metadata_root) as probe:
-        root.CERTIFIED_ALLOWLIST = build_test_allowlist(probe, project_root, STORAGE)
+def _lease_phase(backend, project_root: str, metadata_root: str) -> dict:
     try:
         with root._recovery_lease(
             backend, project_root, metadata_root, STORAGE
         ) as lease:
             active = lease._store.read_active()
-            payload = {
+            return {
                 "trapped": None,
                 "workspaces": list(lease._store.list_workspaces()),
                 "unindexed_blobs": list(lease._store.list_unindexed_blobs()),
                 "active": None if active is None else active.txid,
             }
     except NotImplementedError as caught:
-        payload = {"trapped": str(caught)}
+        return {"trapped": str(caught)}
+
+
+def _durable_phase(backend, project_root: str, metadata_root: str) -> dict:
+    with acquire_project_lock(backend, metadata_root) as lock:
+        allowlist = build_test_allowlist(lock, project_root, STORAGE)
+        with bind_project_volume(
+            project_root, lock, allowlist=allowlist, storage=STORAGE
+        ) as binding, open_store(binding) as store:
+            active = store.read_active()
+            if active is None:
+                return {"active": None, "state": None, "blobs": {}}
+            blobs = {}
+            for digest, byte_len in referenced_digests(active.spec):
+                fd = store.open_blob(digest)
+                try:
+                    blobs[digest] = len(os.read(fd, byte_len + 1))
+                finally:
+                    os.close(fd)
+            return {
+                "active": active.txid,
+                "state": active.state.value,
+                "blobs": blobs,
+            }
+
+
+def main(project_root: str, metadata_root: str) -> int:
+    backend = LinuxBackend()
+    with acquire_project_lock(backend, metadata_root) as probe:
+        root.CERTIFIED_ALLOWLIST = build_test_allowlist(probe, project_root, STORAGE)
+    payload = {"lease": _lease_phase(backend, project_root, metadata_root)}
+    with contextlib.suppress(NotImplementedError):
+        payload["durable"] = _durable_phase(backend, project_root, metadata_root)
     print(json.dumps(payload))
     return 0
 
@@ -3021,6 +3470,9 @@ def main(project_root: str, metadata_root: str) -> int:
 if __name__ == "__main__":
     raise SystemExit(main(*sys.argv[1:]))
 ```
+
+Phase 2 running at all is itself evidence for Task 3's release property from the far side: a lease that
+had not released its `flock` would make `acquire_project_lock` here block until the timeout.
 
 Create `tests/test_coordinator_process.py`:
 
@@ -3060,17 +3512,42 @@ def _roots(lease) -> tuple[str, str]:
     )
 
 
-def test_a_second_lease_reclaims_orphan_scratch_and_spares_the_referenced(leased):
-    """Ledger #23's crash-cut claim: the first process exits leaving pre-COMMIT leaves
-    behind, and the second process's lease entry drains exactly the unreferenced ones."""
+def test_a_second_lease_reclaims_both_kinds_of_orphan_and_spares_the_referenced(leased):
+    """Ledger #23's crash-cut claim.
+
+    The unindexed blob is produced the only way one can be: `promote_staging` renames
+    each blob into `blobs/` and flushes it BEFORE its `INSERT_BLOB` runs, so a
+    transaction that rolls back leaves the file on disk with no row. A test that merely
+    asserted the child sees none would pass against a store that never had one.
+    """
+    from atoms.store.blobs import StagedBlob
+    from tests.store_support import digest_of, spec_referencing, stage
+
+    content = b"orphaned by a cut before COMMIT"
+    digest = digest_of(content)
+
     with leased() as lease:
         project_root, metadata_root = _roots(lease)
-        lease._store.create_workspace("orphan").close()
         lease._store.create_workspace("kept").close()
         with lease._store.transaction() as txn:
             txn.insert_record("kept", one_effect_spec())
 
-    seen = _second_process(project_root, metadata_root)
+        with lease._store.create_workspace("orphan") as workspace:
+            stage(workspace, "b0", content)
+            with pytest.raises(RuntimeError), lease._store.transaction() as txn:
+                txn.promote_staging(
+                    workspace,
+                    (StagedBlob(name="b0", digest=digest, byte_len=len(content)),),
+                )
+                txn.insert_record("orphan", spec_referencing(content))
+                raise RuntimeError("cut before COMMIT")
+
+        # Both orphans exist in THIS process, before any restart.
+        assert lease._store.read_record("orphan") is None
+        assert lease._store.list_unindexed_blobs() == (digest,)
+        assert set(lease._store.list_workspaces()) == {"kept", "orphan"}
+
+    seen = _second_process(project_root, metadata_root)["lease"]
 
     assert seen["trapped"] is None
     assert seen["workspaces"] == ["kept"]
@@ -3078,25 +3555,63 @@ def test_a_second_lease_reclaims_orphan_scratch_and_spares_the_referenced(leased
     assert seen["active"] is None
 
 
-def test_a_published_record_traps_a_fresh_lease(leased):
+def test_a_published_record_traps_a_fresh_lease_and_survives_intact(leased):
     """Ledger #17's enforcement half survives a restart: the trap is a property of lease
-    entry, not of the process that published the record. Blob durability across a
-    process boundary is A5a's claim (#22) and is not re-tested here."""
+    entry, not of the process that published the record. The second phase confirms the
+    record and its blobs are readable afterwards -- a trap that had damaged them would
+    be worse than no trap."""
     with leased() as lease:
         project_root, metadata_root = _roots(lease)
-        prepared(lease)
+        approved = prepared(lease)
 
     seen = _second_process(project_root, metadata_root)
 
-    assert seen["trapped"] == "recovery execution is not implemented until A7"
+    assert seen["lease"]["trapped"] == "recovery execution is not implemented until A7"
+    assert seen["durable"]["active"] == approved.txid
+    assert seen["durable"]["state"] == "prepared"
+    assert list(seen["durable"]["blobs"].values()) == [len(AFTER)]
+
+
+def test_a_cut_inside_preparation_publishes_nothing_across_a_restart(
+    leased, monkeypatch
+):
+    """Design §10's before-state for publication, proved through the production
+    function rather than a re-implementation of its body."""
+    from atoms.store.connection import _StoreTransaction
+
+    from atoms.coordinator.prepare import open_workspace, prepare_transaction
+    from tests.coordinator_support import admission_for, stage_manifest
+
+    with leased() as lease:
+        project_root, metadata_root = _roots(lease)
+        approved = admission_for(lease)
+        workspace = open_workspace(lease, approved)
+        manifest = stage_manifest(workspace)
+
+        def cut(self, txid):
+            raise RuntimeError("cut inside prepare_transaction, before COMMIT")
+
+        monkeypatch.setattr(_StoreTransaction, "set_active", cut)
+        with pytest.raises(RuntimeError):
+            prepare_transaction(lease, approved, workspace, manifest)
+        workspace.close()
+
+    seen = _second_process(project_root, metadata_root)
+
+    assert seen["lease"]["trapped"] is None
+    assert seen["lease"]["active"] is None
+    assert seen["durable"]["active"] is None
+    # Reclamation also drained the blob the cut orphaned in blobs/.
+    assert seen["lease"]["unindexed_blobs"] == []
 ```
 
-Run: `uv run pytest tests/test_coordinator_process.py -v`. Expected: PASS, 2 tests.
+Add `import pytest` and `from tests.coordinator_support import AFTER, prepared` to the module's imports.
 
-**If the second test fails because the child never reaches the trap**, the cause is that
-`_reclaim_orphans` removed the prepared transaction's workspace before `_resolve` ran — check that
-`prepared` published a record naming that txid, since reclamation spares exactly the referenced ones.
-Report either way.
+Run: `uv run pytest tests/test_coordinator_process.py -v`. Expected: PASS, 3 tests.
+
+**If the trap test fails because the child never reaches it**, the cause is that `_reclaim_orphans`
+removed the prepared transaction's workspace before `_resolve` ran — check that `prepared` published a
+record naming that txid, since reclamation spares exactly the referenced ones. Report either way.
 
 - [ ] **Step 5: Update the packaging metadata**
 
@@ -3196,10 +3711,27 @@ takes `(lease, txid, step)` — no `plan`, because every payload it writes is on
 load-bearing while `_occupied_scratch` is stubbed. Task 5 Step 6 records that rather than claiming it,
 and Task 6 Step 8 arms and runs the mutation.
 
-**Two places the implementer must read the code rather than trust this plan**, both flagged inline:
-Task 8 Step 1's `OBSERVED_ABSENT` / `EntryIdentity` / `FileBuildRelation` import locations, and Task 4
-Step 3's lift of `_NAMESPACE_CONTRADICTIONS` out of `PathResolver`, which touches existing code and must
-leave `tests/test_fs_resolve_*.py` green before anything new is written.
+**Every test drives production code, not a re-implementation of it.** Two cases were rewritten for
+this: the publication cut now patches `_StoreTransaction.set_active` and calls `prepare_transaction`,
+so a wrong ordering inside the production function fails it; and both unindexed-blob cases produce a
+real orphan through a rolled-back `promote_staging` rather than asserting that an empty list is empty.
+
+**Design §10's mismatch matrix has one independent case per comparand.** Identity, `NAME_MAX`,
+`LookupProof`, and mount membership each have their own case, and both declared resolver refusal types
+— `ProjectApprovalRefused` and `CapabilityUnavailable` — are translated separately, with a fifth case
+asserting `approve_for_project`'s own refusals are **not** translated. The projection matrix reduces to
+the cursor at which the prefix already projects each field's state (`start=2` for rollback result,
+`start=1` for halt diagnostic), so no case is silently absorbed by the transaction-state check that
+runs before it.
+
+**One guard is conditional on being provable.** The `plan.bound_snapshot.topology == approved.topology`
+comparison is kept only if Task 8 can construct a snapshot that fails it independently of the compiled
+check; if not, the task deletes it rather than shipping a guard no test can fail.
+
+**One place the implementer must read the code rather than trust this plan:** Task 4 Step 3's lift of
+`_NAMESPACE_CONTRADICTIONS` out of `PathResolver`, which touches existing code and must leave
+`tests/test_fs_resolve_*.py` green before anything new is written. Its one class use is at
+`resolve.py:207`.
 
 **Everything the plan asserts about A4b's and A3's output shapes was executed, not inferred.** The
 approval shapes, the scratch leaf format, the `work_base is None` case, and all five plan step vectors
