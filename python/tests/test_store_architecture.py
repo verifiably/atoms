@@ -119,6 +119,29 @@ def test_no_blanket_oserror_handler(path):
 SWALLOW_EXEMPTION = "connection._rollback_quietly"
 
 
+def _assigned_expressions(tree: ast.Module) -> list[tuple[str, ast.expr]]:
+    assigned: list[tuple[str, ast.expr]] = []
+
+    def pair(target: ast.expr, value: ast.expr) -> None:
+        if isinstance(target, ast.Name):
+            assigned.append((target.id, value))
+        elif (
+            isinstance(target, ast.Tuple | ast.List)
+            and isinstance(value, ast.Tuple | ast.List)
+            and len(target.elts) == len(value.elts)
+        ):
+            for nested_target, nested_value in zip(target.elts, value.elts, strict=True):
+                pair(nested_target, nested_value)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                pair(target, node.value)
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            pair(node.target, node.value)
+    return assigned
+
+
 def _sqlite_exception_aliases(
     tree: ast.Module,
 ) -> tuple[set[str], set[str], set[str]]:
@@ -143,6 +166,21 @@ def _sqlite_exception_aliases(
                 for alias in node.names
                 if alias.name == "Error"
             )
+    pending = _assigned_expressions(tree)
+    while pending:
+        resolved: set[str] = set()
+        for name, value in pending:
+            if _catches_sqlite_exception(
+                value, modules, database_errors, "DatabaseError"
+            ):
+                database_errors.add(name)
+                resolved.add(name)
+            elif _catches_sqlite_exception(value, modules, errors, "Error"):
+                errors.add(name)
+                resolved.add(name)
+        if not resolved:
+            break
+        pending = [(name, value) for name, value in pending if name not in resolved]
     return modules, database_errors, errors
 
 
@@ -721,6 +759,8 @@ def _statement_target(text: str) -> str | None:
     if verb not in ("INSERT", "REPLACE", "UPDATE", "DELETE"):
         return None
     assert index < len(tokens), f"{verb} has no target"
+    if index + 2 < len(tokens) and tokens[index + 1] == ".":
+        index += 2
     return _identifier(tokens[index])
 
 
@@ -1104,6 +1144,14 @@ def test_sql_guard_rejects_hostile_resolution_paths(
             "block-comment-prefix",
             "/* harmless heading */ DELETE FROM blob",
         ),
+        (
+            "qualified-update",
+            "UPDATE main.blob SET byte_len = 1",
+        ),
+        (
+            "quoted-qualified-insert",
+            'INSERT INTO "main"."blob" VALUES (?, ?)',
+        ),
     ],
 )
 def test_blob_inventory_rejects_every_second_writer_kind(
@@ -1332,6 +1380,45 @@ def test_sqlite_error_guard_resolves_a_module_alias(
     )["hostile"]
     with pytest.raises(AssertionError):
         test_no_module_catches_the_whole_sqlite_hierarchy(path)
+
+
+@pytest.mark.parametrize(
+    "aliases",
+    [
+        "DBError = sqlite3.DatabaseError\n",
+        (
+            "DBError, WholeError = (\n"
+            "    sqlite3.DatabaseError, sqlite3.Error,\n"
+            ")\n"
+        ),
+    ],
+    ids=("assigned", "tuple-assigned"),
+)
+def test_database_error_guards_resolve_assigned_exception_aliases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    aliases: str,
+):
+    paths = _plant_store_package(
+        tmp_path,
+        monkeypatch,
+        {
+            "connection": ROLLBACK_EXEMPTION,
+            "hostile": (
+                "import sqlite3\n"
+                f"{aliases}"
+                "def swallow():\n"
+                "    try:\n"
+                "        pass\n"
+                "    except DBError:\n"
+                "        return\n"
+            ),
+        },
+    )
+    with pytest.raises(AssertionError):
+        test_every_database_error_handler_contains_a_bare_raise(paths["hostile"])
+    with pytest.raises(AssertionError):
+        test_the_package_has_exactly_one_swallowed_database_error()
 
 
 @pytest.mark.parametrize(
