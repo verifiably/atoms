@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import signal
+import socket
 import sqlite3
 
 import pytest
@@ -799,6 +800,7 @@ def test_removing_an_already_absent_leaf_raises_protocol_error(opened_store):
         ("symlink", "is a symlink"),
         ("directory", "not a regular file"),
         ("fifo", "not a regular file"),
+        ("socket", "not a regular file"),
         ("wrong_content", "hashes to sha256:"),
     ],
 )
@@ -806,22 +808,38 @@ def test_an_unverifiable_orphan_is_preserved(opened_store, store_binding, kind, 
     digest = digest_of(b"pretend")
     leaf = digest_to_leaf(digest)
     with child_dir(store_binding.metadata_root_fd, "blobs/sha256") as blobs_fd:
-        if kind == "symlink":
-            os.symlink("/etc/passwd", leaf, dir_fd=blobs_fd)
-        elif kind == "directory":
-            os.mkdir(leaf, dir_fd=blobs_fd)
-        elif kind == "fifo":
-            os.mkfifo(leaf, 0o600, dir_fd=blobs_fd)
-        else:
-            fd = os.open(leaf, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600, dir_fd=blobs_fd)
-            try:
-                os.write(fd, b"different")
-            finally:
-                os.close(fd)
-        with pytest.raises(MetadataStoreInvalid) as caught:
-            opened_store.remove_unindexed_blob(digest)
-        assert digest in str(caught.value)
-        assert message in str(caught.value)
+        before = open_descriptor_count()
+        unix_socket = None
+        try:
+            if kind == "symlink":
+                os.symlink("/etc/passwd", leaf, dir_fd=blobs_fd)
+            elif kind == "directory":
+                os.mkdir(leaf, dir_fd=blobs_fd)
+            elif kind == "fifo":
+                os.mkfifo(leaf, 0o600, dir_fd=blobs_fd)
+            elif kind == "socket":
+                unix_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                unix_socket.bind(f"/proc/self/fd/{blobs_fd}/{leaf}")
+            else:
+                fd = os.open(
+                    leaf,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    0o600,
+                    dir_fd=blobs_fd,
+                )
+                try:
+                    os.write(fd, b"different")
+                finally:
+                    os.close(fd)
+            with pytest.raises(MetadataStoreInvalid) as caught:
+                opened_store.remove_unindexed_blob(digest)
+            assert digest in str(caught.value)
+            assert message in str(caught.value)
+            assert leaf in os.listdir(blobs_fd)
+        finally:
+            if unix_socket is not None:
+                unix_socket.close()
+        assert open_descriptor_count() == before
         assert leaf in os.listdir(blobs_fd)
 
 
@@ -831,6 +849,7 @@ def test_an_unverifiable_orphan_is_preserved(opened_store, store_binding, kind, 
         ("symlink", "is a symlink"),
         ("directory", "not a regular file"),
         ("fifo", "not a regular file"),
+        ("socket", "not a regular file"),
         ("wrong_content", "hashes to sha256:"),
     ],
 )
@@ -840,22 +859,38 @@ def test_enumeration_preserves_and_refuses_an_unverifiable_leaf(
     digest = digest_of(b"pretend")
     leaf = digest_to_leaf(digest)
     with child_dir(store_binding.metadata_root_fd, "blobs/sha256") as blobs_fd:
-        if kind == "symlink":
-            os.symlink("elsewhere", leaf, dir_fd=blobs_fd)
-        elif kind == "directory":
-            os.mkdir(leaf, dir_fd=blobs_fd)
-        elif kind == "fifo":
-            os.mkfifo(leaf, 0o600, dir_fd=blobs_fd)
-        else:
-            fd = os.open(leaf, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600, dir_fd=blobs_fd)
-            try:
-                os.write(fd, b"different")
-            finally:
-                os.close(fd)
-        with pytest.raises(MetadataStoreInvalid) as caught:
-            opened_store.list_unindexed_blobs()
-        assert digest in str(caught.value)
-        assert message in str(caught.value)
+        before = open_descriptor_count()
+        unix_socket = None
+        try:
+            if kind == "symlink":
+                os.symlink("elsewhere", leaf, dir_fd=blobs_fd)
+            elif kind == "directory":
+                os.mkdir(leaf, dir_fd=blobs_fd)
+            elif kind == "fifo":
+                os.mkfifo(leaf, 0o600, dir_fd=blobs_fd)
+            elif kind == "socket":
+                unix_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                unix_socket.bind(f"/proc/self/fd/{blobs_fd}/{leaf}")
+            else:
+                fd = os.open(
+                    leaf,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    0o600,
+                    dir_fd=blobs_fd,
+                )
+                try:
+                    os.write(fd, b"different")
+                finally:
+                    os.close(fd)
+            with pytest.raises(MetadataStoreInvalid) as caught:
+                opened_store.list_unindexed_blobs()
+            assert digest in str(caught.value)
+            assert message in str(caught.value)
+            assert leaf in os.listdir(blobs_fd)
+        finally:
+            if unix_socket is not None:
+                unix_socket.close()
+        assert open_descriptor_count() == before
         assert leaf in os.listdir(blobs_fd)
 
 

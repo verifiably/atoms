@@ -550,3 +550,57 @@ def test_orphan_flush_continues_on_its_held_descriptor_after_unlink(store_on, mo
         assert len(flushed) == 1
         assert not store._connection.in_transaction
         store.close()
+
+
+@pytest.mark.parametrize("release", RELEASES, ids=("closed_binding", "released_lock"))
+def test_unindexed_enumeration_rechecks_liveness_after_verification(
+    store_on, monkeypatch, release
+):
+    from atoms.store import blobs as blobs_module
+    from tests.store_support import child_dir, digest_of, stage
+
+    with store_on() as binding:
+        store = open_store(binding)
+        content = b"orphaned"
+        digest = digest_of(content)
+        with store.create_workspace("tx1") as workspace:
+            stage(workspace, "one", content)
+            with pytest.raises(ProtocolError) as promotion_error, store.transaction() as txn:
+                txn.promote_staging(
+                    workspace,
+                    (blobs_module.StagedBlob("one", digest, len(content)),),
+                )
+        assert digest in str(promotion_error.value)
+        assert "does not reference" in str(promotion_error.value)
+
+        real_verify = blobs_module.verify_leaf
+
+        def release_after_verification(fd, digest_, byte_len):
+            result = real_verify(fd, digest_, byte_len)
+            release(binding)
+            return result
+
+        statements: list[str] = []
+        store._connection.set_trace_callback(statements.append)
+        with metadata_root_snapshot(binding) as root_fd:
+            with child_dir(root_fd, "blobs/sha256") as parent:
+                blobs_path = os.readlink(f"/proc/self/fd/{parent}")
+            monkeypatch.setattr(blobs_module, "verify_leaf", release_after_verification)
+            try:
+                with pytest.raises(ProtocolError) as caught:
+                    store.list_unindexed_blobs()
+            finally:
+                store._connection.set_trace_callback(None)
+            assert ("closed" if release is close_binding else "lock") in str(caught.value)
+            assert statements[-1] == "ROLLBACK"
+            assert "COMMIT" not in statements
+            with child_dir(root_fd, "blobs/sha256") as parent:
+                assert digest.split(":", 1)[1] in os.listdir(parent)
+            targets: list[str] = []
+            for fd in os.listdir("/proc/self/fd"):
+                try:
+                    targets.append(os.readlink(f"/proc/self/fd/{fd}"))
+                except FileNotFoundError:
+                    pass
+            assert blobs_path not in targets
+        store.close()

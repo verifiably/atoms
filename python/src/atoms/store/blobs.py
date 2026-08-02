@@ -93,6 +93,10 @@ def open_entry_nofollow(parent_fd: int, name: str, what: str) -> int:
     except OSError as caught:
         if caught.errno == errno.ELOOP:
             raise MetadataStoreInvalid(f"{what} is a symlink") from caught
+        if caught.errno == errno.ENXIO:
+            raise MetadataStoreInvalid(
+                f"{what} is not a regular file; no permitted producer could have written it"
+            ) from caught
         raise
 
 
