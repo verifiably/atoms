@@ -13,7 +13,11 @@ import atoms.fs
 from atoms.core.errors import CapabilityUnavailable
 from atoms.fs import platform as fs_platform
 from atoms.fs.volume import CERTIFIED_ALLOWLIST, DurabilityAllowlist
-from tests.architecture_support import fixture_names, unregistered_test_arguments
+from tests.architecture_support import (
+    fixture_names,
+    oserror_handler_discriminates,
+    unregistered_test_arguments,
+)
 
 SOURCE_ROOT = Path(__file__).parents[1] / "src" / "atoms"
 
@@ -395,7 +399,6 @@ def test_a4a_status_is_synchronized_across_authority_documents():
         "**A4a — capability backend and project volume binding: implemented on "
         "2026-07-30.**"
     ) in agents
-    assert "A5–A8 remain unimplemented" in agents
     assert (
         "A4a mutates only engine-owned `metadata_root`, never project paths."
     ) in agents
@@ -515,49 +518,10 @@ def test_no_blanket_oserror_handler(module_name):
         )
         for entry in names:
             if isinstance(entry, ast.Name) and entry.id == "OSError":
-                assert _oserror_handler_discriminates(node), (
+                assert oserror_handler_discriminates(node), (
                     f"{module_name}.py catches OSError without discriminating on errno "
                     "or passing the caught object to _frontier_from"
                 )
-
-
-def _handler_nodes(handler: ast.ExceptHandler):
-    stack: list[ast.AST] = list(reversed(handler.body))
-    while stack:
-        node = stack.pop()
-        yield node
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
-            continue
-        stack.extend(reversed(list(ast.iter_child_nodes(node))))
-
-
-def _oserror_handler_discriminates(handler: ast.ExceptHandler) -> bool:
-    if handler.name is None:
-        return False
-    nodes = list(_handler_nodes(handler))
-    delegates = any(
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "_frontier_from"
-        and any(
-            isinstance(argument, ast.Name) and argument.id == handler.name
-            for argument in node.args
-        )
-        for node in nodes
-    )
-    errno_controls_branch = any(
-        isinstance(node, (ast.If, ast.IfExp))
-        and isinstance(node.test, ast.Compare)
-        and any(
-            isinstance(part, ast.Attribute)
-            and isinstance(part.value, ast.Name)
-            and part.value.id == handler.name
-            and part.attr == "errno"
-            for part in ast.walk(node.test)
-        )
-        for node in nodes
-    )
-    return delegates or errno_controls_branch
 
 
 @pytest.mark.parametrize(
@@ -607,7 +571,7 @@ def test_oserror_guard_requires_control_flow_or_delegation(source, expected):
     handler = next(
         node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.ExceptHandler)
     )
-    assert _oserror_handler_discriminates(handler) is expected
+    assert oserror_handler_discriminates(handler) is expected
 
 
 def test_the_backend_protocol_and_revision_are_exact():

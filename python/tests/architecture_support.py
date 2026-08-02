@@ -155,3 +155,46 @@ def unregistered_test_arguments(
                 - receivers
             )
     return missing
+
+
+def handler_nodes(handler: ast.ExceptHandler):
+    """Walk a handler body without laundering evidence through a nested scope."""
+    stack: list[ast.AST] = list(reversed(handler.body))
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(
+            node,
+            (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda),
+        ):
+            continue
+        stack.extend(reversed(list(ast.iter_child_nodes(node))))
+
+
+def oserror_handler_discriminates(handler: ast.ExceptHandler) -> bool:
+    if handler.name is None:
+        return False
+    nodes = list(handler_nodes(handler))
+    delegates = any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_frontier_from"
+        and any(
+            isinstance(argument, ast.Name) and argument.id == handler.name
+            for argument in node.args
+        )
+        for node in nodes
+    )
+    errno_controls_branch = any(
+        isinstance(node, (ast.If, ast.IfExp))
+        and isinstance(node.test, ast.Compare)
+        and any(
+            isinstance(part, ast.Attribute)
+            and isinstance(part.value, ast.Name)
+            and part.value.id == handler.name
+            and part.attr == "errno"
+            for part in ast.walk(node.test)
+        )
+        for node in nodes
+    )
+    return delegates or errno_controls_branch
