@@ -12,7 +12,15 @@ import pytest
 from atoms.core.errors import ProtocolError
 from atoms.store.errors import MetadataStoreInvalid
 from atoms.store.workspace import Workspace
-from tests.store_support import child_dir, stage
+from tests.store_support import RELEASES, child_dir, metadata_root_snapshot, release_lock, stage
+
+
+def _child_bytes(parent_fd: int, name: str) -> bytes:
+    fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC, dir_fd=parent_fd)
+    try:
+        return os.read(fd, 4096)
+    finally:
+        os.close(fd)
 
 
 def test_creation_makes_both_directories(opened_store, store_binding):
@@ -25,8 +33,92 @@ def test_creation_makes_both_directories(opened_store, store_binding):
 
 def test_creation_refuses_when_either_directory_exists(opened_store):
     opened_store.create_workspace("tx1").close()
-    with pytest.raises(ProtocolError):
+    with pytest.raises(ProtocolError) as caught:
         opened_store.create_workspace("tx1")
+    assert "staging/tx1 already exists" in str(caught.value)
+
+
+def test_creation_refuses_when_only_the_work_directory_exists(opened_store, store_binding):
+    with child_dir(store_binding.metadata_root_fd, "work") as work_parent:
+        os.mkdir("tx1", dir_fd=work_parent)
+    with pytest.raises(ProtocolError) as caught:
+        opened_store.create_workspace("tx1")
+    assert "work/tx1 already exists" in str(caught.value)
+
+
+def test_creation_gate_before_the_first_mkdir_leaves_both_names_absent(
+    store_on, monkeypatch
+):
+    from atoms.store import workspace as workspace_module
+    from atoms.store.connection import open_store
+
+    with store_on() as binding, metadata_root_snapshot(binding) as root:
+        store = open_store(binding)
+        real = workspace_module._stat_or_none
+        calls = 0
+
+        def release_after_second_preflight(parent_fd, name):
+            nonlocal calls
+            result = real(parent_fd, name)
+            calls += 1
+            if calls == 2:
+                release_lock(binding)
+            return result
+
+        monkeypatch.setattr(workspace_module, "_stat_or_none", release_after_second_preflight)
+        with pytest.raises(ProtocolError) as caught:
+            store.create_workspace("tx1")
+        assert "lock" in str(caught.value).lower()
+        for parent in ("staging", "work"):
+            with child_dir(root, parent) as parent_fd:
+                assert "tx1" not in os.listdir(parent_fd)
+        store.close()
+
+
+def test_creation_gate_before_the_second_mkdir_leaves_only_staging(store_on, monkeypatch):
+    from atoms.store import workspace as workspace_module
+    from atoms.store.connection import open_store
+
+    with store_on() as binding, metadata_root_snapshot(binding) as root:
+        store = open_store(binding)
+        real = workspace_module.os.mkdir
+        calls: list[str] = []
+
+        def release_after_first_mkdir(name, mode=0o777, *, dir_fd=None):
+            result = real(name, mode, dir_fd=dir_fd)
+            calls.append(name)
+            if len(calls) == 1:
+                release_lock(binding)
+            return result
+
+        monkeypatch.setattr(workspace_module.os, "mkdir", release_after_first_mkdir)
+        with pytest.raises(ProtocolError) as caught:
+            store.create_workspace("tx1")
+        assert "lock" in str(caught.value).lower()
+        assert calls == ["tx1"]
+        with child_dir(root, "staging") as staging:
+            assert "tx1" in os.listdir(staging)
+        with child_dir(root, "work") as work:
+            assert "tx1" not in os.listdir(work)
+        store.close()
+
+
+def test_creation_flushes_both_workspace_parents(opened_store, store_binding, monkeypatch):
+    backend = store_binding.backend
+    real = backend.flush_directory
+    flushed: list[int] = []
+    with child_dir(store_binding.metadata_root_fd, "staging") as staging:
+        staging_inode = os.fstat(staging).st_ino
+    with child_dir(store_binding.metadata_root_fd, "work") as work:
+        work_inode = os.fstat(work).st_ino
+
+    def record(fd: int) -> None:
+        flushed.append(os.fstat(fd).st_ino)
+        real(fd)
+
+    monkeypatch.setattr(backend, "flush_directory", record)
+    opened_store.create_workspace("tx1").close()
+    assert flushed == [staging_inode, work_inode]
 
 
 def test_the_anchors_are_usable_by_a6_and_a7(opened_store):
@@ -153,11 +245,130 @@ def test_removal_refuses_a_non_empty_work_directory(opened_store):
     assert "tx1" in opened_store.list_workspaces()
 
 
+def test_removal_preflights_work_before_unlinking_staged_bytes(opened_store):
+    with opened_store.create_workspace("tx1") as workspace:
+        staged = {"a": b"one", "b": b"two"}
+        for name, content in staged.items():
+            stage(workspace, name, content)
+        os.mkdir("partial", dir_fd=workspace.work_fd)
+        with pytest.raises(ProtocolError) as caught:
+            opened_store.remove_workspace(workspace)
+        assert "work/tx1/ is not empty" in str(caught.value)
+        assert {
+            name: _child_bytes(workspace.staging_fd, name) for name in staged
+        } == staged
+        assert os.listdir(workspace.work_fd) == ["partial"]
+
+
 def test_removal_is_not_idempotent(opened_store):
     workspace = opened_store.create_workspace("tx1")
     opened_store.remove_workspace(workspace)
-    with pytest.raises(ProtocolError):
+    with pytest.raises(ProtocolError) as caught:
         opened_store.remove_workspace(workspace)
+    assert "workspace is closed" in str(caught.value)
+
+
+def test_removal_gate_before_each_staging_unlink_preserves_later_files(store_on, monkeypatch):
+    from atoms.store import workspace as workspace_module
+    from atoms.store.connection import open_store
+
+    with store_on() as binding, metadata_root_snapshot(binding) as root:
+        store = open_store(binding)
+        workspace = store.create_workspace("tx1")
+        stage(workspace, "a", b"one")
+        stage(workspace, "b", b"two")
+        real = workspace_module.os.unlink
+        calls: list[str] = []
+
+        def release_after_first_unlink(name, *, dir_fd=None):
+            result = real(name, dir_fd=dir_fd)
+            calls.append(name)
+            if len(calls) == 1:
+                release_lock(binding)
+            return result
+
+        monkeypatch.setattr(workspace_module.os, "unlink", release_after_first_unlink)
+        with pytest.raises(ProtocolError) as caught:
+            store.remove_workspace(workspace)
+        assert "lock" in str(caught.value).lower()
+        assert calls == ["a"]
+        with child_dir(root, "staging") as staging, child_dir(staging, "tx1") as tx_staging:
+            assert os.listdir(tx_staging) == ["b"]
+            assert _child_bytes(tx_staging, "b") == b"two"
+        store.close()
+
+
+def test_removal_gate_before_staging_rmdir_preserves_both_directories(store_on, monkeypatch):
+    from atoms.store.connection import open_store
+
+    with store_on() as binding, metadata_root_snapshot(binding) as root:
+        store = open_store(binding)
+        workspace = store.create_workspace("tx1")
+        backend = binding.backend
+        real = backend.flush_directory
+        flushes = 0
+
+        def release_after_staging_flush(fd):
+            nonlocal flushes
+            real(fd)
+            flushes += 1
+            if flushes == 1:
+                release_lock(binding)
+
+        monkeypatch.setattr(backend, "flush_directory", release_after_staging_flush)
+        with pytest.raises(ProtocolError) as caught:
+            store.remove_workspace(workspace)
+        assert "lock" in str(caught.value).lower()
+        with child_dir(root, "staging") as staging:
+            assert "tx1" in os.listdir(staging)
+        with child_dir(root, "work") as work:
+            assert "tx1" in os.listdir(work)
+        store.close()
+
+
+def test_removal_gate_before_work_rmdir_preserves_work_directory(store_on, monkeypatch):
+    from atoms.store.connection import open_store
+
+    with store_on() as binding, metadata_root_snapshot(binding) as root:
+        store = open_store(binding)
+        workspace = store.create_workspace("tx1")
+        backend = binding.backend
+        real = backend.flush_directory
+        flushes = 0
+
+        def release_after_staging_parent_flush(fd):
+            nonlocal flushes
+            real(fd)
+            flushes += 1
+            if flushes == 2:
+                release_lock(binding)
+
+        monkeypatch.setattr(backend, "flush_directory", release_after_staging_parent_flush)
+        with pytest.raises(ProtocolError) as caught:
+            store.remove_workspace(workspace)
+        assert "lock" in str(caught.value).lower()
+        with child_dir(root, "staging") as staging:
+            assert "tx1" not in os.listdir(staging)
+        with child_dir(root, "work") as work:
+            assert "tx1" in os.listdir(work)
+        store.close()
+
+
+def test_removal_flushes_the_work_parent_last(opened_store, store_binding, monkeypatch):
+    workspace = opened_store.create_workspace("tx1")
+    backend = store_binding.backend
+    real = backend.flush_directory
+    flushed: list[int] = []
+    with child_dir(store_binding.metadata_root_fd, "work") as work:
+        work_inode = os.fstat(work).st_ino
+
+    def record(fd: int) -> None:
+        flushed.append(os.fstat(fd).st_ino)
+        real(fd)
+
+    monkeypatch.setattr(backend, "flush_directory", record)
+    opened_store.remove_workspace(workspace)
+    assert flushed[-1] == work_inode
 
 
 def test_a_failure_after_the_staging_rmdir_leaves_no_anchor_on_a_gone_directory(
@@ -215,13 +426,20 @@ def test_a_foreign_or_forged_workspace_is_refused(opened_store):
     workspace.close()
 
 
+def test_removal_refuses_a_value_that_is_not_exactly_workspace(opened_store):
+    with pytest.raises(ProtocolError) as caught:
+        opened_store.remove_workspace(object())
+    assert "expected exactly Workspace, got object" in str(caught.value)
+
+
 def test_a_workspace_from_another_store_over_the_same_binding_is_refused(store_on):
     from atoms.store.connection import open_store
 
     with store_on() as binding, open_store(binding) as first, open_store(binding) as second:
         workspace = first.create_workspace("tx1")
-        with pytest.raises(ProtocolError):
+        with pytest.raises(ProtocolError) as caught:
             second.remove_workspace(workspace)
+        assert "different Store over the same binding" in str(caught.value)
         workspace.close()
 
 
@@ -247,6 +465,17 @@ def test_enumeration_refuses_an_entry_no_permitted_producer_could_have_written(
         assert "stray" in os.listdir(parent_fd)
 
 
+def test_enumeration_refuses_a_valid_txid_symlink(opened_store, store_binding, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    with child_dir(store_binding.metadata_root_fd, "staging") as staging:
+        os.symlink(str(outside), "tx1", dir_fd=staging)
+        with pytest.raises(MetadataStoreInvalid) as caught:
+            opened_store.list_workspaces()
+        assert "staging/tx1 is not a directory" in str(caught.value)
+        assert "tx1" in os.listdir(staging)
+
+
 @pytest.mark.parametrize("parent", ["staging", "work"])
 def test_enumeration_refuses_a_directory_whose_name_is_not_a_txid(
     opened_store, store_binding, parent
@@ -262,3 +491,38 @@ def test_enumeration_refuses_a_directory_whose_name_is_not_a_txid(
 def test_the_txid_is_validated_before_any_mkdir(opened_store, bad):
     with pytest.raises(ProtocolError):
         opened_store.create_workspace(bad)
+
+
+@pytest.mark.parametrize("release", RELEASES, ids=("closed_binding", "released_lock"))
+def test_borrowed_workspace_anchors_name_each_dead_binding_branch(store_on, release):
+    from atoms.store.connection import open_store
+
+    with store_on() as binding:
+        store = open_store(binding)
+        workspace = store.create_workspace("tx1")
+        release(binding)
+        expected = "closed" if release.__name__ == "close_binding" else "lock"
+        for name in ("staging_fd", "work_fd"):
+            with pytest.raises(ProtocolError) as caught:
+                getattr(workspace, name)
+            assert expected in str(caught.value).lower()
+        workspace.close()
+        workspace.close()
+        store.close()
+
+
+@pytest.mark.parametrize("release", RELEASES, ids=("closed_binding", "released_lock"))
+def test_removal_names_each_dead_binding_branch(store_on, release):
+    from atoms.store.connection import open_store
+
+    with store_on() as binding:
+        store = open_store(binding)
+        workspace = store.create_workspace("tx1")
+        release(binding)
+        with pytest.raises(ProtocolError) as caught:
+            store.remove_workspace(workspace)
+        expected = "closed" if release.__name__ == "close_binding" else "lock"
+        assert expected in str(caught.value).lower()
+        workspace.close()
+        workspace.close()
+        store.close()
