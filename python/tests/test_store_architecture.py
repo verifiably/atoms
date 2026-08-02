@@ -548,10 +548,25 @@ def _literal_structure_names(
         return set()
     tree = _tree(path)
     counts = _module_binding_counts(tree)
+    values = _static_values(path)
+
+    def is_immutable_static(node: ast.expr) -> bool:
+        if isinstance(node, ast.Tuple):
+            return all(is_immutable_static(element) for element in node.elts)
+        if _string_value(node, values) is not None:
+            return True
+        try:
+            value = _literal_value(node)
+        except (ValueError, SyntaxError, TypeError):
+            return False
+        return value is None or isinstance(value, str | bytes | int | float | complex)
+
     names = {
         name
         for name, value in _module_bindings(tree)
-        if counts[name] == 1 and isinstance(value, ast.Tuple | ast.List | ast.Set)
+        if counts[name] == 1
+        and isinstance(value, ast.Tuple)
+        and is_immutable_static(value)
     }
     for node in tree.body:
         if not isinstance(node, ast.ImportFrom):
@@ -697,6 +712,7 @@ def _parameters_fed_only_constants(
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
             by_name.setdefault(node.name, []).append(node)
     calls: dict[str, list[ast.Call]] = {}
+    ambiguous: set[str] = set()
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -711,9 +727,11 @@ def _parameters_fed_only_constants(
         )
         if name in by_name:
             calls.setdefault(name, []).append(node)
+        elif isinstance(node.func, ast.Attribute) and node.func.attr in by_name:
+            ambiguous.add(node.func.attr)
     resolved: dict[str, set[str]] = {}
     for name, definitions in by_name.items():
-        if len(definitions) != 1:
+        if len(definitions) != 1 or name in ambiguous:
             resolved[name] = set()
             continue
         sites = calls.get(name, [])
@@ -812,11 +830,9 @@ def test_every_public_transaction_method_poisons_on_failure():
         for node in ast.walk(tree)
         if isinstance(node, ast.ClassDef) and node.name == "_StoreTransaction"
     )
-    methods = {
-        node.name: node for node in body if isinstance(node, ast.FunctionDef)
-    }
+    methods = {node.name: node for node in body if isinstance(node, FunctionScope)}
 
-    def opens_mutating(node: ast.FunctionDef) -> bool:
+    def opens_mutating(node: FunctionScope) -> bool:
         statements = [line for line in node.body if not _is_docstring(line)]
         if len(statements) != 1 or not isinstance(statements[0], ast.With):
             return False
@@ -1320,6 +1336,26 @@ def test_sql_guard_accepts_imported_store_constants(
             "def hostile(connection):\n"
             "    connection.execute(SAFE)\n"
         ),
+        (
+            "SCHEMA_STATEMENTS = (runtime_statement(),)\n"
+            "def hostile(connection):\n"
+            "    for statement in SCHEMA_STATEMENTS:\n"
+            "        connection.execute(statement)\n"
+        ),
+        (
+            "SCHEMA_STATEMENTS = ['SELECT 1']\n"
+            "def hostile(connection):\n"
+            "    for statement in SCHEMA_STATEMENTS:\n"
+            "        connection.execute(statement)\n"
+        ),
+        (
+            "SAFE = 'SELECT 1'\n"
+            "def run(connection, statement):\n"
+            "    connection.execute(statement)\n"
+            "def caller(connection, other):\n"
+            "    run(connection, SAFE)\n"
+            "    other.run(connection, runtime_statement())\n"
+        ),
     ],
     ids=(
         "attribute",
@@ -1339,6 +1375,9 @@ def test_sql_guard_accepts_imported_store_constants(
         "async-shadow",
         "omitted-runtime-default",
         "reassigned-module-constant",
+        "runtime-tuple-element",
+        "mutable-schema-loop",
+        "non-self-helper-call",
     ),
 )
 def test_sql_guard_rejects_hostile_resolution_paths(
@@ -1812,6 +1851,25 @@ def test_transaction_guard_requires_one_complete_self_mutating_body(
         tmp_path,
         monkeypatch,
         {"connection": "class _StoreTransaction:\n    def _mutating(self): pass\n" + method},
+    )
+    with pytest.raises(AssertionError):
+        test_every_public_transaction_method_poisons_on_failure()
+
+
+def test_transaction_guard_rejects_an_unguarded_async_public_method(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _plant_store_package(
+        tmp_path,
+        monkeypatch,
+        {
+            "connection": (
+                "class _StoreTransaction:\n"
+                "    def _mutating(self): pass\n"
+                "    async def hostile(self):\n"
+                "        write()\n"
+            )
+        },
     )
     with pytest.raises(AssertionError):
         test_every_public_transaction_method_poisons_on_failure()
