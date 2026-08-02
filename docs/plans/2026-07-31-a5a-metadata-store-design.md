@@ -1678,16 +1678,17 @@ the two from drifting apart:
 
 The producer is not always A5a, and an earlier draft's "A5a creates every entry in its own namespace"
 was flatly contradicted by §8.3 two sections earlier: A5a hands `staging_fd` and `work_fd` out as
-borrowed anchors precisely so that A6 writes captures and A7 builds `CreateDirectory.WORK`. What A5a
-actually owns is narrower and still sufficient — it knows *who* is allowed to write into each
-directory, and what each of them is allowed to produce, because both are fixed by the authority. That
-is the version of the claim the table below can support.
+borrowed anchors precisely so that authority §7.3's preparation pipeline writes preimages and planned
+postimages while A7 builds `CreateDirectory.WORK`. What A5a actually owns is narrower and still
+sufficient — it knows *who* is allowed to write into each directory, and what each of them is allowed
+to produce, because both are fixed by the authority. That is the version of the claim the table below
+can support.
 
 | Directory | Producer, and the entries it can write | Enforced by |
 | --- | --- | --- |
 | `blobs/sha256/` | A5a's promotion alone: a regular file named with 64 hex characters whose bytes hash to that name — §8.1 step 1 verified the source and step 2 renamed it under the extracted digest. | §7.3 |
 | `staging/`, `work/` | A5a's `create_workspace` alone: a directory whose name passes §5.5's txid rule — it validated the name and `mkdirat` made it a directory. | §8.3 |
-| `staging/<txid>/` | **A6**, through the borrowed `staging_fd`: regular files and nothing else, since authority §7.3 step 3 has it stream captured file bodies here. | §8.3 |
+| `staging/<txid>/` | **Authority §7.3's preparation pipeline**, through the borrowed `staging_fd`: regular preimage and planned-postimage files and nothing else. A6 supplies captured preimages; A5a is source-agnostic and verifies the complete manifest before promotion. | §8.3 |
 | `work/<txid>/` | **A7**, through the borrowed `work_fd`, and its output is not A5a's to judge: authority §9.5 classifies these by inode against the live filesystem, so removal refuses a non-empty one outright (§8.3). | §8.3 |
 
 The verdict is `MetadataStoreInvalid` rather than `ProtocolError` because the condition is a fact about

@@ -133,7 +133,7 @@ def two_length_spec():
 
 
 def stage(workspace, name: str, content: bytes) -> None:
-    """Write one capture into staging/<txid>/ through the borrowed anchor, as A6 does."""
+    """Write one preparation blob through the borrowed staging anchor."""
     fd = os.open(name, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600, dir_fd=workspace.staging_fd)
     try:
         os.write(fd, content)
