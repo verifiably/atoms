@@ -22,6 +22,7 @@ from atoms.core.recovery.model import (
     IdentityRelation,
     JournalState,
     OperatorAction,
+    RollbackResult,
     TransactionState,
 )
 from atoms.store.errors import MetadataStoreInvalid
@@ -407,9 +408,9 @@ def test_setting_a_journal_state_for_an_unknown_effect_refuses(opened_store):
 
 
 def test_set_active_enforces_the_single_active_row(opened_store, store_binding):
+    commit_record(opened_store, store_binding, "tx1", one_effect_spec())
+    commit_record(opened_store, store_binding, "tx2", replace_spec())
     with opened_store.transaction() as txn:
-        txn.insert_record("tx1", one_effect_spec())
-        txn.insert_record("tx2", replace_spec())
         txn.set_active("tx1")
         txn.set_active("tx2")
     raw = raw_connect(store_binding)
@@ -483,11 +484,25 @@ def _plant(raw, sql, parameters=()):
     raw.execute(sql, parameters)
 
 
+def _plant_spec_json(raw, spec_json, effect_rows):
+    raw.execute("DELETE FROM effect WHERE txid = 'tx1'")
+    raw.execute("DELETE FROM transaction_record WHERE txid = 'tx1'")
+    raw.execute(
+        "INSERT INTO transaction_record VALUES "
+        "('tx1', ?, 'prepared', 'uncommitted', NULL, NULL)",
+        (spec_json,),
+    )
+    for effect_id, variant in effect_rows:
+        raw.execute(
+            "INSERT INTO effect VALUES ('tx1', ?, ?, 'pending')", (effect_id, variant)
+        )
+
+
 @pytest.mark.parametrize(
     ("rule", "prepare", "corrupt"),
     (
-        (RULE_SPEC_DECODES, one_effect_spec, lambda raw: _plant(raw, "UPDATE transaction_record SET spec_json = '{\"nope\": 1}'")),
-        (RULE_SPEC_COMPILES, non_compiling_spec, lambda raw: None),
+        (RULE_SPEC_DECODES, one_effect_spec, lambda raw: _plant_spec_json(raw, '{"nope": 1}', ())),
+        (RULE_SPEC_COMPILES, one_effect_spec, lambda raw: _plant_spec_json(raw, canonical_json(non_compiling_spec()), (("only", "create_file_no_clobber"),))),
         (RULE_EFFECT_COVERAGE, one_effect_spec, lambda raw: _plant(raw, "DELETE FROM effect")),
         (RULE_EFFECT_VARIANT, one_effect_spec, lambda raw: _plant(raw, "UPDATE effect SET variant = 'delete_path'")),
         (RULE_BLOB_ROW_PRESENT, replace_spec, lambda raw: _plant(raw, "DELETE FROM blob")),

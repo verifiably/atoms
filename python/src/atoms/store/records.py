@@ -30,6 +30,7 @@ from atoms.core.recovery.model import (
     IdentityRelation,
     JournalState,
     OperatorAction,
+    RollbackResult,
     TransactionState,
 )
 from atoms.store.errors import MetadataStoreInvalid
