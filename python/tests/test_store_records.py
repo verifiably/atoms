@@ -46,10 +46,10 @@ from atoms.store.records import (
 )
 from tests.store_support import (
     commit_record,
+    digest_of,
     duplicate_effect_spec,
     every_diagnostic_shape,
     matching_diagnostic,
-    digest_of,
     non_compiling_spec,
     one_effect_spec,
     raw_connect,
@@ -668,6 +668,7 @@ def test_a_read_takes_one_snapshot_across_a_concurrent_commit(store_on):
             reader._connection.set_trace_callback(None)
         after = reader.read_record("tx1")
     assert fired
+    assert during is not None and after is not None
     assert (during.state, during.journals[0].state) == (TransactionState.PREPARED, JournalState.PENDING)
     assert (after.state, after.journals[0].state) == (TransactionState.APPLYING, JournalState.STARTED)
 
