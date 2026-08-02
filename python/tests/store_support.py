@@ -234,6 +234,21 @@ def close_binding(binding) -> None:
 #: `binding.active` would fail half of them.
 RELEASES = (close_binding, release_lock)
 
+#: Design §7.1's public Store methods and one valid-enough argument tuple for each.
+#: `close` is absent because it is the sole operation that succeeds after close.
+STORE_SURFACE: tuple[tuple[str, tuple[object, ...]], ...] = (
+    ("transaction", ()),
+    ("read_record", ("tx1",)),
+    ("read_active", ()),
+    ("open_blob", ("sha256:" + "a" * 64,)),
+    ("list_unindexed_blobs", ()),
+    ("remove_unindexed_blob", ("sha256:" + "a" * 64,)),
+    ("create_workspace", ("tx1",)),
+    ("reopen_workspace", ("tx1",)),
+    ("list_workspaces", ()),
+    ("remove_workspace", (None,)),
+)
+
 
 class CommitFails:
     """A connection proxy whose COMMIT raises with the transaction left open.

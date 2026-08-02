@@ -807,6 +807,16 @@ class Store:
 
         return open_blob(self, digest)
 
+    def list_unindexed_blobs(self) -> tuple[str, ...]:
+        from atoms.store.blobs import list_unindexed_blobs
+
+        return list_unindexed_blobs(self)
+
+    def remove_unindexed_blob(self, digest: str) -> None:
+        from atoms.store.blobs import remove_unindexed_blob
+
+        remove_unindexed_blob(self, digest)
+
     def __enter__(self) -> Self:
         return self
 

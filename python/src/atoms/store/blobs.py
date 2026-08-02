@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from atoms.core.errors import ProtocolError
-from atoms.store.errors import MetadataStoreInvalid
+from atoms.store.errors import MetadataStoreInvalid, translated
 from atoms.store.records import SELECT_BLOB
 from atoms.store.workspace import STAGING_PARENT, Workspace
 
@@ -25,6 +25,8 @@ INSERT_BLOB = (
     "INSERT INTO blob (digest, byte_len) VALUES (?, ?) "
     "ON CONFLICT(digest) DO NOTHING"
 )
+_BEGIN_IMMEDIATE_SQL = "BEGIN IMMEDIATE"
+_COMMIT_SQL = "COMMIT"
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +63,17 @@ def digest_to_leaf(digest: str) -> str:
 
 def leaf_to_digest(leaf: str) -> str:
     return require_digest(f"sha256:{leaf}")
+
+
+def leaf_to_digest_or_refuse(leaf: str) -> str:
+    """Require the exact name shape promotion produces under blobs/sha256/."""
+    try:
+        return leaf_to_digest(leaf)
+    except ProtocolError as caught:
+        raise MetadataStoreInvalid(
+            f"{BLOBS_PARENT}/{leaf!r} is not a name promotion could have written; "
+            "leaf names are fixed-width hex by construction"
+        ) from caught
 
 
 def _blobs_fd(store: Store) -> int:
@@ -135,6 +148,89 @@ def open_blob(store: Store, digest: str) -> int:
         os.close(fd)
         raise
     return fd
+
+
+def list_unindexed_blobs(store: Store) -> tuple[str, ...]:
+    """Return verified leaves with no blob row, from one deferred read snapshot."""
+    store._require_live()
+    parent = _blobs_fd(store)
+    try:
+        orphans: list[str] = []
+        with store._read_transaction() as connection:
+            for leaf in sorted(os.listdir(parent)):
+                digest = leaf_to_digest_or_refuse(leaf)
+                with translated("reading blob membership during reclamation"):
+                    row = connection.execute(SELECT_BLOB, (digest,)).fetchone()
+                try:
+                    fd = open_entry_nofollow(parent, leaf, f"the leaf for {digest}")
+                except FileNotFoundError as caught:
+                    raise MetadataStoreInvalid(
+                        f"the leaf for {digest} disappeared during enumeration"
+                    ) from caught
+                try:
+                    verify_leaf(fd, digest, None if row is None else row[0])
+                finally:
+                    os.close(fd)
+                if row is None:
+                    orphans.append(digest)
+    finally:
+        os.close(parent)
+    store._require_live()
+    return tuple(orphans)
+
+
+def remove_unindexed_blob(store: Store, digest: str) -> None:
+    """Verify and unlink one still-unindexed leaf under a writer lock."""
+    from atoms.store.connection import _rollback_quietly, gate
+
+    require_digest(digest)
+    store._require_live()
+    if store._active_transaction is not None:
+        raise ProtocolError(
+            "remove_unindexed_blob opens its own write transaction and cannot nest "
+            "inside this Store's write transaction"
+        )
+    with translated("beginning reclamation"):
+        store._connection.execute(_BEGIN_IMMEDIATE_SQL)
+    try:
+        with translated("rechecking blob membership during reclamation"):
+            row = store._connection.execute(SELECT_BLOB, (digest,)).fetchone()
+        if row is not None:
+            raise ProtocolError(
+                f"{digest} is indexed; remove_unindexed_blob can only delete something "
+                "no record names"
+            )
+        parent = _blobs_fd(store)
+        try:
+            try:
+                fd = open_entry_nofollow(
+                    parent, digest_to_leaf(digest), f"the leaf for {digest}"
+                )
+            except FileNotFoundError as caught:
+                raise ProtocolError(
+                    f"no leaf for {digest}; the argument is stale, re-enumerate"
+                ) from caught
+            try:
+                verify_leaf(fd, digest, None)
+            finally:
+                os.close(fd)
+            backend = store._binding.backend
+            gate(store._binding)
+            try:
+                os.unlink(digest_to_leaf(digest), dir_fd=parent)
+            except FileNotFoundError as caught:
+                raise ProtocolError(
+                    f"no leaf for {digest}; the argument is stale, re-enumerate"
+                ) from caught
+            backend.flush_directory(parent)
+        finally:
+            os.close(parent)
+        gate(store._binding)
+        with translated("ending reclamation"):
+            store._connection.execute(_COMMIT_SQL)
+    except BaseException:
+        _rollback_quietly(store._connection)
+        raise
 
 
 def _preflight(store: Store, workspace: Workspace, manifest: tuple[StagedBlob, ...]) -> None:

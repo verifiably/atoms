@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import signal
+import sqlite3
 
 import pytest
 
@@ -725,3 +726,259 @@ def test_a_retained_transaction_cannot_promote_into_a_later_transaction(opened_s
 def test_promotion_is_only_a_transaction_operation(opened_store):
     assert not hasattr(opened_store, "promote_staging")
     assert not hasattr(opened_store, "insert_blobs")
+
+
+def _promote_orphan(store, content: bytes = b"orphaned") -> str:
+    digest = digest_of(content)
+    with store.create_workspace("tx1") as workspace:
+        stage(workspace, "one", content)
+        with pytest.raises(ProtocolError) as caught, store.transaction() as txn:
+            txn.promote_staging(workspace, _manifest(("one", content)))
+    assert digest in str(caught.value)
+    assert "does not reference" in str(caught.value)
+    return digest
+
+
+def test_a_promoted_orphan_is_listed_and_removed(opened_store, store_binding):
+    digest = _promote_orphan(opened_store)
+    assert opened_store.list_unindexed_blobs() == (digest,)
+    opened_store.remove_unindexed_blob(digest)
+    assert opened_store.list_unindexed_blobs() == ()
+    with child_dir(store_binding.metadata_root_fd, "blobs/sha256") as blobs_fd:
+        assert os.listdir(blobs_fd) == []
+
+
+def test_enumeration_is_one_deferred_read_transaction(opened_store):
+    digest = _promote_orphan(opened_store)
+    statements: list[str] = []
+    opened_store._connection.set_trace_callback(statements.append)
+    try:
+        assert opened_store.list_unindexed_blobs() == (digest,)
+    finally:
+        opened_store._connection.set_trace_callback(None)
+    assert statements[0] == "BEGIN"
+    assert statements[-1] == "ROLLBACK"
+    assert statements.count("BEGIN") == 1
+    assert "BEGIN IMMEDIATE" not in statements
+
+
+def test_removal_rechecks_in_one_immediate_transaction(opened_store):
+    digest = _promote_orphan(opened_store)
+    statements: list[str] = []
+    opened_store._connection.set_trace_callback(statements.append)
+    try:
+        opened_store.remove_unindexed_blob(digest)
+    finally:
+        opened_store._connection.set_trace_callback(None)
+    assert statements[0] == "BEGIN IMMEDIATE"
+    assert statements[-1] == "COMMIT"
+    assert statements.count("BEGIN IMMEDIATE") == 1
+
+
+def test_an_indexed_digest_is_refused_and_still_exists(promoted_blob):
+    store, digest, _content = promoted_blob
+    assert digest not in store.list_unindexed_blobs()
+    with pytest.raises(ProtocolError) as caught:
+        store.remove_unindexed_blob(digest)
+    assert digest in str(caught.value)
+    assert "indexed" in str(caught.value)
+    os.close(store.open_blob(digest))
+
+
+def test_removing_an_already_absent_leaf_raises_protocol_error(opened_store):
+    digest = f"sha256:{HEX}"
+    with pytest.raises(ProtocolError) as caught:
+        opened_store.remove_unindexed_blob(digest)
+    assert digest in str(caught.value)
+    assert "stale" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("kind", "message"),
+    [
+        ("symlink", "is a symlink"),
+        ("directory", "not a regular file"),
+        ("fifo", "not a regular file"),
+        ("wrong_content", "hashes to sha256:"),
+    ],
+)
+def test_an_unverifiable_orphan_is_preserved(opened_store, store_binding, kind, message):
+    digest = digest_of(b"pretend")
+    leaf = digest_to_leaf(digest)
+    with child_dir(store_binding.metadata_root_fd, "blobs/sha256") as blobs_fd:
+        if kind == "symlink":
+            os.symlink("/etc/passwd", leaf, dir_fd=blobs_fd)
+        elif kind == "directory":
+            os.mkdir(leaf, dir_fd=blobs_fd)
+        elif kind == "fifo":
+            os.mkfifo(leaf, 0o600, dir_fd=blobs_fd)
+        else:
+            fd = os.open(leaf, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600, dir_fd=blobs_fd)
+            try:
+                os.write(fd, b"different")
+            finally:
+                os.close(fd)
+        with pytest.raises(MetadataStoreInvalid) as caught:
+            opened_store.remove_unindexed_blob(digest)
+        assert digest in str(caught.value)
+        assert message in str(caught.value)
+        assert leaf in os.listdir(blobs_fd)
+
+
+@pytest.mark.parametrize(
+    ("kind", "message"),
+    [
+        ("symlink", "is a symlink"),
+        ("directory", "not a regular file"),
+        ("fifo", "not a regular file"),
+        ("wrong_content", "hashes to sha256:"),
+    ],
+)
+def test_enumeration_preserves_and_refuses_an_unverifiable_leaf(
+    opened_store, store_binding, kind, message
+):
+    digest = digest_of(b"pretend")
+    leaf = digest_to_leaf(digest)
+    with child_dir(store_binding.metadata_root_fd, "blobs/sha256") as blobs_fd:
+        if kind == "symlink":
+            os.symlink("elsewhere", leaf, dir_fd=blobs_fd)
+        elif kind == "directory":
+            os.mkdir(leaf, dir_fd=blobs_fd)
+        elif kind == "fifo":
+            os.mkfifo(leaf, 0o600, dir_fd=blobs_fd)
+        else:
+            fd = os.open(leaf, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600, dir_fd=blobs_fd)
+            try:
+                os.write(fd, b"different")
+            finally:
+                os.close(fd)
+        with pytest.raises(MetadataStoreInvalid) as caught:
+            opened_store.list_unindexed_blobs()
+        assert digest in str(caught.value)
+        assert message in str(caught.value)
+        assert leaf in os.listdir(blobs_fd)
+
+
+def test_a_leaf_that_is_not_well_formed_hex_refuses_the_enumeration(
+    opened_store, store_binding
+):
+    with child_dir(store_binding.metadata_root_fd, "blobs/sha256") as blobs_fd:
+        fd = os.open("tmp.part", os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600, dir_fd=blobs_fd)
+        os.close(fd)
+        with pytest.raises(MetadataStoreInvalid) as caught:
+            opened_store.list_unindexed_blobs()
+        assert "tmp.part" in str(caught.value)
+        assert "fixed-width hex" in str(caught.value)
+        assert "tmp.part" in os.listdir(blobs_fd)
+
+
+@pytest.mark.parametrize("bad", [3, None, b"x"])
+def test_reclamation_requires_an_exact_string_digest(opened_store, bad):
+    with pytest.raises(ProtocolError) as caught:
+        opened_store.remove_unindexed_blob(bad)
+    assert "must be exactly str" in str(caught.value)
+
+
+def test_removal_is_refused_inside_a_write_transaction(opened_store):
+    with opened_store.transaction() as txn:
+        txn.insert_record("tx1", one_effect_spec())
+        with pytest.raises(ProtocolError) as caught:
+            opened_store.remove_unindexed_blob(f"sha256:{HEX}")
+        assert "write transaction" in str(caught.value)
+
+
+def test_a_reclaimer_does_not_race_another_stores_promotion(store_on):
+    import threading
+
+    content = b"contested"
+    digest = digest_of(content)
+    with store_on() as binding, open_store(binding) as writer:
+        with writer.create_workspace("tx1") as workspace:
+            stage(workspace, "one", content)
+            ready = threading.Event()
+            started = threading.Event()
+            enumerated = threading.Event()
+            attempted_remove = threading.Event()
+            outcome: dict[str, object] = {}
+
+            def reclaim():
+                try:
+                    with open_store(binding) as reclaimer:
+                        reclaimer._connection.set_trace_callback(
+                            lambda statement: attempted_remove.set()
+                            if statement == "BEGIN IMMEDIATE"
+                            else None
+                        )
+                        ready.set()
+                        if not started.wait(5):
+                            raise AssertionError("writer never armed the interleaving")
+                        candidates = reclaimer.list_unindexed_blobs()
+                        outcome["candidates"] = candidates
+                        enumerated.set()
+                        for candidate in candidates:
+                            reclaimer.remove_unindexed_blob(candidate)
+                        outcome["error"] = None
+                except Exception as caught:  # noqa: BLE001 -- recorded, then asserted
+                    outcome["error"] = caught
+
+            thread = threading.Thread(target=reclaim)
+            thread.start()
+            assert ready.wait(5)
+            with writer.transaction() as txn:
+                txn.promote_staging(
+                    workspace,
+                    (StagedBlob(name="one", digest=digest, byte_len=len(content)),),
+                )
+                txn.insert_record("tx1", spec_referencing(content))
+                started.set()
+                assert enumerated.wait(5)
+                assert attempted_remove.wait(5)
+            thread.join(10)
+            assert not thread.is_alive()
+        assert outcome.get("candidates") == (digest,)
+        assert isinstance(outcome.get("error"), ProtocolError)
+        assert digest in str(outcome["error"])
+        assert "indexed" in str(outcome["error"])
+        with open_store(binding) as reader:
+            record = reader.read_record("tx1")
+            assert record is not None
+            os.close(reader.open_blob(digest))
+
+
+def test_a_failed_orphan_verification_rolls_back_the_writer_transaction(
+    opened_store, store_binding
+):
+    digest = digest_of(b"pretend")
+    with child_dir(store_binding.metadata_root_fd, "blobs/sha256") as blobs_fd:
+        fd = os.open(
+            digest_to_leaf(digest),
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+            0o600,
+            dir_fd=blobs_fd,
+        )
+        os.write(fd, b"different")
+        os.close(fd)
+    statements: list[str] = []
+    opened_store._connection.set_trace_callback(statements.append)
+    try:
+        with pytest.raises(MetadataStoreInvalid) as caught:
+            opened_store.remove_unindexed_blob(digest)
+    finally:
+        opened_store._connection.set_trace_callback(None)
+    assert digest in str(caught.value)
+    assert statements[-1] == "ROLLBACK"
+    assert not opened_store._connection.in_transaction
+
+
+def test_a_failed_reclamation_commit_rolls_back_the_sqlite_transaction(
+    opened_store, monkeypatch
+):
+    from tests.store_support import CommitFails
+
+    digest = _promote_orphan(opened_store)
+    proxy = CommitFails(opened_store._connection)
+    monkeypatch.setattr(opened_store, "_connection", proxy)
+    with pytest.raises(sqlite3.OperationalError) as caught:
+        opened_store.remove_unindexed_blob(digest)
+    assert "disk I/O error" in str(caught.value)
+    assert not proxy.in_transaction
