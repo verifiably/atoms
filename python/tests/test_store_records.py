@@ -107,25 +107,41 @@ def test_every_path_state_variant_round_trips_inside_a_diagnostic_entry(state):
 @pytest.mark.parametrize(
     ("mutate", "names"),
     [
-        (lambda obj: obj.pop("reason"), "reason"),
+        (
+            lambda obj: obj.pop("reason"),
+            # `_require_keys` is the only check that can catch a missing field, so there is
+            # no field-specific path underneath it to mask -- but the assertion still has to
+            # prove *reason specifically* went missing, not merely that some key did. The
+            # `got` list is the complete, alphabetically sorted set of the other 11 fields
+            # with `reason` absent; pinned whole, it cannot be produced by any other case's
+            # mutation (verified: absent from all 12 other real messages).
+            (
+                "got ['commit_decision', 'effect_id', 'expected', 'identity_relations', "
+                "'journals', 'observed', 'operator_action', 'paths', 'pre_halt_state', "
+                "'projected_journals', 'projected_transaction_state']"
+            ),
+        ),
         (lambda obj: obj.update({"reason": "no_such_reason"}), "HaltReason"),
         (lambda obj: obj.update({"unexpected": 1}), "unexpected"),
         (lambda obj: obj.update({"pre_halt_state": "not_a_state"}), "TransactionState"),
-        (lambda obj: obj.update({"journals": [{"effect_id": "e1"}]}), "state"),
+        (
+            lambda obj: obj.update({"journals": [{"effect_id": "e1"}]}),
+            "expected keys ['effect_id', 'state'], got ['effect_id']",
+        ),
         # Shapes that reached a *raw* exception before the field checks existed.
         # `journals: 5` left as `TypeError: 'int' object is not iterable`; `paths` as a
         # string decoded character by character and refused nothing; `effect_id: 7` was
         # copied straight through into a HaltDiagnostic A3 would later choke on.
-        (lambda obj: obj.update({"journals": 5}), "journals"),
-        (lambda obj: obj.update({"paths": "a.txt"}), "paths"),
+        (lambda obj: obj.update({"journals": 5}), "journals must be an array"),
+        (lambda obj: obj.update({"paths": "a.txt"}), "paths must be an array"),
         (lambda obj: obj.update({"paths": ["a.txt", 7]}), "paths[1]"),
-        (lambda obj: obj.update({"effect_id": 7}), "effect_id"),
-        (lambda obj: obj.update({"expected": {"slot": "a"}}), "expected"),
+        (lambda obj: obj.update({"effect_id": 7}), "effect_id must be a string"),
+        (lambda obj: obj.update({"expected": {"slot": "a"}}), "expected must be an array"),
         (lambda obj: obj["journals"][0].update({"effect_id": None}), "NoneType"),
         # The two nullable fields: null is a value, but only null. A helper that admits
         # `None` must not thereby admit everything else.
         (lambda obj: obj["expected"][0].update({"has_unmodeled_child": "yes"}), "has_unmodeled_child"),
-        (lambda obj: obj.update({"effect_id": False}), "effect_id"),
+        (lambda obj: obj.update({"effect_id": False}), "effect_id must be a string, got bool"),
     ],
 )
 def test_a_malformed_diagnostic_payload_refuses(mutate, names):
