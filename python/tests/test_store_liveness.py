@@ -166,3 +166,24 @@ def test_lock_released_before_commit_rolls_back(store_on, release):
             assert raw.execute("SELECT count(*) FROM transaction_record").fetchone() == (0,)
         finally:
             raw.close()
+
+
+@pytest.mark.parametrize("release", RELEASES, ids=("closed_binding", "released_lock"))
+def test_lock_released_during_a_load_returns_no_record(store_on, monkeypatch, release):
+    from atoms.store import records as records_module
+    from tests.store_support import one_effect_spec
+
+    with store_on() as binding:
+        store = open_store(binding)
+        with store.transaction() as txn:
+            txn.insert_record("tx1", one_effect_spec())
+        real = records_module.coherence_findings
+
+        def release_then_check(connection, txid):
+            release(binding)
+            return real(connection, txid)
+
+        monkeypatch.setattr(records_module, "coherence_findings", release_then_check)
+        with pytest.raises(ProtocolError):
+            store.read_record("tx1")
+        store.close()
