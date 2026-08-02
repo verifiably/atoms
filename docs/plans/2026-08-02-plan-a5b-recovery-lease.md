@@ -43,8 +43,13 @@ implementation, stop and report it — do not adapt around it silently.**
 | `PathResolver._NAMESPACE_CONTRADICTIONS` has **one** use inside the class — `self._NAMESPACE_CONTRADICTIONS` at `resolve.py:207`. | `resolve.py:144`, `:207` |
 | `OBSERVED_ABSENT`, `EntryIdentity`, and `FileBuildRelation` are all re-exported by `atoms.core.recovery`. | package `__init__` |
 | `promote_staging` renames each blob into `blobs/` and flushes it **before** `INSERT_BLOB` runs in the SQLite transaction. A rolled-back transaction therefore leaves a real unindexed blob — the only way to produce one. | probe: rollback left one digest in `list_unindexed_blobs()` |
-| `bind_project_volume` with the shipping empty allowlist raises `CapabilityUnavailable("volume configuration is not on the supplied durability allowlist: …")`. | probe, 2026-08-02 |
+| `bind_project_volume` with the shipping empty allowlist raises `CapabilityUnavailable("volume configuration is not on the supplied durability allowlist: …")` — but **only after** its own step-4 reclamation, so `probe/` is emptied even with no root-level reclamation at all. This refusal cannot discriminate where `root.py` reclaims. | probe, 2026-08-02; `binding.py:192` then `:194` |
+| An **absent project root** refuses at `binding.py:177`'s `establish_root(create=False)` — the first statement in `bind_project_volume`, before reclamation — with `FileNotFoundError('[Errno 2] No such file or directory')` and no filename. Assert the type, not the message. | probe, 2026-08-02 |
 | `metadata_root/probe/` exists after the first successful bind, so `reclaim_probe_survivors` has somewhere to reclaim from on a later entry. | probe: entries were `blobs, lock, probe, staging, work` |
+| A topology that parents `PersistentNode('d/f.txt')` and `ScratchNode('e1', STAGING)` **directly at `ProjectRoot()`** — dropping A4b's intermediate `TopologyDirectory(node_id=0)` — is accepted by both `build_recovery_snapshot` and `classify_recovery` (same `ActionPlan`, 3 steps) and is `!=` the resolved topology. The topology guard therefore has an independently failing case. | probe, 2026-08-02 |
+| `coherence_findings` compares a stored `HaltDiagnostic`'s `commit_decision` and `journals` against the durable rows, and **nothing else** — not `paths`, not `pre_halt_state`. `matching_diagnostic("e1")` is therefore committable against the `d/f.txt` record. | `records.py:484-492` |
+| No coherence rule couples a journal state to the transaction state, so a journal row may be advanced independently of the record's state. | `records.py:455-500` |
+| `HeldProjectLock._lock_fd` holds the `flock`. `os.dup` of it shares the open file description, so the lock survives the original's close — the one-line mutation that leaks the lock. | `lock.py:145-153` |
 | `coherence_findings` requires a `blob` row for every referenced digest, and requires `rollback_result` present exactly when `ROLLED_BACK` and `halt_diagnostic` present exactly when `HALTED`. | `records.py:472-483` |
 | For `CreateFileNoClobber("e1", "d/f.txt")` with `d` existing: parent node is `TopologyDirectory(node_id=0)` (**not** `PersistentNode`), scratch leaf is `.#~<txid>.e1.staging`, `work_base` is `None`. | probe, 2026-08-02 |
 | For `CreateDirectory("e1", "d")` + `CreateFileNoClobber("e2", "d/f.txt")`: `directories` holds `ApprovedExistingDirectory(ProjectRoot())`, `ApprovedPlannedDirectory(PersistentNode('d'))`, `ApprovedPlannedDirectory(WorkRoot())`; `work_base` is populated. All three §6.4 branches come from this one spec. | probe, 2026-08-02 |
@@ -423,8 +428,10 @@ test needs torn down.
 
 from __future__ import annotations
 
+import hashlib
 import os
 
+from atoms.core.canonical import canonical_json
 from atoms.core.compiler import CompiledSpec, compile_spec
 from atoms.core.effects import CreateDirectory, CreateFileNoClobber
 from atoms.core.fingerprint import ABSENT, DirectoryState
@@ -482,6 +489,16 @@ def directory_spec() -> TransactionSpec:
             CreateFileNoClobber(effect_id="e2", path="d/f.txt", post=POST),
         ],
     )
+
+
+def spec_digest(spec: TransactionSpec) -> str:
+    """A short stable identity for a spec, for comparison across a process boundary.
+
+    `canonical_json` is the same encoding A5a stores and re-verifies, so two specs share
+    a digest exactly when the store would treat them as one. Hashed rather than sent
+    whole so the child's JSON stays small and an assertion failure stays readable.
+    """
+    return hashlib.sha256(canonical_json(spec).encode("utf-8")).hexdigest()
 
 
 def compiled_for(lease: Lease) -> CompiledSpec:
@@ -759,18 +776,29 @@ import block.
 
 - [ ] **Step 7: Prove reclamation runs even when binding then refuses**
 
-Ledger #17 says *every* lease entry reclaims probe survivors, which holds only if reclamation precedes
-the first thing that can refuse. `bind_project_volume` reaches its own reclamation at step 4, after
-checks that can refuse first — and the shipping empty allowlist makes it refuse every time, which is
-exactly the early refusal this must survive.
+Ledger #17 says *every* lease entry reclaims probe survivors, which holds only if `root.py` reclaims
+before the first thing that can refuse.
+
+**Not every refusal can prove that.** `bind_project_volume` reclaims at `binding.py:192` and only then
+matches the allowlist at `:194`, so an empty-allowlist refusal empties `probe/` by itself — measured
+2026-08-02, with no root-level reclamation in the call at all. A test built on that refusal stays green
+wherever `root.py` puts its reclamation, which makes it worthless as a guard.
+
+The refusal must land **before** `binding.py:192`. An absent project root does: `establish_root` at
+`binding.py:177` is the function's first statement, and it raises `FileNotFoundError` for a path that
+is not there. Nothing has been reclaimed by anyone at that point, so the survivor is gone only if
+`root.py` removed it.
 
 ```python
 def test_probe_survivors_are_reclaimed_before_an_early_bind_refusal(
-    coordinator_on, leased, monkeypatch
+    coordinator_on, leased
 ):
-    from atoms.core.errors import CapabilityUnavailable
+    """Ledger #17, at the one refusal that can discriminate.
+
+    The `FileNotFoundError` carries no filename -- measured `'[Errno 2] No such file or
+    directory'` -- so the type is the assertion.
+    """
     from atoms.coordinator import root
-    from atoms.fs.volume import DurabilityAllowlist
 
     ingredients = coordinator_on()
     backend, project_root, metadata_root, storage = ingredients
@@ -782,78 +810,145 @@ def test_probe_survivors_are_reclaimed_before_an_early_bind_refusal(
     assert probe_dir.is_dir()
     (probe_dir / "survivor.db").write_text("debris", encoding="utf-8")
 
-    # The real shipping constant: binding refuses every volume until A8 certifies one.
-    monkeypatch.setattr(
-        root, "CERTIFIED_ALLOWLIST", DurabilityAllowlist(entries=frozenset())
-    )
-    with pytest.raises(CapabilityUnavailable) as caught:
-        with root._recovery_lease(backend, project_root, metadata_root, storage):
+    absent = f"{project_root}-does-not-exist"
+    assert not Path(absent).exists()
+    with pytest.raises(FileNotFoundError):
+        with root._recovery_lease(backend, absent, metadata_root, storage):
             pass
 
-    assert "durability allowlist" in str(caught.value)
     assert list(probe_dir.iterdir()) == []
 ```
 
-Then move `reclaim_probe_survivors(lock)` to *after* the `bind_project_volume` line, re-run, and confirm
-this test fails on `list(probe_dir.iterdir()) == []`. Restore and report the observed failure.
+Then move `reclaim_probe_survivors(lock)` to *after* the `bind_project_volume` line — where it is
+inside the `with` body that never runs — re-run, and confirm this test fails on
+`list(probe_dir.iterdir()) == []`. Restore and report the observed failure.
+
+**Also run the mutation against the empty-allowlist shape**, as the negative control: temporarily swap
+`absent` for `project_root` and `root.CERTIFIED_ALLOWLIST` for `DurabilityAllowlist(entries=frozenset())`,
+keep the moved reclamation, and confirm the test **passes** anyway. Report both results together — the
+pair is what shows the chosen refusal is the load-bearing one. Restore both.
 
 - [ ] **Step 8: Prove the trap mutates no project path and releases everything**
 
 The process tier cannot prove release: a child exiting frees its descriptors and its `flock` whether or
-not the context managers unwound correctly. These two properties are therefore same-process only.
+not the context managers unwound correctly. These three properties are therefore same-process only.
+
+**Path names are not project state.** An overwrite in place, a `chmod`, or a truncation all leave the
+tree shape identical, so the comparison snapshots what a mutation would actually move — kind, mode,
+size, and content — for every path under the root:
 
 ```python
-def _project_tree(project_root: str) -> list[tuple[str, list[str], list[str]]]:
-    return [
-        (root_dir, sorted(dirs), sorted(files))
-        for root_dir, dirs, files in sorted(os.walk(project_root))
-    ]
+def _project_state(project_root: str) -> dict[str, tuple[object, ...]]:
+    """Every path under the project root, with the durable state of each.
+
+    Content is hashed rather than compared inline so a failure message stays readable,
+    and `lstat` is used throughout so a symlink is compared as a symlink.
+    """
+    state: dict[str, tuple[object, ...]] = {}
+    for directory, directories, files in os.walk(project_root):
+        directories.sort()
+        for name in sorted(directories) + sorted(files):
+            full = os.path.join(directory, name)
+            info = os.lstat(full)
+            if stat.S_ISLNK(info.st_mode):
+                payload: object = os.readlink(full)
+            elif stat.S_ISDIR(info.st_mode):
+                payload = None
+            else:
+                payload = hashlib.sha256(Path(full).read_bytes()).hexdigest()
+            state[os.path.relpath(full, project_root)] = (
+                stat.S_IFMT(info.st_mode),
+                stat.S_IMODE(info.st_mode),
+                info.st_size,
+                payload,
+            )
+    return state
+
+
+def _trapping_lease(coordinator_on, leased):
+    """Ingredients whose metadata root already holds a live record, so re-entering
+    `_recovery_lease` over them reaches `_resolve` and traps."""
+    from tests.store_support import one_effect_spec
+
+    ingredients = coordinator_on()
+    with leased(ingredients) as lease:
+        with lease._store.transaction() as txn:
+            txn.insert_record("tx1", one_effect_spec())
+            txn.set_active("tx1")
+    return ingredients
 
 
 def test_the_trap_mutates_no_project_path(coordinator_on, leased):
     from atoms.coordinator import root
-    from tests.store_support import one_effect_spec
 
-    ingredients = coordinator_on()
-    backend, project_root, metadata_root, storage = ingredients
-    with leased(ingredients) as lease:
-        with lease._store.transaction() as txn:
-            txn.insert_record("tx1", one_effect_spec())
-            txn.set_active("tx1")
+    backend, project_root, metadata_root, storage = _trapping_lease(
+        coordinator_on, leased
+    )
 
-    before = _project_tree(project_root)
-    with pytest.raises(NotImplementedError):
+    before = _project_state(project_root)
+    with pytest.raises(NotImplementedError) as caught:
         with root._recovery_lease(backend, project_root, metadata_root, storage):
             pass
 
-    assert _project_tree(project_root) == before
+    assert str(caught.value) == "recovery execution is not implemented until A7"
+    assert _project_state(project_root) == before
 
 
-def test_the_trap_releases_the_lock_and_every_descriptor(coordinator_on, leased):
+def test_the_trap_leaks_no_descriptor(coordinator_on, leased):
     """The trap raises from inside `_recovery_lease`'s generator, before its `yield`,
-    so both `with` blocks unwind. Nothing may be left holding the lock or a fd."""
+    so every `with` in the stack unwinds. One count covers the lock fd, both root
+    descriptors, and SQLite's own handles -- a leak of any of them moves it."""
     from atoms.coordinator import root
-    from tests.store_support import one_effect_spec
 
-    ingredients = coordinator_on()
-    backend, project_root, metadata_root, storage = ingredients
-    with leased(ingredients) as lease:
-        with lease._store.transaction() as txn:
-            txn.insert_record("tx1", one_effect_spec())
-            txn.set_active("tx1")
+    backend, project_root, metadata_root, storage = _trapping_lease(
+        coordinator_on, leased
+    )
 
-    open_fds = sorted(os.listdir("/proc/self/fd"))
-    with pytest.raises(NotImplementedError):
+    before = len(os.listdir("/proc/self/fd"))
+    with pytest.raises(NotImplementedError) as caught:
         with root._recovery_lease(backend, project_root, metadata_root, storage):
             pass
 
-    assert len(sorted(os.listdir("/proc/self/fd"))) == len(open_fds)
+    assert str(caught.value) == "recovery execution is not implemented until A7"
+    assert len(os.listdir("/proc/self/fd")) == before
+
+
+def test_the_trap_releases_the_project_lock(coordinator_on, leased):
+    """Separate from the descriptor count so a contender proves the `flock` itself is
+    gone, not merely that the number of open files came back."""
+    from atoms.coordinator import root
+
+    backend, project_root, metadata_root, storage = _trapping_lease(
+        coordinator_on, leased
+    )
+
+    with pytest.raises(NotImplementedError) as caught:
+        with root._recovery_lease(backend, project_root, metadata_root, storage):
+            pass
+
+    assert str(caught.value) == "recovery execution is not implemented until A7"
     assert _contend(metadata_root) == 0
 ```
 
-The descriptor count covers the lock fd, both root descriptors, and SQLite's own handles in one
-assertion — a leak of any of them moves the count. Then delete `_resolve`'s call site so the trap never
-fires, re-run, and confirm both tests fail rather than silently passing. Restore and report.
+Add `import hashlib` and `import stat` to the module's import block.
+
+**Three mutations, each of which must keep the trap firing.** Deleting `_resolve`'s call site would
+make all three tests fail at `pytest.raises` before reaching a single property assertion, which proves
+only that the trap exists — something the earlier tests already prove. Each mutation below is one line
+inserted into `_recovery_lease` immediately **before** `_resolve(store)`, where `binding` and `lock`
+are both in scope, so the trap still raises and the property is the only thing that changes:
+
+| Mutation | Must fail | Must still pass |
+| --- | --- | --- |
+| `os.open("mutant", os.O_CREAT \| os.O_WRONLY, 0o600, dir_fd=binding.project_root_fd)` | `test_the_trap_mutates_no_project_path` | the other two |
+| `os.dup(binding.project_root_fd)` | `test_the_trap_leaks_no_descriptor` | the other two |
+| `os.dup(lock._lock_fd)` | `test_the_trap_releases_the_project_lock` **and** `test_the_trap_leaks_no_descriptor` | `test_the_trap_mutates_no_project_path` |
+
+The third failing two tests is expected, not a defect in the split: `flock` is held by the open file
+description, so a duplicated lock descriptor keeps the lock alive past the original's close *and* is
+itself a leaked descriptor. What the pair shows is that the lock assertion is not vacuous — the first
+two mutations leave it green and the third does not. Restore after each, confirm
+`git status --porcelain` is empty, and report all four observed failures.
 
 - [ ] **Step 9: Run the gates and commit**
 
@@ -2418,6 +2513,29 @@ classifier's token anyway (`plan.py:130`), and building the snapshot from the pr
 - [ ] **Step 1: Extend `tests/coordinator_support.py`**
 
 ```python
+def flattened_topology(approved: ProjectApprovedSpec) -> RecoveryTopology:
+    """The proof's own nodes, re-parented directly at the project root.
+
+    A4b resolves `d/f.txt` through an intermediate `TopologyDirectory(node_id=0)`;
+    dropping it and parenting both the persistent and the scratch node at `ProjectRoot()`
+    keeps every rule `_validate_topology` enforces -- exact persistent and scratch
+    coverage, a shared resolved parent, an acyclic tree -- while producing a topology
+    that is `!=` the resolved one. Measured 2026-08-02: `build_recovery_snapshot` and
+    `classify_recovery` both accept it and yield the same `ActionPlan` shape.
+
+    This is the only way to reach `_require_projection_matches`'s topology comparison,
+    since the compiled comparison runs first and a different spec would trip that.
+    """
+    project = ProjectRoot()
+    return RecoveryTopology(
+        parents=tuple(
+            TopologyParent(node=edge.node, parent=project)
+            for edge in approved.topology.parents
+            if type(edge.node) in (PersistentNode, ScratchNode)
+        )
+    )
+
+
 def snapshot_for(
     approved: ProjectApprovedSpec,
     *,
@@ -2427,20 +2545,22 @@ def snapshot_for(
     staged: ObservedEntry,
     relation: FileBuildRelation | None = None,
     path: str = "d/f.txt",
+    topology: RecoveryTopology | None = None,
 ) -> RecoverySnapshot:
     """A snapshot over the PROOF's compiled spec and topology.
 
     Built from `approved` rather than from a parallel fixture so that
     `_require_projection_matches`'s compiled and topology equality checks are satisfied
     by construction: a snapshot describing a different spec is exactly the mismatch that
-    guard exists to catch.
+    guard exists to catch. `topology` overrides only that half, for the one test that
+    needs the compiled halves to agree while the topologies differ.
 
     `relation` must be None outside JournalState.STARTED -- `build_recovery_snapshot`
     refuses `file_build_relation is present in the wrong construction state` otherwise.
     """
     return build_recovery_snapshot(
         compiled=approved.compiled,
-        topology=approved.topology,
+        topology=approved.topology if topology is None else topology,
         transaction_state=state,
         commit_decision=CommitDecision.UNCOMMITTED,
         rollback_result=None,
@@ -2567,10 +2687,15 @@ from atoms.core.recovery import (
     JournalState,
     ObservedEntry,
     ObservedFile,
+    PersistentNode,
     PersistentObservation,
+    ProjectRoot,
     RecoverySnapshot,
+    RecoveryTopology,
+    ScratchNode,
     ScratchObservation,
     ScratchRole,
+    TopologyParent,
     TransactionState,
     build_recovery_snapshot,
     classify_recovery,
@@ -2770,6 +2895,46 @@ def test_a_plan_bound_to_another_compiled_spec_refuses(leased):
         assert "different compiled spec" in str(caught.value)
 
 
+def test_a_plan_bound_to_another_topology_refuses(leased):
+    """The topology comparison in isolation, with the compiled halves identical.
+
+    A4b resolves `d/f.txt` through an intermediate `TopologyDirectory`; this snapshot
+    parents the same two nodes at the project root instead. Measured 2026-08-02:
+    structurally valid, accepted by `build_recovery_snapshot` and `classify_recovery`,
+    and `!=` the resolved topology -- so the compiled equality passes and this check is
+    the only one left to fire.
+    """
+    from atoms.coordinator.transitions import persist_plan_prefix
+    from tests.coordinator_support import flattened_topology, snapshot_for
+    from atoms.core.recovery import (
+        OBSERVED_ABSENT,
+        JournalState,
+        TransactionState,
+        classify_recovery,
+    )
+
+    with leased() as lease:
+        approved, _ = prepared_metadata_only(lease)
+        rearranged = flattened_topology(approved)
+        assert rearranged != approved.topology
+
+        plan = classify_recovery(
+            snapshot_for(
+                approved,
+                state=TransactionState.PREPARED,
+                journal=JournalState.PENDING,
+                live=OBSERVED_ABSENT,
+                staged=OBSERVED_ABSENT,
+                topology=rearranged,
+            )
+        )
+
+        with pytest.raises(ProtocolError) as caught:
+            persist_plan_prefix(lease, approved, plan, 0)
+
+        assert "different topology" in str(caught.value)
+
+
 def test_a_record_whose_spec_disagrees_with_the_prefix_refuses(leased):
     """The spec comparison in isolation: the plan and the proof agree with each other,
     and every other durable field matches, but the record on disk was published from a
@@ -2963,16 +3128,14 @@ def _require_projection_matches(
 `canonical_json` is used for the spec rather than `==` because the record's spec was decoded from
 durable JSON; comparing the canonical encodings is the same comparison A5a's own coherence rules make.
 
-**The topology check needs an independent case or it must go.** `test_a_plan_bound_to_another_compiled_spec_refuses`
-trips the compiled comparison first, and for one compiled spec on one volume A4b's resolution is
-deterministic — so two proofs that agree on `compiled` appear to agree on `topology` as well. Try to
-build a `RecoverySnapshot` that pairs `approved.compiled` with a structurally valid but *different*
-`RecoveryTopology` (`tests/recovery_support.py:77`'s `create_topology` hand-builds one, so
-`build_recovery_snapshot` accepts hand-made topologies when they cover the spec). If such a snapshot
-can be built, add the case and assert `"different topology"`. **If it cannot, delete the topology
-comparison** and say so in the task report: the compiled equality already pins the spec, and shipping a
-guard no test can fail is the failure mode this project's review has caught repeatedly. Do not leave it
-in unproved.
+**Both comparisons have their own failing case.** The compiled one is
+`test_a_plan_bound_to_another_compiled_spec_refuses`; the topology one is
+`test_a_plan_bound_to_another_topology_refuses`, which keeps `approved.compiled` and substitutes
+`flattened_topology(approved)`. Design §8.2 requires the topology comparison, and it is not vacuous:
+`_validate_topology` constrains coverage and parentage but not *which* intermediate directory nodes a
+tree uses, so A4b's resolved arrangement and the flattened one are both valid for the same spec.
+Measured 2026-08-02 — `build_recovery_snapshot` and `classify_recovery` accept the flattened form and
+return the same `ActionPlan` shape.
 
 - [ ] **Step 6: Implement the barrier discipline**
 
@@ -3029,36 +3192,113 @@ free, since it advances strictly in plan order.
 - [ ] **Step 7: Run to verify it passes**
 
 Run: `uv run pytest tests/test_coordinator_transitions.py -v`
-Expected: PASS, 11 tests.
+Expected: PASS, 13 tests.
 
 - [ ] **Step 8: Prove the projection check is complete, field by field**
 
 **The cursor matters here.** The comparison runs in order — transaction state, commit decision,
 rollback result, halt diagnostic, journals — so a case that sets the record to `ROLLED_BACK` or
 `HALTED` and then calls with `start=0` reports a *transaction-state* mismatch and never reaches the
-field it meant to test. Each case must use the cursor at which the prefix already projects that state:
+field it meant to test. Each case uses the cursor at which the prefix already projects that state:
 
-| Field | Plan | `start` | What the prefix projects there | How to force the mismatch |
+| Field | Plan | `start` | What the prefix projects there | Case |
 | --- | --- | --- | --- | --- |
-| transaction state | halt | 0 | `PREPARED` | covered by `test_the_first_halt_diagnostic_wins` |
-| commit decision | metadata-only | 0 | `UNCOMMITTED` | covered by `test_a_record_disagreeing_with_the_reduced_prefix_refuses` |
-| rollback result | metadata-only | **2** | `ROLLED_BACK` + `RESTORED`, still active | advance the record to `ROLLED_BACK` with `RollbackResult.EXTERNAL_DRIFT_PRESERVED` |
-| halt diagnostic | halt | **1** | `HALTED` + the plan's own diagnostic | advance the record to `HALTED` with `matching_diagnostic("e1")` |
-| journals | metadata-only | 0 | `PENDING` | `txn.set_journal_state(txid, "e1", JournalState.DONE)` |
-| spec | — | 0 | — | covered by `test_a_record_whose_spec_disagrees_with_the_prefix_refuses` |
+| transaction state | halt | 0 | `PREPARED` | `test_the_first_halt_diagnostic_wins` (exists) |
+| commit decision | metadata-only | 0 | `UNCOMMITTED` | `test_a_record_disagreeing_with_the_reduced_prefix_refuses` (exists) |
+| spec | metadata-only | 0 | the proof's spec | `test_a_record_whose_spec_disagrees_with_the_prefix_refuses` (exists) |
+| rollback result | metadata-only | **2** | `ROLLED_BACK` + `RESTORED`, still active | new, below |
+| halt diagnostic | halt | **1** | `HALTED` + the plan's own diagnostic | new, below |
+| journals | remove-scratch | 0 | `APPLYING` + `STARTED` | new, below |
 
-Read the measured step vectors at the top of this plan to confirm those two cursors: the metadata-only
-plan's step 2 is `DetachActive`, so reducing to 2 has applied both transitions but not the detach; the
-halt plan has exactly one step, so reducing to 1 has applied it.
+Read the measured step vectors at the top of this plan to confirm the two shifted cursors: the
+metadata-only plan's step 2 is `DetachActive`, so reducing to 2 has applied both transitions but not
+the detach; the halt plan has exactly one step, so reducing to 1 has applied it.
+
+The journals case uses the remove-scratch fixture rather than the metadata-only one so that `APPLYING`
++ `STARTED` is the projected baseline and `DONE` is a forward move from it. Measured: no coherence rule
+couples a journal state to the transaction state (`records.py:455-500`), so the write commits.
+
+Append to `tests/test_coordinator_transitions.py`:
+
+```python
+def test_a_record_whose_rollback_result_disagrees_refuses(leased):
+    """Cursor 2. Both transitions have been applied by then, so transaction state and
+    commit decision both match and this is the first field that can disagree. At
+    `start=0` the transaction-state check would fire instead and this would prove
+    nothing."""
+    from atoms.coordinator.transitions import persist_plan_prefix
+
+    with leased() as lease:
+        approved, plan = prepared_metadata_only(lease)
+        # Two barriers: A5a refuses a ROLLED_BACK row with no rollback_result, so the
+        # intermediate state cannot carry one and the terminal one must.
+        with lease._store.transaction() as txn:
+            txn.set_transaction_state(approved.txid, TransactionState.ROLLING_BACK)
+        with lease._store.transaction() as txn:
+            txn.set_transaction_state(approved.txid, TransactionState.ROLLED_BACK)
+            txn.set_rollback_result(
+                approved.txid, RollbackResult.EXTERNAL_DRIFT_PRESERVED
+            )
+
+        with pytest.raises(ProtocolError) as caught:
+            persist_plan_prefix(lease, approved, plan, 2)
+
+        message = str(caught.value)
+        assert "rollback result" in message
+        assert "external_drift_preserved" in message.lower()
+
+
+def test_a_record_whose_halt_diagnostic_disagrees_refuses(leased):
+    """Cursor 1. The halt plan's single step has been applied by then, so the record is
+    legitimately HALTED and the diagnostic is the only field left to disagree."""
+    from atoms.coordinator.transitions import persist_plan_prefix
+    from tests.store_support import matching_diagnostic
+
+    with leased() as lease:
+        approved, plan = prepared_with_halt(lease)
+        other = matching_diagnostic("e1")
+        # Without this the case is vacuous: two equal diagnostics disagree about nothing.
+        assert other != plan.diagnostic
+
+        with lease._store.transaction() as txn:
+            txn.set_transaction_state(approved.txid, TransactionState.HALTED)
+            txn.set_halt_diagnostic(approved.txid, other)
+
+        with pytest.raises(ProtocolError) as caught:
+            persist_plan_prefix(lease, approved, plan, 1)
+
+        assert "halt diagnostic" in str(caught.value)
+
+
+def test_a_record_whose_journals_disagree_refuses(leased):
+    """Cursor 0 on the remove-scratch plan, whose bound snapshot is APPLYING/STARTED --
+    so every scalar field still matches and only the journal vector has moved."""
+    from atoms.coordinator.transitions import persist_plan_prefix
+
+    with leased() as lease:
+        approved, plan = prepared_with_remove_scratch(lease)
+        with lease._store.transaction() as txn:
+            txn.set_journal_state(approved.txid, "e1", JournalState.DONE)
+
+        with pytest.raises(ProtocolError) as caught:
+            persist_plan_prefix(lease, approved, plan, 0)
+
+        assert "journals" in str(caught.value)
+```
 
 `matching_diagnostic` is `tests/store_support.py:352` and exists precisely so a coherent HALTED record
-can be written before something about it is broken — A5a's coherence barrier refuses a HALTED row whose
-diagnostic disagrees with its durable rows, so an arbitrary diagnostic could not be committed at all.
+can be written before something about it is broken. Measured: `coherence_findings` compares a stored
+diagnostic's `commit_decision` and `journals` against the durable rows and nothing else
+(`records.py:484-492`), so `matching_diagnostic("e1")`'s `paths=("a.txt",)` — which names no path in
+this spec — does not block the write. It is that mismatch in every *other* field which makes it a
+different diagnostic from the plan's.
 
-Write the three new cases, then delete each field's row from the comparison tuple in turn, re-run, and
-confirm **only that field's own test fails**. A deletion that breaks two tests means two cases are
-firing the same gate and one of them is not proving what it claims. Restore after each and report the
-six observed failures.
+Then delete each field's row from the comparison tuple in turn, re-run, and confirm **only that
+field's own test fails**. A deletion that breaks two tests means two cases are firing the same gate and
+one of them is not proving what it claims. Do the same for the `canonical_json` spec comparison and for
+the `topology` equality above. Restore after each and report the seven observed failures.
+
+Run: `uv run pytest tests/test_coordinator_transitions.py -v`. Expected: PASS, 16 tests.
 
 - [ ] **Step 9: Prove one barrier per writable step**
 
@@ -3099,6 +3339,8 @@ opened and closed its own transaction.
 on the nested-transaction error rather than on this test's assertion, and would prove nothing about
 barrier granularity. The assertion above is the proof: a single shared transaction would have rolled
 back the first step's write along with the second's.
+
+Run: `uv run pytest tests/test_coordinator_transitions.py -v`. Expected: PASS, 17 tests.
 
 - [ ] **Step 10: Commit**
 
@@ -3180,11 +3422,18 @@ def _first_statement(function: ast.FunctionDef) -> ast.stmt:
     return body[0]
 
 
+#: The module that DEFINES the proof, exempt by identity. Exempting every file merely
+#: *named* `approval.py` would silently excuse a future `atoms/store/approval.py`.
+_DEFINING_MODULE = SOURCE_ROOT / "fs" / "approval.py"
+
+
 def test_only_the_coordinator_consumes_the_approved_spec():
     """Ledger #9's enforcement half, part one: nothing outside the boundary sees it."""
     consumers = []
     for path in sorted(SOURCE_ROOT.rglob("*.py")):
-        if path.name == "approval.py" or path.parts[-2] == "coordinator":
+        if path == _DEFINING_MODULE:
+            continue
+        if path.relative_to(SOURCE_ROOT).parts[0] == "coordinator":
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"))
         _, package = _source_module(SOURCE_ROOT.parent, path)
@@ -3345,18 +3594,55 @@ def test_the_coordinator_exports_nothing():
     assert not hasattr(package, "_recovery_lease")
 
 
-def test_no_module_outside_the_coordinator_names_the_lease():
+def _coordinator_importers(source_root: Path) -> list[str]:
+    """Modules outside the coordinator that import the coordinator package at all.
+
+    A substring scan for `"coordinator.lease"` misses `from atoms.coordinator import
+    lease`, whose text never contains that spelling, and misses
+    `import atoms.coordinator as c` entirely. Resolving each import target catches every
+    spelling, and the package boundary -- not the `lease` module alone -- is what the
+    DAG actually forbids crossing inward.
+    """
+    offenders = []
+    for path in sorted(source_root.rglob("*.py")):
+        parts = path.relative_to(source_root).parts
+        if parts[0] == "coordinator":
+            continue
+        package = ".".join(("atoms", *parts[:-1]))
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        if any(
+            name == "atoms.coordinator" or name.startswith("atoms.coordinator.")
+            for name in _resolved_imports(tree, package=package)
+        ):
+            offenders.append(str(path.relative_to(source_root)))
+    return offenders
+
+
+def test_no_module_outside_the_coordinator_imports_it():
     """Absence from __all__ is not enforcement -- `atoms.coordinator.root` is still
     importable. The underscore states the contract; this guard covers the population it
     can speak for: in-tree callers."""
-    offenders = []
-    for path in sorted(SOURCE_ROOT.rglob("*.py")):
-        if path.relative_to(SOURCE_ROOT).parts[0] == "coordinator":
-            continue
-        source = path.read_text(encoding="utf-8")
-        if "_recovery_lease" in source or "coordinator.lease" in source:
-            offenders.append(str(path.relative_to(SOURCE_ROOT)))
-    assert offenders == []
+    assert _coordinator_importers(SOURCE_ROOT) == []
+
+
+def test_the_coordinator_import_scanner_finds_a_planted_offender(tmp_path):
+    """The four spellings the replaced substring scan would have split on."""
+    root = tmp_path / "atoms"
+    for relative, source in (
+        ("fs/leak.py", "from atoms.coordinator import lease\n"),
+        ("core/leak.py", "from atoms.coordinator.root import _recovery_lease\n"),
+        ("store/leak.py", "import atoms.coordinator.lease\n"),
+        ("coordinator/root.py", "from atoms.coordinator.lease import Lease\n"),
+    ):
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source, encoding="utf-8")
+
+    assert _coordinator_importers(root) == [
+        "core/leak.py",
+        "fs/leak.py",
+        "store/leak.py",
+    ]
 
 
 def test_the_coordinator_fixture_registry_covers_every_test_argument():
@@ -3400,7 +3686,6 @@ what that record contains:
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import sys
@@ -3412,6 +3697,7 @@ from atoms.fs.lock import acquire_project_lock
 from atoms.fs.volume import StorageProfile
 from atoms.store.connection import open_store
 from atoms.store.records import referenced_digests
+from tests.coordinator_support import spec_digest
 from tests.fs_support import build_test_allowlist
 
 STORAGE = StorageProfile(profile_id="atoms-test-profile")
@@ -3441,7 +3727,7 @@ def _durable_phase(backend, project_root: str, metadata_root: str) -> dict:
         ) as binding, open_store(binding) as store:
             active = store.read_active()
             if active is None:
-                return {"active": None, "state": None, "blobs": {}}
+                return {"active": None, "state": None, "spec": None, "blobs": {}}
             blobs = {}
             for digest, byte_len in referenced_digests(active.spec):
                 fd = store.open_blob(digest)
@@ -3452,6 +3738,9 @@ def _durable_phase(backend, project_root: str, metadata_root: str) -> dict:
             return {
                 "active": active.txid,
                 "state": active.state.value,
+                # The blob list above is derived from whatever spec is on disk, so it
+                # cannot tell a right spec from a wrong one. This digest can.
+                "spec": spec_digest(active.spec),
                 "blobs": blobs,
             }
 
@@ -3460,10 +3749,18 @@ def main(project_root: str, metadata_root: str) -> int:
     backend = LinuxBackend()
     with acquire_project_lock(backend, metadata_root) as probe:
         root.CERTIFIED_ALLOWLIST = build_test_allowlist(probe, project_root, STORAGE)
-    payload = {"lease": _lease_phase(backend, project_root, metadata_root)}
-    with contextlib.suppress(NotImplementedError):
-        payload["durable"] = _durable_phase(backend, project_root, metadata_root)
-    print(json.dumps(payload))
+    # No `contextlib.suppress` here. `_durable_phase` is a plain bind-and-open with no
+    # A7 trap in it; a `NotImplementedError` escaping it would be an unexplained
+    # failure, and swallowing one would hand the parent a payload with no "durable" key
+    # and no reason why.
+    print(
+        json.dumps(
+            {
+                "lease": _lease_phase(backend, project_root, metadata_root),
+                "durable": _durable_phase(backend, project_root, metadata_root),
+            }
+        )
+    )
     return 0
 
 
@@ -3559,7 +3856,12 @@ def test_a_published_record_traps_a_fresh_lease_and_survives_intact(leased):
     """Ledger #17's enforcement half survives a restart: the trap is a property of lease
     entry, not of the process that published the record. The second phase confirms the
     record and its blobs are readable afterwards -- a trap that had damaged them would
-    be worse than no trap."""
+    be worse than no trap.
+
+    The spec digest is the load-bearing half of that. The child's blob list is derived
+    from whichever spec it finds on disk, so it agrees with itself no matter which spec
+    that is; only comparing the durable spec against the proof's own can catch a wrong
+    one."""
     with leased() as lease:
         project_root, metadata_root = _roots(lease)
         approved = prepared(lease)
@@ -3569,6 +3871,7 @@ def test_a_published_record_traps_a_fresh_lease_and_survives_intact(leased):
     assert seen["lease"]["trapped"] == "recovery execution is not implemented until A7"
     assert seen["durable"]["active"] == approved.txid
     assert seen["durable"]["state"] == "prepared"
+    assert seen["durable"]["spec"] == spec_digest(approved.compiled.spec)
     assert list(seen["durable"]["blobs"].values()) == [len(AFTER)]
 
 
@@ -3601,13 +3904,21 @@ def test_a_cut_inside_preparation_publishes_nothing_across_a_restart(
     assert seen["lease"]["trapped"] is None
     assert seen["lease"]["active"] is None
     assert seen["durable"]["active"] is None
+    assert seen["durable"]["spec"] is None
     # Reclamation also drained the blob the cut orphaned in blobs/.
     assert seen["lease"]["unindexed_blobs"] == []
 ```
 
-Add `import pytest` and `from tests.coordinator_support import AFTER, prepared` to the module's imports.
+Add `import pytest` and `from tests.coordinator_support import AFTER, prepared, spec_digest` to the
+module's imports.
 
 Run: `uv run pytest tests/test_coordinator_process.py -v`. Expected: PASS, 3 tests.
+
+**Then prove the spec comparison is load-bearing.** In `prepare.py`, change `txn.insert_record(...)` to
+publish `other_file_spec()` instead of `approved.compiled.spec`, re-run
+`test_a_published_record_traps_a_fresh_lease_and_survives_intact`, and confirm it fails on the `spec`
+assertion — *not* on `blobs`, which will have silently followed the wrong spec. That contrast is the
+reason the digest is there. Restore and report both the failure and which assertions stayed green.
 
 **If the trap test fails because the child never reaches it**, the cause is that `_reclaim_orphans`
 removed the prepared transaction's workspace before `_resolve` ran — check that `prepared` published a
@@ -3635,7 +3946,7 @@ Move #7, #18, #21, and #23 from the open table into the discharged table, append
 | 7 | `tests/test_coordinator_admission.py`, `tests/test_coordinator_prepare.py` |
 | 18 | `tests/test_fs_architecture.py::test_the_only_production_bind_caller_is_the_coordinator_root`, `::test_the_production_bind_call_passes_the_certified_allowlist` |
 | 21 | `tests/test_coordinator_admission.py`, `tests/test_coordinator_prepare.py`, `tests/test_coordinator_transitions.py` |
-| 23 | `tests/test_coordinator_lease.py`, `tests/test_coordinator_process.py::test_a_second_lease_reclaims_orphan_scratch_and_spares_the_referenced` |
+| 23 | `tests/test_coordinator_lease.py`, `tests/test_coordinator_process.py::test_a_second_lease_reclaims_both_kinds_of_orphan_and_spares_the_referenced` |
 
 **#7 needs one sentence of its own** in the discharged row's required-behavior column, because A5b
 regenerates on two conditions rather than one: *scratch occupancy* (the admitted shape) and *a durable
@@ -3716,6 +4027,14 @@ this: the publication cut now patches `_StoreTransaction.set_active` and calls `
 so a wrong ordering inside the production function fails it; and both unindexed-blob cases produce a
 real orphan through a rolled-back `promote_staging` rather than asserting that an empty list is empty.
 
+**Nothing an observer derives from the thing under test is used to check it.** The fresh-process
+durable phase reports a `spec_digest` alongside its blob list, because the blob list is computed from
+whichever spec is on disk and therefore agrees with a wrong one; the digest is compared against
+`approved.compiled.spec`. Likewise the trap's project-state comparison hashes content and records mode
+and kind, since path names alone survive an overwrite, a `chmod`, or a truncation. And
+`coordinator_child.py` no longer suppresses `NotImplementedError` around its durable phase: that phase
+contains no A7 trap, so one escaping it is an unexplained failure the child must surface.
+
 **Design §10's mismatch matrix has one independent case per comparand.** Identity, `NAME_MAX`,
 `LookupProof`, and mount membership each have their own case, and both declared resolver refusal types
 — `ProjectApprovalRefused` and `CapabilityUnavailable` — are translated separately, with a fifth case
@@ -3724,9 +4043,15 @@ the cursor at which the prefix already projects each field's state (`start=2` fo
 `start=1` for halt diagnostic), so no case is silently absorbed by the transaction-state check that
 runs before it.
 
-**One guard is conditional on being provable.** The `plan.bound_snapshot.topology == approved.topology`
-comparison is kept only if Task 8 can construct a snapshot that fails it independently of the compiled
-check; if not, the task deletes it rather than shipping a guard no test can fail.
+**Every guard has a test that can fail it, and every mutation preserves the property it is not
+testing.** The topology comparison design §8.2 requires now has `test_a_plan_bound_to_another_topology_refuses`,
+built on a measured fact: `_validate_topology` constrains coverage and parentage but not which
+intermediate directory nodes a tree uses, so the flattened arrangement is valid for the same compiled
+spec. The reclamation guard uses an absent project root rather than the empty allowlist, because
+`bind_project_volume` reclaims at `binding.py:192` *before* the allowlist match at `:194` and so cleans
+`probe/` by itself — measured, and run as a negative control. The trap's three mutations each insert
+one line before `_resolve(store)` so the trap still fires and only the asserted property moves; deleting
+the trap would fail all three at `pytest.raises` and prove nothing.
 
 **One place the implementer must read the code rather than trust this plan:** Task 4 Step 3's lift of
 `_NAMESPACE_CONTRADICTIONS` out of `PathResolver`, which touches existing code and must leave
