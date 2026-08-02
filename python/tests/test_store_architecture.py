@@ -1293,6 +1293,16 @@ def test_a5_status_is_synchronized_across_authority_documents():
     assert "A5b not yet designed" not in agents
     assert "A5b implemented" not in agents
 
+    # The name promises synchronization ACROSS documents, so read the other one.
+    # A5a's own design carries no Status line; A5b's does, and it is the document
+    # that would drift first when A5b lands.
+    design = (
+        Path(__file__).parents[2]
+        / "docs/plans/2026-08-02-a5b-recovery-lease-design.md"
+    ).read_text(encoding="utf-8")
+    assert "**Status:** Designed and unimplemented." in design
+    assert "A5a is implemented; A5b–A8 remain unimplemented." in design
+
 
 def _plant_store_package(
     tmp_path: Path,

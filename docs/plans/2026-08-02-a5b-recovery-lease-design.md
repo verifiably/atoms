@@ -169,6 +169,29 @@ receives the `Store`, the `ProjectBinding`, or any other mutable ownership state
 
 `root.py` owns the public entry; `lease.py` owns the protocol over what it produces.
 
+### 5.0 The lease value
+
+`recovery_lease` yields a `Lease` — an opaque, coordinator-internal handle. The rest of this design
+writes `lease.binding` and `lease.store`, and those are **private, borrowed** attributes: readable
+within `atoms/coordinator/`, absent from the package's `__all__`, and never returned to a consumer.
+
+```python
+@dataclass(frozen=True, slots=True)
+class Lease:
+    _binding: ProjectBinding
+    _store: Store
+```
+
+Borrowed, not owned: the lease does not close either resource on its own. `recovery_lease`'s
+`finally` closes them in reverse acquisition order, so a `Lease` that outlives its `with` block
+references spent objects and every A5a call through it refuses — A5a already spends its `Store` on
+close and refuses afterwards, so the escape is caught by the layer below rather than by a flag here.
+
+This is what makes authority §4.2's "consumer code never receives mutable ownership state" a
+structural property rather than a convention. The consumer calls a coordinator command; the command
+enters the lease on its behalf; the `Lease` never crosses back out. An architecture test asserts
+`Lease`, `ProjectBinding`, and `Store` are absent from `atoms.coordinator.__all__`.
+
 ### 5.1 Entry and exit order
 
 ```text
@@ -309,6 +332,57 @@ parent node and a leaf, never a resolvable path. A minimal descriptor-anchored c
 the occupancy observation and the parent facts from one open parent, rather than duplicating traversal
 inside the coordinator.
 
+It returns one frozen value, so a single open parent answers both questions:
+
+```python
+@dataclass(frozen=True, slots=True)
+class ChildObservation:
+    parent_identity: FilesystemIdentity
+    parent_constraints: DirectoryConstraints
+    present: bool
+```
+
+`DirectoryConstraints` already bundles `lookup_proof` and `name_max`, so one comparison against
+`approved.directories` covers identity, `LookupProof`, and `NAME_MAX` together.
+
+**Mapping a `TopologyNode` to a parent path.** `TopologyNode` is
+`ProjectRoot | WorkRoot | TopologyDirectory(node_id) | PersistentNode(path) | ScratchNode(...)`, and
+only two of those carry a path directly. A5b builds the map once per admission:
+
+| Node | Parent path |
+| --- | --- |
+| `ProjectRoot` | the binding's project root |
+| `WorkRoot` | `metadata_root/work` — engine-owned, not project space |
+| `PersistentNode(path)` | that project-relative path |
+| `TopologyDirectory(node_id)` | derived from `approved.paths`: an `ApprovedPath(path, parent_node, leaf)` whose `parent_node` is this node fixes the directory as `path` minus its trailing `leaf` |
+
+The derivation is total for the nodes A5b actually needs. A `STAGING`, `TOMBSTONE`, or `ANCHOR` leaf
+sits beside its target, so its `parent_node` is that target's `parent_node` — and the target is itself
+an `ApprovedPath`, which supplies the mapping. A node with no mapping is a `ProtocolError`, never a
+silently skipped check.
+
+**`WORK` is the exception and is not project space.** A `ScratchNode` with `role=WORK` has `WorkRoot`
+as its parent: `CreateDirectory` stages into `metadata_root/work/<txid>/`, which `store.create_workspace`
+owns. Its occupancy question is answered against the work root under `approved.work_base`, not against
+a project directory, and A5b never applies the project-containment rules to it.
+
+**A planned parent is absent by construction.** `ApprovedDirectory` is
+`ApprovedExistingDirectory | ApprovedPlannedDirectory`, and a planned directory does not exist yet, so
+a child beneath it cannot be occupied. Observing one is still required rather than assumed: if the
+planned parent is *present* now, that is post-approval drift and refuses. `ApprovedPlannedDirectory`
+carries `constraints` but no `identity`, so only the constraints are compared — there is no approved
+identity to compare against, and inventing one from the live filesystem would be a fresh observation
+authorizing itself.
+
+**Refusals from the resolver are translated.** `atoms/fs/resolve.py` raises `ProjectApprovalRefused`
+(lines 169, 174, 223, 251, 305, 323) and `CapabilityUnavailable` (lines 120, 156) — correct at approval
+time, wrong afterwards. A mount change, a casefold-attribute change, or any other post-approval
+divergence found during re-resolution is drift, and §9 requires `PreconditionRefused` for it. A5b
+therefore catches both types around its re-resolution and re-raises `PreconditionRefused` with the
+original chained, so a caller cannot mistake post-approval drift for an approval that never succeeded.
+This translation applies **only** to A5b's own re-resolution; it never wraps `approve_for_project`,
+whose refusals are genuine approval refusals and must surface unchanged.
+
 ### 6.5 The entry-point gate set
 
 `prepare_transaction(lease, approved, workspace, manifest)`:
@@ -330,13 +404,22 @@ itself (§8.1).
 ## 7. Preparation
 
 `prepare_transaction(lease, approved, workspace, manifest)` performs authority §7.3 steps 2–4 after
-its gates pass:
+its gates pass. All of it happens inside **one** A5a transaction, because `promote_staging` is a method
+of `_StoreTransaction` — obtainable only by entering `Store.transaction()` — and it writes the `blob`
+index rows itself:
 
-1. `promote_staging(workspace, manifest)` — steps 2 and 3, including the cross-directory flush.
-2. One SQLite transaction inserting the `transaction_record` row as `PREPARED` with its immutable
-   `spec_json`, the `effect` rows as `PENDING`, any new `blob` index rows, and the singleton `active`
-   row.
-3. **COMMIT** — step 4, the single durable barrier that publishes the record atomically.
+```python
+with lease.store.transaction() as txn:
+    txn.promote_staging(workspace, manifest)          # §7.3 steps 2-3
+    txn.insert_record(approved.txid, approved.compiled.spec)
+    txn.set_active(approved.txid)
+# COMMIT on exit -- §7.3 step 4, the single durable barrier
+```
+
+`insert_record` derives the `effect` rows as `PENDING` from the spec itself, so they are never passed
+separately. `promote_staging` performs its cross-directory flush during the transaction body, which is
+what satisfies the cross-substrate rule: every blob is durable on the filesystem *before* the COMMIT
+that references it, even though both happen within one `with`.
 
 Step 1 of authority §7.3 — coherently capturing and verifying the initial surface — is A6's. The
 manifest is a `tuple[StagedBlob, ...]`, a plain value naming files already written into the workspace's
@@ -348,6 +431,14 @@ into it; preparation uses those pinned descriptors, and re-resolving afterward c
 their creation. The coordinator re-resolves `metadata_root/work` against `approved.work_base` under
 the held lock, then creates the workspace — which is precisely why A4b-1 retained `ApprovedWorkBase`
 rather than consuming it.
+
+**The comparison is conditional on `work_base is not None`.** `ProjectApprovedSpec.work_base` is
+`ApprovedWorkBase | None` and is populated only when the spec contains a `CreateDirectory`, the sole
+effect with a `WORK` scratch role. When it is `None`, A4b has deliberately judged `work/` irrelevant to
+this transaction, and A5b compares nothing — it still creates the workspace, whose `staging/` half every
+transaction needs. Treating `None` as a comparison failure would refuse every transaction that creates
+no directory; treating it as a baseline of "no facts" would let a fresh observation authorize itself,
+which is the exact shape #19 forbids.
 
 ## 8. Transition persistence
 
@@ -411,12 +502,20 @@ supplied by A7 follows a durably completed effect. That remains A7's obligation,
 
 ## 9. Errors
 
-No new type. The existing hierarchy carries every meaning:
+No new type. The existing hierarchy carries every meaning, with §3.3's amendment broadening
+`PreconditionRefused` to "external state prevents clean execution." **Durable txid occupancy is part of
+that meaning**: a txid an existing record already owns is external state in exactly the same sense as
+an occupied scratch leaf — it is not concurrent, not drift, and may predate this attempt by any amount
+of time.
 
 | Situation | Type |
 | --- | --- |
 | Scratch still occupied after the attempt bound (#7) | `PreconditionRefused` |
+| Every candidate txid owned by a durable record, after the attempt bound (#7) | `PreconditionRefused` |
 | Re-resolution mismatch, no durable record yet (#19) | `PreconditionRefused` |
+| Post-approval resolver refusal translated from `ProjectApprovalRefused` / `CapabilityUnavailable` (§6.4) | `PreconditionRefused` |
+| No active record when persisting a plan (§8.1) | `ProtocolError` |
+| A scratch `parent_node` with no path mapping (§6.4) | `ProtocolError` |
 | Re-resolution mismatch, durable record exists (#19) | `TransactionHalted` — **not reachable in A5b**, see below |
 | txid ≠ the proof's txid (#21) | `ProtocolError` |
 | Anything but a `ProjectApprovedSpec` at a transaction-stage entry point (#9) | `ProtocolError` |
@@ -490,8 +589,10 @@ On a real ext4 volume, using the existing binding fixtures.
 4. The lock is held across the entire write phase and released on every exit path.
 5. A live record at lease entry raises the A7 trap without coordinator-directed transaction mutation.
 6. A candidate txid owned by a durable record is discarded and the attempt counted.
-7. Scratch occupancy regenerates the txid at most `SCRATCH_ATTEMPTS` times, producing a wholly fresh
-   proof each time, then refuses with `PreconditionRefused` naming the occupied leaves.
+7. Admission makes at most `SCRATCH_ATTEMPTS` candidate/approval attempts — that is, at most
+   `SCRATCH_ATTEMPTS - 1` regenerations after the initial candidate — producing a wholly fresh proof
+   each time, then refuses with `PreconditionRefused` distinguishing occupancy from durable-record
+   collision.
 8. Re-resolution compares against the proof as baseline and never authorizes from it; a mismatch
    raises immediately, pre-publication refusals being `PreconditionRefused`.
 9. Every post-approval transaction-stage entry point accepts only a `ProjectApprovedSpec` whose txid
