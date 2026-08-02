@@ -233,12 +233,24 @@ def test_a_resumed_store_equals_an_uninterrupted_one(store_on):
     """Schema, version, and mode -- the third is where the unpublished cut is caught."""
     with store_on() as binding:
         create_store(binding).close()
-        reference = frozenset(raw_connect(binding).execute("SELECT type, name, tbl_name, sql FROM sqlite_schema"))
+        raw = raw_connect(binding)
+        try:
+            reference = frozenset(
+                raw.execute("SELECT type, name, tbl_name, sql FROM sqlite_schema")
+            )
+        finally:
+            raw.close()
         reference_mode = os.stat("atoms.db", dir_fd=binding.metadata_root_fd).st_mode & 0o777
     with store_on() as binding:
         _cut_after_publishing(binding)
         reopen_store(binding).close()
-        resumed = frozenset(raw_connect(binding).execute("SELECT type, name, tbl_name, sql FROM sqlite_schema"))
+        raw = raw_connect(binding)
+        try:
+            resumed = frozenset(
+                raw.execute("SELECT type, name, tbl_name, sql FROM sqlite_schema")
+            )
+        finally:
+            raw.close()
         resumed_mode = os.stat("atoms.db", dir_fd=binding.metadata_root_fd).st_mode & 0o777
     assert resumed == reference
     assert resumed_mode == reference_mode
@@ -274,17 +286,57 @@ def test_a_non_empty_delete_mode_database_is_refused_and_stays_in_delete_mode(st
             raw.close()
 
 
+def test_a_completed_store_in_delete_mode_is_refused_without_rewriting_it(store_on):
+    with store_on() as binding:
+        create_store(binding).close()
+        raw = raw_connect(binding)
+        try:
+            assert raw.execute("PRAGMA journal_mode = DELETE").fetchone() == ("delete",)
+        finally:
+            raw.close()
+
+        with pytest.raises(MetadataStoreInvalid) as caught:
+            reopen_store(binding)
+        assert "completed store must already be in WAL" in str(caught.value)
+
+        raw = raw_connect(binding)
+        try:
+            assert raw.execute("PRAGMA journal_mode").fetchone() == ("delete",)
+        finally:
+            raw.close()
+
+
 @pytest.mark.parametrize(
-    ("application_id", "user_version", "create_table", "fragment"),
+    ("application_id", "user_version", "create_table", "expected"),
     [
-        (APPLICATION_ID, SCHEMA_VERSION + 1, True, "store version"),
-        (APPLICATION_ID, 99, True, "store version"),
-        (0, 0, True, "version zero"),
-        (12345, 0, False, "not this engine"),
+        (
+            APPLICATION_ID,
+            SCHEMA_VERSION + 1,
+            True,
+            f"incompatible store version {SCHEMA_VERSION + 1}; this build knows {SCHEMA_VERSION}",
+        ),
+        (
+            APPLICATION_ID,
+            99,
+            True,
+            f"incompatible store version 99; this build knows {SCHEMA_VERSION}",
+        ),
+        (
+            0,
+            0,
+            True,
+            "version zero with a non-empty schema is not an initialization this engine interrupted",
+        ),
+        (
+            12345,
+            0,
+            False,
+            f"application_id 12345 is not this engine's ({APPLICATION_ID})",
+        ),
     ],
 )
 def test_every_version_table_row_produces_its_verdict(
-    store_on, application_id, user_version, create_table, fragment
+    store_on, application_id, user_version, create_table, expected
 ):
     with store_on() as binding:
         raw = raw_connect(binding)
@@ -297,7 +349,7 @@ def test_every_version_table_row_produces_its_verdict(
             raw.close()
         with pytest.raises(MetadataStoreInvalid) as caught:
             reopen_store(binding)
-        assert fragment.split()[0] in str(caught.value).lower()
+        assert expected in str(caught.value)
 
 
 def test_a_same_version_wrong_schema_store_is_refused(store_on):

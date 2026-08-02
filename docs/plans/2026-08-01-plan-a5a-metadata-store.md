@@ -739,8 +739,8 @@ import hashlib
 import os
 import sqlite3
 
-from atoms.core.effects import CreateFileNoClobber, ReplaceFile
-from atoms.core.fingerprint import ABSENT, FileState
+from atoms.core.effects import CreateDirectory, CreateFileNoClobber, ReplaceFile
+from atoms.core.fingerprint import ABSENT, DirectoryState, FileState
 from atoms.core.spec import build_spec
 
 DATABASE_ENTRIES = ("atoms.db", "atoms.db-wal", "atoms.db-shm", "atoms.db-journal")
@@ -759,15 +759,15 @@ def digest_of(content: bytes) -> str:
     return "sha256:" + hashlib.sha256(content).hexdigest()
 
 
-def one_effect_spec(effect_id: str = "e1", content: bytes = b"after"):
-    """A minimal spec that compile_spec accepts: one CreateFileNoClobber."""
-    post = file_state(content)
+def one_effect_spec(effect_id: str = "e1"):
+    """A minimal blob-free spec that compile_spec accepts."""
+    post = DirectoryState(mode=0o755)
     return build_spec(
         consumer_tag="test",
         intent_digest="sha256:" + "0" * 64,
         initial_surface={"a.txt": ABSENT},
         final_surface={"a.txt": post},
-        effects=[CreateFileNoClobber(effect_id=effect_id, path="a.txt", post=post)],
+        effects=[CreateDirectory(effect_id=effect_id, path="a.txt", post=post)],
     )
 
 
@@ -804,24 +804,20 @@ def duplicate_effect_spec():
 
 
 def two_length_spec():
-    """One digest declared at two byte_lens across the initial surface.
+    """One digest declared at two byte_lens across initial and final surfaces.
 
     compile_spec accepts this -- measured -- because it never compares two paths'
     fingerprints to each other. A hash and a length are both properties of the same
     bytes, so the store refuses it under §7.6.
     """
-    pre_a = FileState(content_hash=SHARED_DIGEST, mode=0o644, byte_len=5)
-    pre_b = FileState(content_hash=SHARED_DIGEST, mode=0o644, byte_len=6)
-    post_a, post_b = file_state(b"one"), file_state(b"two")
+    pre = FileState(content_hash=SHARED_DIGEST, mode=0o644, byte_len=5)
+    post = FileState(content_hash=SHARED_DIGEST, mode=0o644, byte_len=6)
     return build_spec(
         consumer_tag="test",
         intent_digest="sha256:" + "3" * 64,
-        initial_surface={"a.txt": pre_a, "b.txt": pre_b},
-        final_surface={"a.txt": post_a, "b.txt": post_b},
-        effects=[
-            ReplaceFile(effect_id="e1", path="a.txt", pre=pre_a, post=post_a),
-            ReplaceFile(effect_id="e2", path="b.txt", pre=pre_b, post=post_b),
-        ],
+        initial_surface={"a.txt": pre},
+        final_surface={"a.txt": post},
+        effects=[ReplaceFile(effect_id="e1", path="a.txt", pre=pre, post=post)],
     )
 
 
@@ -965,7 +961,7 @@ import pytest
 
 from atoms.core.errors import CapabilityUnavailable, ProtocolError
 from atoms.store.connection import create_store, gate
-from atoms.store.errors import MetadataStoreInvalid
+from atoms.store.errors import MetadataStoreInvalid, translated
 from atoms.store.schema import APPLICATION_ID, EXPECTED_CATALOG, SCHEMA_VERSION
 from tests.store_support import DATABASE_ENTRIES, raw_connect
 
@@ -1566,17 +1562,39 @@ def test_a_non_empty_delete_mode_database_is_refused_and_stays_in_delete_mode(st
             raw.close()
 
 
+def test_a_completed_store_in_delete_mode_is_refused_without_rewriting_it(store_on):
+    with store_on() as binding:
+        create_store(binding).close()
+        raw = raw_connect(binding)
+        try:
+            assert raw.execute("PRAGMA journal_mode = DELETE").fetchone() == ("delete",)
+        finally:
+            raw.close()
+        with pytest.raises(MetadataStoreInvalid) as caught:
+            reopen_store(binding)
+        assert "completed store must already be in WAL" in str(caught.value)
+        raw = raw_connect(binding)
+        try:
+            assert raw.execute("PRAGMA journal_mode").fetchone() == ("delete",)
+        finally:
+            raw.close()
+
+
 @pytest.mark.parametrize(
-    ("application_id", "user_version", "create_table", "fragment"),
+    ("application_id", "user_version", "create_table", "expected"),
     [
-        (APPLICATION_ID, SCHEMA_VERSION + 1, True, "store version"),
-        (APPLICATION_ID, 99, True, "store version"),
-        (0, 0, True, "version zero"),
-        (12345, 0, False, "not this engine"),
+        (APPLICATION_ID, SCHEMA_VERSION + 1, True,
+         f"incompatible store version {SCHEMA_VERSION + 1}; this build knows {SCHEMA_VERSION}"),
+        (APPLICATION_ID, 99, True,
+         f"incompatible store version 99; this build knows {SCHEMA_VERSION}"),
+        (0, 0, True,
+         "version zero with a non-empty schema is not an initialization this engine interrupted"),
+        (12345, 0, False,
+         f"application_id 12345 is not this engine's ({APPLICATION_ID})"),
     ],
 )
 def test_every_version_table_row_produces_its_verdict(
-    store_on, application_id, user_version, create_table, fragment
+    store_on, application_id, user_version, create_table, expected
 ):
     with store_on() as binding:
         raw = raw_connect(binding)
@@ -1589,7 +1607,7 @@ def test_every_version_table_row_produces_its_verdict(
             raw.close()
         with pytest.raises(MetadataStoreInvalid) as caught:
             reopen_store(binding)
-        assert fragment.split()[0] in str(caught.value).lower()
+        assert expected in str(caught.value)
 
 
 def test_a_same_version_wrong_schema_store_is_refused(store_on):
@@ -1716,8 +1734,9 @@ def repair_unpublished(binding: ProjectBinding) -> None:
 
 
 def _integrity_findings(connection: sqlite3.Connection) -> tuple[str, ...]:
-    with translated("checking integrity"):
+    with translated("running quick_check"):
         quick = tuple(row[0] for row in connection.execute(_QUICK_CHECK))
+    with translated("running foreign_key_check"):
         foreign = tuple(str(row) for row in connection.execute(_FOREIGN_KEY_CHECK))
     return tuple(finding for finding in quick if finding != "ok") + foreign
 
@@ -1733,8 +1752,9 @@ def _catalog(connection: sqlite3.Connection) -> frozenset[tuple[str, str, str, s
 
 def classify(connection: sqlite3.Connection) -> Verdict:
     """Identity, version, and schema -- from reads alone (design §5.2 step 4)."""
-    with translated("reading identity"):
+    with translated("reading application_id"):
         application_id = connection.execute(_READ_APPLICATION_ID).fetchone()[0]
+    with translated("reading user_version"):
         user_version = connection.execute(_READ_USER_VERSION).fetchone()[0]
     catalog = _catalog(connection)
 
@@ -2332,7 +2352,7 @@ from atoms.core.recovery.model import (
     OperatorAction,
     TransactionState,
 )
-from atoms.store.errors import MetadataStoreInvalid
+from atoms.store.errors import MetadataStoreInvalid, translated
 from atoms.store.records import decode_diagnostic, encode_diagnostic
 from tests.store_support import every_diagnostic_shape
 
@@ -2634,7 +2654,7 @@ from atoms.core.recovery.model import (
     OperatorAction,
     TransactionState,
 )
-from atoms.store.errors import MetadataStoreInvalid
+from atoms.store.errors import MetadataStoreInvalid, translated
 
 _DIAGNOSTIC_FIELDS = (
     "pre_halt_state",
@@ -3011,7 +3031,7 @@ def test_insert_record_derives_every_effect_row_from_the_spec(opened_store, stor
         ).fetchall()
     finally:
         raw.close()
-    assert rows == [("only", "create_file_no_clobber", "pending")]
+    assert rows == [("only", "create_directory", "pending")]
 
 
 def test_spec_json_is_write_once_at_the_database(opened_store, store_binding):
@@ -3325,7 +3345,7 @@ Append to `src/atoms/store/connection.py`, inside `_StoreTransaction`:
                 raise ProtocolError(
                     f"spec must be exactly TransactionSpec, got {type(spec).__name__}"
                 )
-            with translated("inserting a record"):
+            with translated("inserting a transaction record"):
                 store._connection.execute(
                     INSERT_RECORD,
                     (
@@ -3335,7 +3355,8 @@ Append to `src/atoms/store/connection.py`, inside `_StoreTransaction`:
                         CommitDecision.UNCOMMITTED.value,
                     ),
                 )
-                for effect in spec.effects:
+            for effect in spec.effects:
+                with translated("inserting an effect row"):
                     store._connection.execute(
                         INSERT_EFFECT,
                         (txid, effect.effect_id, variant_of(effect).value,
@@ -3464,7 +3485,7 @@ git commit -m "feat(store): derive every effect row from the spec it was inserte
   `COHERENCE_RULES: tuple[str, ...]` and the twelve `RULE_*` constants it lists;
   `journal_vector(spec, rows) -> tuple[EffectJournalState, ...]`; `Store.read_record(txid)`,
   `Store.read_active()`; a filled-in `_StoreTransaction._run_barrier`. In `tests/store_support.py`:
-  `commit_record(store, binding, txid, spec)` and `non_compiling_spec(effect_id="only")`.
+  `commit_record(store, txid, spec, *contents)` and `non_compiling_spec(effect_id="only")`.
 
 **One predicate, two verdicts.** On a load a violation is durable state that cannot be interpreted:
 `MetadataStoreInvalid`. On a write the same violation is a caller assembling an incoherent record,
@@ -3602,7 +3623,8 @@ def _plant_halted(raw, diagnostic):
     )
 
 
-ONE_EFFECT_ROW = (("only", "create_file_no_clobber"),)
+ONE_EFFECT_ROW = (("only", "create_directory"),)
+CREATE_FILE_ROW = (("only", "create_file_no_clobber"),)
 
 
 def _only_spec():
@@ -3628,7 +3650,7 @@ READ_SIDE_CORRUPTIONS = (
         RULE_SPEC_COMPILES,
         _only_spec,
         lambda raw: _plant_spec_json(
-            raw, canonical_json(non_compiling_spec()), ONE_EFFECT_ROW
+            raw, canonical_json(non_compiling_spec()), CREATE_FILE_ROW
         ),
     ),
     (
@@ -3730,7 +3752,8 @@ def test_every_cross_row_rule_refuses_on_a_load(
     findings' details, so a substring match over the joined message would pass on the
     wrong rule. Only then is the verdict triggered, which is the part `read_record` owns.
     """
-    commit_record(opened_store, store_binding, "tx1", spec())
+    contents = (b"before", b"after") if spec is replace_spec else ()
+    commit_record(opened_store, "tx1", spec(), *contents)
     raw = raw_connect(store_binding)
     try:
         corrupt(raw)
@@ -3883,7 +3906,7 @@ def test_every_reachable_cross_row_rule_refuses_on_a_write(
     outright while the store owns a write transaction (§7.4) -- the right rule, and the
     reason this reaches past it to the connection.
     """
-    commit_record(opened_store, store_binding, "tx2", one_effect_spec(effect_id="only"))
+    commit_record(opened_store, "tx2", one_effect_spec(effect_id="only"))
     if plant is not None:
         raw = raw_connect(store_binding)
         try:
@@ -3981,8 +4004,8 @@ def test_the_barrier_validates_only_structure_not_transition_legality(opened_sto
 
 
 def test_one_digest_declared_at_two_lengths_refuses(opened_store, store_binding):
-    """Design §7.6, criterion 23. compile_spec accepts a spec whose initial surface
-    declares one digest at two byte_lens -- measured -- so the store is where it is
+    """Design §7.6, criterion 23. compile_spec accepts a spec whose initial and final
+    surfaces declare one digest at two byte_lens -- measured -- so the store is where it is
     caught, and only if referenced_digests keeps both references. Collapsed into a
     mapping, whichever reference the dict kept would agree with the row and the other
     would vanish."""
@@ -4174,38 +4197,28 @@ def non_compiling_spec(effect_id: str = "only"):
     )
 
 
-def commit_record(store, binding, txid: str, spec) -> None:
-    """Commit one record, with whatever `blob` rows its initial surface references.
-
-    A record whose referenced digest has no `blob` row cannot be committed at all --
-    §7.7 runs the same predicate before COMMIT -- so a read-side test that wants to
-    *remove* that row, or contradict it, has to get it there first. Every test that
-    commits a `replace_spec` record needs this; the ones built on `one_effect_spec`
-    start from `ABSENT` and reference no digest, which is why they commit with no blob
-    at all.
-
-    The row is written **directly**, through `raw_connect`, and stays that way once
-    Task 11 exists. Promotion is not a better way to reach this state, it is a different
-    subject: it would make the setup for a corruption test depend on the staging,
-    verification, rename, and barrier machinery those tests are not about, and it would
-    stage real bytes for a row half of them go on to delete or contradict. The blob row
-    here is a *precondition*, written the same way `_plant_spec_json` writes a record --
-    the promotion path has its own tests, in `test_store_blobs.py`.
-    """
+def commit_record(store, txid: str, spec, *contents: bytes) -> None:
+    """Commit through the production path with every referenced blob durable."""
+    from atoms.store.blobs import StagedBlob
     from atoms.store.records import referenced_digests
 
-    digests = referenced_digests(spec)
-    if digests:
-        raw = raw_connect(binding)
-        try:
-            for digest, byte_len in digests:
-                raw.execute(
-                    "INSERT INTO blob (digest, byte_len) VALUES (?, ?)", (digest, byte_len)
-                )
-        finally:
-            raw.close()
-    with store.transaction() as txn:
-        txn.insert_record(txid, spec)
+    referenced = set(referenced_digests(spec))
+    supplied = {(digest_of(content), len(content)): content for content in contents}
+    assert set(supplied) == referenced
+    if not referenced:
+        with store.transaction() as txn:
+            txn.insert_record(txid, spec)
+        return
+
+    with store.create_workspace(txid) as workspace:
+        manifest = []
+        for index, ((digest, byte_len), content) in enumerate(sorted(supplied.items())):
+            name = f"blob-{index}"
+            stage(workspace, name, content)
+            manifest.append(StagedBlob(name=name, digest=digest, byte_len=byte_len))
+        with store.transaction() as txn:
+            txn.promote_staging(workspace, tuple(manifest))
+            txn.insert_record(txid, spec)
 ```
 
 - [ ] **Step 3: Run the tests to verify they fail**
@@ -4294,16 +4307,15 @@ class StoredRecord:
 def referenced_digests(spec: TransactionSpec) -> tuple[tuple[str, int], ...]:
     """Every (digest, byte_len) this record needs a blob for, deduplicated but not merged.
 
-    The **initial** surface only. Blobs are rollback material: authority §7.3 step 3 has
-    A6 stream the captured *pre*-state of each path into staging and step 4 promote it.
-    A final-surface hash names content the transaction will produce, for which no blob
-    exists or should -- including it here would make every record refuse until something
-    promoted a blob for content that does not exist yet.
+    Both surfaces. Initial files are rollback material; final files are planned
+    postimages which authority §7.3 step 2 requires preparation to write or verify
+    before the PREPARED record COMMIT. A create from ABSENT therefore still references
+    its final file blob, and a replace references both preimage and postimage.
 
     **Pairs, not a mapping.** A hash and a length are both properties of the same bytes,
     so two paths carrying one digest must carry one length -- but compile_spec accepts a
-    spec where they do not (measured: two initial entries at digest X with byte_len 5 and
-    6 compile clean). Keyed by digest, the second reference silently overwrites the first
+    spec where they do not (measured: digest X with byte_len 5 initially and 6 finally
+    compiles cleanly). Keyed by digest, the second reference silently overwrites the first
     and §7.6 then checks the blob row against whichever survived. As pairs both survive,
     at most one can match the row, and the disagreement refuses with no special case.
 
@@ -4311,7 +4323,8 @@ def referenced_digests(spec: TransactionSpec) -> tuple[tuple[str, int], ...]:
     """
     return tuple(sorted({
         (entry.state.content_hash, entry.state.byte_len)
-        for entry in spec.initial_surface
+        for surface in (spec.initial_surface, spec.final_surface)
+        for entry in surface
         if isinstance(entry.state, FileState)
     }))
 
@@ -4328,7 +4341,8 @@ def coherence_findings(connection: Any, txid: str) -> tuple[str, ...]:
     left for A3 to classify -- pre-empting it here would put a second classifier in the
     store.
     """
-    row = connection.execute(SELECT_RECORD, (txid,)).fetchone()
+    with translated("reading a transaction record for coherence"):
+        row = connection.execute(SELECT_RECORD, (txid,)).fetchone()
     if row is None:
         return ()
     spec_json, state_value, committed_value, rollback_value, diagnostic_text = row
@@ -4350,7 +4364,8 @@ def coherence_findings(connection: Any, txid: str) -> tuple[str, ...]:
             RULE_SPEC_COMPILES, f"spec_json is a spec A2 would refuse: {caught}"
         ))
 
-    rows = connection.execute(SELECT_EFFECTS, (txid,)).fetchall()
+    with translated("reading effect rows for coherence"):
+        rows = connection.execute(SELECT_EFFECTS, (txid,)).fetchall()
     stored = {effect_id: (variant, journal) for effect_id, variant, journal in rows}
     declared = {effect.effect_id: variant_of(effect).value for effect in spec.effects}
     covered = set(declared) == set(stored)
@@ -4371,7 +4386,8 @@ def coherence_findings(connection: Any, txid: str) -> tuple[str, ...]:
             ))
 
     for digest, byte_len in referenced_digests(spec):
-        blob = connection.execute(SELECT_BLOB, (digest,)).fetchone()
+        with translated("reading a referenced blob row for coherence"):
+            blob = connection.execute(SELECT_BLOB, (digest,)).fetchone()
         if blob is None:
             findings.append(_finding(
                 RULE_BLOB_ROW_PRESENT, f"no blob row for referenced digest {digest!r}"
@@ -4419,9 +4435,11 @@ def coherence_findings(connection: Any, txid: str) -> tuple[str, ...]:
                 "not cover spec_json",
             ))
 
-    active = connection.execute(SELECT_ACTIVE).fetchone()
+    with translated("reading the active transaction for coherence"):
+        active = connection.execute(SELECT_ACTIVE).fetchone()
     if active is not None:
-        exists = connection.execute(SELECT_RECORD, (active[0],)).fetchone()
+        with translated("checking the active transaction record"):
+            exists = connection.execute(SELECT_RECORD, (active[0],)).fetchone()
         if exists is None:
             findings.append(_finding(
                 RULE_ACTIVE_RECORD, f"active names txid {active[0]!r}, which has no record"
@@ -4450,7 +4468,8 @@ def _journal_vector(
 
 def load_record(connection: Any, txid: str) -> StoredRecord | None:
     """Assemble one record. The caller has already opened the read transaction."""
-    row = connection.execute(SELECT_RECORD, (txid,)).fetchone()
+    with translated("materializing a transaction record"):
+        row = connection.execute(SELECT_RECORD, (txid,)).fetchone()
     if row is None:
         return None
     findings = coherence_findings(connection, txid)
@@ -4460,7 +4479,8 @@ def load_record(connection: Any, txid: str) -> StoredRecord | None:
         )
     spec_json, state_value, committed_value, rollback_value, diagnostic_text = row
     spec = from_canonical_json(spec_json)
-    rows = connection.execute(SELECT_EFFECTS, (txid,)).fetchall()
+    with translated("materializing effect rows"):
+        rows = connection.execute(SELECT_EFFECTS, (txid,)).fetchall()
     stored = {effect_id: (variant, journal) for effect_id, variant, journal in rows}
     return StoredRecord(
         txid=txid,
@@ -4512,7 +4532,8 @@ Append to `src/atoms/store/connection.py`, on `Store`:
 
     def read_active(self) -> StoredRecord | None:
         with self._read_transaction() as connection:
-            row = connection.execute(SELECT_ACTIVE).fetchone()
+            with translated("reading the active transaction"):
+                row = connection.execute(SELECT_ACTIVE).fetchone()
             record = None if row is None else load_record(connection, row[0])
         self._require_live()
         return record
@@ -4569,19 +4590,11 @@ uv run pyright
 ```
 Expected: PASS, `All checks passed!`, `0 errors`.
 
-**Every test in `test_store_records.py` that commits a `replace_spec` record** now needs a `blob`
-row that no task has written yet — `replace_spec`'s `pre` is a `FileState` whose content hash has no
-row, so `coherence_findings` reports `blob_row_present` and the barrier refuses. Route every such
-commit through `commit_record`, which inserts exactly the rows `referenced_digests` reports; run the
-file and take the list from the failures rather than from this paragraph.
-
-Only the **initial**-surface digest needs a row — `replace_spec`'s `pre` — because that is the
-one `referenced_digests` reports. `one_effect_spec` starts from `ABSENT` and needs none, which
-is why the tests that use it commit without any blob at all.
-
-`commit_record`'s direct insert is permanent. Task 11 adds promotion beside it, not in place
-of it — see the helper's own docstring for why a corruption fixture writes its precondition row
-rather than earning it.
+**Every record test must supply all file bytes named by either surface.** A replace supplies both its
+preimage and postimage; a create-from-absent supplies its postimage. Route those preparations through
+`commit_record`, which asserts that the supplied `(digest, byte_len)` set equals
+`referenced_digests`, then stages, promotes, indexes, and commits through the production surface.
+`one_effect_spec` is deliberately a directory-only spec, so tests unrelated to blobs need none.
 
 - [ ] **Step 6: Commit**
 
@@ -5133,10 +5146,18 @@ def _issue(store: Store, workspace: Workspace) -> Workspace:
 
 
 def _parent_fd(store: Store, name: str) -> int:
-    return os.open(
-        name, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
-        dir_fd=store._binding.metadata_root_fd,
+    return store._binding.backend.open_child_directory(
+        store._binding.metadata_root_fd, name
     )
+
+
+def _parent_fds(store: Store) -> tuple[int, int]:
+    staging_parent = _parent_fd(store, STAGING_PARENT)
+    try:
+        return staging_parent, _parent_fd(store, WORK_PARENT)
+    except BaseException:
+        os.close(staging_parent)
+        raise
 
 
 def _open_child(parent_fd: int, parent: str, txid: str) -> int | None:
@@ -5211,8 +5232,7 @@ def create_workspace(store: Store, txid: str) -> Workspace:
     """
     store._require_live()
     require_identifier("txid", txid)
-    staging_parent = _parent_fd(store, STAGING_PARENT)
-    work_parent = _parent_fd(store, WORK_PARENT)
+    staging_parent, work_parent = _parent_fds(store)
     try:
         for parent_fd, parent in ((staging_parent, STAGING_PARENT), (work_parent, WORK_PARENT)):
             if _stat_or_none(parent_fd, txid) is not None:
@@ -5271,8 +5291,7 @@ def reopen_workspace(store: Store, txid: str) -> Workspace:
     """Opens whichever of the two directories exist. Adopts nothing that was not there."""
     store._require_live()
     require_identifier("txid", txid)
-    staging_parent = _parent_fd(store, STAGING_PARENT)
-    work_parent = _parent_fd(store, WORK_PARENT)
+    staging_parent, work_parent = _parent_fds(store)
     try:
         workspace = _open_both(store, txid, staging_parent, work_parent)
         if workspace._staging_fd is None and workspace._work_fd is None:
@@ -5315,8 +5334,7 @@ def remove_workspace(store: Store, workspace: Workspace) -> None:
     from atoms.store.connection import gate
 
     txid = workspace._txid
-    staging_parent = _parent_fd(store, STAGING_PARENT)
-    work_parent = _parent_fd(store, WORK_PARENT)
+    staging_parent, work_parent = _parent_fds(store)
     try:
         # 1. Preflight: every staging entry is a regular file, work/<txid>/ is empty.
         staging_names: tuple[str, ...] = ()
@@ -5645,13 +5663,15 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from atoms.core.errors import ProtocolError
-from atoms.store.errors import MetadataStoreInvalid
+from atoms.store.errors import MetadataStoreInvalid, translated
 from atoms.store.records import SELECT_BLOB
 
 if TYPE_CHECKING:
     from atoms.store.connection import Store
 
-BLOBS_PARENT = "blobs/sha256"
+BLOBS_DIRECTORY = "blobs"
+SHA256_DIRECTORY = "sha256"
+BLOBS_PARENT = f"{BLOBS_DIRECTORY}/{SHA256_DIRECTORY}"
 DIGEST_PATTERN = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
 _READ_CHUNK = 1 << 20
 
@@ -5699,11 +5719,15 @@ def leaf_to_digest(leaf: str) -> str:
     return require_digest(f"sha256:{leaf}")
 
 
-def blobs_fd(store: Store) -> int:
-    return os.open(
-        BLOBS_PARENT, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
-        dir_fd=store._binding.metadata_root_fd,
+def _blobs_fd(store: Store) -> int:
+    backend = store._binding.backend
+    blobs_fd = backend.open_child_directory(
+        store._binding.metadata_root_fd, BLOBS_DIRECTORY
     )
+    try:
+        return backend.open_child_directory(blobs_fd, SHA256_DIRECTORY)
+    finally:
+        os.close(blobs_fd)
 
 
 def open_entry_nofollow(parent_fd: int, name: str, what: str) -> int:
@@ -5762,7 +5786,8 @@ def open_blob(store: Store, digest: str) -> int:
     """Design §7.2 -- membership, then content, then ownership transfer."""
     require_digest(digest)
     with store._read_transaction() as connection:
-        row = connection.execute(SELECT_BLOB, (digest,)).fetchone()
+        with translated("reading blob membership"):
+            row = connection.execute(SELECT_BLOB, (digest,)).fetchone()
         if row is None:
             raise ProtocolError(
                 f"{digest} is not indexed by this store; a promoted-but-unindexed orphan "
@@ -5770,7 +5795,7 @@ def open_blob(store: Store, digest: str) -> int:
             )
         byte_len = row[0]
     store._require_live()
-    parent = blobs_fd(store)
+    parent = _blobs_fd(store)
     try:
         try:
             fd = open_entry_nofollow(
@@ -5867,23 +5892,16 @@ follow a promotion:
 
 ```python
 def spec_referencing(*contents: bytes):
-    """A spec whose INITIAL surface declares one FileState per content.
-
-    The promoted blobs are that record's rollback material, which is exactly what the
-    §7.7 barrier checks for. Putting the hashes in the final surface would not work:
-    referenced_digests walks the initial surface only (Task 8), because a final-surface
-    hash names content the transaction has not produced yet.
-    """
+    """A create-from-absent spec whose final surface references every content."""
     names = [f"f{index}.txt" for index in range(len(contents))]
-    pre = {n: file_state(c) for n, c in zip(names, contents, strict=True)}
-    post = {n: file_state(c + b"!") for n, c in zip(names, contents, strict=True)}
+    post = {n: file_state(c) for n, c in zip(names, contents, strict=True)}
     return build_spec(
         consumer_tag="test",
         intent_digest="sha256:" + "5" * 64,
-        initial_surface=pre,
+        initial_surface={name: ABSENT for name in names},
         final_surface=post,
         effects=[
-            ReplaceFile(effect_id=f"e{index}", path=name, pre=pre[name], post=post[name])
+            CreateFileNoClobber(effect_id=f"e{index}", path=name, post=post[name])
             for index, name in enumerate(names)
         ],
     )
@@ -5940,7 +5958,7 @@ def test_promotion_spends_the_staging_half(opened_store):
 
 
 def test_an_empty_manifest_still_spends_the_staging_half(opened_store, store_binding):
-    """A spec whose initial surface names no file has nothing to capture, so the
+    """A file-free spec has no preimage or postimage blob, so the
     directory is removed with no source removed. Spending on the first source removal
     would leave this workspace holding a descriptor to an unlinked directory, which
     §8.3's disposition table says must read as spent (design §8.1 step 4)."""
@@ -6289,10 +6307,11 @@ def _preflight(store: Store, workspace: Workspace, manifest: tuple[StagedBlob, .
             os.close(fd)
         del observed
 
-    parent = blobs_fd(store)
+    parent = _blobs_fd(store)
     try:
         for digest in sorted(lengths):
-            row = store._connection.execute(SELECT_BLOB, (digest,)).fetchone()
+            with translated("reading blob membership during promotion"):
+                row = store._connection.execute(SELECT_BLOB, (digest,)).fetchone()
             if row is None:
                 continue
             if row[0] != lengths[digest]:
@@ -6332,7 +6351,7 @@ def promote_staging(
 
     backend = store._binding.backend
     staging_fd = workspace.staging_fd
-    parent = blobs_fd(store)
+    parent = _blobs_fd(store)
     spent = False
     try:
         for entry in manifest:
@@ -6367,23 +6386,23 @@ def promote_staging(
             workspace._spend_staging()
         os.close(parent)
 
-    staging_parent = os.open(
-        STAGING_PARENT, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
-        dir_fd=store._binding.metadata_root_fd,
+    staging_parent = backend.open_child_directory(
+        store._binding.metadata_root_fd, STAGING_PARENT
     )
     try:
         gate(store._binding)
         os.rmdir(workspace.txid, dir_fd=staging_parent)
         # The directory is gone, so the half is spent even if no source was removed --
-        # an empty manifest is a real case (a spec whose initial surface names no file
-        # has nothing to capture), and it reaches here with `spent` still False.
+        # an empty manifest is a real case (a file-free spec has no preimage or
+        # postimage blob), and it reaches here with `spent` still False.
         workspace._spend_staging()
         backend.flush_directory(staging_parent)
     finally:
         os.close(staging_parent)
 
     for entry in manifest:
-        store._connection.execute(INSERT_BLOB, (entry.digest, entry.byte_len))
+        with translated("indexing a promoted blob"):
+            store._connection.execute(INSERT_BLOB, (entry.digest, entry.byte_len))
 ```
 
 Add `from atoms.store.workspace import STAGING_PARENT, Workspace` to the imports.
@@ -6422,7 +6441,8 @@ Replace the second loop of `_run_barrier` with the record-reference check:
 
 ```python
         for txid, promoted in sorted(self._promoted.items()):
-            row = store._connection.execute(SELECT_RECORD, (txid,)).fetchone()
+            with translated("reading a promoted blob's record before commit"):
+                row = store._connection.execute(SELECT_RECORD, (txid,)).fetchone()
             referenced = (
                 set()
                 if row is None
@@ -7087,7 +7107,7 @@ def list_unindexed_blobs(store: Store) -> tuple[str, ...]:
     than only the type.
     """
     store._require_live()
-    parent = blobs_fd(store)
+    parent = _blobs_fd(store)
     try:
         leaves = sorted(os.listdir(parent))
     finally:
@@ -7136,13 +7156,14 @@ def remove_unindexed_blob(store: Store, digest: str) -> None:
     with translated("beginning reclamation"):
         store._connection.execute(_BEGIN_IMMEDIATE_SQL)
     try:
-        row = store._connection.execute(SELECT_BLOB, (digest,)).fetchone()
+        with translated("rechecking blob membership during reclamation"):
+            row = store._connection.execute(SELECT_BLOB, (digest,)).fetchone()
         if row is not None:
             raise ProtocolError(
                 f"{digest} is indexed; remove_unindexed_blob can only ever delete "
                 "something no record names"
             )
-        parent = blobs_fd(store)
+        parent = _blobs_fd(store)
         try:
             try:
                 fd = os.open(
@@ -7337,6 +7358,40 @@ def test_the_store_exports_no_sqlite_connection():
     for name in atoms.store.__all__:
         value = getattr(atoms.store, name)
         assert value is not sqlite3.Connection
+
+
+def _function_definition(path: Path, name: str) -> ast.FunctionDef:
+    return next(
+        node for node in ast.walk(_tree(path))
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    )
+
+
+def _attribute_call_count(function: ast.FunctionDef, attribute: str) -> int:
+    return sum(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == attribute
+        for node in ast.walk(function)
+    )
+
+
+def test_fixed_engine_directory_walks_use_the_guarded_backend_helper():
+    workspace_parent = _function_definition(PACKAGE / "workspace.py", "_parent_fd")
+    blobs_parent = _function_definition(PACKAGE / "blobs.py", "_blobs_fd")
+    promotion = _function_definition(PACKAGE / "blobs.py", "promote_staging")
+    assert _attribute_call_count(workspace_parent, "open_child_directory") == 1
+    assert _attribute_call_count(blobs_parent, "open_child_directory") == 2
+    assert _attribute_call_count(promotion, "open_child_directory") == 1
+    for function in (workspace_parent, blobs_parent, promotion):
+        assert not any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "os"
+            and node.func.attr == "open"
+            for node in ast.walk(function)
+        )
 
 
 @pytest.mark.parametrize("path", SOURCES, ids=lambda p: p.name)
@@ -7751,6 +7806,86 @@ def test_every_execute_argument_resolves_to_a_module_level_constant(path):
             f"{path.name}: execute({first.id}) in {where} does not resolve to a "
             "module-level SQL constant of the package"
         )
+
+
+def _untranslated_execute_sites(path: Path) -> list[int]:
+    sites: list[int] = []
+
+    def descend(node: ast.AST, owner: str | None, translated_depth: int) -> None:
+        child_owner = owner
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            child_owner = node.name
+        child_depth = translated_depth
+        if isinstance(node, ast.With) and any(
+            isinstance(item.context_expr, ast.Call)
+            and isinstance(item.context_expr.func, ast.Name)
+            and item.context_expr.func.id == "translated"
+            for item in node.items
+        ):
+            child_depth += 1
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"execute", "executemany"}
+            and not (
+                path.name == "connection.py" and child_owner == "_rollback_quietly"
+            )
+            and child_depth == 0
+        ):
+            sites.append(node.lineno)
+        for child in ast.iter_child_nodes(node):
+            descend(child, child_owner, child_depth)
+
+    descend(_tree(path), None, 0)
+    return sites
+
+
+def _wide_translation_sites(path: Path) -> list[tuple[int, int]]:
+    sites: list[tuple[int, int]] = []
+
+    def count(node: ast.AST, *, root: ast.With) -> int:
+        if isinstance(node, ast.With) and node is not root and any(
+            isinstance(item.context_expr, ast.Call)
+            and isinstance(item.context_expr.func, ast.Name)
+            and item.context_expr.func.id == "translated"
+            for item in node.items
+        ):
+            return 0
+        own = int(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"execute", "executemany"}
+        )
+        return own + sum(count(child, root=root) for child in ast.iter_child_nodes(node))
+
+    for node in ast.walk(_tree(path)):
+        if isinstance(node, ast.With) and any(
+            isinstance(item.context_expr, ast.Call)
+            and isinstance(item.context_expr.func, ast.Name)
+            and item.context_expr.func.id == "translated"
+            for item in node.items
+        ):
+            executions = count(node, root=node)
+            if executions != 1:
+                sites.append((node.lineno, executions))
+    return sites
+
+
+@pytest.mark.parametrize("path", SOURCES, ids=lambda p: p.name)
+def test_every_sqlite_execution_is_inside_narrow_translation(path):
+    """Totality plus narrowness, not a sample of hand-picked runtime sites.
+
+    `_untranslated_execute_sites` recursively tracks function ownership and nesting in
+    `with translated(...)`, exempting only `_rollback_quietly` by name.
+    `_wide_translation_sites` counts execute/executemany calls in each such scope while
+    not charging a nested translated scope to its parent.
+    """
+    assert not (sites := _untranslated_execute_sites(path)), (
+        f"{path.name} has untranslated SQLite execution at lines {sites}"
+    )
+    assert not (sites := _wide_translation_sites(path)), (
+        f"{path.name} has translated scopes with execute counts other than one: {sites}"
+    )
 
 
 def test_no_statement_in_the_package_attaches_or_vacuums():
@@ -8189,18 +8324,36 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from atoms.core.canonical import canonical_json
 from atoms.store.blobs import StagedBlob
 from atoms.store.connection import open_store
 from atoms.store.records import referenced_digests
-from tests.store_support import digest_of, spec_referencing, stage
+from tests.store_support import digest_of, replace_spec, spec_referencing, stage
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_a_committed_record_reads_back_identically_in_a_fresh_process(store_on):
-    content = b"durable bytes"
-    digest = digest_of(content)
+@pytest.mark.parametrize(
+    ("spec", "contents"),
+    [
+        pytest.param(
+            spec_referencing(b"durable postimage"),
+            (b"durable postimage",),
+            id="create-from-absent",
+        ),
+        pytest.param(
+            replace_spec(before=b"durable preimage", after=b"durable postimage"),
+            (b"durable preimage", b"durable postimage"),
+            id="replace",
+        ),
+    ],
+)
+def test_a_committed_record_reads_all_blobs_in_a_fresh_process(
+    store_on, spec, contents
+):
+    expected_blobs = {digest_of(content): len(content) for content in contents}
     with store_on() as binding:
         # Read the two roots back off the live descriptors: this works whatever the
         # underlying volume fixture is named in this checkout.
@@ -8208,13 +8361,17 @@ def test_a_committed_record_reads_back_identically_in_a_fresh_process(store_on):
         metadata_root = os.readlink(f"/proc/self/fd/{binding.metadata_root_fd}")
         with open_store(binding) as store:
             with store.create_workspace("tx1") as workspace:
-                stage(workspace, "capture", content)
-                with store.transaction() as txn:
-                    txn.promote_staging(
-                        workspace,
-                        (StagedBlob(name="capture", digest=digest, byte_len=len(content)),),
+                manifest = []
+                for index, content in enumerate(contents):
+                    name = f"blob-{index}"
+                    digest = digest_of(content)
+                    stage(workspace, name, content)
+                    manifest.append(
+                        StagedBlob(name=name, digest=digest, byte_len=len(content))
                     )
-                    txn.insert_record("tx1", spec_referencing(content))
+                with store.transaction() as txn:
+                    txn.promote_staging(workspace, tuple(manifest))
+                    txn.insert_record("tx1", spec)
                     txn.set_active("tx1")
             written = store.read_record("tx1")
         assert written is not None
@@ -8222,7 +8379,7 @@ def test_a_committed_record_reads_back_identically_in_a_fresh_process(store_on):
             "spec": canonical_json(written.spec),
             "state": written.state.value,
             "journals": [[j.effect_id, j.state.value] for j in written.journals],
-            "blobs": {digest: len(content)},
+            "blobs": expected_blobs,
             "active": "tx1",
         }
     # The binding -- and with it the project lock -- is released here. A second process
@@ -8240,10 +8397,8 @@ def test_a_committed_record_never_names_a_missing_blob(store_on):
     it writes only verified digests over flushed leaves, and §7.6 requires every
     referenced digest to have one.
 
-    Walk `referenced_digests`, not a surface. The final surface names content the
-    transaction will produce, for which no blob exists or should -- iterating it either
-    finds nothing (proving nothing) or asks open_blob for a digest that was never
-    promoted.
+    Walk `referenced_digests`, not one surface. The create-from-absent case proves that
+    a planned postimage is preparation material and must resolve after commit.
     """
     content = b"referenced"
     digest = digest_of(content)
@@ -8278,14 +8433,16 @@ Expected: PASS. `test_a5_status_is_synchronized_across_authority_documents` fail
 - [ ] **Step 4: Record the ledger discharge**
 
 Edit `docs/deferred-obligation-ledger.md`. Move row **#22** out of the open table and into the
-discharged table, carrying every original column through "Verification" unchanged and appending
-the three discharge columns the A4b-2 record uses. Its evidence is
+discharged table, correcting the admitted/required text to name both initial and final references and
+appending the three discharge columns the A4b-2 record uses. Its evidence is
+`tests/test_store_records.py::test_referenced_digests_include_initial_and_final_file_surfaces`,
+`::test_one_digest_with_conflicting_lengths_across_surfaces_keeps_both_pairs`,
 `tests/test_store_architecture.py::test_exactly_one_statement_in_the_package_writes_blob`,
 `::test_no_trigger_body_writes_blob`,
 `::test_every_execute_argument_resolves_to_a_module_level_constant`,
 `::test_executescript_is_never_called`, and, for the behavioural half,
 `tests/test_store_process.py::test_a_committed_record_never_names_a_missing_blob` and
-`::test_a_committed_record_reads_back_identically_in_a_fresh_process`.
+`::test_a_committed_record_reads_all_blobs_in_a_fresh_process`.
 
 **#23 stays open and unchanged.** A5a supplies `list_workspaces`, `reopen_workspace`,
 `remove_workspace`, `list_unindexed_blobs`, and `remove_unindexed_blob` and invokes none of
@@ -8302,8 +8459,9 @@ Edit `AGENTS.md`, replacing the A5 bullet with:
 - **A5 — durable metadata store and recovery lease: A5a implemented on 2026-08-01, A5b not yet
   designed.** `python/src/atoms/store/` holds the SQLite-WAL store as a mechanism — creation and
   reopen under the verified `metadata_root`, the pinned connection profile, the schema, typed
-  record read/write, blob promotion bound to the COMMIT that references it, and per-txid
-  workspaces. It discharges ledger #22 and admits #23. A5b composes it into the recovery-resolve
+  record read/write, guarded blob promotion of both preimages and planned postimages bound to the
+  COMMIT that references them, and per-txid workspaces. It discharges ledger #22 and admits #23. A5b
+  composes it into the recovery-resolve
   lease and owns entries #7, #9's enforcement half, #12, #17, #18, #19's part, #21, and #23.
 ```
 
@@ -8356,12 +8514,12 @@ git commit -m "test(store): guard the package boundary and discharge ledger #22"
 `TEMP_STORE=MEMORY` does not cover every SQLite transient, and the ownerless-directory threat model is
 inherited from A4a. There is nothing to build; the ledger paragraph it belongs to is already written.
 
-**One gap the first self-review found and this plan closes.** `referenced_digests` originally walked
-both surfaces, which would have made every record refuse at the barrier: a final-surface hash names
-content the transaction is about to *produce*, for which no blob exists or should. Blobs are rollback
-material — authority §7.3 step 3 captures the *pre*-state — so the predicate walks the initial surface
-only. This changed `spec_referencing`, the temporary blob rows in Task 8, and made `one_effect_spec`
-(which starts from `ABSENT`) need no blob at all, which is why most record tests commit without one.
+**Correction to the first self-review.** Its initial-surface-only conclusion contradicted authority
+§7.3 step 2, which requires preparation to write or verify planned postimage blobs before the PREPARED
+record COMMIT. `referenced_digests` therefore walks both surfaces: create-from-absent needs its final
+blob, and replace needs both preimage and postimage. `spec_referencing` is the create case;
+`one_effect_spec` is directory-only so blob-unrelated tests remain minimal. Test preparation promotes
+every referenced byte through the production path instead of manufacturing blob rows directly.
 
 **What the fourteenth review found, and what changed.** Each was reproduced before it was closed.
 
@@ -8429,7 +8587,7 @@ about `atoms.store` not existing yet rather than about the ordering this plan wr
 | --- | --- |
 | The stored-row length check was unarmed: the test declared `len(content) + 1` against a correct staged file, so `verify_leaf` refused the **source** one loop earlier and the index comparison was never reached | the manifest is now correct and the stored row is the corruption — `UPDATE blob SET byte_len = 999` through `raw_connect` — with the message asserted, which is what keeps the two rungs apart. That mismatch was never uncovered: `test_a_staged_source_is_verified_before_it_moves[length]` already owns it (Task 11) |
 | "Exactly one finding" was a docstring claim, not an assertion — both matrices only checked that the tag appeared somewhere in the combined message, so a second finding would have passed | both now run the predicate and assert `len(findings) == 1` and `findings[0].startswith(f"{rule}: ")` **before** triggering the verdict. Re-measured across all 24 cases: 15/15 read-side and 9/9 write-side produce exactly one correctly-tagged finding (Task 8; design §11.2, criterion 23) |
-| Task 8 marked `commit_record`'s insert `# Task 11: promote instead`, Task 11 then instructed deleting marked blocks from a **different file** and supplied no replacement, and the self-review described the helper as still inserting directly | the promise is withdrawn rather than fulfilled: the direct insert is permanent, with the reason stated where the helper is defined. Task 11's Files list drops `tests/test_store_records.py` and gains `tests/store_support.py`, which Step 1 does modify. Task 10's marker instruction goes too — Task 11 Step 4 replaces that fixture body whole, so nothing greps for a comment (Tasks 8, 10, 11) |
+| Task 8's `commit_record` manufactured blob rows directly, allowing fixtures to describe a committed record whose bytes had never passed the filesystem durability path | the helper now asserts that supplied bytes exactly cover both surfaces' references and stages/promotes/indexes them through production before inserting the record. Corruption tests mutate that valid completed state afterwards (Tasks 8, 11) |
 | A copy-ready fence shipped `os.path.stat.S_ISREG`, with prose afterwards telling the implementer to write something else | `import stat` and `stat.S_ISREG(info.st_mode)` are in the fence and the note is gone (Task 3) |
 
 One correction to the finding as stated: `os.path.stat` **is** a real attribute — measured,
@@ -8437,6 +8595,18 @@ One correction to the finding as stated: `os.path.stat` **is** a real attribute 
 name leaks. It is an undocumented re-export that a type checker refuses, which is why the line
 carried a `# type: ignore` at all. The defect is the same either way and the fix is the one asked
 for; the fence should never have needed the prose.
+
+**What the final whole-branch review found, and what changed.** Each load-bearing test was first RED,
+or was mutation-checked when the implementation already happened to satisfy it.
+
+| Finding | Closure |
+| --- | --- |
+| `referenced_digests` walked only the initial surface, contradicting authority §7.3 step 2 and making create-from-absent postimages impossible to promote | both surfaces contribute `(digest, byte_len)` pairs; create and replace commit every referenced byte and reopen it in a fresh process; conflicting lengths across surfaces retain both pairs and fail coherence |
+| Fixed `staging`, `work`, and `blobs/sha256` parent opens used ordinary `os.open`, so substituted symlinks and mount crossings bypassed guarded traversal | every component routes through `Backend.open_child_directory`; top-level and intermediate symlink tests prove no outside mutation, and an AST assertion proves A5a uses A4a's helper. A private mount test is omitted because mount setup is privileged and A4a already owns `NO_XDEV` behavior |
+| Create, reopen, and remove leaked the first workspace-parent descriptor if opening the second failed | `_parent_fds` closes `staging/` on the second-open failure; all three entry points share it and assert `EBADF` on the captured descriptor |
+| Several record, barrier, and blob-index statements could leak raw `SQLITE_CORRUPT` | every SQLite execution outside best-effort rollback is inside a one-statement `translated` scope; a total AST inventory and injected materialization, coherence, promotion read/insert, pre-COMMIT, and COMMIT cases enforce it |
+| WAL refusal, version diagnostics, filesystem-before-index order, and orphan sorting lacked mutation-resistant assertions | completed DELETE-mode stores remain unmodified and refused; full version phrases distinguish rows; `INSERT_BLOB` is traced after all three directory flushes; reverse enumeration still returns sorted digests. Each test failed its deliberate production mutation |
+| Stale test and fixture claims obscured the real surface | the release-liveness test names binding closure, raw connections close, EIO is asserted by errno, multi-orphan order is exercised, and `store_on` documents that repeated calls create distinct roots rather than simulate same-root restart |
 
 **Placeholder scan.** Clean. Every step that says "write this" carries the code. The nine-site gate
 inventory in Task 12 was briefly a parametrized case with a `raise AssertionError` body; it is now six
@@ -8513,11 +8683,9 @@ and the conditional was hiding the fact that `binding.__exit__()` never released
   two different test files read the same tuple — `STORE_SURFACE` is read by the after-close suite in
   `test_store_liveness.py` and by the attribute-set assertion in `test_store_architecture.py`, which
   is what keeps criteria 16 and 37 stated over one list.
-  `commit_record(store, binding, txid, spec)` inserts the `blob` rows `referenced_digests` reports
-  before committing, because a record referencing a digest with no row cannot be committed at all —
-  the barrier is the same predicate. That insert is **direct and permanent**: Task 11 adds promotion
-  beside it, not in place of it, since a corruption fixture writing its own precondition row is not
-  a debt owed to the promotion path.
+  `commit_record(store, txid, spec, *contents)` asserts the supplied bytes equal the full
+  `referenced_digests` pair set, then stages, promotes, indexes, and commits through production. This
+  keeps every completed test record inside ledger #22 before a corruption test mutates it.
 - `coherence_findings(connection, txid)` is imported into `tests/test_store_records.py` alongside the
   `RULE_*` constants, because both matrices now assert the finding *count* rather than a substring of
   the message. On the write side it is called with `opened_store._connection` from inside the open

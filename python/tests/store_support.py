@@ -9,7 +9,7 @@ import sqlite3
 from contextlib import contextmanager
 from typing import Any
 
-from atoms.core.effects import CreateFileNoClobber, ReplaceFile
+from atoms.core.effects import CreateDirectory, CreateFileNoClobber, ReplaceFile
 from atoms.core.fingerprint import ABSENT, AbsentState, DirectoryState, FileState, SymlinkState
 from atoms.core.recovery.model import (
     CommitDecision,
@@ -51,33 +51,32 @@ def digest_of(content: bytes) -> str:
     return "sha256:" + hashlib.sha256(content).hexdigest()
 
 
-def one_effect_spec(effect_id: str = "e1", content: bytes = b"after"):
-    """A minimal spec that compile_spec accepts: one CreateFileNoClobber."""
-    post = file_state(content)
+def one_effect_spec(effect_id: str = "e1"):
+    """A minimal blob-free spec that compile_spec accepts."""
+    post = DirectoryState(mode=0o755)
     return build_spec(
         consumer_tag="test",
         intent_digest="sha256:" + "0" * 64,
         initial_surface={"a.txt": ABSENT},
         final_surface={"a.txt": post},
-        effects=[CreateFileNoClobber(effect_id=effect_id, path="a.txt", post=post)],
+        effects=[CreateDirectory(effect_id=effect_id, path="a.txt", post=post)],
     )
 
 
 def spec_referencing(*contents: bytes):
-    """A spec whose initial surface declares one FileState per content."""
+    """A create-from-absent spec whose final surface references every content."""
     names = [f"f{index}.txt" for index in range(len(contents))]
-    pre = {name: file_state(content) for name, content in zip(names, contents, strict=True)}
     post = {
-        name: file_state(content + b"!")
+        name: file_state(content)
         for name, content in zip(names, contents, strict=True)
     }
     return build_spec(
         consumer_tag="test",
         intent_digest="sha256:" + "5" * 64,
-        initial_surface=pre,
+        initial_surface={name: ABSENT for name in names},
         final_surface=post,
         effects=[
-            ReplaceFile(effect_id=f"e{index}", path=name, pre=pre[name], post=post[name])
+            CreateFileNoClobber(effect_id=f"e{index}", path=name, post=post[name])
             for index, name in enumerate(names)
         ],
     )
@@ -116,24 +115,20 @@ def duplicate_effect_spec():
 
 
 def two_length_spec():
-    """One digest declared at two byte_lens across the initial surface.
+    """One digest declared at two byte_lens across the initial and final surfaces.
 
     compile_spec accepts this -- measured -- because it never compares two paths'
     fingerprints to each other. A hash and a length are both properties of the same
     bytes, so the store refuses it under §7.6.
     """
-    pre_a = FileState(content_hash=SHARED_DIGEST, mode=0o644, byte_len=5)
-    pre_b = FileState(content_hash=SHARED_DIGEST, mode=0o644, byte_len=6)
-    post_a, post_b = file_state(b"one"), file_state(b"two")
+    pre = FileState(content_hash=SHARED_DIGEST, mode=0o644, byte_len=5)
+    post = FileState(content_hash=SHARED_DIGEST, mode=0o644, byte_len=6)
     return build_spec(
         consumer_tag="test",
         intent_digest="sha256:" + "3" * 64,
-        initial_surface={"a.txt": pre_a, "b.txt": pre_b},
-        final_surface={"a.txt": post_a, "b.txt": post_b},
-        effects=[
-            ReplaceFile(effect_id="e1", path="a.txt", pre=pre_a, post=post_a),
-            ReplaceFile(effect_id="e2", path="b.txt", pre=pre_b, post=post_b),
-        ],
+        initial_surface={"a.txt": pre},
+        final_surface={"a.txt": post},
+        effects=[ReplaceFile(effect_id="e1", path="a.txt", pre=pre, post=post)],
     )
 
 
@@ -272,6 +267,30 @@ class CommitFails:
         return getattr(self._connection, name)
 
 
+class CorruptsStatement:
+    """A connection proxy injecting SQLITE_CORRUPT at one exact execute call."""
+
+    def __init__(
+        self, connection: sqlite3.Connection, statement: str, *, occurrence: int = 1
+    ) -> None:
+        self._connection = connection
+        self._statement = statement
+        self._occurrence = occurrence
+        self._seen = 0
+
+    def execute(self, statement: str, *parameters: Any):
+        if statement == self._statement:
+            self._seen += 1
+            if self._seen == self._occurrence:
+                error = sqlite3.DatabaseError("synthetic corruption")
+                error.sqlite_errorcode = sqlite3.SQLITE_CORRUPT  # type: ignore[attr-defined]
+                raise error
+        return self._connection.execute(statement, *parameters)
+
+    def __getattr__(self, name: str):
+        return getattr(self._connection, name)
+
+
 def every_diagnostic_shape() -> tuple[HaltDiagnostic, ...]:
     """One diagnostic per structurally distinct shape: empty tuples, populated tuples,
     a null effect_id, and every optional field on both settings."""
@@ -362,14 +381,24 @@ def non_compiling_spec(effect_id: str = "only"):
     )
 
 
-def commit_record(store, binding, txid: str, spec) -> None:
+def commit_record(store, txid: str, spec, *contents: bytes) -> None:
+    from atoms.store.blobs import StagedBlob
     from atoms.store.records import referenced_digests
 
-    raw = raw_connect(binding)
-    try:
-        for digest, byte_len in referenced_digests(spec):
-            raw.execute("INSERT INTO blob (digest, byte_len) VALUES (?, ?)", (digest, byte_len))
-    finally:
-        raw.close()
-    with store.transaction() as txn:
-        txn.insert_record(txid, spec)
+    referenced = set(referenced_digests(spec))
+    supplied = {(digest_of(content), len(content)): content for content in contents}
+    assert set(supplied) == referenced
+    if not referenced:
+        with store.transaction() as txn:
+            txn.insert_record(txid, spec)
+        return
+
+    with store.create_workspace(txid) as workspace:
+        manifest = []
+        for index, ((digest, byte_len), content) in enumerate(sorted(supplied.items())):
+            name = f"blob-{index}"
+            stage(workspace, name, content)
+            manifest.append(StagedBlob(name=name, digest=digest, byte_len=byte_len))
+        with store.transaction() as txn:
+            txn.promote_staging(workspace, tuple(manifest))
+            txn.insert_record(txid, spec)

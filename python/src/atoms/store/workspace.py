@@ -118,11 +118,18 @@ def _issue(store: Store, workspace: Workspace) -> Workspace:
 
 
 def _parent_fd(store: Store, name: str) -> int:
-    return os.open(
-        name,
-        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
-        dir_fd=store._binding.metadata_root_fd,
+    return store._binding.backend.open_child_directory(
+        store._binding.metadata_root_fd, name
     )
+
+
+def _parent_fds(store: Store) -> tuple[int, int]:
+    staging_parent = _parent_fd(store, STAGING_PARENT)
+    try:
+        return staging_parent, _parent_fd(store, WORK_PARENT)
+    except BaseException:
+        os.close(staging_parent)
+        raise
 
 
 def _open_child(parent_fd: int, parent: str, txid: str) -> int | None:
@@ -194,8 +201,7 @@ def _open_both(store: Store, txid: str, staging_parent: int, work_parent: int) -
 def create_workspace(store: Store, txid: str) -> Workspace:
     store._require_live()
     require_identifier("txid", txid)
-    staging_parent = _parent_fd(store, STAGING_PARENT)
-    work_parent = _parent_fd(store, WORK_PARENT)
+    staging_parent, work_parent = _parent_fds(store)
     try:
         for parent_fd, parent in ((staging_parent, STAGING_PARENT), (work_parent, WORK_PARENT)):
             if _stat_or_none(parent_fd, txid) is not None:
@@ -220,8 +226,7 @@ def create_workspace(store: Store, txid: str) -> Workspace:
 def reopen_workspace(store: Store, txid: str) -> Workspace:
     store._require_live()
     require_identifier("txid", txid)
-    staging_parent = _parent_fd(store, STAGING_PARENT)
-    work_parent = _parent_fd(store, WORK_PARENT)
+    staging_parent, work_parent = _parent_fds(store)
     try:
         workspace = _open_both(store, txid, staging_parent, work_parent)
         if workspace._staging_fd is None and workspace._work_fd is None:
@@ -259,8 +264,7 @@ def remove_workspace(store: Store, workspace: Workspace) -> None:
     from atoms.store.connection import gate
 
     txid = workspace._txid
-    staging_parent = _parent_fd(store, STAGING_PARENT)
-    work_parent = _parent_fd(store, WORK_PARENT)
+    staging_parent, work_parent = _parent_fds(store)
     try:
         staging_names: tuple[str, ...] = ()
         if workspace._staging_fd is not None:

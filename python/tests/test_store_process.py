@@ -8,36 +8,56 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from atoms.core.canonical import canonical_json
 from atoms.store.blobs import StagedBlob
 from atoms.store.connection import open_store
 from atoms.store.records import referenced_digests
-from tests.store_support import digest_of, spec_referencing, stage
+from tests.store_support import digest_of, replace_spec, spec_referencing, stage
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_a_committed_record_reads_back_identically_in_a_fresh_process(store_on):
-    content = b"durable bytes"
-    digest = digest_of(content)
+@pytest.mark.parametrize(
+    ("spec", "contents"),
+    [
+        pytest.param(
+            spec_referencing(b"durable postimage"),
+            (b"durable postimage",),
+            id="create-from-absent",
+        ),
+        pytest.param(
+            replace_spec(before=b"durable preimage", after=b"durable postimage"),
+            (b"durable preimage", b"durable postimage"),
+            id="replace",
+        ),
+    ],
+)
+def test_a_committed_record_reads_all_blobs_in_a_fresh_process(
+    store_on, spec, contents
+):
+    expected_blobs = {digest_of(content): len(content) for content in contents}
     with store_on() as binding:
         project_root = os.readlink(f"/proc/self/fd/{binding.project_root_fd}")
         metadata_root = os.readlink(f"/proc/self/fd/{binding.metadata_root_fd}")
         with open_store(binding) as store:
             with store.create_workspace("tx1") as workspace:
-                stage(workspace, "capture", content)
-                with store.transaction() as txn:
-                    txn.promote_staging(
-                        workspace,
-                        (
-                            StagedBlob(
-                                name="capture",
-                                digest=digest,
-                                byte_len=len(content),
-                            ),
-                        ),
+                manifest = []
+                for index, content in enumerate(contents):
+                    name = f"blob-{index}"
+                    digest = digest_of(content)
+                    stage(workspace, name, content)
+                    manifest.append(
+                        StagedBlob(
+                            name=name,
+                            digest=digest,
+                            byte_len=len(content),
+                        )
                     )
-                    txn.insert_record("tx1", spec_referencing(content))
+                with store.transaction() as txn:
+                    txn.promote_staging(workspace, tuple(manifest))
+                    txn.insert_record("tx1", spec)
                     txn.set_active("tx1")
             written = store.read_record("tx1")
         assert written is not None
@@ -48,7 +68,7 @@ def test_a_committed_record_reads_back_identically_in_a_fresh_process(store_on):
                 [journal.effect_id, journal.state.value]
                 for journal in written.journals
             ],
-            "blobs": {digest: len(content)},
+            "blobs": expected_blobs,
             "active": "tx1",
         }
     result = subprocess.run(

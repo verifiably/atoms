@@ -93,14 +93,16 @@ A5a discharges none of A5's seven. What it changes for each:
 
 Two:
 
-> **#22** — authority §7.3's cross-substrate rule: every blob a record references must be durable on
-> the filesystem before the COMMIT that references it. Admitted by the A5a store contract. First owner:
+> **#22** — authority §7.3's cross-substrate rule: every blob a record references — from both its
+> initial/preimage and final/planned-postimage `FileState`s — must be durable on the filesystem before
+> the COMMIT that references it. Admitted by the A5a store contract. First owner:
 > **A5a** — reassigned from A5b, because the mechanism that would have needed enforcing from above no
 > longer exists. `promote_staging` is the sole writer of a `blob` row (§7.1), it writes rows only from
 > the manifest step 1 verified, and only after step 3 has flushed the leaves; §7.6 requires every
 > referenced digest to have a row. The property is therefore structural rather than delegated.
-> Required behavior: keep it that way and prove it — a fresh-process test that a committed record never
-> names a missing blob, plus §11.6's assertion that no second writer of `blob` rows exists.
+> Required behavior: keep it that way and prove it — fresh-process create-from-absent and replace tests
+> that a committed record never names a missing preimage or postimage blob, plus §11.6's assertion that
+> no second writer of `blob` rows exists.
 > Verification: authority §13.4. The entry stays open until A5a lands with that suite, per the ledger's
 > own rule; it is not discharged by a design claiming the shape is unreachable.
 
@@ -540,6 +542,14 @@ nothing about `name` being `"../x"`, which is still resolved relative to that de
 multi-component names for exactly this reason, and A5a does not get to skip it because its namespace is
 engine-owned — A5b will pass a txid that A4b regenerated (#7) and a manifest A6 produced.
 
+The fixed engine-owned parents are guarded too. `staging`, `work`, `blobs`, and `sha256` are opened
+one component at a time through `Backend.open_child_directory`, which carries A4a's `NO_SYMLINKS` and
+`NO_XDEV` contract. A slash-containing `os.open("blobs/sha256", ...)` or a plain open of `staging`
+would silently follow a substituted parent before the leaf-level checks ran. §11 proves the routing
+statically and substitutes symlinks at both levels behaviorally. It does not create a private mount:
+mount setup is privileged and A4a's backend suite already owns the `NO_XDEV` syscall contract; the
+static helper proof is the non-privileged evidence that A5a cannot bypass it.
+
 ## 6. The schema
 
 ### 6.1 Tables
@@ -759,11 +769,12 @@ removes the barrier with it: with no second way to write a `blob` row, "every pr
 is true by construction and asserting it at COMMIT would be asserting that the same function did both
 halves of its own body.
 
-Nothing needed the separate method. Every digest a record references is a capture of that transaction
-(authority §7.3 steps 3–4), so it is in that transaction's manifest — including the content-addressing
-case where the bytes already exist as a blob, since the capture still lands in `staging/<txid>/` and
-promotion resolves it through §8.2's `EEXIST` path. §8.4's idempotency is unchanged; it is now reached
-from inside promotion instead of from a method A5b had to remember to call.
+Nothing needed the separate method. Every digest a record references is preparation material for that
+transaction: initial-surface file states are captured preimages, and final-surface file states are
+planned postimages which authority §7.3 step 2 explicitly requires preparation to write or verify
+before the record COMMIT. Both sets therefore enter the transaction's promotion manifest (or the
+verified `EEXIST` path when content is already present). §8.4's idempotency is unchanged; it is now
+reached from inside promotion instead of from a method A5b had to remember to call.
 
 **`_StoreTransaction` is private and stays private.** It is absent from `__all__` because no caller
 constructs one or annotates against one — it is obtained only by entering `Store.transaction()`, used
@@ -1296,7 +1307,7 @@ directory with its digest and byte length:
    resurrecting preparation-only staging — authority §7.3's stated reason.
 4. Require `staging/<txid>/` to be empty, **gate**, then `rmdir` it. **The staging half is spent the
    moment that `rmdir` succeeds**, not the moment a source is removed. The two differ on an empty
-   manifest — a spec whose initial surface names no file has nothing to capture, so promotion removes
+   manifest — a file-free spec has no preimage or postimage blob, so promotion removes
    the directory without removing any source — and spending on source removal alone would leave that
    workspace holding a descriptor to an unlinked directory, which is the exact state §8.3 spends the
    half to prevent. Source
@@ -1385,6 +1396,11 @@ correct outcome, not a retry.
 `staging/<txid>/` and `work/<txid>/` are created and removed through A4a's guarded traversal from the
 retained `metadata_root` descriptor, never by absolute path. Removal is durable: `rmdir`, then
 `backend.flush_directory` on the parent.
+
+Opening the two fixed parents is one ownership operation: if opening `work/` fails after `staging/`
+opened, the first descriptor is closed before the error escapes. Create, reopen, and remove all use
+that helper; none can leak the first parent merely because the second parent was substituted or
+otherwise refused.
 
 A workspace is the pair, and its shape and lifetime are exact. **It is a resource, not a value, so it
 is not frozen** — the distinction `ProjectBinding` already draws in the same words: "Not frozen, because
@@ -1781,9 +1797,10 @@ and `OperationalError`, so a handler that translated everything it caught would 
 busy lock as a corrupt store. Those are operational failures a caller may retry or escalate; calling
 them corruption would send a consumer to preserve evidence for a condition that clears itself.
 
-**This is verified by behavior, not by grep.** §11.6's static check is now the narrow one it can
-actually justify — no `except sqlite3.Error` (the whole hierarchy, which would swallow programming
-errors too) and no bare `except:` — while the real assertion is a runtime test in §11.2: injected
+**This is verified by behavior and a total syntax inventory, not by grep.** §11.6 requires every
+`execute`/`executemany` site except the named best-effort rollback to be inside `translated`, and every
+such scope to contain exactly one SQLite statement. It also bans `except sqlite3.Error` (the whole
+hierarchy, which would swallow programming errors too) and bare `except:`. Runtime tests in §11.2 inject
 `SQLITE_BUSY` and `SQLITE_READONLY` propagate as their original classes with their original codes, and
 only a corrupt or non-database file yields `MetadataStoreInvalid`. A syntactic ban on the correct catch
 would have passed a lint that the contract fails.
@@ -2186,8 +2203,9 @@ and promotion cuts are §8.2's preserved evidence.
 A record written and committed in one process is read back identically in a new one. This is the
 durability claim A5a actually makes.
 
-**Ledger #22's proof lives here**: a committed record's every referenced digest resolves through
-`open_blob` in a fresh process, with the bytes verifying against the digest. The claim is structural —
+**Ledger #22's proof lives here**: create-from-absent and replace records prove that every referenced
+digest from both initial and final surfaces resolves through `open_blob` in a fresh process, with the
+bytes verifying against the digest. The claim is structural —
 §7.1 leaves one writer of `blob` rows and §8.1 orders its flushes before its inserts — but structure is
 what the test protects, not a substitute for it. Cross-process WAL exclusion is **not** re-tested: A4a's
 `certify_sqlite_wal` already proves it at bind time, and re-asserting it here would duplicate a
@@ -2237,6 +2255,12 @@ This is the static half of ledger #22, and it is the half that carries the weigh
 verify, publish, flush, then index — is worth exactly nothing if a second site can write a row without
 it. No `ATTACH` or `VACUUM` statement appears in the package. No
 blanket `OSError` handler, extending the existing guard.
+
+Every SQLite execution site is also inventoried. Apart from `_rollback_quietly`, which deliberately
+preserves the original failure, each `execute` or `executemany` must be inside `translated`, and each
+translation scope must contain exactly one syntactic statement site. Runtime injections cover record
+materialization, coherence and pre-COMMIT barrier reads, blob index reads and inserts, and COMMIT, so
+the inventory proves total routing while behavior proves the result-code discrimination.
 
 **No `os.fsync` call appears in `atoms.store`** — every durability barrier goes through
 `Backend.flush_file` or `Backend.flush_directory` (§5.1 step 3). This one is worth checking statically
@@ -2505,11 +2529,12 @@ table shapes, and §11 refusal vocabulary (§3.3).
     The class surfaces are asserted as **sets**: `Store`, `_StoreTransaction`, and `Workspace` expose
     exactly §7.1's and §8.3's listings and nothing else. This is where `_StoreTransaction` having no
     `insert_blobs` and `Workspace._spend_staging` being private are enforceable at all — both are
-    claims about absent methods, which no behavioural test can make. A fresh process resolves every digest a committed record
-    references through `open_blob`. These are the two halves of ledger #22, one static and one
-    behavioral.
+    claims about absent methods, which no behavioural test can make. A fresh process resolves every
+    initial- and final-surface digest of create-from-absent and replace records through `open_blob`.
+    These are the two halves of ledger #22, one static and one behavioral.
 38. `atoms.fs` and `atoms.core` import nothing from `atoms.store`.
-39. A record committed in one process is read back identically in a fresh process.
+39. Create-from-absent and replace records committed in one process are read back identically in a
+    fresh process, including every initial- and final-surface blob.
 40. No `ProjectApprovedSpec` is accepted anywhere in `atoms.store`, so ledger #9's enforcement cannot
     be satisfied at this layer by accident.
 41. No consumer of `atoms.store` exists yet, asserted rather than assumed.
@@ -2524,4 +2549,5 @@ table shapes, and §11 refusal vocabulary (§3.3).
     alone**. That function is the rollback §7.7 routes every failing exit through, and it must return
     rather than raise, because §7.7 forbids masking the original exception with the rollback's own.
     A second swallow anywhere in the package fails the count, so the exemption cannot spread by
-    resembling itself.
+    resembling itself. A total AST inventory additionally requires every SQLite execution site outside
+    that exemption to be inside a one-statement `translated` scope.

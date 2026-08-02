@@ -10,6 +10,7 @@ import pytest
 
 from atoms.core.errors import ProtocolError
 from atoms.store.connection import open_store
+from atoms.store.errors import MetadataStoreInvalid
 from tests.store_support import (
     RELEASES,
     STORE_SURFACE,
@@ -132,6 +133,19 @@ def test_a_failed_commit_leaves_no_open_transaction(opened_store, monkeypatch):
         pass
 
 
+def test_corruption_reported_by_commit_is_translated_and_rolled_back(
+    opened_store, monkeypatch
+):
+    from tests.store_support import CorruptsStatement, one_effect_spec
+
+    proxy = CorruptsStatement(opened_store._connection, "COMMIT")
+    monkeypatch.setattr(opened_store, "_connection", proxy)
+    with pytest.raises(MetadataStoreInvalid) as caught, opened_store.transaction() as txn:
+        txn.insert_record("tx1", one_effect_spec())
+    assert isinstance(caught.value.__cause__, sqlite3.DatabaseError)
+    assert not proxy.in_transaction
+
+
 def test_a_transaction_after_close_raises_protocol_error_not_sqlite(opened_store):
     opened_store.close()
     with pytest.raises(ProtocolError), opened_store.transaction():
@@ -144,7 +158,7 @@ def test_the_store_exposes_no_connection(opened_store):
     )
 
 
-def test_a_released_lock_refuses_every_operation(store_on):
+def test_transaction_entry_refuses_after_the_binding_closes(store_on):
     with store_on() as binding:
         store = open_store(binding)
     with pytest.raises(ProtocolError), store.transaction():

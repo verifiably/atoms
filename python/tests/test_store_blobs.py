@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import signal
 import socket
@@ -10,11 +11,19 @@ import sqlite3
 import pytest
 
 from atoms.core.errors import ProtocolError
-from atoms.store.blobs import StagedBlob, digest_to_leaf, leaf_to_digest, require_component
+from atoms.store.blobs import (
+    INSERT_BLOB,
+    StagedBlob,
+    digest_to_leaf,
+    leaf_to_digest,
+    require_component,
+)
 from atoms.store.connection import open_store
 from atoms.store.errors import MetadataStoreInvalid
+from atoms.store.records import SELECT_BLOB, SELECT_RECORD
 from tests.store_support import (
     RELEASES,
+    CorruptsStatement,
     child_dir,
     digest_of,
     metadata_root_snapshot,
@@ -71,6 +80,40 @@ def test_an_unindexed_digest_raises_protocol_error_on_a_healthy_store(opened_sto
     assert "not indexed" in str(caught.value)
 
 
+@pytest.mark.parametrize("substitution", ["blobs", "sha256"])
+def test_blob_parent_symlink_is_refused_without_unlinking_outside_content(
+    opened_store, store_binding, tmp_path, substitution
+):
+    content = b"outside content"
+    digest = digest_of(content)
+    leaf = digest_to_leaf(digest)
+    outside = tmp_path / f"outside-{substitution}"
+    outside.mkdir()
+    root = store_binding.metadata_root_fd
+    if substitution == "blobs":
+        (outside / "sha256").mkdir()
+        target = outside / "sha256"
+        os.rename("blobs", "blobs-owned", src_dir_fd=root, dst_dir_fd=root)
+        os.symlink(str(outside), "blobs", dir_fd=root)
+    else:
+        target = outside
+        with child_dir(root, "blobs") as blobs_fd:
+            os.rename(
+                "sha256",
+                "sha256-owned",
+                src_dir_fd=blobs_fd,
+                dst_dir_fd=blobs_fd,
+            )
+            os.symlink(str(outside), "sha256", dir_fd=blobs_fd)
+    (target / leaf).write_bytes(content)
+
+    with pytest.raises(OSError) as caught:
+        opened_store.remove_unindexed_blob(digest)
+
+    assert caught.value.errno == errno.ELOOP
+    assert (target / leaf).read_bytes() == content
+
+
 def test_open_blob_returns_a_verified_descriptor_at_offset_zero(promoted_blob):
     store, digest, content = promoted_blob
     fd = store.open_blob(digest)
@@ -78,6 +121,20 @@ def test_open_blob_returns_a_verified_descriptor_at_offset_zero(promoted_blob):
         assert os.read(fd, len(content)) == content
     finally:
         os.close(fd)
+
+
+def test_corruption_from_open_blobs_index_read_is_translated(
+    promoted_blob, monkeypatch
+):
+    store, digest, _content = promoted_blob
+    monkeypatch.setattr(
+        store,
+        "_connection",
+        CorruptsStatement(store._connection, SELECT_BLOB),
+    )
+    with pytest.raises(MetadataStoreInvalid) as caught:
+        store.open_blob(digest)
+    assert isinstance(caught.value.__cause__, sqlite3.DatabaseError)
 
 
 def test_the_returned_descriptor_is_the_callers_to_close(promoted_blob):
@@ -285,12 +342,12 @@ def test_a_promoted_digest_must_be_referenced_by_its_workspaces_record(opened_st
     assert "tx1" in str(caught.value)
 
 
-def test_a_final_surface_reference_does_not_justify_promotion(opened_store):
+def test_a_create_from_absent_postimage_reference_justifies_promotion(opened_store):
     with opened_store.create_workspace("tx1") as workspace:
         stage(workspace, "one", b"after")
-        with pytest.raises(ProtocolError), opened_store.transaction() as txn:
+        with opened_store.transaction() as txn:
             txn.promote_staging(workspace, _manifest(("one", b"after")))
-            txn.insert_record("tx1", one_effect_spec(content=b"after"))
+            txn.insert_record("tx1", spec_referencing(b"after"))
 
 
 @pytest.mark.parametrize(
@@ -645,6 +702,27 @@ def test_flushes_continue_on_held_descriptors_then_rmdir_has_a_late_gate(
         store.close()
 
 
+def test_promotion_refuses_a_substituted_staging_parent_without_outside_rmdir(
+    opened_store, store_binding, tmp_path
+):
+    content = b"postimage"
+    workspace = opened_store.create_workspace("tx1")
+    stage(workspace, "one", content)
+    outside = tmp_path / "outside-staging"
+    (outside / "tx1").mkdir(parents=True)
+    root = store_binding.metadata_root_fd
+    os.rename("staging", "staging-owned", src_dir_fd=root, dst_dir_fd=root)
+    os.symlink(str(outside), "staging", dir_fd=root)
+
+    with pytest.raises(OSError) as caught, opened_store.transaction() as txn:
+        txn.promote_staging(workspace, _manifest(("one", content)))
+        txn.insert_record("tx1", spec_referencing(content))
+
+    assert caught.value.errno == errno.ELOOP
+    assert (outside / "tx1").is_dir()
+    workspace.close()
+
+
 def test_successful_promotion_flushes_blob_staging_and_staging_parent_in_order(
     opened_store, store_binding, monkeypatch
 ):
@@ -657,17 +735,74 @@ def test_successful_promotion_flushes_blob_staging_and_staging_parent_in_order(
         parent_inode = os.fstat(staging_fd).st_ino
     backend = store_binding.backend
     real = backend.flush_directory
-    flushes: list[int] = []
+    events: list[int | str] = []
 
     def record(fd):
-        flushes.append(os.fstat(fd).st_ino)
+        events.append(os.fstat(fd).st_ino)
         real(fd)
 
     monkeypatch.setattr(backend, "flush_directory", record)
-    with opened_store.transaction() as txn:
-        txn.promote_staging(workspace, _manifest(("one", b"first")))
-        txn.insert_record("tx1", spec_referencing(b"first"))
-    assert flushes == [blobs_inode, staging_inode, parent_inode]
+    opened_store._connection.set_trace_callback(
+        lambda statement: events.append("INSERT_BLOB")
+        if statement.startswith("INSERT INTO blob")
+        else None
+    )
+    try:
+        with opened_store.transaction() as txn:
+            txn.promote_staging(workspace, _manifest(("one", b"first")))
+            txn.insert_record("tx1", spec_referencing(b"first"))
+    finally:
+        opened_store._connection.set_trace_callback(None)
+    assert events == [blobs_inode, staging_inode, parent_inode, "INSERT_BLOB"]
+
+
+def test_corruption_from_promotions_blob_index_read_is_translated(
+    opened_store, monkeypatch
+):
+    content = b"postimage"
+    with opened_store.create_workspace("tx1") as workspace:
+        stage(workspace, "one", content)
+        monkeypatch.setattr(
+            opened_store,
+            "_connection",
+            CorruptsStatement(opened_store._connection, SELECT_BLOB),
+        )
+        with pytest.raises(MetadataStoreInvalid) as caught, opened_store.transaction() as txn:
+            txn.promote_staging(workspace, _manifest(("one", content)))
+    assert isinstance(caught.value.__cause__, sqlite3.DatabaseError)
+
+
+def test_corruption_from_promotions_blob_index_insert_is_translated(
+    opened_store, monkeypatch
+):
+    content = b"postimage"
+    with opened_store.create_workspace("tx1") as workspace:
+        stage(workspace, "one", content)
+        monkeypatch.setattr(
+            opened_store,
+            "_connection",
+            CorruptsStatement(opened_store._connection, INSERT_BLOB),
+        )
+        with pytest.raises(MetadataStoreInvalid) as caught, opened_store.transaction() as txn:
+            txn.promote_staging(workspace, _manifest(("one", content)))
+    assert isinstance(caught.value.__cause__, sqlite3.DatabaseError)
+
+
+def test_corruption_from_promotions_precommit_reference_query_is_translated(
+    opened_store, monkeypatch
+):
+    content = b"postimage"
+    with opened_store.create_workspace("tx1") as workspace:
+        stage(workspace, "one", content)
+        monkeypatch.setattr(
+            opened_store,
+            "_connection",
+            CorruptsStatement(opened_store._connection, SELECT_RECORD, occurrence=2),
+        )
+        with pytest.raises(MetadataStoreInvalid) as caught, opened_store.transaction() as txn:
+            txn.promote_staging(workspace, _manifest(("one", content)))
+            txn.insert_record("tx1", spec_referencing(content))
+    assert isinstance(caught.value.__cause__, sqlite3.DatabaseError)
 
 
 def test_promoting_without_a_record_rolls_back_index_but_leaves_the_orphan(
@@ -729,9 +864,11 @@ def test_promotion_is_only_a_transaction_operation(opened_store):
     assert not hasattr(opened_store, "insert_blobs")
 
 
-def _promote_orphan(store, content: bytes = b"orphaned") -> str:
+def _promote_orphan(
+    store, content: bytes = b"orphaned", *, txid: str = "tx1"
+) -> str:
     digest = digest_of(content)
-    with store.create_workspace("tx1") as workspace:
+    with store.create_workspace(txid) as workspace:
         stage(workspace, "one", content)
         with pytest.raises(ProtocolError) as caught, store.transaction() as txn:
             txn.promote_staging(workspace, _manifest(("one", content)))
@@ -747,6 +884,23 @@ def test_a_promoted_orphan_is_listed_and_removed(opened_store, store_binding):
     assert opened_store.list_unindexed_blobs() == ()
     with child_dir(store_binding.metadata_root_fd, "blobs/sha256") as blobs_fd:
         assert os.listdir(blobs_fd) == []
+
+
+def test_multiple_orphans_are_sorted_even_when_enumerated_in_reverse(
+    opened_store, monkeypatch
+):
+    contents = (b"first orphan", b"second orphan")
+    expected = tuple(sorted(digest_of(content) for content in contents))
+    for index, content in enumerate(contents):
+        _promote_orphan(opened_store, content, txid=f"tx{index}")
+
+    real_listdir = os.listdir
+    monkeypatch.setattr(
+        os,
+        "listdir",
+        lambda fd: sorted(real_listdir(fd), reverse=True),
+    )
+    assert opened_store.list_unindexed_blobs() == expected
 
 
 def test_enumeration_is_one_deferred_read_transaction(opened_store):

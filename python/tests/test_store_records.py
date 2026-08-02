@@ -40,11 +40,15 @@ from atoms.store.records import (
     RULE_SPEC_CANONICAL,
     RULE_SPEC_COMPILES,
     RULE_SPEC_DECODES,
+    SELECT_ACTIVE,
+    SELECT_EFFECTS,
     coherence_findings,
     decode_diagnostic,
     encode_diagnostic,
+    referenced_digests,
 )
 from tests.store_support import (
+    CorruptsStatement,
     commit_record,
     digest_of,
     duplicate_effect_spec,
@@ -54,6 +58,7 @@ from tests.store_support import (
     one_effect_spec,
     raw_connect,
     replace_spec,
+    two_length_spec,
 )
 
 
@@ -228,7 +233,21 @@ def test_insert_record_derives_every_effect_row_from_the_spec(opened_store, stor
         ).fetchall()
     finally:
         raw.close()
-    assert rows == [("only", "create_file_no_clobber", "pending")]
+    assert rows == [("only", "create_directory", "pending")]
+
+
+def test_referenced_digests_include_initial_and_final_file_surfaces():
+    spec = replace_spec(before=b"before", after=b"after")
+    assert referenced_digests(spec) == tuple(
+        sorted(((digest_of(b"before"), 6), (digest_of(b"after"), 5)))
+    )
+
+
+def test_one_digest_with_conflicting_lengths_across_surfaces_keeps_both_pairs():
+    assert referenced_digests(two_length_spec()) == (
+        ("sha256:" + "a" * 64, 5),
+        ("sha256:" + "a" * 64, 6),
+    )
 
 
 def test_spec_json_is_write_once_at_the_database(opened_store, store_binding):
@@ -418,8 +437,8 @@ def test_setting_a_journal_state_for_an_unknown_effect_refuses(opened_store):
 
 
 def test_set_active_enforces_the_single_active_row(opened_store, store_binding):
-    commit_record(opened_store, store_binding, "tx1", one_effect_spec())
-    commit_record(opened_store, store_binding, "tx2", replace_spec())
+    commit_record(opened_store, "tx1", one_effect_spec())
+    commit_record(opened_store, "tx2", replace_spec(), b"before", b"after")
     with opened_store.transaction() as txn:
         txn.set_active("tx1")
         txn.set_active("tx2")
@@ -473,7 +492,7 @@ def test_strict_typing_refuses_a_value_that_cannot_convert(opened_store, store_b
 
 def test_a_record_round_trips_through_the_store(opened_store, store_binding):
     spec = replace_spec(effect_id="e1")
-    commit_record(opened_store, store_binding, "tx1", spec)
+    commit_record(opened_store, "tx1", spec, b"before", b"after")
     with opened_store.transaction() as txn:
         txn.set_active("tx1")
     record = opened_store.read_record("tx1")
@@ -516,7 +535,8 @@ def _plant_halted(raw, diagnostic):
     )
 
 
-ONE_EFFECT_ROW = (("only", "create_file_no_clobber"),)
+ONE_EFFECT_ROW = (("only", "create_directory"),)
+CREATE_FILE_ROW = (("only", "create_file_no_clobber"),)
 
 
 def _only_spec():
@@ -526,11 +546,11 @@ def _only_spec():
 CROSS_ROW_CASES = (
         (RULE_SPEC_DECODES, _only_spec, lambda raw: _plant_spec_json(raw, '{"nope": 1}', ())),
         (RULE_SPEC_CANONICAL, _only_spec, lambda raw: _plant_spec_json(raw, " " + canonical_json(_only_spec()), ONE_EFFECT_ROW)),
-        (RULE_SPEC_COMPILES, _only_spec, lambda raw: _plant_spec_json(raw, canonical_json(non_compiling_spec()), ONE_EFFECT_ROW)),
+        (RULE_SPEC_COMPILES, _only_spec, lambda raw: _plant_spec_json(raw, canonical_json(non_compiling_spec()), CREATE_FILE_ROW)),
         (RULE_EFFECT_COVERAGE, _only_spec, lambda raw: _plant(raw, "DELETE FROM effect")),
         (RULE_EFFECT_VARIANT, _only_spec, lambda raw: _plant(raw, "UPDATE effect SET variant = 'delete_path'")),
-        (RULE_BLOB_ROW_PRESENT, replace_spec, lambda raw: _plant(raw, "DELETE FROM blob")),
-        (RULE_BLOB_BYTE_LEN, replace_spec, lambda raw: _plant(raw, "UPDATE blob SET byte_len = 999")),
+        (RULE_BLOB_ROW_PRESENT, replace_spec, lambda raw: _plant(raw, "DELETE FROM blob WHERE digest = ?", (digest_of(b"before"),))),
+        (RULE_BLOB_BYTE_LEN, replace_spec, lambda raw: _plant(raw, "UPDATE blob SET byte_len = 999 WHERE digest = ?", (digest_of(b"before"),))),
         (RULE_ROLLBACK_RESULT, _only_spec, lambda raw: _plant(raw, "UPDATE transaction_record SET state = 'rolled_back'")),
         (RULE_HALT_DIAGNOSTIC, _only_spec, lambda raw: _plant(raw, "UPDATE transaction_record SET state = 'halted'")),
         (RULE_DIAGNOSTIC_DECISION, _only_spec, lambda raw: _plant_halted(raw, replace(matching_diagnostic("only"), commit_decision=CommitDecision.COMMITTED))),
@@ -544,7 +564,8 @@ CROSS_ROW_CASES = (
     CROSS_ROW_CASES,
 )
 def test_cross_row_corruption_refuses_on_load(opened_store, store_binding, rule, prepare, corrupt):
-    commit_record(opened_store, store_binding, "tx1", prepare())
+    contents = (b"before", b"after") if prepare is replace_spec else ()
+    commit_record(opened_store, "tx1", prepare(), *contents)
     raw = raw_connect(store_binding)
     try:
         corrupt(raw)
@@ -563,7 +584,7 @@ def test_the_cross_row_matrix_covers_every_rule_on_read_side():
 
 
 def test_reading_a_ghost_active_reference_refuses(opened_store, store_binding):
-    commit_record(opened_store, store_binding, "tx1", _only_spec())
+    commit_record(opened_store, "tx1", _only_spec())
     raw = raw_connect(store_binding)
     try:
         raw.execute("DELETE FROM effect WHERE txid = 'tx1'")
@@ -589,10 +610,22 @@ def _halt_with(txn, diagnostic):
     txn.set_halt_diagnostic("tx2", diagnostic)
 
 
+def _plant_replace_blob_rows(raw, *, before_len: int | None) -> None:
+    if before_len is not None:
+        raw.execute(
+            "INSERT INTO blob VALUES (?, ?)",
+            (digest_of(b"before"), before_len),
+        )
+    raw.execute(
+        "INSERT INTO blob VALUES (?, ?)",
+        (digest_of(b"after"), len(b"after")),
+    )
+
+
 WRITE_SIDE_INCOHERENCE = (
     (RULE_SPEC_COMPILES, None, lambda txn: txn.insert_record("tx3", non_compiling_spec())),
-    (RULE_BLOB_ROW_PRESENT, None, lambda txn: txn.insert_record("tx3", replace_spec())),
-    (RULE_BLOB_BYTE_LEN, lambda raw: raw.execute("INSERT INTO blob VALUES (?, ?)", (digest_of(b"before"), 999)), lambda txn: txn.insert_record("tx3", replace_spec())),
+    (RULE_BLOB_ROW_PRESENT, lambda raw: _plant_replace_blob_rows(raw, before_len=None), lambda txn: txn.insert_record("tx3", replace_spec())),
+    (RULE_BLOB_BYTE_LEN, lambda raw: _plant_replace_blob_rows(raw, before_len=999), lambda txn: txn.insert_record("tx3", replace_spec())),
     (RULE_ROLLBACK_RESULT, None, lambda txn: txn.set_transaction_state("tx2", TransactionState.ROLLED_BACK)),
     (RULE_ROLLBACK_RESULT, None, lambda txn: txn.set_rollback_result("tx2", RollbackResult.RESTORED)),
     (RULE_HALT_DIAGNOSTIC, None, lambda txn: txn.set_transaction_state("tx2", TransactionState.HALTED)),
@@ -620,7 +653,7 @@ WRITE_UNREACHABLE_RULES = (
 
 @pytest.mark.parametrize(("rule", "plant", "body"), WRITE_SIDE_INCOHERENCE)
 def test_every_reachable_cross_row_rule_refuses_on_a_write(opened_store, store_binding, rule, plant, body):
-    commit_record(opened_store, store_binding, "tx2", _only_spec())
+    commit_record(opened_store, "tx2", _only_spec())
     if plant:
         raw = raw_connect(store_binding)
         try:
@@ -677,8 +710,7 @@ def test_the_journal_vector_follows_spec_order_not_row_order(opened_store):
         final_surface={f"{name}.txt": posts[name] for name in posts},
         effects=[CreateFileNoClobber(effect_id=name, path=f"{name}.txt", post=posts[name]) for name in ("z", "a", "m")],
     )
-    with opened_store.transaction() as txn:
-        txn.insert_record("tx1", spec)
+    commit_record(opened_store, "tx1", spec, *(name.encode() for name in posts))
     assert tuple(j.effect_id for j in opened_store.read_record("tx1").journals) == ("z", "a", "m")
 
 
@@ -745,3 +777,31 @@ def test_a_failed_read_closes_its_transaction(opened_store, store_binding):
         opened_store.read_record("tx1")
     with opened_store.transaction():
         pass
+
+
+def test_corruption_from_the_record_materialization_query_is_translated(
+    opened_store, monkeypatch
+):
+    with opened_store.transaction() as txn:
+        txn.insert_record("tx1", one_effect_spec())
+    monkeypatch.setattr(
+        opened_store,
+        "_connection",
+        CorruptsStatement(opened_store._connection, SELECT_EFFECTS, occurrence=2),
+    )
+    with pytest.raises(MetadataStoreInvalid) as caught:
+        opened_store.read_record("tx1")
+    assert isinstance(caught.value.__cause__, sqlite3.DatabaseError)
+
+
+def test_corruption_from_a_precommit_coherence_query_is_translated(
+    opened_store, monkeypatch
+):
+    monkeypatch.setattr(
+        opened_store,
+        "_connection",
+        CorruptsStatement(opened_store._connection, SELECT_ACTIVE),
+    )
+    with pytest.raises(MetadataStoreInvalid) as caught, opened_store.transaction() as txn:
+        txn.insert_record("tx1", one_effect_spec())
+    assert isinstance(caught.value.__cause__, sqlite3.DatabaseError)

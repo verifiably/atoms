@@ -179,6 +179,42 @@ def test_the_store_exports_no_sqlite_connection():
         assert getattr(atoms.store, name) is not sqlite3.Connection
 
 
+def _function_definition(path: Path, name: str) -> ast.FunctionDef:
+    return next(
+        node
+        for node in ast.walk(_tree(path))
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    )
+
+
+def _attribute_call_count(function: ast.FunctionDef, attribute: str) -> int:
+    return sum(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == attribute
+        for node in ast.walk(function)
+    )
+
+
+def test_fixed_engine_directory_walks_use_the_guarded_backend_helper():
+    workspace_parent = _function_definition(PACKAGE / "workspace.py", "_parent_fd")
+    blobs_parent = _function_definition(PACKAGE / "blobs.py", "_blobs_fd")
+    promotion = _function_definition(PACKAGE / "blobs.py", "promote_staging")
+
+    assert _attribute_call_count(workspace_parent, "open_child_directory") == 1
+    assert _attribute_call_count(blobs_parent, "open_child_directory") == 2
+    assert _attribute_call_count(promotion, "open_child_directory") == 1
+    for function in (workspace_parent, blobs_parent, promotion):
+        assert not any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "os"
+            and node.func.attr == "open"
+            for node in ast.walk(function)
+        )
+
+
 @pytest.mark.parametrize("path", SOURCES, ids=lambda path: path.name)
 def test_no_raw_fsync_appears_in_the_package(path):
     assert not _calls_forbidden(
@@ -800,6 +836,79 @@ def test_every_execute_argument_resolves_to_a_module_level_constant(path):
         )
 
 
+def _untranslated_execute_sites(path: Path) -> list[int]:
+    sites: list[int] = []
+
+    def descend(node: ast.AST, owner: str | None, translated_depth: int) -> None:
+        child_owner = owner
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            child_owner = node.name
+        child_depth = translated_depth
+        if isinstance(node, ast.With) and any(
+            isinstance(item.context_expr, ast.Call)
+            and isinstance(item.context_expr.func, ast.Name)
+            and item.context_expr.func.id == "translated"
+            for item in node.items
+        ):
+            child_depth += 1
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"execute", "executemany"}
+            and not (
+                path.name == "connection.py" and child_owner == "_rollback_quietly"
+            )
+            and child_depth == 0
+        ):
+            sites.append(node.lineno)
+        for child in ast.iter_child_nodes(node):
+            descend(child, child_owner, child_depth)
+
+    descend(_tree(path), None, 0)
+    return sites
+
+
+def _wide_translation_sites(path: Path) -> list[tuple[int, int]]:
+    sites: list[tuple[int, int]] = []
+
+    def count(node: ast.AST, *, root: ast.With) -> int:
+        if isinstance(node, ast.With) and node is not root and any(
+            isinstance(item.context_expr, ast.Call)
+            and isinstance(item.context_expr.func, ast.Name)
+            and item.context_expr.func.id == "translated"
+            for item in node.items
+        ):
+            return 0
+        own = int(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"execute", "executemany"}
+        )
+        return own + sum(count(child, root=root) for child in ast.iter_child_nodes(node))
+
+    for node in ast.walk(_tree(path)):
+        if isinstance(node, ast.With) and any(
+            isinstance(item.context_expr, ast.Call)
+            and isinstance(item.context_expr.func, ast.Name)
+            and item.context_expr.func.id == "translated"
+            for item in node.items
+        ):
+            executions = count(node, root=node)
+            if executions != 1:
+                sites.append((node.lineno, executions))
+    return sites
+
+
+@pytest.mark.parametrize("path", SOURCES, ids=lambda path: path.name)
+def test_every_sqlite_execution_is_inside_narrow_translation(path):
+    assert not (sites := _untranslated_execute_sites(path)), (
+        f"{path.name} has untranslated SQLite execution at lines {sites}"
+    )
+    assert not (sites := _wide_translation_sites(path)), (
+        f"{path.name} has translated scopes with execute counts other than one: {sites}"
+    )
+
+
 def test_no_statement_in_the_package_attaches_or_vacuums():
     from atoms.store.schema import SCHEMA_STATEMENTS
 
@@ -1241,6 +1350,29 @@ def test_sql_guard_accepts_imported_store_constants(
     test_every_execute_argument_resolves_to_a_module_level_constant(
         paths["connection"]
     )
+
+
+@pytest.mark.parametrize(
+    "function",
+    ["hostile", "_rollback_quietly"],
+    ids=["ordinary", "counterfeit-rollback"],
+)
+def test_translation_guard_rejects_a_planted_execute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, function: str
+):
+    path = _plant_store_package(
+        tmp_path,
+        monkeypatch,
+        {
+            "hostile": (
+                "QUERY = 'SELECT 1'\n"
+                f"def {function}(connection):\n"
+                "    connection.execute(QUERY)\n"
+            )
+        },
+    )["hostile"]
+    with pytest.raises(AssertionError):
+        test_every_sqlite_execution_is_inside_narrow_translation(path)
 
 
 @pytest.mark.parametrize(

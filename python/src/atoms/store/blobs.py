@@ -18,7 +18,9 @@ from atoms.store.workspace import STAGING_PARENT, Workspace
 if TYPE_CHECKING:
     from atoms.store.connection import Store
 
-BLOBS_PARENT = "blobs/sha256"
+BLOBS_DIRECTORY = "blobs"
+SHA256_DIRECTORY = "sha256"
+BLOBS_PARENT = f"{BLOBS_DIRECTORY}/{SHA256_DIRECTORY}"
 DIGEST_PATTERN = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
 _READ_CHUNK = 1 << 20
 INSERT_BLOB = (
@@ -77,11 +79,14 @@ def leaf_to_digest_or_refuse(leaf: str) -> str:
 
 
 def _blobs_fd(store: Store) -> int:
-    return os.open(
-        BLOBS_PARENT,
-        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
-        dir_fd=store._binding.metadata_root_fd,
+    backend = store._binding.backend
+    blobs_fd = backend.open_child_directory(
+        store._binding.metadata_root_fd, BLOBS_DIRECTORY
     )
+    try:
+        return backend.open_child_directory(blobs_fd, SHA256_DIRECTORY)
+    finally:
+        os.close(blobs_fd)
 
 
 def open_entry_nofollow(parent_fd: int, name: str, what: str) -> int:
@@ -124,7 +129,8 @@ def open_blob(store: Store, digest: str) -> int:
     """Verify an indexed blob and transfer its descriptor to the caller."""
     require_digest(digest)
     with store._read_transaction() as connection:
-        row = connection.execute(SELECT_BLOB, (digest,)).fetchone()
+        with translated("reading blob membership"):
+            row = connection.execute(SELECT_BLOB, (digest,)).fetchone()
         if row is None:
             raise ProtocolError(f"{digest} is not indexed by this store")
         byte_len = row[0]
@@ -291,7 +297,8 @@ def _preflight(store: Store, workspace: Workspace, manifest: tuple[StagedBlob, .
     parent = _blobs_fd(store)
     try:
         for digest in sorted(lengths):
-            row = store._connection.execute(SELECT_BLOB, (digest,)).fetchone()
+            with translated("reading blob membership during promotion"):
+                row = store._connection.execute(SELECT_BLOB, (digest,)).fetchone()
             if row is None:
                 continue
             if row[0] != lengths[digest]:
@@ -364,10 +371,8 @@ def promote_staging(
             workspace._spend_staging()
         os.close(parent)
 
-    staging_parent = os.open(
-        STAGING_PARENT,
-        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
-        dir_fd=store._binding.metadata_root_fd,
+    staging_parent = backend.open_child_directory(
+        store._binding.metadata_root_fd, STAGING_PARENT
     )
     try:
         gate(store._binding)
@@ -378,4 +383,5 @@ def promote_staging(
         os.close(staging_parent)
 
     for entry in manifest:
-        store._connection.execute(INSERT_BLOB, (entry.digest, entry.byte_len))
+        with translated("indexing a promoted blob"):
+            store._connection.execute(INSERT_BLOB, (entry.digest, entry.byte_len))

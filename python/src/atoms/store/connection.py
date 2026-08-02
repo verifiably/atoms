@@ -353,8 +353,9 @@ def repair_unpublished(binding: ProjectBinding) -> None:
 
 
 def _integrity_findings(connection: sqlite3.Connection) -> tuple[str, ...]:
-    with translated("checking integrity"):
+    with translated("running quick_check"):
         quick = tuple(row[0] for row in connection.execute(_QUICK_CHECK))
+    with translated("running foreign_key_check"):
         foreign = tuple(str(row) for row in connection.execute(_FOREIGN_KEY_CHECK))
     return tuple(finding for finding in quick if finding != "ok") + foreign
 
@@ -370,8 +371,9 @@ def _catalog(connection: sqlite3.Connection) -> frozenset[tuple[str, str, str, s
 
 def classify(connection: sqlite3.Connection) -> Verdict:
     """Identity, version, and schema -- from reads alone (design §5.2 step 4)."""
-    with translated("reading identity"):
+    with translated("reading application_id"):
         application_id = connection.execute(_READ_APPLICATION_ID).fetchone()[0]
+    with translated("reading user_version"):
         user_version = connection.execute(_READ_USER_VERSION).fetchone()[0]
     catalog = _catalog(connection)
 
@@ -540,7 +542,8 @@ class _StoreTransaction:
                     + "; ".join(findings)
                 )
         for txid, promoted in sorted(self._promoted.items()):
-            row = store._connection.execute(SELECT_RECORD, (txid,)).fetchone()
+            with translated("reading a promoted blob's record before commit"):
+                row = store._connection.execute(SELECT_RECORD, (txid,)).fetchone()
             referenced = (
                 set()
                 if row is None
@@ -578,7 +581,7 @@ class _StoreTransaction:
                 raise ProtocolError(
                     f"spec must be exactly TransactionSpec, got {type(spec).__name__}"
                 )
-            with translated("inserting a record"):
+            with translated("inserting a transaction record"):
                 store._connection.execute(
                     INSERT_RECORD,
                     (
@@ -588,7 +591,8 @@ class _StoreTransaction:
                         CommitDecision.UNCOMMITTED.value,
                     ),
                 )
-                for effect in spec.effects:
+            for effect in spec.effects:
+                with translated("inserting an effect row"):
                     store._connection.execute(
                         INSERT_EFFECT,
                         (txid, effect.effect_id, variant_of(effect).value,
@@ -731,7 +735,8 @@ class Store:
 
     def read_active(self) -> StoredRecord | None:
         with self._read_transaction() as connection:
-            row = connection.execute(SELECT_ACTIVE).fetchone()
+            with translated("reading the active transaction"):
+                row = connection.execute(SELECT_ACTIVE).fetchone()
             record = None if row is None else load_record(connection, row[0])
         self._require_live()
         return record

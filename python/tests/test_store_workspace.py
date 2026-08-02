@@ -31,6 +31,66 @@ def test_creation_makes_both_directories(opened_store, store_binding):
                 assert "tx1" in os.listdir(parent_fd)
 
 
+@pytest.mark.parametrize("parent", ["staging", "work"])
+def test_workspace_parent_symlink_is_refused_without_outside_mutation(
+    opened_store, store_binding, tmp_path, parent
+):
+    outside = tmp_path / f"outside-{parent}"
+    outside.mkdir()
+    (outside / "sentinel").write_bytes(b"untouched")
+    owned = f"{parent}-owned"
+    root = store_binding.metadata_root_fd
+    os.rename(parent, owned, src_dir_fd=root, dst_dir_fd=root)
+    os.symlink(str(outside), parent, dir_fd=root)
+
+    with pytest.raises(OSError) as caught:
+        opened_store.create_workspace("tx1")
+
+    assert caught.value.errno == errno.ELOOP
+    assert {entry.name for entry in outside.iterdir()} == {"sentinel"}
+    with child_dir(root, owned) as owned_fd:
+        assert "tx1" not in os.listdir(owned_fd)
+
+
+@pytest.mark.parametrize("operation", ["create", "reopen", "remove"])
+def test_first_workspace_parent_fd_closes_when_the_second_open_fails(
+    opened_store, monkeypatch, operation
+):
+    from atoms.store import workspace as workspace_module
+
+    workspace = None
+    if operation in ("reopen", "remove"):
+        workspace = opened_store.create_workspace("tx1")
+        if operation == "reopen":
+            workspace.close()
+
+    real = workspace_module._parent_fd
+    opened: list[int] = []
+
+    def fail_work_parent(store, name):
+        if name == workspace_module.WORK_PARENT:
+            raise OSError(errno.EIO, "second parent refused")
+        fd = real(store, name)
+        opened.append(fd)
+        return fd
+
+    monkeypatch.setattr(workspace_module, "_parent_fd", fail_work_parent)
+    with pytest.raises(OSError) as caught:
+        if operation == "create":
+            opened_store.create_workspace("tx1")
+        elif operation == "reopen":
+            opened_store.reopen_workspace("tx1")
+        else:
+            assert workspace is not None
+            opened_store.remove_workspace(workspace)
+
+    assert caught.value.errno == errno.EIO
+    assert len(opened) == 1
+    with pytest.raises(OSError) as closed:
+        os.fstat(opened[0])
+    assert closed.value.errno == errno.EBADF
+
+
 def test_creation_refuses_when_either_directory_exists(opened_store):
     opened_store.create_workspace("tx1").close()
     with pytest.raises(ProtocolError) as caught:
@@ -386,8 +446,9 @@ def test_a_failure_after_the_staging_rmdir_leaves_no_anchor_on_a_gone_directory(
         real(fd)
 
     monkeypatch.setattr(backend, "flush_directory", failing)
-    with pytest.raises(OSError):
+    with pytest.raises(OSError) as caught:
         opened_store.remove_workspace(workspace)
+    assert caught.value.errno == errno.EIO
 
     with pytest.raises(ProtocolError) as caught:
         _ = workspace.staging_fd

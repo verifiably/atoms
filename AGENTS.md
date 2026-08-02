@@ -42,8 +42,8 @@ Plan B is written only after Plan A's interfaces settle.
 - **A5 — durable metadata store and recovery lease: A5a implemented on 2026-08-01, A5b not yet
   designed.** `python/src/atoms/store/` holds the SQLite-WAL store as a mechanism — creation and
   reopen under the verified `metadata_root`, the pinned connection profile, the schema, typed
-  record read/write, blob promotion bound to the COMMIT that references it, and per-txid
-  workspaces. It discharges ledger #22 and admits #23. A5b composes it into the recovery-resolve
+  record read/write, guarded blob promotion of both preimages and planned postimages bound to the
+  COMMIT that references them, and per-txid workspaces. It discharges ledger #22 and admits #23. A5b composes it into the recovery-resolve
   lease and owns entries #7, #9's enforcement half, #12, #17, #18, #19's part, #21, and #23.
 
 Work lives under `python/` (`uv run pytest`, `uv run ruff check`, `uv run pyright`, all from

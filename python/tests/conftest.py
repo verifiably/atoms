@@ -533,7 +533,9 @@ def store_on(ext4_volume, ext4_project_root, test_storage_profile):
     the one `ext4_metadata_root` fixture instance every other consumer shares. A test
     that cuts a creation sequence and then opens a second, uninterrupted store for
     comparison needs the second store_on() to see an empty metadata root, not the
-    first call's surviving `atoms.db`.
+    first call's surviving `atoms.db`. Repeated calls therefore cannot model a restart
+    of one metadata root; that requires retaining its project/metadata paths and rebinding
+    them explicitly, as the fresh-process tests do.
     """
     counter = itertools.count()
 

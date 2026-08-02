@@ -33,7 +33,7 @@ from atoms.core.recovery.model import (
     TransactionState,
 )
 from atoms.core.spec import TransactionSpec
-from atoms.store.errors import MetadataStoreInvalid
+from atoms.store.errors import MetadataStoreInvalid, translated
 from atoms.store.schema import variant_of
 
 _DIAGNOSTIC_FIELDS = (
@@ -412,7 +412,9 @@ def _finding(rule: str, detail: str) -> str:
 def referenced_digests(spec: TransactionSpec) -> tuple[tuple[str, int], ...]:
     return tuple(sorted({
         (entry.state.content_hash, entry.state.byte_len)
-        for entry in spec.initial_surface if isinstance(entry.state, FileState)
+        for surface in (spec.initial_surface, spec.final_surface)
+        for entry in surface
+        if isinstance(entry.state, FileState)
     }))
 
 
@@ -426,10 +428,18 @@ def journal_vector(
 
 
 def coherence_findings(connection: Any, txid: str) -> tuple[str, ...]:
-    row = connection.execute(SELECT_RECORD, (txid,)).fetchone()
+    with translated("reading a transaction record for coherence"):
+        row = connection.execute(SELECT_RECORD, (txid,)).fetchone()
     if row is None:
-        active = connection.execute(SELECT_ACTIVE).fetchone()
-        if active is not None and connection.execute(SELECT_RECORD, (active[0],)).fetchone() is None:
+        with translated("reading the active transaction for coherence"):
+            active = connection.execute(SELECT_ACTIVE).fetchone()
+        active_record = None
+        if active is not None:
+            with translated("checking the active transaction record"):
+                active_record = connection.execute(
+                    SELECT_RECORD, (active[0],)
+                ).fetchone()
+        if active is not None and active_record is None:
             return (_finding(RULE_ACTIVE_RECORD, f"active names txid {active[0]!r}, which has no record"),)
         return ()
     spec_json, state_value, committed_value, rollback_value, diagnostic_text = row
@@ -444,9 +454,11 @@ def coherence_findings(connection: Any, txid: str) -> tuple[str, ...]:
         compile_spec(spec)
     except SpecValidationError as caught:
         findings.append(_finding(RULE_SPEC_COMPILES, f"spec_json is a spec A2 would refuse: {caught}"))
+    with translated("reading effect rows for coherence"):
+        effect_rows = tuple(connection.execute(SELECT_EFFECTS, (txid,)))
     stored = {
         effect_id: (variant, journal)
-        for effect_id, variant, journal in connection.execute(SELECT_EFFECTS, (txid,))
+        for effect_id, variant, journal in effect_rows
     }
     declared = {effect.effect_id: variant_of(effect).value for effect in spec.effects}
     covered = set(declared) == set(stored)
@@ -458,7 +470,8 @@ def coherence_findings(connection: Any, txid: str) -> tuple[str, ...]:
         if stored[effect_id][0] != declared[effect_id]:
             findings.append(_finding(RULE_EFFECT_VARIANT, f"effect {effect_id!r} has variant {stored[effect_id][0]!r}, spec_json says {declared[effect_id]!r}"))
     for digest, byte_len in referenced_digests(spec):
-        blob = connection.execute(SELECT_BLOB, (digest,)).fetchone()
+        with translated("reading a referenced blob row for coherence"):
+            blob = connection.execute(SELECT_BLOB, (digest,)).fetchone()
         if blob is None:
             findings.append(_finding(RULE_BLOB_ROW_PRESENT, f"no blob row for referenced digest {digest!r}"))
         elif blob[0] != byte_len:
@@ -477,8 +490,13 @@ def coherence_findings(connection: Any, txid: str) -> tuple[str, ...]:
                 findings.append(_finding(RULE_DIAGNOSTIC_JOURNALS, "the diagnostic's journal vector disagrees with the durable rows"))
         else:
             findings.append(_finding(RULE_DIAGNOSTIC_JOURNALS, "the diagnostic's journal vector cannot be compared: the effect rows do not cover spec_json"))
-    active = connection.execute(SELECT_ACTIVE).fetchone()
-    if active is not None and connection.execute(SELECT_RECORD, (active[0],)).fetchone() is None:
+    with translated("reading the active transaction for coherence"):
+        active = connection.execute(SELECT_ACTIVE).fetchone()
+    active_record = None
+    if active is not None:
+        with translated("checking the active transaction record"):
+            active_record = connection.execute(SELECT_RECORD, (active[0],)).fetchone()
+    if active is not None and active_record is None:
         findings.append(_finding(RULE_ACTIVE_RECORD, f"active names txid {active[0]!r}, which has no record"))
     return tuple(findings)
 
@@ -487,14 +505,17 @@ def load_record(connection: Any, txid: str) -> StoredRecord | None:
     findings = coherence_findings(connection, txid)
     if findings:
         raise MetadataStoreInvalid(f"the record for txid {txid!r} cannot be interpreted: " + "; ".join(findings))
-    row = connection.execute(SELECT_RECORD, (txid,)).fetchone()
+    with translated("materializing a transaction record"):
+        row = connection.execute(SELECT_RECORD, (txid,)).fetchone()
     if row is None:
         return None
     spec_json, state_value, committed_value, rollback_value, diagnostic_text = row
     spec = from_canonical_json(spec_json)
+    with translated("materializing effect rows"):
+        effect_rows = tuple(connection.execute(SELECT_EFFECTS, (txid,)))
     rows = {
         effect_id: (variant, journal)
-        for effect_id, variant, journal in connection.execute(SELECT_EFFECTS, (txid,))
+        for effect_id, variant, journal in effect_rows
     }
     return StoredRecord(
         txid, spec, TransactionState(state_value), CommitDecision(committed_value),
