@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import replace
 
 import pytest
 
@@ -26,12 +27,17 @@ from atoms.core.recovery.model import (
 )
 from atoms.store.errors import MetadataStoreInvalid
 from atoms.store.records import (
+    COHERENCE_RULES,
+    RULE_ACTIVE_RECORD,
     RULE_BLOB_BYTE_LEN,
     RULE_BLOB_ROW_PRESENT,
+    RULE_DIAGNOSTIC_DECISION,
+    RULE_DIAGNOSTIC_JOURNALS,
     RULE_EFFECT_COVERAGE,
     RULE_EFFECT_VARIANT,
     RULE_HALT_DIAGNOSTIC,
     RULE_ROLLBACK_RESULT,
+    RULE_SPEC_CANONICAL,
     RULE_SPEC_COMPILES,
     RULE_SPEC_DECODES,
     coherence_findings,
@@ -42,6 +48,7 @@ from tests.store_support import (
     commit_record,
     duplicate_effect_spec,
     every_diagnostic_shape,
+    matching_diagnostic,
     non_compiling_spec,
     one_effect_spec,
     raw_connect,
@@ -500,18 +507,40 @@ def _plant_spec_json(raw, spec_json, effect_rows):
         )
 
 
-@pytest.mark.parametrize(
-    ("rule", "prepare", "corrupt"),
-    (
-        (RULE_SPEC_DECODES, one_effect_spec, lambda raw: _plant_spec_json(raw, '{"nope": 1}', ())),
-        (RULE_SPEC_COMPILES, one_effect_spec, lambda raw: _plant_spec_json(raw, canonical_json(non_compiling_spec()), (("only", "create_file_no_clobber"),))),
-        (RULE_EFFECT_COVERAGE, one_effect_spec, lambda raw: _plant(raw, "DELETE FROM effect")),
-        (RULE_EFFECT_VARIANT, one_effect_spec, lambda raw: _plant(raw, "UPDATE effect SET variant = 'delete_path'")),
+def _plant_halted(raw, diagnostic):
+    raw.execute(
+        "UPDATE transaction_record SET state = 'halted', halt_diagnostic = ? "
+        "WHERE txid = 'tx1'",
+        (encode_diagnostic(diagnostic),),
+    )
+
+
+ONE_EFFECT_ROW = (("only", "create_file_no_clobber"),)
+
+
+def _only_spec():
+    return one_effect_spec(effect_id="only")
+
+
+CROSS_ROW_CASES = (
+        (RULE_SPEC_DECODES, _only_spec, lambda raw: _plant_spec_json(raw, '{"nope": 1}', ())),
+        (RULE_SPEC_CANONICAL, _only_spec, lambda raw: _plant_spec_json(raw, " " + canonical_json(_only_spec()), ONE_EFFECT_ROW)),
+        (RULE_SPEC_COMPILES, _only_spec, lambda raw: _plant_spec_json(raw, canonical_json(non_compiling_spec()), ONE_EFFECT_ROW)),
+        (RULE_EFFECT_COVERAGE, _only_spec, lambda raw: _plant(raw, "DELETE FROM effect")),
+        (RULE_EFFECT_VARIANT, _only_spec, lambda raw: _plant(raw, "UPDATE effect SET variant = 'delete_path'")),
         (RULE_BLOB_ROW_PRESENT, replace_spec, lambda raw: _plant(raw, "DELETE FROM blob")),
         (RULE_BLOB_BYTE_LEN, replace_spec, lambda raw: _plant(raw, "UPDATE blob SET byte_len = 999")),
-        (RULE_ROLLBACK_RESULT, one_effect_spec, lambda raw: _plant(raw, "UPDATE transaction_record SET state = 'rolled_back'")),
-        (RULE_HALT_DIAGNOSTIC, one_effect_spec, lambda raw: _plant(raw, "UPDATE transaction_record SET state = 'halted'")),
-    ),
+        (RULE_ROLLBACK_RESULT, _only_spec, lambda raw: _plant(raw, "UPDATE transaction_record SET state = 'rolled_back'")),
+        (RULE_HALT_DIAGNOSTIC, _only_spec, lambda raw: _plant(raw, "UPDATE transaction_record SET state = 'halted'")),
+        (RULE_DIAGNOSTIC_DECISION, _only_spec, lambda raw: _plant_halted(raw, replace(matching_diagnostic("only"), commit_decision=CommitDecision.COMMITTED))),
+        (RULE_DIAGNOSTIC_JOURNALS, _only_spec, lambda raw: _plant_halted(raw, replace(matching_diagnostic("only"), journals=(EffectJournalState(effect_id="only", state=JournalState.DONE),)))),
+        (RULE_ACTIVE_RECORD, _only_spec, lambda raw: _plant(raw, "INSERT INTO active VALUES (0, 'ghost')")),
+)
+
+
+@pytest.mark.parametrize(
+    ("rule", "prepare", "corrupt"),
+    CROSS_ROW_CASES,
 )
 def test_cross_row_corruption_refuses_on_load(opened_store, store_binding, rule, prepare, corrupt):
     commit_record(opened_store, store_binding, "tx1", prepare())
@@ -526,6 +555,10 @@ def test_cross_row_corruption_refuses_on_load(opened_store, store_binding, rule,
     with pytest.raises(MetadataStoreInvalid) as caught:
         opened_store.read_record("tx1")
     assert rule in str(caught.value)
+
+
+def test_the_cross_row_matrix_covers_every_rule_on_read_side():
+    assert {case[0] for case in CROSS_ROW_CASES} == set(COHERENCE_RULES)
 
 
 def test_a_cross_row_violation_is_protocol_error_before_commit(opened_store):
