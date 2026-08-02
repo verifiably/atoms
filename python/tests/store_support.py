@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import os
 import sqlite3
+from contextlib import contextmanager
 from typing import Any
 
 from atoms.core.effects import CreateFileNoClobber, ReplaceFile
@@ -27,6 +28,15 @@ from atoms.core.spec import build_spec
 
 DATABASE_ENTRIES = ("atoms.db", "atoms.db-wal", "atoms.db-shm", "atoms.db-journal")
 SHARED_DIGEST = "sha256:" + "a" * 64
+
+
+@contextmanager
+def child_dir(root_fd: int, name: str):
+    fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=root_fd)
+    try:
+        yield fd
+    finally:
+        os.close(fd)
 
 
 def file_state(content: bytes, mode: int = 0o644) -> FileState:

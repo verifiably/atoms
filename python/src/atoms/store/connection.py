@@ -48,6 +48,13 @@ from atoms.store.schema import (
     SCHEMA_VERSION,
     variant_of,
 )
+from atoms.store.workspace import (
+    Workspace,
+    create_workspace,
+    list_workspaces,
+    remove_workspace,
+    reopen_workspace,
+)
 
 DATABASE_NAME = "atoms.db"
 SIDECAR_NAMES = ("atoms.db-wal", "atoms.db-shm", "atoms.db-journal")
@@ -633,7 +640,13 @@ class Store:
     descriptor and never closes it -- that stays A4a's.
     """
 
-    __slots__ = ("_active_transaction", "_binding", "_closed", "_connection")
+    __slots__ = (
+        "_active_transaction",
+        "_binding",
+        "_closed",
+        "_connection",
+        "_workspaces",
+    )
 
     def __init__(
         self,
@@ -648,6 +661,7 @@ class Store:
         self._connection = connection
         self._closed = False
         self._active_transaction: _StoreTransaction | None = None
+        self._workspaces: set[Workspace] = set()
 
     def _require_live(self) -> None:
         if self._closed:
@@ -744,7 +758,21 @@ class Store:
             _rollback_quietly(self._connection)
             txn._spend()
             self._active_transaction = None
+        for workspace in tuple(self._workspaces):
+            workspace.close()
         self._connection.close()
+
+    def create_workspace(self, txid: str) -> Workspace:
+        return create_workspace(self, txid)
+
+    def reopen_workspace(self, txid: str) -> Workspace:
+        return reopen_workspace(self, txid)
+
+    def list_workspaces(self) -> tuple[str, ...]:
+        return list_workspaces(self)
+
+    def remove_workspace(self, workspace: Workspace) -> None:
+        remove_workspace(self, workspace)
 
     def __enter__(self) -> Self:
         return self
