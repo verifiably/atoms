@@ -49,6 +49,7 @@ from tests.store_support import (
     duplicate_effect_spec,
     every_diagnostic_shape,
     matching_diagnostic,
+    digest_of,
     non_compiling_spec,
     one_effect_spec,
     raw_connect,
@@ -581,6 +582,94 @@ def test_a_cross_row_violation_is_protocol_error_before_commit(opened_store):
         txn.set_transaction_state("tx1", TransactionState.ROLLED_BACK)
     assert RULE_ROLLBACK_RESULT in str(caught.value)
     assert opened_store.read_record("tx1") is None
+
+
+def _halt_with(txn, diagnostic):
+    txn.set_transaction_state("tx2", TransactionState.HALTED)
+    txn.set_halt_diagnostic("tx2", diagnostic)
+
+
+WRITE_SIDE_INCOHERENCE = (
+    (RULE_SPEC_COMPILES, None, lambda txn: txn.insert_record("tx3", non_compiling_spec())),
+    (RULE_BLOB_ROW_PRESENT, None, lambda txn: txn.insert_record("tx3", replace_spec())),
+    (RULE_BLOB_BYTE_LEN, lambda raw: raw.execute("INSERT INTO blob VALUES (?, ?)", (digest_of(b"before"), 999)), lambda txn: txn.insert_record("tx3", replace_spec())),
+    (RULE_ROLLBACK_RESULT, None, lambda txn: txn.set_transaction_state("tx2", TransactionState.ROLLED_BACK)),
+    (RULE_ROLLBACK_RESULT, None, lambda txn: txn.set_rollback_result("tx2", RollbackResult.RESTORED)),
+    (RULE_HALT_DIAGNOSTIC, None, lambda txn: txn.set_transaction_state("tx2", TransactionState.HALTED)),
+    (RULE_HALT_DIAGNOSTIC, None, lambda txn: txn.set_halt_diagnostic("tx2", matching_diagnostic("only"))),
+    (RULE_DIAGNOSTIC_DECISION, None, lambda txn: _halt_with(txn, replace(matching_diagnostic("only"), commit_decision=CommitDecision.COMMITTED))),
+    (RULE_DIAGNOSTIC_JOURNALS, None, lambda txn: _halt_with(txn, replace(matching_diagnostic("only"), journals=(EffectJournalState("only", JournalState.DONE),)))),
+)
+WRITE_UNREACHABLE_RULES = (RULE_SPEC_DECODES, RULE_SPEC_CANONICAL, RULE_EFFECT_COVERAGE, RULE_EFFECT_VARIANT, RULE_ACTIVE_RECORD)
+
+
+@pytest.mark.parametrize(("rule", "plant", "body"), WRITE_SIDE_INCOHERENCE)
+def test_every_reachable_cross_row_rule_refuses_on_a_write(opened_store, store_binding, rule, plant, body):
+    commit_record(opened_store, store_binding, "tx2", _only_spec())
+    if plant:
+        raw = raw_connect(store_binding)
+        try:
+            plant(raw)
+        finally:
+            raw.close()
+    findings = []
+    with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
+        body(txn)
+        for txid in ("tx2", "tx3"):
+            findings.extend(coherence_findings(opened_store._connection, txid))
+    assert len(findings) == 1, findings
+    assert findings[0].startswith(f"{rule}: ")
+    assert rule in str(caught.value)
+
+
+def test_the_cross_row_matrix_covers_every_rule_on_both_sides():
+    assert {case[0] for case in CROSS_ROW_CASES} == set(COHERENCE_RULES)
+    written = {case[0] for case in WRITE_SIDE_INCOHERENCE}
+    assert not written & set(WRITE_UNREACHABLE_RULES)
+    assert written | set(WRITE_UNREACHABLE_RULES) == set(COHERENCE_RULES)
+
+
+def test_the_journal_vector_follows_spec_order_not_row_order(opened_store):
+    from atoms.core.effects import CreateFileNoClobber
+    from atoms.core.fingerprint import ABSENT
+    from atoms.core.spec import build_spec
+    from tests.store_support import file_state
+
+    posts = {name: file_state(name.encode()) for name in ("z", "a", "m")}
+    spec = build_spec(
+        consumer_tag="test", intent_digest="sha256:" + "2" * 64,
+        initial_surface={f"{name}.txt": ABSENT for name in posts},
+        final_surface={f"{name}.txt": posts[name] for name in posts},
+        effects=[CreateFileNoClobber(effect_id=name, path=f"{name}.txt", post=posts[name]) for name in ("z", "a", "m")],
+    )
+    with opened_store.transaction() as txn:
+        txn.insert_record("tx1", spec)
+    assert tuple(j.effect_id for j in opened_store.read_record("tx1").journals) == ("z", "a", "m")
+
+
+def test_a_read_takes_one_snapshot_across_a_concurrent_commit(store_on):
+    from atoms.store.connection import open_store
+
+    with store_on() as binding, open_store(binding) as writer, open_store(binding) as reader:
+        with writer.transaction() as txn:
+            txn.insert_record("tx1", one_effect_spec(effect_id="e1"))
+        fired = []
+        def commit_between(statement):
+            if "FROM effect" not in statement or fired:
+                return
+            fired.append(statement)
+            with writer.transaction() as txn:
+                txn.set_journal_state("tx1", "e1", JournalState.STARTED)
+                txn.set_transaction_state("tx1", TransactionState.APPLYING)
+        reader._connection.set_trace_callback(commit_between)
+        try:
+            during = reader.read_record("tx1")
+        finally:
+            reader._connection.set_trace_callback(None)
+        after = reader.read_record("tx1")
+    assert fired
+    assert (during.state, during.journals[0].state) == (TransactionState.PREPARED, JournalState.PENDING)
+    assert (after.state, after.journals[0].state) == (TransactionState.APPLYING, JournalState.STARTED)
 
 
 def test_a_coherent_rollback_sequence_commits(opened_store):
