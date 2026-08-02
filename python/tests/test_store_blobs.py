@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import signal
 
 import pytest
 
@@ -101,6 +102,32 @@ def test_an_indexed_digest_whose_leaf_is_not_a_regular_file_refuses(
     with pytest.raises(MetadataStoreInvalid) as caught:
         store.open_blob(digest)
     assert ("is a symlink" if kind == "symlink" else "not a regular file") in str(caught.value)
+    assert open_descriptor_count() == before
+
+
+def test_an_indexed_fifo_leaf_is_refused_without_waiting_or_leaking_a_descriptor(
+    promoted_blob, store_binding
+):
+    """O_RDONLY alone blocks before fstat can reject a FIFO as nonregular."""
+    store, digest, _content = promoted_blob
+    leaf = digest_to_leaf(digest)
+    with child_dir(store_binding.metadata_root_fd, "blobs/sha256") as blobs_fd:
+        os.unlink(leaf, dir_fd=blobs_fd)
+        os.mkfifo(leaf, 0o600, dir_fd=blobs_fd)
+    before = open_descriptor_count()
+
+    def timeout(_signum, _frame) -> None:
+        raise TimeoutError("opening a FIFO waited for a writer")
+
+    previous = signal.signal(signal.SIGALRM, timeout)
+    signal.setitimer(signal.ITIMER_REAL, 0.2)
+    try:
+        with pytest.raises(MetadataStoreInvalid) as caught:
+            store.open_blob(digest)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+    assert "not a regular file" in str(caught.value)
     assert open_descriptor_count() == before
 
 

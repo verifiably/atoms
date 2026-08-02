@@ -69,7 +69,9 @@ def _blobs_fd(store: Store) -> int:
 def open_entry_nofollow(parent_fd: int, name: str, what: str) -> int:
     """Open a leaf without following symlinks, translating that forbidden shape."""
     try:
-        return os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd)
+        return os.open(
+            name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd
+        )
     except OSError as caught:
         if caught.errno == errno.ELOOP:
             raise MetadataStoreInvalid(f"{what} is a symlink") from caught
