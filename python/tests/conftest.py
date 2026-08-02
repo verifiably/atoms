@@ -522,3 +522,9 @@ def approval_context(ext4_bound_volume):
             yield ProjectContext(binding=binding, txid=txid), binding
 
     return build
+
+
+@pytest.fixture
+def store_on(ext4_bound_volume):
+    """A bound ext4 volume with an empty metadata root, ready for store creation."""
+    return ext4_bound_volume
