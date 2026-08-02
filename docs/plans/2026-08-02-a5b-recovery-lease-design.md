@@ -167,7 +167,7 @@ import-namespaces = ["atoms"]
 The lease is entered by the coordinator command **on the consumer's behalf**. Consumer code never
 receives the `Store`, the `ProjectBinding`, or any other mutable ownership state (authority §4.2).
 
-`root.py` owns the public entry; `lease.py` owns the protocol over what it produces.
+`root.py` owns the package-private entry; `lease.py` owns the protocol over what it produces.
 
 ### 5.0 The lease value
 
