@@ -1138,6 +1138,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import stat
 
 from atoms.core.errors import CapabilityUnavailable, ProtocolError
 from atoms.fs.binding import ProjectBinding
@@ -1220,7 +1221,7 @@ def _preflight_entries(binding: ProjectBinding, *, require_absent: bool) -> dict
             info = os.stat(name, dir_fd=binding.metadata_root_fd, follow_symlinks=False)
         except FileNotFoundError:
             continue
-        if not os.path.stat.S_ISREG(info.st_mode):  # type: ignore[attr-defined]
+        if not stat.S_ISREG(info.st_mode):
             raise MetadataStoreInvalid(
                 f"{name} under metadata_root is not a regular file; a symlink there "
                 "redirects SQLite's own recovery"
@@ -1389,10 +1390,6 @@ def initialize_schema(binding: ProjectBinding, connection: sqlite3.Connection) -
         _rollback_quietly(connection)
         raise
 ```
-
-`os.path.stat.S_ISREG` is not a real attribute — import `stat` at the top and call
-`stat.S_ISREG(info.st_mode)`. The `# type: ignore` above is there only to mark the line;
-write the real import.
 
 - [ ] **Step 6: Run the tests and the gates**
 
@@ -3415,6 +3412,7 @@ from atoms.store.records import (
     RULE_SPEC_CANONICAL,
     RULE_SPEC_COMPILES,
     RULE_SPEC_DECODES,
+    coherence_findings,
 )
 from tests.store_support import (
     SHARED_DIGEST,
@@ -3630,18 +3628,23 @@ def test_every_cross_row_rule_refuses_on_a_load(
 ):
     """Design §11.2: every §7.6 rule, failed one at a time, on the read side.
 
-    Each case is measured to produce **exactly one** finding against an otherwise
-    coherent record, so the assertion on the rule tag is not passing because some other
-    rule fired first. The tag is what makes that checkable at all: `"effect"` and
-    `"variant"` appear in several messages, so a fragment match would go green on the
-    wrong rule.
+    "One at a time" is asserted, not asserted-about. The predicate is run directly on the
+    corrupted database and its result must be a tuple of length **one** carrying this
+    rule's tag -- so a case cannot go green on a rule that fired alongside the intended
+    one, and cannot go green on a message fragment either. The tag is what makes it
+    checkable at all: `"effect"`, `"variant"`, and `"blob"` each appear in several
+    findings' details, so a substring match over the joined message would pass on the
+    wrong rule. Only then is the verdict triggered, which is the part `read_record` owns.
     """
     commit_record(opened_store, store_binding, "tx1", spec())
     raw = raw_connect(store_binding)
     try:
         corrupt(raw)
+        findings = coherence_findings(raw, "tx1")
     finally:
         raw.close()
+    assert len(findings) == 1, findings
+    assert findings[0].startswith(f"{rule}: ")
     with pytest.raises(MetadataStoreInvalid) as caught:
         opened_store.read_record("tx1")
     assert rule in str(caught.value)
@@ -3771,6 +3774,20 @@ def test_every_reachable_cross_row_rule_refuses_on_a_write(
     `tx2` is committed coherently first, so the setter cases have a record to break and
     the assertion that it survives unchanged is meaningful. The cases that insert a
     record of their own use `tx3`, which must not exist afterwards.
+
+    "Exactly one finding" is asserted here the same way it is on the read side, but the
+    reading has to happen **inside** the transaction: the incoherence this case creates
+    exists only between `body` and the barrier, and the barrier's own refusal erases it.
+    Both txids are probed rather than the one this case touches, because
+    `coherence_findings` returns `()` for a txid with no row and the barrier's scope is
+    every touched txid -- so the count is over the whole transaction, and a case that
+    incidentally broke the coherent record beside it would be caught rather than
+    averaged away. Parsing the count out of the message instead is not available:
+    findings are joined with `"; "` and two of the details contain `"; "` themselves.
+
+    The predicate is called directly rather than through `read_record`, which refuses
+    outright while the store owns a write transaction (§7.4) -- the right rule, and the
+    reason this reaches past it to the connection.
     """
     commit_record(opened_store, store_binding, "tx2", one_effect_spec(effect_id="only"))
     if plant is not None:
@@ -3779,8 +3796,13 @@ def test_every_reachable_cross_row_rule_refuses_on_a_write(
             plant(raw)
         finally:
             raw.close()
+    findings: list[str] = []
     with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
         body(txn)
+        for probe in ("tx2", "tx3"):
+            findings.extend(coherence_findings(opened_store._connection, probe))
+    assert len(findings) == 1, findings
+    assert findings[0].startswith(f"{rule}: ")
     assert rule in str(caught.value)
     survivor = opened_store.read_record("tx2")
     assert survivor is not None
@@ -4068,12 +4090,16 @@ def commit_record(store, binding, txid: str, spec) -> None:
     start from `ABSENT` and reference no digest, which is why they commit with no blob
     at all.
 
-    Task 11 replaces the direct insert with a real promotion. Leave the
-    `# Task 11: promote instead` comment on it.
+    The row is written **directly**, through `raw_connect`, and stays that way once
+    Task 11 exists. Promotion is not a better way to reach this state, it is a different
+    subject: it would make the setup for a corruption test depend on the staging,
+    verification, rename, and barrier machinery those tests are not about, and it would
+    stage real bytes for a row half of them go on to delete or contradict. The blob row
+    here is a *precondition*, written the same way `_plant_spec_json` writes a record --
+    the promotion path has its own tests, in `test_store_blobs.py`.
     """
     from atoms.store.records import referenced_digests
 
-    # Task 11: promote instead
     digests = referenced_digests(spec)
     if digests:
         raw = raw_connect(binding)
@@ -4459,8 +4485,9 @@ Only the **initial**-surface digest needs a row — `replace_spec`'s `pre` — b
 one `referenced_digests` reports. `one_effect_spec` starts from `ABSENT` and needs none, which
 is why the tests that use it commit without any blob at all.
 
-Task 11 replaces `commit_record`'s insert with a real promotion; the
-`# Task 11: promote instead` comment sits on that one line, and Task 11 removes it.
+`commit_record`'s direct insert is permanent. Task 11 adds promotion beside it, not in place
+of it — see the helper's own docstring for why a corruption fixture writes its precondition row
+rather than earning it.
 
 - [ ] **Step 6: Commit**
 
@@ -5496,8 +5523,10 @@ def promoted_blob(opened_store):
 ```
 
 That raw `INSERT` is a **fixture-only** statement and does not live in `atoms/store/`, so it
-does not violate the sole-writer rule Task 13 asserts over the package. Task 11 rewrites the
-fixture to promote instead; leave a `# Task 11: promote instead` comment on the INSERT.
+does not violate the sole-writer rule Task 13 asserts over the package. Task 11 Step 4 replaces
+this fixture body wholesale with a real promotion — the whole `promoted_blob` function, `INSERT`
+included — so nothing here needs a marker comment to find later. `commit_record`'s insert in
+`tests/store_support.py` is a different statement with a different fate: it stays.
 
 - [ ] **Step 3: Run the tests to verify they fail**
 
@@ -5702,15 +5731,15 @@ git commit -m "feat(store): verify a blob's bytes before handing out its descrip
 **Files:**
 - Modify: `src/atoms/store/blobs.py`
 - Modify: `src/atoms/store/connection.py`
+- Modify: `tests/store_support.py`
 - Modify: `tests/test_store_blobs.py`
 - Modify: `tests/conftest.py`
-- Modify: `tests/test_store_records.py`
 
 **Interfaces:**
 - Consumes: `Backend.transfer_noclobber`, `Backend.flush_directory`; Task 10's `verify_leaf`,
   `digest_to_leaf`, `require_digest`, `require_component`; `Workspace._spend_staging`.
 - Produces: `_StoreTransaction.promote_staging(workspace, manifest)`; `INSERT_BLOB`; the
-  record-reference half of `_run_barrier`.
+  record-reference half of `_run_barrier`. In `tests/store_support.py`: `spec_referencing(*contents)`.
 
 **Promotion is a `_StoreTransaction` method and writes the `blob` rows itself.** Publishing a blob and
 inserting its row are two substrates, and any interval between them is a window in which the blob is on
@@ -6024,16 +6053,35 @@ def test_an_already_indexed_digest_has_its_leaf_verified_not_assumed(
         assert "again" in set(os.listdir(workspace.staging_fd))
 
 
-def test_promoting_an_already_indexed_digest_with_a_different_length_refuses(
+def test_promoting_a_digest_whose_stored_row_disagrees_with_the_content_refuses(
     opened_store, store_binding, promoted_blob
 ):
+    """The index comparison in step 1, which is reached only when the staged source has
+    already verified.
+
+    The manifest is **correct** and the stored row is the thing corrupted, because it is
+    the only arrangement that gets here. A manifest declaring `len(content) + 1` against
+    a correct staged file fails one loop earlier, at `verify_leaf` on the source, with
+    `the leaf for sha256:... is 16 bytes, the index says 17` -- a message about an index
+    that was never consulted. That mismatch is already covered by
+    `test_a_staged_source_is_verified_before_it_moves[length]`; this is the other rung,
+    and the assertion on the message is what keeps the two apart.
+    """
     store, digest, content = promoted_blob
+    raw = raw_connect(store_binding)
+    try:
+        raw.execute("UPDATE blob SET byte_len = 999 WHERE digest = ?", (digest,))
+    finally:
+        raw.close()
     with store.create_workspace("tx9") as workspace:
         stage(workspace, "again", content)
-        with pytest.raises(MetadataStoreInvalid), store.transaction() as txn:
+        with pytest.raises(MetadataStoreInvalid) as caught, store.transaction() as txn:
             txn.promote_staging(workspace, (
-                StagedBlob(name="again", digest=digest, byte_len=len(content) + 1),
+                StagedBlob(name="again", digest=digest, byte_len=len(content)),
             ))
+        assert "the stored row" in str(caught.value)
+        assert "999" in str(caught.value)
+        assert "again" in set(os.listdir(workspace.staging_fd))
 
 
 def test_a_replay_of_a_promoted_entry_raises_enoent_not_eexist(opened_store, store_binding):
@@ -6331,9 +6379,11 @@ def promoted_blob(opened_store):
 
 `spec_referencing` is the helper Step 1 added to `tests/store_support.py`.
 
-Then delete the direct `INSERT INTO blob` blocks from `tests/test_store_records.py` that
-Task 8 marked `# Task 11: promote instead`, and route those tests through `promoted_blob` or a
-promotion of their own.
+**`commit_record` is not touched by this task**, and neither is any test in
+`tests/test_store_records.py`. The helper keeps its direct
+`INSERT INTO blob`: the tests it serves corrupt the row it writes, and earning that row through a
+promotion would couple every cross-row corruption case to the machinery this task is adding. The
+fixture above is where promotion becomes the way a blob gets indexed for tests *about* blobs.
 
 - [ ] **Step 5: Run the tests and the gates**
 
@@ -8279,6 +8329,21 @@ only reads an anchor), and **3 `PYI034`** (`__enter__` annotated with the class 
 Constraints, and the extraction now leaves only `I001` — the documented transient, confirmed to be
 about `atoms.store` not existing yet rather than about the ordering this plan writes.
 
+**What the seventeenth review found, and what changed.** Each was reproduced before it was closed.
+
+| Finding | Closure |
+| --- | --- |
+| The stored-row length check was unarmed: the test declared `len(content) + 1` against a correct staged file, so `verify_leaf` refused the **source** one loop earlier and the index comparison was never reached | the manifest is now correct and the stored row is the corruption — `UPDATE blob SET byte_len = 999` through `raw_connect` — with the message asserted, which is what keeps the two rungs apart. That mismatch was never uncovered: `test_a_staged_source_is_verified_before_it_moves[length]` already owns it (Task 11) |
+| "Exactly one finding" was a docstring claim, not an assertion — both matrices only checked that the tag appeared somewhere in the combined message, so a second finding would have passed | both now run the predicate and assert `len(findings) == 1` and `findings[0].startswith(f"{rule}: ")` **before** triggering the verdict. Re-measured across all 24 cases: 15/15 read-side and 9/9 write-side produce exactly one correctly-tagged finding (Task 8; design §11.2, criterion 23) |
+| Task 8 marked `commit_record`'s insert `# Task 11: promote instead`, Task 11 then instructed deleting marked blocks from a **different file** and supplied no replacement, and the self-review described the helper as still inserting directly | the promise is withdrawn rather than fulfilled: the direct insert is permanent, with the reason stated where the helper is defined. Task 11's Files list drops `tests/test_store_records.py` and gains `tests/store_support.py`, which Step 1 does modify. Task 10's marker instruction goes too — Task 11 Step 4 replaces that fixture body whole, so nothing greps for a comment (Tasks 8, 10, 11) |
+| A copy-ready fence shipped `os.path.stat.S_ISREG`, with prose afterwards telling the implementer to write something else | `import stat` and `stat.S_ISREG(info.st_mode)` are in the fence and the note is gone (Task 3) |
+
+One correction to the finding as stated: `os.path.stat` **is** a real attribute — measured,
+`os.path.stat.S_ISREG(0o100644)` returns `True`, because `posixpath` imports the module and the
+name leaks. It is an undocumented re-export that a type checker refuses, which is why the line
+carried a `# type: ignore` at all. The defect is the same either way and the fix is the one asked
+for; the fence should never have needed the prose.
+
 **Placeholder scan.** Clean. Every step that says "write this" carries the code. The nine-site gate
 inventory in Task 12 was briefly a parametrized case with a `raise AssertionError` body; it is now six
 named tests with real bodies and a stated technique — release the lock *after* occurrence k of the
@@ -8356,7 +8421,14 @@ and the conditional was hiding the fact that `binding.__exit__()` never released
   is what keeps criteria 16 and 37 stated over one list.
   `commit_record(store, binding, txid, spec)` inserts the `blob` rows `referenced_digests` reports
   before committing, because a record referencing a digest with no row cannot be committed at all —
-  the barrier is the same predicate.
+  the barrier is the same predicate. That insert is **direct and permanent**: Task 11 adds promotion
+  beside it, not in place of it, since a corruption fixture writing its own precondition row is not
+  a debt owed to the promotion path.
+- `coherence_findings(connection, txid)` is imported into `tests/test_store_records.py` alongside the
+  `RULE_*` constants, because both matrices now assert the finding *count* rather than a substring of
+  the message. On the write side it is called with `opened_store._connection` from inside the open
+  transaction: the incoherence exists only between the mutation and the barrier, and the barrier's
+  refusal erases it.
 
 **Import direction.** `connection.py` imports `workspace.py` and `blobs.py` for its delegating methods,
 so those two import `gate` from `connection.py` *inside function bodies*. That is deliberate and Task 9

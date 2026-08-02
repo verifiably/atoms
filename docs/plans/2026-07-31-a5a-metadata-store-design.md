@@ -2368,7 +2368,12 @@ table shapes, and §11 refusal vocabulary (§3.3).
     malformed-encoding cases — each failing independently, each finding tagged with the rule that
     produced it, and the read-side and write-side tables asserted to name **every** rule the predicate
     can emit between them, with the rules the public write API cannot reach listed beside the test
-    that proves each unreachable. `byte_len` agreement is checked against
+    that proves each unreachable. "Independently" is asserted rather than described: each case runs
+    the predicate and requires **exactly one** finding, carrying that case's tag, before the verdict
+    is triggered. A case that merely searched the raised message for its tag would pass on a record
+    that had also broken something else, which is the opposite of what this criterion asks — and on
+    the write side the reading has to happen inside the open transaction, because the barrier's own
+    refusal erases the state being counted. `byte_len` agreement is checked against
     **every** reference, so a spec declaring one digest at two lengths refuses rather than being
     silently reduced to whichever reference a map happened to keep — `compile_spec` accepts that spec,
     measured, so the store is where it is caught. A finding that depends on an earlier one holding —
