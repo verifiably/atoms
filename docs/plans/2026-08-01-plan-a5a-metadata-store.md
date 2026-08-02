@@ -44,6 +44,23 @@ over both.
   refuses a bare attribute expression, so a `pytest.raises` body that only reads an anchor is
   `_ = workspace.staging_fd`; and `PYI034` refuses `def __enter__(self) -> Store:` — annotate `Self`,
   as A4a already does at `binding.py:149`.
+- **A refusal test must assert which refusal fired.** Asserting only that an exception type was raised
+  proves that *something* refused. Where a different defect in the same path would raise the same type,
+  the case must also assert the field, constraint, or member its own refusal names. This is not a
+  precaution, it is measured twice: the malformed-diagnostic matrix stayed **8 of 13** green when the
+  key check was forced to fire for the wrong reason, and `test_every_setter_validates_the_txid` stays
+  **6 of 6** green with `require_identifier` neutered to the identity function, because
+  `_set_column`'s `rowcount != 1` branch raises `ProtocolError` too. A bare `pytest.raises(Exception)`
+  never satisfies this — bind it (`as caught`), which also drops ruff's `B017`.
+- **`pytest.raises` may be the inner manager of a `with A, B:` only when the exception it catches is
+  raised outside every `_mutating()` block of the enclosing transaction.** `SIM117` forces the
+  single-statement form, and in that form the *order* is load-bearing: with `pytest.raises` inner, its
+  `__exit__` **suppresses** the exception, so `transaction()`'s generator resumes past its `yield`
+  rather than being thrown into, `_require_not_poisoned` fires — `_mutating` poisons on any
+  `BaseException`, caller misuse included — and that second `ProtocolError` escapes from `__exit__`
+  outside every `pytest.raises` scope. Measured. Put `pytest.raises` **outer** whenever the body calls a
+  mutating method; the two inner-`raises` sites in `test_store_liveness.py` are safe only because what
+  they catch never reaches `_mutating`.
 - **pyright type-checks the tests** — `[tool.pyright]` sets no `include`.
 - **Every fixture lands in `tests/conftest.py`.** Task 13 extends the existing fixture-registry guard to
   `test_store_*.py`; until then, still put fixtures there.
@@ -3011,9 +3028,10 @@ def test_spec_json_is_write_once_at_the_database(opened_store, store_binding):
 
 def test_a_duplicate_txid_is_refused(opened_store):
     with opened_store.transaction() as txn:
-        txn.insert_record("tx1", one_effect_spec())
-    with pytest.raises(Exception), opened_store.transaction() as txn:
-        txn.insert_record("tx1", one_effect_spec())
+        txn.insert_record("tx1", one_effect_spec(effect_id="e1"))
+    with pytest.raises(sqlite3.IntegrityError) as caught, opened_store.transaction() as txn:
+        txn.insert_record("tx1", one_effect_spec(effect_id="e2"))
+    assert "transaction_record.txid" in str(caught.value)
 
 
 def test_a_caught_write_failure_cannot_be_committed(opened_store, store_binding):
@@ -3059,23 +3077,29 @@ def test_a_caught_write_failure_does_not_break_the_next_transaction(opened_store
 
 
 @pytest.mark.parametrize("bad", [3, None, b"tx", "../escape", "", "x" * 65])
-def test_every_setter_validates_the_txid(opened_store, bad):
-    with opened_store.transaction() as txn, pytest.raises(ProtocolError):
+def test_set_transaction_state_validates_the_txid(opened_store, bad):
+    with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
         txn.set_transaction_state(bad, TransactionState.APPLYING)
+    message = str(caught.value)
+    if type(bad) is str:
+        assert "is not 1-64 characters" in message
+    else:
+        assert "must be exactly str" in message
+    assert "no transaction_record row" not in message
 
 
 @pytest.mark.parametrize(
-    ("method", "bad"),
+    ("method", "bad", "refusal"),
     [
-        ("set_transaction_state", "applied"),
-        ("set_transaction_state", CommitDecision.COMMITTED),
-        ("set_commit_decision", "committed"),
-        ("set_commit_decision", TransactionState.COMMITTED),
-        ("set_rollback_result", 0),
-        ("set_halt_diagnostic", "{}"),
+        ("set_transaction_state", "applied", "state must be exactly TransactionState"),
+        ("set_transaction_state", CommitDecision.COMMITTED, "state must be exactly TransactionState"),
+        ("set_commit_decision", "committed", "decision must be exactly CommitDecision"),
+        ("set_commit_decision", TransactionState.COMMITTED, "decision must be exactly CommitDecision"),
+        ("set_rollback_result", 0, "result must be exactly RollbackResult"),
+        ("set_halt_diagnostic", "{}", "diagnostic must be exactly HaltDiagnostic"),
     ],
 )
-def test_a_wrong_exact_type_refuses_with_protocol_error(opened_store, method, bad):
+def test_a_wrong_exact_type_refuses_with_protocol_error(opened_store, method, bad, refusal):
     """§9's table: a wrong exact type is caller misuse, `ProtocolError`, never a raw
     `AttributeError` from inside the store.
 
@@ -3093,7 +3117,32 @@ def test_a_wrong_exact_type_refuses_with_protocol_error(opened_store, method, ba
     """
     with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
         getattr(txn, method)("tx1", bad)
-    assert "exactly" in str(caught.value)
+    assert refusal in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("method", "bad"),
+    [
+        ("set_transaction_state", "applied"),
+        ("set_commit_decision", "committed"),
+        ("set_rollback_result", 0),
+        ("set_halt_diagnostic", "{}"),
+    ],
+)
+def test_a_caught_wrong_typed_argument_cannot_commit(opened_store, store_binding, method, bad):
+    """An argument refusal inside a writer makes a previously successful write roll back."""
+    with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
+        txn.insert_record("tx1", one_effect_spec())
+        try:
+            getattr(txn, method)("tx1", bad)
+        except ProtocolError:
+            pass
+    assert "poison" in str(caught.value).lower()
+    raw = raw_connect(store_binding)
+    try:
+        assert raw.execute("SELECT count(*) FROM transaction_record").fetchone() == (0,)
+    finally:
+        raw.close()
 
 
 def test_setting_a_journal_state_updates_exactly_one_row(opened_store, store_binding):
@@ -3145,8 +3194,9 @@ def test_set_active_refuses_a_transaction_that_does_not_exist(opened_store):
     """foreign_keys=ON makes active.txid a real reference, so `active` can never name a
     transaction that does not exist -- the shape authority §7.3 promises recovery will
     never see (design §6.2)."""
-    with pytest.raises(Exception), opened_store.transaction() as txn:
+    with pytest.raises(sqlite3.IntegrityError) as caught, opened_store.transaction() as txn:
         txn.set_active("never-inserted")
+    assert "FOREIGN KEY" in str(caught.value)
 
 
 @pytest.mark.parametrize("value", [42.5, "abc", b"x"])
@@ -3155,8 +3205,12 @@ def test_strict_typing_refuses_a_value_that_cannot_convert(opened_store, store_b
     uses the values that actually raise (design §6.2)."""
     raw = raw_connect(store_binding)
     try:
-        with pytest.raises(Exception):
-            raw.execute("INSERT INTO blob (digest, byte_len) VALUES (?, ?)", ("sha256:" + "a" * 64, value))
+        with pytest.raises(sqlite3.IntegrityError) as caught:
+            raw.execute(
+                "INSERT INTO blob (digest, byte_len) VALUES (?, ?)",
+                ("sha256:" + "a" * 64, value),
+            )
+        assert "blob.byte_len" in str(caught.value)
     finally:
         raw.close()
 ```
@@ -3301,25 +3355,31 @@ Append to `src/atoms/store/connection.py`, inside `_StoreTransaction`:
             self._touched.add(txid)
 
     def set_transaction_state(self, txid: str, state: TransactionState) -> None:
-        self._set_column(UPDATE_STATE, txid, require_member("state", state, TransactionState))
+        with self._mutating():
+            self._set_column(
+                UPDATE_STATE, txid, require_member("state", state, TransactionState)
+            )
 
     def set_commit_decision(self, txid: str, decision: CommitDecision) -> None:
-        self._set_column(
-            UPDATE_COMMITTED, txid, require_member("decision", decision, CommitDecision)
-        )
+        with self._mutating():
+            self._set_column(
+                UPDATE_COMMITTED, txid, require_member("decision", decision, CommitDecision)
+            )
 
     def set_rollback_result(self, txid: str, result: RollbackResult) -> None:
-        self._set_column(
-            UPDATE_ROLLBACK_RESULT, txid, require_member("result", result, RollbackResult)
-        )
+        with self._mutating():
+            self._set_column(
+                UPDATE_ROLLBACK_RESULT, txid, require_member("result", result, RollbackResult)
+            )
 
     def set_halt_diagnostic(self, txid: str, diagnostic: HaltDiagnostic) -> None:
-        if type(diagnostic) is not HaltDiagnostic:
-            raise ProtocolError(
-                f"diagnostic must be exactly HaltDiagnostic, got "
-                f"{type(diagnostic).__name__}"
-            )
-        self._set_column(UPDATE_HALT_DIAGNOSTIC, txid, encode_diagnostic(diagnostic))
+        with self._mutating():
+            if type(diagnostic) is not HaltDiagnostic:
+                raise ProtocolError(
+                    f"diagnostic must be exactly HaltDiagnostic, got "
+                    f"{type(diagnostic).__name__}"
+                )
+            self._set_column(UPDATE_HALT_DIAGNOSTIC, txid, encode_diagnostic(diagnostic))
 
     def set_journal_state(self, txid: str, effect_id: str, state: JournalState) -> None:
         with self._mutating() as store:
@@ -3351,8 +3411,8 @@ Append to `src/atoms/store/connection.py`, inside `_StoreTransaction`:
 **Every method above opens with `with self._mutating() as store:`** and none calls `_require_current`
 directly. That context manager is design §7.7's poison rule (Task 5): it checks ownership on the way in
 and, on the way out, records the first exception that escaped so the transaction cannot commit even if
-the caller swallows it. The four one-line setters delegate to `_set_column`, which opens it for them;
-Task 13's guard accepts exactly that shape and nothing looser.
+the caller swallows it. The four setters open it before validating caller input, then `_set_column`
+opens its own permitted nested scope; Task 13's guard accepts exactly that shape and nothing looser.
 
 Add the corresponding imports to `connection.py`: `TransactionSpec`, `TransactionState`,
 `CommitDecision`, `JournalState`, `RollbackResult`, `HaltDiagnostic`, `canonical_json`, and

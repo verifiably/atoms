@@ -221,10 +221,17 @@ def test_spec_json_is_write_once_at_the_database(opened_store, store_binding):
 
 
 def test_a_duplicate_txid_is_refused(opened_store):
+    """Narrowed to `sqlite3.IntegrityError` on `transaction_record.txid` specifically
+    (review round 1, finding 2): both inserts used to default to `effect_id="e1"`, so
+    `effect`'s own composite PK collided too -- measured, the test stayed green even with
+    `transaction_record`'s PRIMARY KEY removed entirely. A distinct `effect_id` on the
+    second insert leaves the record PK as the only constraint that can fire.
+    """
     with opened_store.transaction() as txn:
-        txn.insert_record("tx1", one_effect_spec())
-    with pytest.raises(Exception), opened_store.transaction() as txn:  # noqa: B017
-        txn.insert_record("tx1", one_effect_spec())
+        txn.insert_record("tx1", one_effect_spec(effect_id="e1"))
+    with pytest.raises(sqlite3.IntegrityError) as caught, opened_store.transaction() as txn:
+        txn.insert_record("tx1", one_effect_spec(effect_id="e2"))
+    assert "transaction_record.txid" in str(caught.value)
 
 
 def test_a_caught_write_failure_cannot_be_committed(opened_store, store_binding):
@@ -270,23 +277,41 @@ def test_a_caught_write_failure_does_not_break_the_next_transaction(opened_store
 
 
 @pytest.mark.parametrize("bad", [3, None, b"tx", "../escape", "", "x" * 65])
-def test_every_setter_validates_the_txid(opened_store, bad):
-    with pytest.raises(ProtocolError), opened_store.transaction() as txn:
+def test_set_transaction_state_validates_the_txid(opened_store, bad):
+    """Renamed from `test_every_setter_validates_the_txid` (review round 1, finding 2):
+    it only ever called `set_transaction_state`, so the old name overclaimed.
+
+    Bound and message-checked rather than a bare `pytest.raises(ProtocolError)` (review
+    round 1, finding 2): `_set_column`'s `rowcount != 1` branch raises `ProtocolError`
+    too, for a txid that binds fine as a SQLite parameter and simply matches no row --
+    measured, monkeypatching `require_identifier` to the identity function leaves every
+    parametrization here green under the un-narrowed assertion. Splitting the expected
+    text by whether `bad` is even a `str` -- `require_identifier`'s own two-step order --
+    and refusing the rowcount message by name is what ties the pass to the identifier
+    gate specifically.
+    """
+    with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
         txn.set_transaction_state(bad, TransactionState.APPLYING)
+    message = str(caught.value)
+    if type(bad) is str:
+        assert "is not 1-64 characters" in message
+    else:
+        assert "must be exactly str" in message
+    assert "no transaction_record row" not in message
 
 
 @pytest.mark.parametrize(
-    ("method", "bad"),
+    ("method", "bad", "refusal"),
     [
-        ("set_transaction_state", "applied"),
-        ("set_transaction_state", CommitDecision.COMMITTED),
-        ("set_commit_decision", "committed"),
-        ("set_commit_decision", TransactionState.COMMITTED),
-        ("set_rollback_result", 0),
-        ("set_halt_diagnostic", "{}"),
+        ("set_transaction_state", "applied", "state must be exactly TransactionState"),
+        ("set_transaction_state", CommitDecision.COMMITTED, "state must be exactly TransactionState"),
+        ("set_commit_decision", "committed", "decision must be exactly CommitDecision"),
+        ("set_commit_decision", TransactionState.COMMITTED, "decision must be exactly CommitDecision"),
+        ("set_rollback_result", 0, "result must be exactly RollbackResult"),
+        ("set_halt_diagnostic", "{}", "diagnostic must be exactly HaltDiagnostic"),
     ],
 )
-def test_a_wrong_exact_type_refuses_with_protocol_error(opened_store, method, bad):
+def test_a_wrong_exact_type_refuses_with_protocol_error(opened_store, method, bad, refusal):
     """§9's table: a wrong exact type is caller misuse, `ProtocolError`, never a raw
     `AttributeError` from inside the store.
 
@@ -304,7 +329,49 @@ def test_a_wrong_exact_type_refuses_with_protocol_error(opened_store, method, ba
     """
     with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
         getattr(txn, method)("tx1", bad)
-    assert "exactly" in str(caught.value)
+    assert refusal in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("method", "bad"),
+    [
+        ("set_transaction_state", "applied"),
+        ("set_commit_decision", "committed"),
+        ("set_rollback_result", 0),
+        ("set_halt_diagnostic", "{}"),
+    ],
+)
+def test_a_wrong_typed_argument_checks_ownership_first_and_cannot_commit(
+    opened_store, store_binding, method, bad
+):
+    """Finding 1 (review round 1): for these four setters, `require_member`/the exact-type
+    check has to run *inside* `_mutating()`, not in the argument list evaluated before
+    `_set_column` opens it -- otherwise a caught argument failure never poisons because
+    `_mutating()`'s `try` was never entered.
+
+    Two properties, on the same four methods: on a spent transaction the ownership
+    refusal fires (never the argument refusal); on a live one, the argument refusal
+    poisons -- a prior successful write makes the blocked commit observable.
+    """
+    with opened_store.transaction() as txn:
+        pass
+    with pytest.raises(ProtocolError) as caught:
+        getattr(txn, method)("tx1", bad)
+    assert "spent" in str(caught.value).lower()
+    assert "exactly" not in str(caught.value)
+
+    with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
+        txn.insert_record("tx1", one_effect_spec())
+        try:
+            getattr(txn, method)("tx1", bad)
+        except ProtocolError:
+            pass
+    assert "poison" in str(caught.value).lower()
+    raw = raw_connect(store_binding)
+    try:
+        assert raw.execute("SELECT count(*) FROM transaction_record").fetchone() == (0,)
+    finally:
+        raw.close()
 
 
 def test_setting_a_journal_state_updates_exactly_one_row(opened_store, store_binding):
@@ -355,9 +422,14 @@ def test_set_active_none_clears_the_row(opened_store, store_binding):
 def test_set_active_refuses_a_transaction_that_does_not_exist(opened_store):
     """foreign_keys=ON makes active.txid a real reference, so `active` can never name a
     transaction that does not exist -- the shape authority §7.3 promises recovery will
-    never see (design §6.2)."""
-    with pytest.raises(Exception), opened_store.transaction() as txn:  # noqa: B017
+    never see (design §6.2).
+
+    Narrowed to `sqlite3.IntegrityError` naming `FOREIGN KEY` (review round 1, finding 2):
+    a bare `pytest.raises(Exception)` pins that *some* refusal fired, not which one.
+    """
+    with pytest.raises(sqlite3.IntegrityError) as caught, opened_store.transaction() as txn:
         txn.set_active("never-inserted")
+    assert "FOREIGN KEY" in str(caught.value)
 
 
 @pytest.mark.parametrize("value", [42.5, "abc", b"x"])
@@ -366,7 +438,11 @@ def test_strict_typing_refuses_a_value_that_cannot_convert(opened_store, store_b
     uses the values that actually raise (design §6.2)."""
     raw = raw_connect(store_binding)
     try:
-        with pytest.raises(Exception):  # noqa: B017
-            raw.execute("INSERT INTO blob (digest, byte_len) VALUES (?, ?)", ("sha256:" + "a" * 64, value))
+        with pytest.raises(sqlite3.IntegrityError) as caught:
+            raw.execute(
+                "INSERT INTO blob (digest, byte_len) VALUES (?, ?)",
+                ("sha256:" + "a" * 64, value),
+            )
+        assert "blob.byte_len" in str(caught.value)
     finally:
         raw.close()

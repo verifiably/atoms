@@ -552,25 +552,31 @@ class _StoreTransaction:
             self._touched.add(txid)
 
     def set_transaction_state(self, txid: str, state: TransactionState) -> None:
-        self._set_column(UPDATE_STATE, txid, require_member("state", state, TransactionState))
+        with self._mutating():
+            self._set_column(
+                UPDATE_STATE, txid, require_member("state", state, TransactionState)
+            )
 
     def set_commit_decision(self, txid: str, decision: CommitDecision) -> None:
-        self._set_column(
-            UPDATE_COMMITTED, txid, require_member("decision", decision, CommitDecision)
-        )
+        with self._mutating():
+            self._set_column(
+                UPDATE_COMMITTED, txid, require_member("decision", decision, CommitDecision)
+            )
 
     def set_rollback_result(self, txid: str, result: RollbackResult) -> None:
-        self._set_column(
-            UPDATE_ROLLBACK_RESULT, txid, require_member("result", result, RollbackResult)
-        )
+        with self._mutating():
+            self._set_column(
+                UPDATE_ROLLBACK_RESULT, txid, require_member("result", result, RollbackResult)
+            )
 
     def set_halt_diagnostic(self, txid: str, diagnostic: HaltDiagnostic) -> None:
-        if type(diagnostic) is not HaltDiagnostic:
-            raise ProtocolError(
-                f"diagnostic must be exactly HaltDiagnostic, got "
-                f"{type(diagnostic).__name__}"
-            )
-        self._set_column(UPDATE_HALT_DIAGNOSTIC, txid, encode_diagnostic(diagnostic))
+        with self._mutating():
+            if type(diagnostic) is not HaltDiagnostic:
+                raise ProtocolError(
+                    f"diagnostic must be exactly HaltDiagnostic, got "
+                    f"{type(diagnostic).__name__}"
+                )
+            self._set_column(UPDATE_HALT_DIAGNOSTIC, txid, encode_diagnostic(diagnostic))
 
     def set_journal_state(self, txid: str, effect_id: str, state: JournalState) -> None:
         with self._mutating() as store:
