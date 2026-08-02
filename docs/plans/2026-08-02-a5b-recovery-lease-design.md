@@ -38,8 +38,8 @@ decides.
 - `persist_plan_prefix` — A3 transition persistence in plan order with the §7.4 barriers, stopping
   structurally at the first step A7 must execute (§8).
 - The production composition root: the single call site passing `CERTIFIED_ALLOWLIST` (§4.1).
-- One new filesystem-level observer, `observe_child`, because scratch leaves cannot be resolved by
-  the existing resolver (§6.4).
+- Two new filesystem-level observers, `observe_child` and `observe_work_child`, because scratch leaves
+  cannot be resolved by the existing resolver (§6.4).
 
 ### 2.2 Not in scope
 
@@ -337,7 +337,15 @@ parent node and a leaf, never a resolvable path. A minimal descriptor-anchored c
 the occupancy observation and the parent facts from one open parent, rather than duplicating traversal
 inside the coordinator.
 
-It returns one frozen value, so a single open parent answers both questions:
+**`observe_work_child(binding, leaf)`, its metadata-space sibling.** The `WorkRoot` branch below must
+re-resolve `metadata_root/work` and ask about one child of it, and that is a different namespace from
+project space: containment rules that apply to one do not apply to the other. One function switching
+coordinate systems on a magic `parent_path` value would be exactly the ambiguity §9.4 exists to
+prevent, so the work base gets its own entry point sharing the same core and returning the same
+`ChildObservation`. Its parent facts are the pair `PathResolver.work_base_facts()` records in
+`ApprovedWorkBase`, so the comparison is like with like.
+
+Both return one frozen value, so a single open parent answers both questions:
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -362,7 +370,7 @@ inventing an identity from the live filesystem, which is a fresh observation aut
 | --- | --- |
 | Existing project directory (`ApprovedExistingDirectory`) | `observe_child(parent_path, leaf)`; compare `parent_identity` and `parent_constraints` against the approved entry; then read `present` for occupancy |
 | Planned project directory (`ApprovedPlannedDirectory`) | Re-resolve the parent and require it **remains absent**. No `ChildObservation` is constructed: an absent parent has no identity to compare and no child to be occupied. A parent that is present now is post-approval drift and refuses |
-| `WorkRoot` | Re-resolve `metadata_root/work` against `approved.work_base` and require `work/<txid>` absent; `store.create_workspace` then owns it. Never enters `observe_child`, and the project-containment rules never apply to it |
+| `WorkRoot` | `observe_work_child(binding, txid)`; compare its parent facts against `approved.work_base`, then read `present`. An occupied `work/<txid>` is regenerable occupancy; a moved or re-flagged work base is drift and refuses. `store.create_workspace` then owns the slot. Never enters `observe_child`, and the project-containment rules never apply to it |
 
 **Mapping a `TopologyNode` to a project-relative parent path**, for the first branch only:
 
