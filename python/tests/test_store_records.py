@@ -600,7 +600,22 @@ WRITE_SIDE_INCOHERENCE = (
     (RULE_DIAGNOSTIC_DECISION, None, lambda txn: _halt_with(txn, replace(matching_diagnostic("only"), commit_decision=CommitDecision.COMMITTED))),
     (RULE_DIAGNOSTIC_JOURNALS, None, lambda txn: _halt_with(txn, replace(matching_diagnostic("only"), journals=(EffectJournalState("only", JournalState.DONE),)))),
 )
-WRITE_UNREACHABLE_RULES = (RULE_SPEC_DECODES, RULE_SPEC_CANONICAL, RULE_EFFECT_COVERAGE, RULE_EFFECT_VARIANT, RULE_ACTIVE_RECORD)
+WRITE_UNREACHABLE_RULES = (
+    # `insert_record` writes `canonical_json(spec)` of an exact `TransactionSpec`, so no
+    # caller can make the stored text fail to decode or fail to re-encode --
+    # `test_insert_record_stores_the_canonical_encoding` is the property.
+    RULE_SPEC_DECODES,
+    RULE_SPEC_CANONICAL,
+    # The same method derives every `effect` row and its variant from that spec, and no
+    # setter adds, drops, or retypes one --
+    # `test_insert_record_derives_every_effect_row_from_the_spec` is the property.
+    RULE_EFFECT_COVERAGE,
+    RULE_EFFECT_VARIANT,
+    # `active.txid` is a real foreign key under `foreign_keys = ON`, so `set_active`
+    # raises `IntegrityError` long before the barrier --
+    # `test_set_active_refuses_a_transaction_that_does_not_exist` is the property.
+    RULE_ACTIVE_RECORD,
+)
 
 
 @pytest.mark.parametrize(("rule", "plant", "body"), WRITE_SIDE_INCOHERENCE)
@@ -623,6 +638,8 @@ def test_every_reachable_cross_row_rule_refuses_on_a_write(opened_store, store_b
 
 
 def test_the_cross_row_matrix_covers_every_rule_on_both_sides():
+    """The read side is total; the write side covers reachable public-write shapes and
+    names each unreachable rule beside the API property and proving test."""
     assert {case[0] for case in CROSS_ROW_CASES} == set(COHERENCE_RULES)
     written = {case[0] for case in WRITE_SIDE_INCOHERENCE}
     assert not written & set(WRITE_UNREACHABLE_RULES)
