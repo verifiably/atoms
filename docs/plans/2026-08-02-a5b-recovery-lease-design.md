@@ -127,8 +127,8 @@ New package `atoms/coordinator/`.
 
 | Module | Owns |
 | --- | --- |
-| `root.py` | The public resource stack: `recovery_lease(backend, project_root, metadata_root, storage)`, and the sole production `bind_project_volume` call, passing `CERTIFIED_ALLOWLIST` |
-| `lease.py` | The internal reclamation/resolution protocol over the resulting `binding` and `store` |
+| `root.py` | The package-private resource stack: `_recovery_lease(backend, project_root, metadata_root, storage)`, and the sole production `bind_project_volume` call, passing `CERTIFIED_ALLOWLIST` |
+| `lease.py` | The `Lease` value and the internal reclamation/resolution protocol over its `_binding` and `_store` |
 | `admission.py` | `new_txid`, the regeneration loop, re-resolution, occupancy, and the entry-point gate set |
 | `prepare.py` | `prepare_transaction` — authority §7.3 steps 2–4 |
 | `transitions.py` | `persist_plan_prefix` — plan-order persistence and the §7.4 barriers |
@@ -171,9 +171,9 @@ receives the `Store`, the `ProjectBinding`, or any other mutable ownership state
 
 ### 5.0 The lease value
 
-`recovery_lease` yields a `Lease` — an opaque, coordinator-internal handle. The rest of this design
-writes `lease.binding` and `lease.store`, and those are **private, borrowed** attributes: readable
-within `atoms/coordinator/`, absent from the package's `__all__`, and never returned to a consumer.
+`_recovery_lease` yields a `Lease`. **Both are package-private.** A5b ships no consumer-facing
+command — those are authority §12.1's, out of scope here — so nothing in A5b's public surface returns
+or accepts a `Lease`. A future coordinator command enters it; external consumers never do.
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -182,15 +182,20 @@ class Lease:
     _store: Store
 ```
 
-Borrowed, not owned: the lease does not close either resource on its own. `recovery_lease`'s
+Every reference in this design is `lease._binding` and `lease._store`. There is no public `binding` or
+`store` property; adding one would be the whole boundary undone in a single line.
+
+Borrowed, not owned: the lease does not close either resource on its own. `_recovery_lease`'s
 `finally` closes them in reverse acquisition order, so a `Lease` that outlives its `with` block
 references spent objects and every A5a call through it refuses — A5a already spends its `Store` on
 close and refuses afterwards, so the escape is caught by the layer below rather than by a flag here.
 
-This is what makes authority §4.2's "consumer code never receives mutable ownership state" a
-structural property rather than a convention. The consumer calls a coordinator command; the command
-enters the lease on its behalf; the `Lease` never crosses back out. An architecture test asserts
-`Lease`, `ProjectBinding`, and `Store` are absent from `atoms.coordinator.__all__`.
+**Absence from `__all__` is not enforcement**, since `atoms.coordinator.root._recovery_lease` remains
+importable by anyone willing to spell it. The leading underscore states the contract, and the
+architecture test enforces what it can: no module outside `atoms/coordinator/` imports `_recovery_lease`
+or `Lease`, and neither name — nor `ProjectBinding` or `Store` — appears in
+`atoms.coordinator.__all__`. That makes authority §4.2's "consumer code never receives mutable
+ownership state" structural for every in-tree caller, which is the population the guard can speak for.
 
 ### 5.1 Entry and exit order
 
@@ -283,10 +288,10 @@ def admit(lease, compiled) -> ProjectApprovedSpec:
     occupied: tuple[str, ...] = ()
     for _ in range(SCRATCH_ATTEMPTS):
         txid = new_txid()
-        if lease.store.read_record(txid) is not None:
+        if lease._store.read_record(txid) is not None:
             occupied = ()                  # durable record already owns it
             continue
-        approved = approve_for_project(compiled, ProjectContext(lease.binding, txid))
+        approved = approve_for_project(compiled, ProjectContext(lease._binding, txid))
         occupied = occupied_scratch(lease, approved)
         if not occupied:
             return approved
@@ -345,43 +350,45 @@ class ChildObservation:
 `DirectoryConstraints` already bundles `lookup_proof` and `name_max`, so one comparison against
 `approved.directories` covers identity, `LookupProof`, and `NAME_MAX` together.
 
-**Mapping a `TopologyNode` to a parent path.** `TopologyNode` is
-`ProjectRoot | WorkRoot | TopologyDirectory(node_id) | PersistentNode(path) | ScratchNode(...)`, and
-only two of those carry a path directly. A5b builds the map once per admission:
+**`parent_path` is project-relative, always.** `ProjectRoot` is `""`. There is exactly one coordinate
+system because `observe_child` is reached from exactly one of the three branches below — the one whose
+parent lives in project space.
+
+**Three branches, because one shape cannot carry all three.** `ChildObservation.parent_identity` is
+mandatory, and an `ApprovedPlannedDirectory` deliberately has none; forcing a value there would mean
+inventing an identity from the live filesystem, which is a fresh observation authorizing itself.
+
+| Parent | What A5b does |
+| --- | --- |
+| Existing project directory (`ApprovedExistingDirectory`) | `observe_child(parent_path, leaf)`; compare `parent_identity` and `parent_constraints` against the approved entry; then read `present` for occupancy |
+| Planned project directory (`ApprovedPlannedDirectory`) | Re-resolve the parent and require it **remains absent**. No `ChildObservation` is constructed: an absent parent has no identity to compare and no child to be occupied. A parent that is present now is post-approval drift and refuses |
+| `WorkRoot` | Re-resolve `metadata_root/work` against `approved.work_base` and require `work/<txid>` absent; `store.create_workspace` then owns it. Never enters `observe_child`, and the project-containment rules never apply to it |
+
+**Mapping a `TopologyNode` to a project-relative parent path**, for the first branch only:
 
 | Node | Parent path |
 | --- | --- |
-| `ProjectRoot` | the binding's project root |
-| `WorkRoot` | `metadata_root/work` — engine-owned, not project space |
-| `PersistentNode(path)` | that project-relative path |
+| `ProjectRoot` | `""` |
+| `PersistentNode(path)` | that path |
 | `TopologyDirectory(node_id)` | derived from `approved.paths`: an `ApprovedPath(path, parent_node, leaf)` whose `parent_node` is this node fixes the directory as `path` minus its trailing `leaf` |
 
-The derivation is total for the nodes A5b actually needs. A `STAGING`, `TOMBSTONE`, or `ANCHOR` leaf
+The derivation is total for the nodes this branch needs. A `STAGING`, `TOMBSTONE`, or `ANCHOR` leaf
 sits beside its target, so its `parent_node` is that target's `parent_node` — and the target is itself
 an `ApprovedPath`, which supplies the mapping. A node with no mapping is a `ProtocolError`, never a
-silently skipped check.
-
-**`WORK` is the exception and is not project space.** A `ScratchNode` with `role=WORK` has `WorkRoot`
-as its parent: `CreateDirectory` stages into `metadata_root/work/<txid>/`, which `store.create_workspace`
-owns. Its occupancy question is answered against the work root under `approved.work_base`, not against
-a project directory, and A5b never applies the project-containment rules to it.
-
-**A planned parent is absent by construction.** `ApprovedDirectory` is
-`ApprovedExistingDirectory | ApprovedPlannedDirectory`, and a planned directory does not exist yet, so
-a child beneath it cannot be occupied. Observing one is still required rather than assumed: if the
-planned parent is *present* now, that is post-approval drift and refuses. `ApprovedPlannedDirectory`
-carries `constraints` but no `identity`, so only the constraints are compared — there is no approved
-identity to compare against, and inventing one from the live filesystem would be a fresh observation
-authorizing itself.
+silently skipped check. `WorkRoot` is absent from this table by construction: a `ScratchNode` with
+`role=WORK` is handled by the third branch, since `CreateDirectory` stages into
+`metadata_root/work/<txid>/` rather than into project space.
 
 **Refusals from the resolver are translated.** `atoms/fs/resolve.py` raises `ProjectApprovalRefused`
-(lines 169, 174, 223, 251, 305, 323) and `CapabilityUnavailable` (lines 120, 156) — correct at approval
+at twelve sites and `CapabilityUnavailable` at two — correct at approval
 time, wrong afterwards. A mount change, a casefold-attribute change, or any other post-approval
 divergence found during re-resolution is drift, and §9 requires `PreconditionRefused` for it. A5b
 therefore catches both types around its re-resolution and re-raises `PreconditionRefused` with the
 original chained, so a caller cannot mistake post-approval drift for an approval that never succeeded.
 This translation applies **only** to A5b's own re-resolution; it never wraps `approve_for_project`,
-whose refusals are genuine approval refusals and must surface unchanged.
+whose refusals are genuine approval refusals and must surface unchanged. The counts are current at
+time of writing and are not a contract — the requirement is categorical, covering every refusal type
+the resolver declares, so it cannot drift as `resolve.py` grows.
 
 ### 6.5 The entry-point gate set
 
@@ -389,7 +396,7 @@ whose refusals are genuine approval refusals and must surface unchanged.
 
 ```text
 approved is exactly ProjectApprovedSpec
-approved.binding is lease.binding
+approved.binding is lease._binding
 workspace.txid == approved.txid
 ```
 
@@ -409,7 +416,7 @@ of `_StoreTransaction` — obtainable only by entering `Store.transaction()` —
 index rows itself:
 
 ```python
-with lease.store.transaction() as txn:
+with lease._store.transaction() as txn:
     txn.promote_staging(workspace, manifest)          # §7.3 steps 2-3
     txn.insert_record(approved.txid, approved.compiled.spec)
     txn.set_active(approved.txid)
@@ -450,7 +457,7 @@ def persist_plan_prefix(lease, approved, plan, start: int) -> int: ...
 
 It takes the lease rather than a caller-owned transaction and owns its own boundaries, and it reads
 the active `StoredRecord` itself. That reading is load-bearing three ways: it enforces
-`approved.binding is lease.binding`, it obtains the independent txid for the #21 comparison, and it
+`approved.binding is lease._binding`, it obtains the independent txid for the #21 comparison, and it
 guarantees that returning past a metadata step means that step's COMMIT completed.
 
 If no active record is found, it refuses with `ProtocolError` rather than proceeding — a plan being
@@ -504,14 +511,15 @@ supplied by A7 follows a durably completed effect. That remains A7's obligation,
 
 No new type. The existing hierarchy carries every meaning, with §3.3's amendment broadening
 `PreconditionRefused` to "external state prevents clean execution." **Durable txid occupancy is part of
-that meaning**: a txid an existing record already owns is external state in exactly the same sense as
-an occupied scratch leaf — it is not concurrent, not drift, and may predate this attempt by any amount
-of time.
+that meaning**, as *pre-existing state* rather than external state: the record was written by this
+engine, not by anything outside it, so calling it external would be wrong. What it shares with an
+occupied scratch leaf is the property the type actually turns on — it is not concurrent, not drift,
+predates this attempt, and blocks clean execution without any mutation having occurred.
 
 | Situation | Type |
 | --- | --- |
 | Scratch still occupied after the attempt bound (#7) | `PreconditionRefused` |
-| Every candidate txid owned by a durable record, after the attempt bound (#7) | `PreconditionRefused` |
+| Every candidate txid owned by a durable record, after the attempt bound (#7) — pre-existing, not external | `PreconditionRefused` |
 | Re-resolution mismatch, no durable record yet (#19) | `PreconditionRefused` |
 | Post-approval resolver refusal translated from `ProjectApprovalRefused` / `CapabilityUnavailable` (§6.4) | `PreconditionRefused` |
 | No active record when persisting a plan (§8.1) | `ProtocolError` |
@@ -552,6 +560,13 @@ On a real ext4 volume, using the existing binding fixtures.
   discarded and the attempt counted.
 - **#19 mismatches**, one case each: directory identity, lookup constraints, `LookupProof`, mount
   membership, and work-base re-resolution before workspace creation.
+- **The three parent branches**, each reached and each refusing for its own reason: an existing parent
+  whose identity or constraints moved; a *planned* parent that is present when approval said it would
+  not be; and a `WorkRoot` whose `work/<txid>` already exists. The planned-parent case additionally
+  asserts no `ChildObservation` is constructed, since there is no identity to put in one.
+- **Resolver translation**, covering every refusal type `resolve.py` declares rather than an
+  enumerated subset: each surfaces as `PreconditionRefused` with the original chained, and
+  `approve_for_project`'s own refusals pass through untranslated.
 - **Pre-publication refusal** rather than halt, and re-resolution mismatch raising immediately instead
   of entering regeneration.
 
@@ -578,6 +593,9 @@ On a real ext4 volume, using the existing binding fixtures.
   `atoms/coordinator/` and `atoms/fs/approval.py`, and every post-approval transaction-stage entry
   point takes one.
 - `atoms.store` is importable only from `atoms/coordinator/`.
+- No module outside `atoms/coordinator/` imports `_recovery_lease` or `Lease`, and none of
+  `Lease`, `ProjectBinding`, or `Store` appears in `atoms.coordinator.__all__`. The guard speaks for
+  in-tree callers, which is the population it can speak for; the leading underscore states the rest.
 - `test_a5_status_is_synchronized_across_authority_documents` reflects "A5b designed, unimplemented."
 
 ## 11. Acceptance criteria
