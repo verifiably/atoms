@@ -638,8 +638,13 @@ def test_every_reachable_cross_row_rule_refuses_on_a_write(opened_store, store_b
 
 
 def test_the_cross_row_matrix_covers_every_rule_on_both_sides():
-    """The read side is total; the write side covers reachable public-write shapes and
-    names each unreachable rule beside the API property and proving test."""
+    """The claim design §11.2 makes, as an assertion rather than a list.
+
+    The read side is total. The write side covers every rule the public write API can
+    actually produce; the rest are listed once, each with the API property that makes it
+    unreachable and the test that proves that property. A rule added to the predicate
+    with no case on either side fails here.
+    """
     assert {case[0] for case in CROSS_ROW_CASES} == set(COHERENCE_RULES)
     written = {case[0] for case in WRITE_SIDE_INCOHERENCE}
     assert not written & set(WRITE_UNREACHABLE_RULES)
