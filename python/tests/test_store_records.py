@@ -105,39 +105,46 @@ def test_every_path_state_variant_round_trips_inside_a_diagnostic_entry(state):
 
 
 @pytest.mark.parametrize(
-    "mutate",
+    ("mutate", "names"),
     [
-        lambda obj: obj.pop("reason"),
-        lambda obj: obj.update({"reason": "no_such_reason"}),
-        lambda obj: obj.update({"unexpected": 1}),
-        lambda obj: obj.update({"pre_halt_state": "not_a_state"}),
-        lambda obj: obj.update({"journals": [{"effect_id": "e1"}]}),
+        (lambda obj: obj.pop("reason"), "reason"),
+        (lambda obj: obj.update({"reason": "no_such_reason"}), "HaltReason"),
+        (lambda obj: obj.update({"unexpected": 1}), "unexpected"),
+        (lambda obj: obj.update({"pre_halt_state": "not_a_state"}), "TransactionState"),
+        (lambda obj: obj.update({"journals": [{"effect_id": "e1"}]}), "state"),
         # Shapes that reached a *raw* exception before the field checks existed.
         # `journals: 5` left as `TypeError: 'int' object is not iterable`; `paths` as a
         # string decoded character by character and refused nothing; `effect_id: 7` was
         # copied straight through into a HaltDiagnostic A3 would later choke on.
-        lambda obj: obj.update({"journals": 5}),
-        lambda obj: obj.update({"paths": "a.txt"}),
-        lambda obj: obj.update({"paths": ["a.txt", 7]}),
-        lambda obj: obj.update({"effect_id": 7}),
-        lambda obj: obj.update({"expected": {"slot": "a"}}),
-        lambda obj: obj["journals"][0].update({"effect_id": None}),
+        (lambda obj: obj.update({"journals": 5}), "journals"),
+        (lambda obj: obj.update({"paths": "a.txt"}), "paths"),
+        (lambda obj: obj.update({"paths": ["a.txt", 7]}), "paths[1]"),
+        (lambda obj: obj.update({"effect_id": 7}), "effect_id"),
+        (lambda obj: obj.update({"expected": {"slot": "a"}}), "expected"),
+        (lambda obj: obj["journals"][0].update({"effect_id": None}), "NoneType"),
         # The two nullable fields: null is a value, but only null. A helper that admits
         # `None` must not thereby admit everything else.
-        lambda obj: obj["expected"][0].update({"has_unmodeled_child": "yes"}),
-        lambda obj: obj.update({"effect_id": False}),
+        (lambda obj: obj["expected"][0].update({"has_unmodeled_child": "yes"}), "has_unmodeled_child"),
+        (lambda obj: obj.update({"effect_id": False}), "effect_id"),
     ],
 )
-def test_a_malformed_diagnostic_payload_refuses(mutate):
+def test_a_malformed_diagnostic_payload_refuses(mutate, names):
     """A missing field, an extra one, an unknown enum member, and a field of the wrong
     primitive type all refuse -- design §9 lists a malformed payload as a
     MetadataStoreInvalid shape, and `halt_diagnostic` is the one column with no CHECK
-    behind it, so this decoder is its entire boundary."""
+    behind it, so this decoder is its entire boundary.
+
+    Asserting only `MetadataStoreInvalid` proves *something* refused, not that it refused
+    for the stated reason: a regression that let an unrelated, over-eager check fire first
+    would still raise the right exception type while masking a broken field-specific path.
+    So each case also asserts the field or member name its own refusal must name.
+    """
     diagnostic = every_diagnostic_shape()[0]
     obj = json.loads(encode_diagnostic(diagnostic))
     mutate(obj)
-    with pytest.raises(MetadataStoreInvalid):
+    with pytest.raises(MetadataStoreInvalid) as caught:
         decode_diagnostic(json.dumps(obj))
+    assert names in str(caught.value)
 
 
 def test_a_duplicate_key_in_the_payload_refuses():
