@@ -307,3 +307,24 @@ def matching_diagnostic(effect_id: str = "only") -> HaltDiagnostic:
         reason=HaltReason.DIRECTORY_NOT_EMPTY,
         operator_action=OperatorAction.INSPECT_PRESERVED_EVIDENCE,
     )
+
+
+def non_compiling_spec(effect_id: str = "only"):
+    return build_spec(
+        consumer_tag="test", intent_digest="sha256:" + "4" * 64,
+        initial_surface={"a.txt": ABSENT}, final_surface={"a.txt": ABSENT},
+        effects=[CreateFileNoClobber(effect_id=effect_id, path="a.txt", post=file_state(b"after"))],
+    )
+
+
+def commit_record(store, binding, txid: str, spec) -> None:
+    from atoms.store.records import referenced_digests
+
+    raw = raw_connect(binding)
+    try:
+        for digest, byte_len in referenced_digests(spec):
+            raw.execute("INSERT INTO blob (digest, byte_len) VALUES (?, ?)", (digest, byte_len))
+    finally:
+        raw.close()
+    with store.transaction() as txn:
+        txn.insert_record(txid, spec)

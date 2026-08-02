@@ -8,6 +8,7 @@ import pytest
 
 from atoms.core.errors import ProtocolError
 from atoms.store.connection import open_store
+from tests.store_support import RELEASES
 
 
 def test_open_store_creates_then_reopens(store_on):
@@ -147,3 +148,21 @@ def test_close_still_succeeds_on_a_dead_binding(store_on):
     with store_on() as binding:
         store = open_store(binding)
     store.close()
+
+
+@pytest.mark.parametrize("release", RELEASES, ids=("closed_binding", "released_lock"))
+def test_lock_released_before_commit_rolls_back(store_on, release):
+    from tests.store_support import one_effect_spec, raw_path
+
+    with store_on() as binding:
+        path = raw_path(binding)
+        store = open_store(binding)
+        with pytest.raises(ProtocolError), store.transaction() as txn:
+            txn.insert_record("tx1", one_effect_spec())
+            release(binding)
+        store.close()
+        raw = sqlite3.connect(path, isolation_level=None)
+        try:
+            assert raw.execute("SELECT count(*) FROM transaction_record").fetchone() == (0,)
+        finally:
+            raw.close()

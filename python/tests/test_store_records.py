@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import replace
 
 import pytest
 
@@ -24,13 +25,24 @@ from atoms.core.recovery.model import (
     TransactionState,
 )
 from atoms.store.errors import MetadataStoreInvalid
-from atoms.store.records import decode_diagnostic, encode_diagnostic
+from atoms.store.records import (
+    COHERENCE_RULES, RULE_ACTIVE_RECORD, RULE_BLOB_BYTE_LEN, RULE_BLOB_ROW_PRESENT,
+    RULE_DIAGNOSTIC_DECISION, RULE_DIAGNOSTIC_JOURNALS, RULE_EFFECT_COVERAGE,
+    RULE_EFFECT_VARIANT, RULE_HALT_DIAGNOSTIC, RULE_ROLLBACK_RESULT,
+    RULE_SPEC_CANONICAL, RULE_SPEC_COMPILES, RULE_SPEC_DECODES, coherence_findings,
+    decode_diagnostic, encode_diagnostic,
+)
 from tests.store_support import (
     duplicate_effect_spec,
     every_diagnostic_shape,
+    SHARED_DIGEST,
+    commit_record,
+    matching_diagnostic,
+    non_compiling_spec,
     one_effect_spec,
     raw_connect,
     replace_spec,
+    two_length_spec,
 )
 
 
@@ -446,3 +458,101 @@ def test_strict_typing_refuses_a_value_that_cannot_convert(opened_store, store_b
         assert "blob.byte_len" in str(caught.value)
     finally:
         raw.close()
+
+
+def test_a_record_round_trips_through_the_store(opened_store, store_binding):
+    spec = replace_spec(effect_id="e1")
+    commit_record(opened_store, store_binding, "tx1", spec)
+    with opened_store.transaction() as txn:
+        txn.set_active("tx1")
+    record = opened_store.read_record("tx1")
+    assert record is not None
+    assert (record.txid, record.spec, record.state, record.committed) == (
+        "tx1", spec, TransactionState.PREPARED, CommitDecision.UNCOMMITTED
+    )
+    assert record.journals == (EffectJournalState("e1", JournalState.PENDING),)
+    assert opened_store.read_active() == record
+
+
+def test_reads_of_absent_records_and_active_rows_return_none(opened_store):
+    assert opened_store.read_record("nope") is None
+    assert opened_store.read_active() is None
+
+
+def _plant(raw, sql, parameters=()):
+    raw.execute(sql, parameters)
+
+
+@pytest.mark.parametrize(
+    ("rule", "prepare", "corrupt"),
+    (
+        (RULE_SPEC_DECODES, one_effect_spec, lambda raw: _plant(raw, "UPDATE transaction_record SET spec_json = '{\"nope\": 1}'")),
+        (RULE_SPEC_COMPILES, non_compiling_spec, lambda raw: None),
+        (RULE_EFFECT_COVERAGE, one_effect_spec, lambda raw: _plant(raw, "DELETE FROM effect")),
+        (RULE_EFFECT_VARIANT, one_effect_spec, lambda raw: _plant(raw, "UPDATE effect SET variant = 'delete_path'")),
+        (RULE_BLOB_ROW_PRESENT, replace_spec, lambda raw: _plant(raw, "DELETE FROM blob")),
+        (RULE_BLOB_BYTE_LEN, replace_spec, lambda raw: _plant(raw, "UPDATE blob SET byte_len = 999")),
+        (RULE_ROLLBACK_RESULT, one_effect_spec, lambda raw: _plant(raw, "UPDATE transaction_record SET state = 'rolled_back'")),
+        (RULE_HALT_DIAGNOSTIC, one_effect_spec, lambda raw: _plant(raw, "UPDATE transaction_record SET state = 'halted'")),
+    ),
+)
+def test_cross_row_corruption_refuses_on_load(opened_store, store_binding, rule, prepare, corrupt):
+    commit_record(opened_store, store_binding, "tx1", prepare())
+    raw = raw_connect(store_binding)
+    try:
+        corrupt(raw)
+        findings = coherence_findings(raw, "tx1")
+    finally:
+        raw.close()
+    assert len(findings) == 1, findings
+    assert findings[0].startswith(f"{rule}: ")
+    with pytest.raises(MetadataStoreInvalid) as caught:
+        opened_store.read_record("tx1")
+    assert rule in str(caught.value)
+
+
+def test_a_cross_row_violation_is_protocol_error_before_commit(opened_store):
+    with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
+        txn.insert_record("tx1", one_effect_spec())
+        txn.set_transaction_state("tx1", TransactionState.ROLLED_BACK)
+    assert RULE_ROLLBACK_RESULT in str(caught.value)
+    assert opened_store.read_record("tx1") is None
+
+
+def test_a_coherent_rollback_sequence_commits(opened_store):
+    with opened_store.transaction() as txn:
+        txn.insert_record("tx1", one_effect_spec())
+    with opened_store.transaction() as txn:
+        txn.set_transaction_state("tx1", TransactionState.ROLLED_BACK)
+        txn.set_rollback_result("tx1", RollbackResult.RESTORED)
+    assert opened_store.read_record("tx1").rollback_result is RollbackResult.RESTORED
+
+
+def test_two_touched_records_roll_back_together(opened_store):
+    with pytest.raises(ProtocolError), opened_store.transaction() as txn:
+        txn.insert_record("tx1", one_effect_spec())
+        txn.insert_record("tx2", one_effect_spec())
+        txn.set_transaction_state("tx2", TransactionState.ROLLED_BACK)
+    assert opened_store.read_record("tx1") is None
+    assert opened_store.read_record("tx2") is None
+
+
+def test_a_read_inside_a_write_transaction_is_refused(opened_store):
+    with opened_store.transaction() as txn:
+        txn.insert_record("tx1", one_effect_spec())
+        with pytest.raises(ProtocolError):
+            opened_store.read_record("tx1")
+
+
+def test_a_failed_read_closes_its_transaction(opened_store, store_binding):
+    with opened_store.transaction() as txn:
+        txn.insert_record("tx1", one_effect_spec())
+    raw = raw_connect(store_binding)
+    try:
+        raw.execute("DELETE FROM effect")
+    finally:
+        raw.close()
+    with pytest.raises(MetadataStoreInvalid):
+        opened_store.read_record("tx1")
+    with opened_store.transaction():
+        pass
