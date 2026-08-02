@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import replace
 
 import pytest
 
@@ -27,23 +26,26 @@ from atoms.core.recovery.model import (
 )
 from atoms.store.errors import MetadataStoreInvalid
 from atoms.store.records import (
-    COHERENCE_RULES, RULE_ACTIVE_RECORD, RULE_BLOB_BYTE_LEN, RULE_BLOB_ROW_PRESENT,
-    RULE_DIAGNOSTIC_DECISION, RULE_DIAGNOSTIC_JOURNALS, RULE_EFFECT_COVERAGE,
-    RULE_EFFECT_VARIANT, RULE_HALT_DIAGNOSTIC, RULE_ROLLBACK_RESULT,
-    RULE_SPEC_CANONICAL, RULE_SPEC_COMPILES, RULE_SPEC_DECODES, coherence_findings,
-    decode_diagnostic, encode_diagnostic,
+    RULE_BLOB_BYTE_LEN,
+    RULE_BLOB_ROW_PRESENT,
+    RULE_EFFECT_COVERAGE,
+    RULE_EFFECT_VARIANT,
+    RULE_HALT_DIAGNOSTIC,
+    RULE_ROLLBACK_RESULT,
+    RULE_SPEC_COMPILES,
+    RULE_SPEC_DECODES,
+    coherence_findings,
+    decode_diagnostic,
+    encode_diagnostic,
 )
 from tests.store_support import (
+    commit_record,
     duplicate_effect_spec,
     every_diagnostic_shape,
-    SHARED_DIGEST,
-    commit_record,
-    matching_diagnostic,
     non_compiling_spec,
     one_effect_spec,
     raw_connect,
     replace_spec,
-    two_length_spec,
 )
 
 

@@ -18,7 +18,6 @@ from atoms.core.fingerprint import (
     SymlinkState,
 )
 from atoms.core.identifiers import is_valid_identifier
-from atoms.core.spec import TransactionSpec
 from atoms.core.recovery.model import (
     CommitDecision,
     DiagnosticEntry,
@@ -33,6 +32,7 @@ from atoms.core.recovery.model import (
     RollbackResult,
     TransactionState,
 )
+from atoms.core.spec import TransactionSpec
 from atoms.store.errors import MetadataStoreInvalid
 from atoms.store.schema import variant_of
 
