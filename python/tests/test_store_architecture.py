@@ -119,23 +119,88 @@ def test_no_blanket_oserror_handler(path):
 SWALLOW_EXEMPTION = "connection._rollback_quietly"
 
 
+def _sqlite_exception_aliases(
+    tree: ast.Module,
+) -> tuple[set[str], set[str], set[str]]:
+    modules: set[str] = set()
+    database_errors: set[str] = set()
+    errors: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules.update(
+                alias.asname or alias.name
+                for alias in node.names
+                if alias.name == "sqlite3"
+            )
+        elif isinstance(node, ast.ImportFrom) and node.module == "sqlite3":
+            database_errors.update(
+                alias.asname or alias.name
+                for alias in node.names
+                if alias.name == "DatabaseError"
+            )
+            errors.update(
+                alias.asname or alias.name
+                for alias in node.names
+                if alias.name == "Error"
+            )
+    return modules, database_errors, errors
+
+
+def _catches_sqlite_exception(
+    caught: ast.expr | None,
+    modules: set[str],
+    names: set[str],
+    attribute: str,
+) -> bool:
+    if isinstance(caught, ast.Tuple):
+        return any(
+            _catches_sqlite_exception(entry, modules, names, attribute)
+            for entry in caught.elts
+        )
+    if isinstance(caught, ast.Name):
+        return caught.id in names
+    return (
+        isinstance(caught, ast.Attribute)
+        and caught.attr == attribute
+        and isinstance(caught.value, ast.Name)
+        and caught.value.id in modules
+    )
+
+
+def _handler_owners(tree: ast.Module) -> dict[ast.ExceptHandler, str | None]:
+    owners: dict[ast.ExceptHandler, str | None] = {}
+
+    def descend(node: ast.AST, scope: tuple[str, ...]) -> None:
+        for child in ast.iter_child_nodes(node):
+            child_scope = scope
+            if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+                child_scope = (*scope, child.name)
+            if isinstance(child, ast.ExceptHandler):
+                owners[child] = ".".join(scope) or None
+            descend(child, child_scope)
+
+    descend(tree, ())
+    return owners
+
+
 @pytest.mark.parametrize("path", SOURCES, ids=lambda path: path.name)
 def test_every_database_error_handler_contains_a_bare_raise(path):
-    for node in ast.walk(_tree(path)):
-        if not isinstance(node, ast.FunctionDef):
+    tree = _tree(path)
+    modules, database_errors, _errors = _sqlite_exception_aliases(tree)
+    owners = _handler_owners(tree)
+    for handler in ast.walk(tree):
+        if not isinstance(handler, ast.ExceptHandler) or not _catches_sqlite_exception(
+            handler.type, modules, database_errors, "DatabaseError"
+        ):
             continue
-        if f"{path.stem}.{node.name}" == SWALLOW_EXEMPTION:
+        owner = owners[handler]
+        qualified = f"{path.stem}.{owner or '<module>'}"
+        if qualified == SWALLOW_EXEMPTION:
             continue
-        for handler in ast.walk(node):
-            if not isinstance(handler, ast.ExceptHandler):
-                continue
-            label = ast.unparse(handler.type) if handler.type else ""
-            if "DatabaseError" not in label:
-                continue
-            assert any(
-                isinstance(inner, ast.Raise) and inner.exc is None
-                for inner in handler_nodes(handler)
-            ), f"{path.name}::{node.name}'s DatabaseError handler has no bare raise"
+        assert any(
+            isinstance(inner, ast.Raise) and inner.exc is None
+            for inner in handler_nodes(handler)
+        ), f"{path.name}::{owner or '<module>'}'s DatabaseError handler has no bare raise"
 
 
 @pytest.mark.parametrize("path", SOURCES, ids=lambda path: path.name)
@@ -546,10 +611,67 @@ def test_every_public_transaction_method_poisons_on_failure():
         )
 
 
-def _statement_kind(text: str) -> str | None:
-    words = [word.upper() for word in re.findall(r"[A-Za-z_]+", text)]
-    if not words:
+_SQL_TOKEN = re.compile(
+    r"(?:\s+|--[^\n]*(?:\n|$)|/\*.*?\*/)"
+    r"|('(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`(?:``|[^`])*`|\[[^]]*\]"
+    r"|[A-Za-z_][A-Za-z0-9_]*|[(),;.]|\S)",
+    re.DOTALL,
+)
+
+
+def _sql_tokens(text: str) -> list[str]:
+    return [match.group(1) for match in _SQL_TOKEN.finditer(text) if match.group(1)]
+
+
+def _after_parenthesized(tokens: list[str], start: int) -> int:
+    assert tokens[start] == "(", "expected a parenthesized SQL clause"
+    depth = 0
+    for index in range(start, len(tokens)):
+        if tokens[index] == "(":
+            depth += 1
+        elif tokens[index] == ")":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    raise AssertionError("unterminated parenthesized SQL clause")
+
+
+def _effective_verb_index(tokens: list[str]) -> int | None:
+    if not tokens:
         return None
+    if tokens[0].upper() != "WITH":
+        return 0
+    index = 1
+    if index < len(tokens) and tokens[index].upper() == "RECURSIVE":
+        index += 1
+    while True:
+        assert index < len(tokens), "WITH has no common-table expression"
+        index += 1  # CTE name
+        if index < len(tokens) and tokens[index] == "(":
+            index = _after_parenthesized(tokens, index)
+        assert index < len(tokens) and tokens[index].upper() == "AS", (
+            "CTE has no AS clause"
+        )
+        index += 1
+        if index < len(tokens) and tokens[index].upper() == "NOT":
+            index += 1
+            assert index < len(tokens) and tokens[index].upper() == "MATERIALIZED"
+            index += 1
+        elif index < len(tokens) and tokens[index].upper() == "MATERIALIZED":
+            index += 1
+        assert index < len(tokens) and tokens[index] == "(", "CTE has no body"
+        index = _after_parenthesized(tokens, index)
+        if index >= len(tokens) or tokens[index] != ",":
+            return index
+        index += 1
+
+
+def _statement_kind(text: str) -> str | None:
+    tokens = _sql_tokens(text)
+    index = _effective_verb_index(tokens)
+    if index is None or index >= len(tokens):
+        return None
+    words = [token.upper() for token in tokens[index:]]
     verb = words[0]
     if verb not in ("INSERT", "REPLACE", "UPDATE", "DELETE"):
         return None
@@ -564,18 +686,52 @@ def _statement_kind(text: str) -> str | None:
     return verb
 
 
+def _identifier(token: str) -> str:
+    if token.startswith('"') and token.endswith('"'):
+        return token[1:-1].replace('""', '"')
+    if token.startswith("`") and token.endswith("`"):
+        return token[1:-1].replace("``", "`")
+    if token.startswith("[") and token.endswith("]"):
+        return token[1:-1]
+    return token
+
+
+def _statement_target(text: str) -> str | None:
+    tokens = _sql_tokens(text)
+    index = _effective_verb_index(tokens)
+    if index is None or index >= len(tokens):
+        return None
+    verb = tokens[index].upper()
+    index += 1
+    if (
+        verb in ("INSERT", "UPDATE")
+        and index < len(tokens)
+        and tokens[index].upper() == "OR"
+    ):
+        index += 2
+    if verb in ("INSERT", "REPLACE"):
+        if index < len(tokens) and tokens[index].upper() == "INTO":
+            index += 1
+    elif (
+        verb == "DELETE"
+        and index < len(tokens)
+        and tokens[index].upper() == "FROM"
+    ):
+        index += 1
+    if verb not in ("INSERT", "REPLACE", "UPDATE", "DELETE"):
+        return None
+    assert index < len(tokens), f"{verb} has no target"
+    return _identifier(tokens[index])
+
+
 def _blob_writers() -> list[tuple[str, str]]:
     writers = []
     for label, text in _sql_constants().items():
         kind = _statement_kind(text)
         if kind is None:
             continue
-        target = re.search(
-            r"\b(?:INTO|UPDATE|FROM)\s+([A-Za-z_][A-Za-z0-9_]*)",
-            text,
-            re.IGNORECASE,
-        )
-        if target and target.group(1).lower() == "blob":
+        target = _statement_target(text)
+        if target and target.lower() == "blob":
             writers.append((label, kind))
     return writers
 
@@ -682,52 +838,62 @@ def test_no_production_module_outside_the_package_imports_the_store():
 
 @pytest.mark.parametrize("path", SOURCES, ids=lambda path: path.name)
 def test_no_module_catches_the_whole_sqlite_hierarchy(path):
-    for node in ast.walk(_tree(path)):
+    tree = _tree(path)
+    modules, _database_errors, errors = _sqlite_exception_aliases(tree)
+    for node in ast.walk(tree):
         if not isinstance(node, ast.ExceptHandler) or node.type is None:
             continue
-        label = ast.unparse(node.type)
-        assert "sqlite3.Error" not in label, (
-            f"{path.name} catches {label}; catch sqlite3.DatabaseError or narrower"
+        assert not _catches_sqlite_exception(
+            node.type, modules, errors, "Error"
+        ), (
+            f"{path.name} catches {ast.unparse(node.type)}; "
+            "catch sqlite3.DatabaseError or narrower"
         )
 
 
 def test_the_package_has_exactly_one_swallowed_database_error():
     swallows = []
     for path in SOURCES:
-        for node in ast.walk(_tree(path)):
-            if not isinstance(node, ast.FunctionDef):
+        tree = _tree(path)
+        modules, database_errors, _errors = _sqlite_exception_aliases(tree)
+        owners = _handler_owners(tree)
+        for handler in ast.walk(tree):
+            if not isinstance(handler, ast.ExceptHandler):
                 continue
-            for handler in ast.walk(node):
-                if not isinstance(handler, ast.ExceptHandler) or handler.type is None:
-                    continue
-                if "DatabaseError" not in ast.unparse(handler.type):
-                    continue
-                if not any(
-                    isinstance(inner, ast.Raise) and inner.exc is None
-                    for inner in handler_nodes(handler)
-                ):
-                    swallows.append(f"{path.stem}.{node.name}")
+            if not _catches_sqlite_exception(
+                handler.type, modules, database_errors, "DatabaseError"
+            ):
+                continue
+            if not any(
+                isinstance(inner, ast.Raise) and inner.exc is None
+                for inner in handler_nodes(handler)
+            ):
+                owner = owners[handler]
+                swallows.append(f"{path.stem}.{owner or '<module>'}")
     assert swallows == ["connection._rollback_quietly"], swallows
 
 
 def _trigger_blob_writers() -> list[str]:
     writers = []
     for statement in _sql_constants().values():
-        if not re.match(
-            r"^\s*CREATE(?:\s+TEMP(?:ORARY)?)?\s+TRIGGER\b",
-            statement,
-            re.IGNORECASE,
-        ):
+        tokens = _sql_tokens(statement)
+        words = [token.upper() for token in tokens]
+        if not words or words[0] != "CREATE":
             continue
-        body = re.split(r"\bBEGIN\b", statement, maxsplit=1, flags=re.IGNORECASE)[1]
-        body = re.split(r"\bEND\b", body, maxsplit=1, flags=re.IGNORECASE)[0]
-        for target in re.finditer(
-            r"\b(?:INTO|UPDATE|FROM)\s+([A-Za-z_][A-Za-z0-9_]*)",
-            body,
-            re.IGNORECASE,
-        ):
-            if target.group(1).lower() == "blob":
+        trigger_index = 2 if len(words) > 1 and words[1] in ("TEMP", "TEMPORARY") else 1
+        if trigger_index >= len(words) or words[trigger_index] != "TRIGGER":
+            continue
+        begin = words.index("BEGIN", trigger_index + 1)
+        end = len(words) - 1 - words[::-1].index("END")
+        body: list[str] = []
+        for token in tokens[begin + 1 : end] + [";"]:
+            if token != ";":
+                body.append(token)
+                continue
+            target = _statement_target(" ".join(body)) if body else None
+            if target is not None and target.lower() == "blob":
                 writers.append(statement)
+            body = []
     return writers
 
 
@@ -751,8 +917,10 @@ def test_the_fixture_guard_understands_parametrized_arguments():
 
 def test_a5_status_is_synchronized_across_authority_documents():
     agents = (Path(__file__).parents[2] / "AGENTS.md").read_text(encoding="utf-8")
-    assert "A5a" in agents
+    assert "A5a is implemented; A5b–A8 remain unimplemented" in agents
+    assert "A5a implemented on 2026-08-01, A5b not yet" in agents
     assert "A5a designed and unimplemented" not in agents
+    assert "A5–A8 remain unimplemented" not in agents
 
 
 def _plant_store_package(
@@ -924,6 +1092,18 @@ def test_sql_guard_rejects_hostile_resolution_paths(
             "upsert",
             "INSERT INTO blob VALUES (?, ?) ON CONFLICT(digest) DO UPDATE SET byte_len = ?",
         ),
+        (
+            "cte-update",
+            "WITH chosen AS (SELECT 1) UPDATE blob SET byte_len = 1",
+        ),
+        (
+            "line-comment-prefix",
+            "-- harmless heading\nUPDATE blob SET byte_len = 1",
+        ),
+        (
+            "block-comment-prefix",
+            "/* harmless heading */ DELETE FROM blob",
+        ),
     ],
 )
 def test_blob_inventory_rejects_every_second_writer_kind(
@@ -956,6 +1136,30 @@ def test_blob_inventory_rejects_a_hostile_trigger(
             "schema": (
                 "SCHEMA_STATEMENTS = (\"CREATE TRIGGER hostile AFTER INSERT ON "
                 "transaction_record BEGIN DELETE FROM blob; END\",)\n"
+            ),
+        },
+    )
+    with pytest.raises(AssertionError):
+        test_no_trigger_body_writes_blob()
+
+
+@pytest.mark.parametrize(
+    "prefix", ["-- harmless heading\n", "/* harmless heading */ "]
+)
+def test_blob_inventory_rejects_a_comment_prefixed_hostile_trigger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    prefix: str,
+):
+    _plant_store_package(
+        tmp_path,
+        monkeypatch,
+        {
+            "blobs": "INSERT_BLOB = 'INSERT INTO blob VALUES (?, ?)'\n",
+            "schema": (
+                "SCHEMA_STATEMENTS = ("
+                f"{prefix + 'CREATE TRIGGER hostile AFTER INSERT ON transaction_record BEGIN DELETE FROM blob; END'!r},"
+                ")\n"
             ),
         },
     )
@@ -1043,6 +1247,91 @@ def test_database_error_guard_ignores_a_nested_bare_raise(
     )["hostile"]
     with pytest.raises(AssertionError):
         test_every_database_error_handler_contains_a_bare_raise(path)
+
+
+ROLLBACK_EXEMPTION = (
+    "import sqlite3\n"
+    "def _rollback_quietly():\n"
+    "    try:\n"
+    "        pass\n"
+    "    except sqlite3.DatabaseError:\n"
+    "        return\n"
+)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            "import sqlite3\n"
+            "try:\n"
+            "    pass\n"
+            "except sqlite3.DatabaseError:\n"
+            "    pass\n"
+        ),
+        (
+            "import sqlite3\n"
+            "async def swallow():\n"
+            "    try:\n"
+            "        pass\n"
+            "    except sqlite3.DatabaseError:\n"
+            "        return\n"
+        ),
+        (
+            "from sqlite3 import DatabaseError as Alias\n"
+            "def swallow():\n"
+            "    try:\n"
+            "        pass\n"
+            "    except Alias:\n"
+            "        return\n"
+        ),
+        (
+            "import sqlite3\n"
+            "def _rollback_quietly():\n"
+            "    async def nested():\n"
+            "        try:\n"
+            "            pass\n"
+            "        except sqlite3.DatabaseError:\n"
+            "            return\n"
+        ),
+    ],
+    ids=("module", "async", "imported-alias", "nested-owner"),
+)
+def test_database_error_guards_reject_every_nonexempt_lexical_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+):
+    modules = {"connection": ROLLBACK_EXEMPTION, "hostile": source}
+    if "def _rollback_quietly" in source:
+        modules = {"connection": source}
+    paths = _plant_store_package(tmp_path, monkeypatch, modules)
+    hostile = paths.get("hostile", paths["connection"])
+    with pytest.raises(AssertionError):
+        test_every_database_error_handler_contains_a_bare_raise(hostile)
+    with pytest.raises(AssertionError):
+        test_the_package_has_exactly_one_swallowed_database_error()
+
+
+def test_sqlite_error_guard_resolves_a_module_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    path = _plant_store_package(
+        tmp_path,
+        monkeypatch,
+        {
+            "hostile": (
+                "import sqlite3 as database\n"
+                "def swallow():\n"
+                "    try:\n"
+                "        pass\n"
+                "    except database.Error:\n"
+                "        return\n"
+            )
+        },
+    )["hostile"]
+    with pytest.raises(AssertionError):
+        test_no_module_catches_the_whole_sqlite_hierarchy(path)
 
 
 @pytest.mark.parametrize(
