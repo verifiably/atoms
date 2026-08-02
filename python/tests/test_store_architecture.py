@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import ast
 import re
+from importlib.util import resolve_name
 from pathlib import Path
 
 import pytest
 
 import atoms.store
 from tests.architecture_support import (
+    decorator_name,
     fixture_names,
     handler_nodes,
     oserror_handler_discriminates,
@@ -26,13 +28,101 @@ def _tree(path: Path) -> ast.Module:
     return ast.parse(path.read_text(encoding="utf-8"))
 
 
-def _imported_modules(tree: ast.Module) -> set[str]:
+def _forbidden_call_aliases(
+    tree: ast.Module, *, module: str | None, attributes: set[str]
+) -> tuple[set[str], set[str]]:
+    modules: set[str] = set()
+    aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import) and module is not None:
+            modules.update(
+                alias.asname or alias.name
+                for alias in node.names
+                if alias.name == module
+            )
+        elif isinstance(node, ast.ImportFrom) and node.module == module:
+            aliases.update(
+                alias.asname or alias.name
+                for alias in node.names
+                if alias.name in attributes
+            )
+    pending = _assigned_expressions(tree)
+    while pending:
+        resolved: set[str] = set()
+        for name, value in pending:
+            if isinstance(value, ast.Name) and value.id in modules:
+                modules.add(name)
+                resolved.add(name)
+            elif (
+                isinstance(value, ast.Name)
+                and value.id in aliases
+                or (
+                    isinstance(value, ast.Attribute)
+                    and value.attr in attributes
+                    and (
+                        module is None
+                        or isinstance(value.value, ast.Name)
+                        and value.value.id in modules
+                    )
+                )
+            ):
+                aliases.add(name)
+                resolved.add(name)
+        if not resolved:
+            break
+        pending = [(name, value) for name, value in pending if name not in resolved]
+    return modules, aliases
+
+
+def _calls_forbidden(
+    tree: ast.Module, *, module: str | None, attributes: set[str]
+) -> bool:
+    modules, aliases = _forbidden_call_aliases(
+        tree, module=module, attributes=attributes
+    )
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name) and node.func.id in aliases:
+            return True
+        if (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr in attributes
+            and (
+                module is None
+                or isinstance(node.func.value, ast.Name)
+                and node.func.value.id in modules
+            )
+        ):
+            return True
+    return False
+
+
+def _package_for(path: Path) -> str:
+    parts = path.with_suffix("").parts
+    atoms_index = len(parts) - 1 - parts[::-1].index("atoms")
+    module = parts[atoms_index:]
+    return ".".join(module[:-1])
+
+
+def _imported_modules(tree: ast.Module, *, package: str) -> set[str]:
     names: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             names.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            names.add(node.module)
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            imported_from = (
+                resolve_name(f"{'.' * node.level}{module}", package)
+                if node.level
+                else module
+            )
+            names.add(imported_from)
+            names.update(
+                f"{imported_from}.{alias.name}"
+                for alias in node.names
+                if alias.name != "*"
+            )
     return names
 
 
@@ -45,7 +135,7 @@ def _imported_modules(tree: ast.Module) -> set[str]:
 def test_neither_fs_nor_core_imports_the_store(path):
     assert not any(
         module.startswith("atoms.store")
-        for module in _imported_modules(_tree(path))
+        for module in _imported_modules(_tree(path), package=_package_for(path))
     ), f"{path.name} imports atoms.store"
 
 
@@ -91,9 +181,9 @@ def test_the_store_exports_no_sqlite_connection():
 
 @pytest.mark.parametrize("path", SOURCES, ids=lambda path: path.name)
 def test_no_raw_fsync_appears_in_the_package(path):
-    for node in ast.walk(_tree(path)):
-        if isinstance(node, ast.Attribute) and node.attr in ("fsync", "fdatasync"):
-            pytest.fail(f"{path.name} calls os.{node.attr} directly")
+    assert not _calls_forbidden(
+        _tree(path), module="os", attributes={"fsync", "fdatasync"}
+    ), f"{path.name} calls os.fsync or os.fdatasync directly or through an alias"
 
 
 @pytest.mark.parametrize("path", SOURCES, ids=lambda path: path.name)
@@ -170,7 +260,10 @@ def _sqlite_exception_aliases(
     while pending:
         resolved: set[str] = set()
         for name, value in pending:
-            if _catches_sqlite_exception(
+            if isinstance(value, ast.Name) and value.id in modules:
+                modules.add(name)
+                resolved.add(name)
+            elif _catches_sqlite_exception(
                 value, modules, database_errors, "DatabaseError"
             ):
                 database_errors.add(name)
@@ -221,6 +314,18 @@ def _handler_owners(tree: ast.Module) -> dict[ast.ExceptHandler, str | None]:
     return owners
 
 
+def _handler_always_reraises(handler: ast.ExceptHandler) -> bool:
+    return (
+        bool(handler.body)
+        and isinstance(handler.body[-1], ast.Raise)
+        and handler.body[-1].exc is None
+        and not any(
+            isinstance(node, ast.Return | ast.Break | ast.Continue)
+            for node in handler_nodes(handler)
+        )
+    )
+
+
 @pytest.mark.parametrize("path", SOURCES, ids=lambda path: path.name)
 def test_every_database_error_handler_contains_a_bare_raise(path):
     tree = _tree(path)
@@ -235,17 +340,17 @@ def test_every_database_error_handler_contains_a_bare_raise(path):
         qualified = f"{path.stem}.{owner or '<module>'}"
         if qualified == SWALLOW_EXEMPTION:
             continue
-        assert any(
-            isinstance(inner, ast.Raise) and inner.exc is None
-            for inner in handler_nodes(handler)
-        ), f"{path.name}::{owner or '<module>'}'s DatabaseError handler has no bare raise"
+        assert _handler_always_reraises(handler), (
+            f"{path.name}::{owner or '<module>'}'s DatabaseError handler can exit "
+            "without a bare raise"
+        )
 
 
 @pytest.mark.parametrize("path", SOURCES, ids=lambda path: path.name)
 def test_executescript_is_never_called(path):
-    for node in ast.walk(_tree(path)):
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            assert node.func.attr != "executescript", f"{path.name} calls executescript"
+    assert not _calls_forbidden(
+        _tree(path), module=None, attributes={"executescript"}
+    ), f"{path.name} calls executescript directly or through an alias"
 
 
 def _module_bindings(tree: ast.Module) -> list[tuple[str, ast.expr]]:
@@ -264,6 +369,32 @@ def _module_bindings(tree: ast.Module) -> list[tuple[str, ast.expr]]:
         ):
             bindings.append((node.target.id, node.value))
     return bindings
+
+
+def _module_binding_counts(tree: ast.Module) -> dict[str, int]:
+    counts: dict[str, int] = {}
+
+    def bind(name: str) -> None:
+        counts[name] = counts.get(name, 0) + 1
+
+    def descend(node: ast.AST) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+                bind(child.name)
+                continue
+            if isinstance(child, ast.Lambda):
+                continue
+            if isinstance(child, ast.alias):
+                bind((child.asname or child.name).split(".")[0])
+                continue
+            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
+                bind(child.id)
+            elif isinstance(child, ast.ExceptHandler) and child.name:
+                bind(child.name)
+            descend(child)
+
+    descend(tree)
+    return counts
 
 
 def _literal_value(node: ast.expr) -> object:
@@ -308,6 +439,26 @@ def _string_value(node: ast.expr, values: dict[str, object] | None = None) -> st
             and part.format_spec is None
         ):
             parts.append(str(values[part.value.id]))
+        elif (
+            isinstance(part, ast.FormattedValue)
+            and isinstance(part.value, ast.Call)
+            and isinstance(part.value.func, ast.Name)
+            and part.value.func.id == "check_list"
+            and len(part.value.args) == 1
+            and isinstance(part.value.args[0], ast.Name)
+            and part.value.args[0].id
+            in {
+                "CommitDecision",
+                "EffectVariant",
+                "JournalState",
+                "RollbackResult",
+                "TransactionState",
+            }
+            and not part.value.keywords
+            and part.conversion == -1
+            and part.format_spec is None
+        ):
+            parts.append("'<statically-enumerated>'")
         else:
             return None
     return "".join(parts)
@@ -317,8 +468,11 @@ def _static_values(path: Path, seen: frozenset[Path] = frozenset()) -> dict[str,
     if path in seen:
         return {}
     tree = _tree(path)
+    counts = _module_binding_counts(tree)
     values: dict[str, object] = {}
     for name, node in _module_bindings(tree):
+        if counts[name] != 1:
+            continue
         try:
             values[name] = _literal_value(node)
         except (ValueError, SyntaxError, TypeError):
@@ -337,10 +491,14 @@ def _static_values(path: Path, seen: frozenset[Path] = frozenset()) -> dict[str,
             {
                 alias.asname or alias.name: imported[alias.name]
                 for alias in node.names
-                if alias.name in imported
+                if alias.name in imported and counts[alias.asname or alias.name] == 1
             }
         )
-    pending = dict(_module_bindings(tree))
+    pending = {
+        name: node
+        for name, node in _module_bindings(tree)
+        if counts[name] == 1
+    }
     while pending:
         resolved = {
             name: text
@@ -383,13 +541,51 @@ def _package_names(path: Path) -> set[str]:
     }
 
 
-def _scope_of(tree: ast.Module) -> dict[ast.AST, ast.FunctionDef | None]:
-    owner: dict[ast.AST, ast.FunctionDef | None] = {}
+def _literal_structure_names(
+    path: Path, seen: frozenset[Path] = frozenset()
+) -> set[str]:
+    if path in seen:
+        return set()
+    tree = _tree(path)
+    counts = _module_binding_counts(tree)
+    names = {
+        name
+        for name, value in _module_bindings(tree)
+        if counts[name] == 1 and isinstance(value, ast.Tuple | ast.List | ast.Set)
+    }
+    for node in tree.body:
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        module = node.module
+        if module is None or not module.startswith("atoms.store."):
+            continue
+        source = PACKAGE / f"{module.rsplit('.', 1)[-1]}.py"
+        if not source.exists():
+            continue
+        imported = _literal_structure_names(source, seen | {path})
+        names.update(
+            alias.asname or alias.name
+            for alias in node.names
+            if alias.name in imported and counts[alias.asname or alias.name] == 1
+        )
+    return names
 
-    def descend(node: ast.AST, current: ast.FunctionDef | None) -> None:
+
+FunctionScope = ast.FunctionDef | ast.AsyncFunctionDef
+
+
+def _scope_of(tree: ast.Module) -> dict[ast.AST, FunctionScope | None]:
+    owner: dict[ast.AST, FunctionScope | None] = {}
+
+    def descend(node: ast.AST, current: FunctionScope | None) -> None:
         for child in ast.iter_child_nodes(node):
             owner[child] = current
-            descend(child, child if isinstance(child, ast.FunctionDef) else current)
+            descend(
+                child,
+                child
+                if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef)
+                else current,
+            )
 
     descend(tree, None)
     return owner
@@ -415,7 +611,7 @@ def _module_level_names(tree: ast.Module) -> set[str]:
     return names
 
 
-def _names_bound_in(scope: ast.FunctionDef) -> set[str]:
+def _names_bound_in(scope: FunctionScope) -> set[str]:
     arguments = scope.args
     names = {
         argument.arg
@@ -439,9 +635,9 @@ def _names_bound_in(scope: ast.FunctionDef) -> set[str]:
 
 def _literal_iterated_names(
     tree: ast.Module,
-    owner: dict[ast.AST, ast.FunctionDef | None],
-    scope: ast.FunctionDef,
-    module_level: set[str],
+    owner: dict[ast.AST, FunctionScope | None],
+    scope: FunctionScope,
+    literal_structures: set[str],
 ) -> set[str]:
     shadowed = _names_bound_in(scope)
     bound: set[str] = set()
@@ -452,7 +648,7 @@ def _literal_iterated_names(
             continue
         if node.iter.id not in PERMITTED_SQL_LOOPS:
             continue
-        if node.iter.id not in module_level or node.iter.id in shadowed:
+        if node.iter.id not in literal_structures or node.iter.id in shadowed:
             continue
         positions = PERMITTED_SQL_LOOPS[node.iter.id]
         if positions is None:
@@ -473,7 +669,7 @@ def test_every_permitted_sql_loop_iterable_exists():
     bound = {
         name
         for path in SOURCES
-        for name, _value in _module_bindings(_tree(path))
+        for name in _literal_structure_names(path)
     }
     assert declared <= bound, sorted(declared - bound)
 
@@ -496,9 +692,9 @@ def test_a_shadowed_permitted_iterable_grants_nothing():
 def _parameters_fed_only_constants(
     tree: ast.Module, allowed: set[str]
 ) -> dict[str, set[str]]:
-    by_name: dict[str, list[ast.FunctionDef]] = {}
+    by_name: dict[str, list[FunctionScope]] = {}
     for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef):
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
             by_name.setdefault(node.name, []).append(node)
     calls: dict[str, list[ast.Call]] = {}
     for node in ast.walk(tree):
@@ -517,6 +713,9 @@ def _parameters_fed_only_constants(
             calls.setdefault(name, []).append(node)
     resolved: dict[str, set[str]] = {}
     for name, definitions in by_name.items():
+        if len(definitions) != 1:
+            resolved[name] = set()
+            continue
         sites = calls.get(name, [])
         for function in definitions:
             positional = [argument.arg for argument in function.args.args]
@@ -527,12 +726,14 @@ def _parameters_fed_only_constants(
                     if index < len(call.args):
                         values.append(call.args[index])
                     else:
-                        values.extend(
+                        supplied = [
                             keyword.value
                             for keyword in call.keywords
                             if keyword.arg == parameter
-                        )
-                if values and all(
+                        ]
+                        if len(supplied) == 1:
+                            values.extend(supplied)
+                if len(values) == len(sites) and values and all(
                     isinstance(value, ast.Name) and value.id in allowed
                     for value in values
                 ):
@@ -546,7 +747,7 @@ def _parameters_fed_only_constants(
 def test_every_execute_argument_resolves_to_a_module_level_constant(path):
     tree = _tree(path)
     owner = _scope_of(tree)
-    module_level = _module_level_names(tree)
+    literal_structures = _literal_structure_names(path)
     module_constants = _package_names(path)
     parameters = _parameters_fed_only_constants(tree, module_constants)
     for node in ast.walk(tree):
@@ -570,7 +771,9 @@ def test_every_execute_argument_resolves_to_a_module_level_constant(path):
         allowed = set(module_constants)
         if scope is not None:
             allowed -= _names_bound_in(scope)
-            allowed |= _literal_iterated_names(tree, owner, scope, module_level)
+            allowed |= _literal_iterated_names(
+                tree, owner, scope, literal_structures
+            )
             allowed |= parameters.get(scope.name, set())
         where = "module level" if scope is None else scope.name
         assert first.id in allowed, (
@@ -614,36 +817,25 @@ def test_every_public_transaction_method_poisons_on_failure():
     }
 
     def opens_mutating(node: ast.FunctionDef) -> bool:
-        first = next((line for line in node.body if not _is_docstring(line)), None)
-        return (
-            isinstance(first, ast.With)
-            and any(
-                isinstance(item.context_expr, ast.Call)
-                and isinstance(item.context_expr.func, ast.Attribute)
-                and item.context_expr.func.attr == "_mutating"
-                for item in first.items
-            )
-        )
-
-    def delegates_to_a_mutating_helper(node: ast.FunctionDef) -> bool:
         statements = [line for line in node.body if not _is_docstring(line)]
-        if len(statements) != 1:
+        if len(statements) != 1 or not isinstance(statements[0], ast.With):
             return False
-        call = statements[0].value if isinstance(statements[0], ast.Expr) else None
-        if (
-            not isinstance(call, ast.Call)
-            or not isinstance(call.func, ast.Attribute)
-            or not isinstance(call.func.value, ast.Name)
-            or call.func.value.id != "self"
-        ):
-            return False
-        target = methods.get(call.func.attr)
-        return target is not None and opens_mutating(target)
+        guarded = statements[0]
+        return (
+            len(guarded.items) == 1
+            and isinstance(guarded.items[0].context_expr, ast.Call)
+            and not guarded.items[0].context_expr.args
+            and not guarded.items[0].context_expr.keywords
+            and isinstance(guarded.items[0].context_expr.func, ast.Attribute)
+            and guarded.items[0].context_expr.func.attr == "_mutating"
+            and isinstance(guarded.items[0].context_expr.func.value, ast.Name)
+            and guarded.items[0].context_expr.func.value.id == "self"
+        )
 
     for name, node in sorted(methods.items()):
         if name.startswith("_"):
             continue
-        assert opens_mutating(node) or delegates_to_a_mutating_helper(node), (
+        assert opens_mutating(node), (
             f"_StoreTransaction.{name} does not run inside _mutating(), so a failure "
             "inside it would not poison the transaction"
         )
@@ -867,10 +1059,12 @@ def test_no_production_module_outside_the_package_imports_the_store():
     offenders = sorted(
         str(path.relative_to(root))
         for path in root.rglob("*.py")
-        if not str(path).startswith(str(PACKAGE))
+        if PACKAGE not in path.parents
         and any(
             name == "atoms.store" or name.startswith("atoms.store.")
-            for name in _imported_modules(_tree(path))
+            for name in _imported_modules(
+                _tree(path), package=_package_for(path)
+            )
         )
     )
     assert offenders == [], offenders
@@ -904,10 +1098,7 @@ def test_the_package_has_exactly_one_swallowed_database_error():
                 handler.type, modules, database_errors, "DatabaseError"
             ):
                 continue
-            if not any(
-                isinstance(inner, ast.Raise) and inner.exc is None
-                for inner in handler_nodes(handler)
-            ):
+            if not _handler_always_reraises(handler):
                 owner = owners[handler]
                 swallows.append(f"{path.stem}.{owner or '<module>'}")
     assert swallows == ["connection._rollback_quietly"], swallows
@@ -944,6 +1135,17 @@ def test_no_trigger_body_writes_blob():
 def test_the_store_fixture_registry_covers_every_test_argument():
     registered = fixture_names(TESTS / "conftest.py")
     assert unregistered_test_arguments(TESTS, registered, "test_store_*.py") == set()
+    misplaced = sorted(
+        f"{path.name}::{node.name}"
+        for path in TESTS.glob("test_store_*.py")
+        for node in ast.walk(_tree(path))
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+        and any(
+            decorator_name(decorator) == "fixture"
+            for decorator in node.decorator_list
+        )
+    )
+    assert misplaced == [], f"fixtures must be declared in conftest.py: {misplaced}"
 
 
 def test_the_fixture_guard_understands_parametrized_arguments():
@@ -1093,6 +1295,31 @@ def test_sql_guard_accepts_imported_store_constants(
             "def hostile(connection):\n"
             "    connection.execute(SQL)\n"
         ),
+        (
+            "SCHEMA_STATEMENTS = build_statements()\n"
+            "def hostile(connection):\n"
+            "    for statement in SCHEMA_STATEMENTS:\n"
+            "        connection.execute(statement)\n"
+        ),
+        (
+            "SAFE = 'SELECT 1'\n"
+            "async def hostile(connection, SAFE):\n"
+            "    connection.execute(SAFE)\n"
+        ),
+        (
+            "SAFE = 'SELECT 1'\n"
+            "def run(connection, statement=runtime_statement()):\n"
+            "    connection.execute(statement)\n"
+            "def caller(connection):\n"
+            "    run(connection, SAFE)\n"
+            "    run(connection)\n"
+        ),
+        (
+            "SAFE = 'SELECT 1'\n"
+            "SAFE = runtime_statement()\n"
+            "def hostile(connection):\n"
+            "    connection.execute(SAFE)\n"
+        ),
     ],
     ids=(
         "attribute",
@@ -1108,6 +1335,10 @@ def test_sql_guard_accepts_imported_store_constants(
         "shadowed-imported-constant",
         "attribute-helper-call",
         "runtime-fstring",
+        "runtime-schema-loop",
+        "async-shadow",
+        "omitted-runtime-default",
+        "reassigned-module-constant",
     ),
 )
 def test_sql_guard_rejects_hostile_resolution_paths(
@@ -1424,6 +1655,47 @@ def test_database_error_guards_resolve_assigned_exception_aliases(
 @pytest.mark.parametrize(
     "source",
     [
+        (
+            "import sqlite3\n"
+            "database = sqlite3\n"
+            "def swallow():\n"
+            "    try:\n"
+            "        pass\n"
+            "    except database.DatabaseError:\n"
+            "        return\n"
+        ),
+        (
+            "import sqlite3\n"
+            "def swallow(condition):\n"
+            "    try:\n"
+            "        pass\n"
+            "    except sqlite3.DatabaseError:\n"
+            "        if condition:\n"
+            "            raise\n"
+            "        return\n"
+        ),
+    ],
+    ids=("assigned-module-alias", "path-sensitive-swallow"),
+)
+def test_database_error_guards_reject_alias_and_partial_reraise(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+):
+    paths = _plant_store_package(
+        tmp_path,
+        monkeypatch,
+        {"connection": ROLLBACK_EXEMPTION, "hostile": source},
+    )
+    with pytest.raises(AssertionError):
+        test_every_database_error_handler_contains_a_bare_raise(paths["hostile"])
+    with pytest.raises(AssertionError):
+        test_the_package_has_exactly_one_swallowed_database_error()
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
         "from atoms.fs import ProjectApprovedSpec\n",
         "def hostile(spec: 'ProjectApprovedSpec') -> None:\n    pass\n",
         "import atoms.fs.approval as approval\nX = approval.ProjectApprovedSpec\n",
@@ -1442,10 +1714,33 @@ def test_project_approval_guard_rejects_all_identifier_shapes(
 
 def test_dependency_guard_rejects_fs_and_core_store_imports(tmp_path: Path):
     for directory in ("fs", "core"):
-        path = tmp_path / f"{directory}.py"
+        path = tmp_path / "atoms" / directory / "hostile.py"
+        path.parent.mkdir(parents=True)
         path.write_text("from atoms.store import Store\n", encoding="utf-8")
         with pytest.raises(AssertionError):
             test_neither_fs_nor_core_imports_the_store(path)
+
+
+def test_dependency_guard_rejects_a_relative_store_import(tmp_path: Path):
+    path = tmp_path / "atoms" / "fs" / "hostile.py"
+    path.parent.mkdir(parents=True)
+    path.write_text("from ..store import Store\n", encoding="utf-8")
+    with pytest.raises(AssertionError):
+        test_neither_fs_nor_core_imports_the_store(path)
+
+
+def test_outside_package_guard_scans_a_store_prefixed_sibling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    atoms_root = tmp_path / "atoms"
+    package = atoms_root / "store"
+    package.mkdir(parents=True)
+    (atoms_root / "store_consumer.py").write_text(
+        "from atoms.store import Store\n", encoding="utf-8"
+    )
+    monkeypatch.setattr("tests.test_store_architecture.PACKAGE", package)
+    with pytest.raises(AssertionError):
+        test_no_production_module_outside_the_package_imports_the_store()
 
 
 def test_transaction_guard_rejects_a_public_method_before_mutating(
@@ -1491,6 +1786,37 @@ def test_transaction_guard_rejects_delegation_to_another_object(
         test_every_public_transaction_method_poisons_on_failure()
 
 
+@pytest.mark.parametrize(
+    "method",
+    [
+        (
+            "    def hostile(self, other):\n"
+            "        with other._mutating():\n"
+            "            write()\n"
+        ),
+        (
+            "    def hostile(self):\n"
+            "        with self._mutating():\n"
+            "            write()\n"
+            "        unguarded_write()\n"
+        ),
+    ],
+    ids=("non-self-context", "write-after-context"),
+)
+def test_transaction_guard_requires_one_complete_self_mutating_body(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+):
+    _plant_store_package(
+        tmp_path,
+        monkeypatch,
+        {"connection": "class _StoreTransaction:\n    def _mutating(self): pass\n" + method},
+    )
+    with pytest.raises(AssertionError):
+        test_every_public_transaction_method_poisons_on_failure()
+
+
 def test_executescript_guard_rejects_a_planted_call(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -1501,6 +1827,36 @@ def test_executescript_guard_rejects_a_planted_call(
     )["hostile"]
     with pytest.raises(AssertionError):
         test_executescript_is_never_called(path)
+
+
+def test_executescript_guard_rejects_an_assigned_call_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    path = _plant_store_package(
+        tmp_path,
+        monkeypatch,
+        {
+            "hostile": (
+                "def hostile(connection):\n"
+                "    run = connection.executescript\n"
+                "    run('SELECT 1')\n"
+            )
+        },
+    )["hostile"]
+    with pytest.raises(AssertionError):
+        test_executescript_is_never_called(path)
+
+
+def test_raw_fsync_guard_rejects_an_imported_call_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    path = _plant_store_package(
+        tmp_path,
+        monkeypatch,
+        {"hostile": "from os import fsync as flush\ndef hostile(fd): flush(fd)\n"},
+    )["hostile"]
+    with pytest.raises(AssertionError):
+        test_no_raw_fsync_appears_in_the_package(path)
 
 
 @pytest.mark.parametrize("statement", ["ATTACH 'other.db' AS other", "VACUUM"])
@@ -1525,6 +1881,41 @@ def test_fixture_guard_rejects_a_fixture_declared_outside_conftest(
         "@pytest.fixture\n"
         "def hidden_fixture(): return 1\n"
         "def test_uses_hidden_fixture(hidden_fixture): pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("tests.test_store_architecture.TESTS", tmp_path)
+    with pytest.raises(AssertionError):
+        test_the_store_fixture_registry_covers_every_test_argument()
+
+
+def test_fixture_guard_rejects_an_unused_fixture_outside_conftest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    (tmp_path / "conftest.py").write_text("", encoding="utf-8")
+    (tmp_path / "test_store_hostile.py").write_text(
+        "import pytest\n"
+        "@pytest.fixture\n"
+        "def hidden_fixture(): return 1\n"
+        "def test_uses_nothing(): pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("tests.test_store_architecture.TESTS", tmp_path)
+    with pytest.raises(AssertionError):
+        test_the_store_fixture_registry_covers_every_test_argument()
+
+
+def test_fixture_guard_rejects_a_shadowing_fixture_outside_conftest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    (tmp_path / "conftest.py").write_text(
+        "import pytest\n@pytest.fixture\ndef shared(): return 1\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "test_store_hostile.py").write_text(
+        "import pytest\n"
+        "@pytest.fixture\n"
+        "def shared(): return 2\n"
+        "def test_uses_nothing(): pass\n",
         encoding="utf-8",
     )
     monkeypatch.setattr("tests.test_store_architecture.TESTS", tmp_path)
