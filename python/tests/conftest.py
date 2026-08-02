@@ -544,3 +544,16 @@ def store_on(ext4_volume, ext4_project_root, test_storage_profile):
         )(withhold=withhold)
 
     return bind
+
+
+@pytest.fixture
+def opened_store(store_on):
+    """A live Store over a fresh ext4 project, closed on exit."""
+    from atoms.store.connection import open_store
+
+    with store_on() as binding:
+        store = open_store(binding)
+        try:
+            yield store
+        finally:
+            store.close()

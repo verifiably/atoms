@@ -5,9 +5,12 @@ from __future__ import annotations
 import os
 import sqlite3
 import stat
+from collections.abc import Iterator
+from contextlib import contextmanager
 from enum import Enum
+from typing import Self
 
-from atoms.core.errors import CapabilityUnavailable
+from atoms.core.errors import CapabilityUnavailable, ProtocolError
 from atoms.fs.binding import ProjectBinding
 from atoms.store.errors import MetadataStoreInvalid, translated
 from atoms.store.schema import (
@@ -403,3 +406,194 @@ def open_database(binding: ProjectBinding) -> sqlite3.Connection:
 def reopen_store(binding: ProjectBinding) -> sqlite3.Connection:
     """Alias naming the caller's intent; `open_database` is the shared implementation."""
     return open_database(binding)
+
+
+_STORE_TOKEN = object()
+
+
+class _StoreTransaction:
+    """The only object that can write a record row (design §7.1).
+
+    Every method verifies that this object is the store's current active transaction and
+    that it is not spent. A retained object must not be able to write into a later
+    transaction, and 'the caller should not do that' is not the same as 'the caller
+    cannot'.
+    """
+
+    __slots__ = ("_poisoned_by", "_spent", "_store", "_touched")
+
+    def __init__(self, store: Store, *, _construction_token: object | None = None) -> None:
+        if _construction_token is not _STORE_TOKEN:
+            raise TypeError("transactions are created only by Store.transaction()")
+        self._store = store
+        self._spent = False
+        self._touched: set[str] = set()
+        self._poisoned_by: BaseException | None = None
+
+    def _require_current(self) -> Store:
+        """Liveness first, then ownership -- the order is the diagnostic.
+
+        A store closed inside its own transaction body spends this object *and* closes
+        the connection, so both checks would fire; reporting "spent" would name the
+        symptom and hide the cause. `_require_live` names the cause.
+        """
+        store = self._store
+        store._require_live()
+        if self._spent:
+            raise ProtocolError(
+                "this transaction is spent; obtain a new one from Store.transaction()"
+            )
+        if store._active_transaction is not self:
+            raise ProtocolError(
+                "this transaction is not the store's current active transaction"
+            )
+        return store
+
+    def _poison(self, cause: BaseException) -> None:
+        """Record that a mutating method failed after SQLite may already have written.
+
+        First cause wins: the one that broke the transaction explains it better than
+        whatever the caller did next.
+        """
+        if self._poisoned_by is None:
+            self._poisoned_by = cause
+
+    def _require_not_poisoned(self) -> None:
+        cause = self._poisoned_by
+        if cause is not None:
+            raise ProtocolError(
+                "this transaction is poisoned: a write raised "
+                f"{type(cause).__name__} and was caught inside the transaction block. "
+                "SQLite rolls back the failing statement, not the transaction, so "
+                "whatever ran before it is still there; committing would make a "
+                "partial write durable"
+            ) from cause
+
+    @contextmanager
+    def _mutating(self) -> Iterator[Store]:
+        """Every public method of this class runs its work inside this.
+
+        Two rules in one place instead of thirteen: the object is the store's current
+        transaction, and a failure poisons what is left. Task 13 asserts every public
+        method opens with it, so the rule is checked rather than remembered.
+        """
+        store = self._require_current()
+        try:
+            yield store
+        except BaseException as caught:
+            self._poison(caught)
+            raise
+
+    def _spend(self) -> None:
+        self._spent = True
+
+    def _run_barrier(self) -> None:
+        """The pre-COMMIT barrier. Task 8 fills this in; here it is deliberately empty so
+        that Task 5's transaction semantics can be reviewed on their own."""
+
+
+class Store:
+    """The durable metadata store as a mechanism (design §7).
+
+    Owns the connection and closes it in close(). Borrows the binding's metadata_root
+    descriptor and never closes it -- that stays A4a's.
+    """
+
+    __slots__ = ("_active_transaction", "_binding", "_closed", "_connection")
+
+    def __init__(
+        self,
+        binding: ProjectBinding,
+        connection: sqlite3.Connection,
+        *,
+        _construction_token: object | None = None,
+    ) -> None:
+        if _construction_token is not _STORE_TOKEN:
+            raise TypeError("Store values are created only by open_store")
+        self._binding = binding
+        self._connection = connection
+        self._closed = False
+        self._active_transaction: _StoreTransaction | None = None
+
+    def _require_live(self) -> None:
+        if self._closed:
+            raise ProtocolError("this Store is closed")
+        gate(self._binding)
+
+    def _require_no_transaction(self) -> None:
+        if self._active_transaction is not None:
+            raise ProtocolError(
+                "a write transaction is already open on this store; A5b chooses one "
+                "barrier per lease step, and a nested BEGIN would mean two callers each "
+                "believe they own the boundary"
+            )
+
+    @contextmanager
+    def transaction(self) -> Iterator[_StoreTransaction]:
+        self._require_live()
+        self._require_no_transaction()
+        with translated("beginning a transaction"):
+            self._connection.execute(_BEGIN_IMMEDIATE)
+        txn = _StoreTransaction(self, _construction_token=_STORE_TOKEN)
+        self._active_transaction = txn
+        try:
+            yield txn
+            txn._require_not_poisoned()
+            # Re-assert ownership *before* the barrier reads anything. A body that
+            # called `store.close()` gets here with the connection already closed, and
+            # without this the first thing to notice would be the COMMIT, raising
+            # `sqlite3.ProgrammingError` -- which §7.8 says a caller must never have to
+            # interpret. `_require_current` names the real condition instead.
+            txn._require_current()
+            txn._run_barrier()
+            gate(self._binding)
+            with translated("committing"):
+                self._connection.execute(_COMMIT)
+        except BaseException:
+            # Reached from five places: the caller's body, the poison check, the
+            # barrier, the gate, and a COMMIT that failed. The last is why the helper
+            # tests state rather than this being an `else:` branch -- a failed COMMIT
+            # leaves the transaction OPEN (measured: `in_transaction` is still true
+            # afterwards and the next BEGIN IMMEDIATE raises "cannot start a
+            # transaction within a transaction"), so a store that spent its transaction
+            # object and cleared its slot on that path would refuse every later
+            # transaction, reporting a caller error for a condition it created itself.
+            _rollback_quietly(self._connection)
+            raise
+        finally:
+            txn._spend()
+            self._active_transaction = None
+
+    def close(self) -> None:
+        """Idempotent, and exempt from the liveness gate (design §7.8).
+
+        A store whose binding died must still be closable: gating close would strand the
+        connection it holds, which is the opposite of what the gate is for.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        txn = self._active_transaction
+        if txn is not None:
+            _rollback_quietly(self._connection)
+            txn._spend()
+            self._active_transaction = None
+        self._connection.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+
+def open_store(binding: ProjectBinding) -> Store:
+    """Create the store if `atoms.db` is absent, otherwise reopen it (design §5)."""
+    require_platform(binding)
+    try:
+        os.stat(DATABASE_NAME, dir_fd=binding.metadata_root_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        connection = create_store(binding)
+    else:
+        connection = open_database(binding)
+    return Store(binding, connection, _construction_token=_STORE_TOKEN)
