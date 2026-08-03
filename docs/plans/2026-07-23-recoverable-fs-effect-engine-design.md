@@ -1,7 +1,10 @@
 # Recoverable filesystem effect engine — design
 
 **Date:** 2026-07-23
-**Status:** Approved — authority design for `atoms`. Plan A implementation underway; A1 (§5.1–§5.3, §5.5-as-data, §7.2/§13.3 format) and A2 (§5.4 filesystem-independent compilation) are implemented.
+**Status:** Approved — authority design for `atoms`. Plan A implementation underway; A1–A5b are
+implemented (pure model and compilation, recovery reference model, capability backend, path resolution
+and project approval, SQLite-WAL metadata store, recovery-resolve lease); A6–A8 (coherent capture,
+effect/recovery execution, synthetic exerciser) remain.
 **Repository:** `atoms` (`~/d/atoms`) — Python-first physical durability substrate below `nodes`
 **Supersedes:** the science-framed [`2026-07-20-recoverable-fs-effect-engine-design.md`](2026-07-20-recoverable-fs-effect-engine-design.md), retained as the historical, review-hardened record.
 
@@ -714,6 +717,13 @@ off-host. The durability model is defined against one local POSIX filesystem; a 
 directory is neither required nor trusted, and a failure to set the ignore marker does not weaken any
 single-host guarantee.
 
+Because transaction metadata never travels with the content it governs, a project tree that arrives
+*without* its metadata root — copied, restored from backup, or freshly cloned — is a normal cold
+bootstrap, not corruption: the engine recreates the store idempotently, and any grammar-matched
+scratch debris such a copy carries is external occupancy handled at preparation (§5.1). A metadata
+root restored *alongside* content captured at a different instant (a non-atomic backup) is an
+ordinary interruption to classify: attributable states resolve, unattributable states halt (§8.4).
+
 ### 7.1 Advisory lock and the universal recovery lease
 
 `lock` is a persistent file held with OS advisory locking (`advisory_project_lock`, §5.5). It
@@ -1312,14 +1322,24 @@ without importing either.
 ### 12.2 Deferred production consumers
 
 Real adoption is Plan B (§14), one consumer at a time, each on its own clock and each responsible for
-producing and authenticating its own frozen intent (§4.1):
+producing and authenticating its own frozen intent (§4.1). Science's substrate-consolidation design
+(science `2026-08-02-substrate-consolidation-design.md`) rules that durability and concurrency belong
+to this engine and that no interim transaction layer is built anywhere else; it also surfaces a
+constraint this section previously ignored: `nodes` holds normative Python/TypeScript parity while
+this engine is Python-only, so portable `nodes` should not depend on it until a language-neutral
+execution seam exists (a serialized spec plus out-of-process executor is the plausible shape, §15).
 
-- **`nodes` corpus-write** — writing a corpus of entity files and rebuilt indexes durably. The likely
-  first production consumer: greenfield, no saved-plan authentication legacy.
-- **science** — the archive, import, cohort-import, and supersede families, whose mutation shapes the
-  engine was originally derived from. Each family keeps its planner and saved-plan authentication and
-  compiles, after authentication, into a `TransactionSpec`. This adoption, and the deletion of
+- **science's composition root** — the likely first production consumer: Science's Python composition
+  root combines `nodes` and this engine ("Science as a `nodes` profile over `atoms`"), so corpus
+  writes flow through that root rather than through a `nodes`-internal adapter. Under science's world
+  model the write unit is a **corpus root**: the consumer keys the engine root — and therefore the
+  lock and metadata root — on the corpus, not on a "project" that merely contributes to one.
+- **science's plan families** — archive, import, cohort-import, and supersede, whose mutation shapes
+  the engine was originally derived from. Each family keeps its planner and saved-plan authentication
+  and compiles, after authentication, into a `TransactionSpec`. This adoption, and the deletion of
   science's existing execution dialects, is science's own hard cut — outside this repo's authority.
+- **`nodes` directly** — deferred behind the language-neutral seam above; adopting this engine from
+  portable `nodes` before that seam exists would break parity or force a second engine implementation.
 
 No consumer adoption may redefine the engine protocol, add a feature flag, or introduce a runtime
 transaction-dialect choice.
@@ -1603,9 +1623,10 @@ transaction model.
 ### Plan B — production adoption
 
 Written only after Plan A's interfaces settle, and it must not redefine the engine protocol. One
-consumer at a time:
+consumer at a time, in the order §12.2 records (science's composition root, then science's plan
+families; direct `nodes` adoption waits on a language-neutral execution seam):
 
-1. `nodes` corpus-write adapter and its acceptance suite.
+1. science composition-root corpus-write adapter and its acceptance suite.
 2. science family adapters (supersede first, then archive, then import/cohort), each keeping its
    planner and Gate-B authentication and compiling into a `TransactionSpec`, plus deletion of science's
    superseded execution dialects. This is science's hard cut, tracked in science.
@@ -1627,6 +1648,31 @@ adapters or reintroduce a second filesystem executor.
 
 Directory-tree recursive effects (recursive move/replace/delete) require a later effect variant with an
 explicit recursive content model (§5.2); they are not implied by the initial closed effect set.
+
+**One transaction, one root.** A `TransactionSpec` addresses a single engine root. Multi-corpus
+operations at the consumer layer — science's merge, a cross-corpus entity move — are consumer-composed
+sequences of per-root transactions; science's world-addressing design itself rules a merge non-atomic
+over a world larger than the checkout, with correctness carried by the redirect record rather than by
+atomicity. No multi-root transaction, cross-root lock ordering, or best-effort effect tier will be
+added.
+
+**The transaction is the publish, not the computation.** A long-running external computation
+(science's execution boundary running a workflow engine for hours into a boundary-owned output root)
+is not an engine transaction. The consumer completes and freezes its output manifest first and
+compiles the spec from that settled surface, so the lease's write phase — and the lock hold — remains
+a publication, never a computation.
+
+**Tamper-evident mutation log (future obligation, not built here).** Science's epistemic-kernel and
+computation-reproducibility designs name this engine as the eventual owner of a general tamper-evident
+mutation log: every mutation durably registered *before* it is applied, in a sequence whose *removal
+is detectable*. That contract is stricter than crash recovery — a recovery journal that can itself be
+deleted is not tamper evidence — and it requires its own design, whose first question is where such a
+log lives and how removal is detected across checkouts (an anchor outside the deletable set), not its
+registration API. Two present-tense choices keep that path open. Terminal records and preimage blobs
+are the natural witnesses of "the prior state, before the write," so their garbage collection (§7.5)
+remains an explicit consumer policy, never an assumed cleanup. And the spec already carries a consumer
+tag and frozen-intent digest (§5.1), persisted in the durable record, so a recovery-completed publish
+remains attributable to the intent that authorized it.
 
 ## 16. Acceptance criteria
 
