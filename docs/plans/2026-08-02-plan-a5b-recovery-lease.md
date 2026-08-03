@@ -833,8 +833,12 @@ inside the `with` body that never runs — re-run, and confirm this test fails o
 
 **Also run the mutation against the empty-allowlist shape**, as the negative control: temporarily swap
 `absent` for `project_root` and `root.CERTIFIED_ALLOWLIST` for `DurabilityAllowlist(entries=frozenset())`,
-keep the moved reclamation, and confirm the test **passes** anyway. Report both results together — the
-pair is what shows the chosen refusal is the load-bearing one. Restore both.
+keep the moved reclamation, and confirm the test **passes** anyway. **The expected exception changes with
+it** — an empty allowlist refuses at `binding.py:194` with `CapabilityUnavailable`, not
+`FileNotFoundError`, so the control run must also swap `pytest.raises(FileNotFoundError)` for
+`pytest.raises(CapabilityUnavailable)` or it fails at the wrong place and proves nothing. Report both
+results together — the pair is what shows the chosen refusal is the load-bearing one. Restore all three
+edits.
 
 - [ ] **Step 8: Prove the trap mutates no project path and releases everything**
 
