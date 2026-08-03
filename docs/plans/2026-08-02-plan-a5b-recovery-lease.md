@@ -2243,10 +2243,60 @@ Expected: PASS.
 
 - [ ] **Step 8: Arm and run Task 5's deferred mutation check**
 
-`_occupied_scratch` is real now. Delete `occupied = ()` from the record-collision branch in `admit`,
-run `test_every_candidate_owned_by_a_record_exhausts_the_bound`, and confirm it fails on
-`"scratch occupied" not in message`. Restore, confirm `git status --porcelain` is empty, and re-run.
-Report the observed failure message.
+`_occupied_scratch` is real now — but **neither existing exhaustion test can arm this mutation**, and
+reusing one would produce a false negative. Measured 2026-08-02 during Task 5's review:
+
+- `test_every_candidate_owned_by_a_record_exhausts_the_bound` collides on a durable record at every
+  attempt, so `continue` fires each time and `_occupied_scratch` is never called. `occupied` never
+  leaves its `()` initializer, with or without the reset.
+- `test_persistent_occupancy_exhausts_and_names_the_leaves` has the mirror problem: no record
+  collisions at all, so nothing ever needs clearing.
+
+Only a **mixed** sequence distinguishes the two versions. Add one — a first candidate whose scratch is
+occupied, followed by candidates that collide with durable records, then exhaustion:
+
+```python
+def test_a_record_collision_clears_an_earlier_candidates_occupancy(leased, monkeypatch):
+    """The `occupied = ()` reset in `admit`'s record-collision branch.
+
+    Without it, a leaf found occupied on an early attempt is still named in the final
+    refusal even though the attempt that exhausted the bound was a record collision --
+    reporting external occupancy for a candidate whose scratch was never examined.
+    """
+    from atoms.coordinator import admission
+    from tests.coordinator_support import compiled_for
+    from tests.store_support import one_effect_spec
+
+    with leased() as lease:
+        compiled = compiled_for(lease)
+        # "a" has no record, so its scratch is consulted; "b" and "c" collide first.
+        for txid in ("b", "c"):
+            with lease._store.transaction() as txn:
+                txn.insert_record(txid, one_effect_spec())
+        issued = iter(["a", "b", "c"])
+        monkeypatch.setattr(admission, "new_txid", lambda: next(issued))
+        monkeypatch.setattr(
+            admission, "_occupied_scratch", lambda lease, approved: ("stale.leaf",)
+        )
+
+        with pytest.raises(PreconditionRefused) as caught:
+            admission.admit(lease, compiled)
+
+        message = str(caught.value)
+        assert "no usable txid after 3 attempts" in message
+        assert "scratch occupied" not in message
+```
+
+`_occupied_scratch` is patched rather than driven through real occupancy because this case is about the
+reset alone: it needs occupancy on attempt 1 and record collisions afterwards, and the real function
+would have to be fed a leaf derived from the txid `new_txid` happens to issue. The neighbouring
+`test_persistent_occupancy_exhausts_and_names_the_leaves` already exercises the real one. If you can
+build the same shape without the patch, prefer that and say so.
+
+Then delete `occupied = ()` from the record-collision branch in `admit`, re-run, and confirm this test
+— and only this test — fails on `"scratch occupied" not in message`. The reviewer's probe observed
+`no usable txid after 3 attempts; scratch occupied at stale.leaf`. Restore, confirm
+`git status --porcelain` is empty, re-run, and report the observed message.
 
 - [ ] **Step 9: Prove the translation's scope and the planned branch's restraint**
 
@@ -2282,6 +2332,9 @@ git commit -m "feat(coordinator): re-resolve each scratch parent against its app
 - Create: `src/atoms/coordinator/prepare.py`
 - Create: `tests/test_coordinator_prepare.py`
 - Modify: `tests/coordinator_support.py`
+
+*(Task 5's header listed `tests/coordinator_support.py` as Modify but described no change to it and
+needed none — `compiled_for` had already landed. That header was stale; this one is not.)*
 
 **Interfaces:**
 - Consumes: A5a `Store.transaction()`, `_StoreTransaction.promote_staging(workspace, manifest)`,
