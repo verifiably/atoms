@@ -41,3 +41,19 @@ def _reclaim_orphans(store: Store) -> tuple[tuple[str, ...], tuple[str, ...]]:
         removed_blobs.append(digest)
 
     return tuple(removed_workspaces), tuple(removed_blobs)
+
+
+def _resolve(store: Store) -> None:
+    """Design §5.3 -- a temporary build-stage trap, not a domain refusal.
+
+    `classify_recovery` needs filesystem observations (ledger #13, owned by A6) and a
+    plan's mutating steps need an executor (A7). Neither exists, so a live record
+    cannot be resolved and must not be advanced past. Removing this raise is what
+    discharges ledger #17's second half.
+
+    The guarantee is scoped to logical transaction state: nothing here writes a record,
+    an effect row, or the active pointer. Reclamation already ran and did remove
+    unreferenced scratch, which is not transaction state.
+    """
+    if store.read_active() is not None:
+        raise NotImplementedError("recovery execution is not implemented until A7")
