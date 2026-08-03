@@ -115,6 +115,13 @@ The four measured plans, verbatim:
 - **No raw `os.fsync`.** Every durability barrier goes through `Backend.flush_file` or
   `Backend.flush_directory`.
 - **No blanket `OSError` handler** and **no `except sqlite3.Error`**, extending A5a's guards.
+- **Two tests are expected to fail from Task 1 until Task 9, and only these two.** Both assert the
+  coordinator does not exist yet, which Task 1 makes false:
+  `test_fs_architecture.py::test_no_production_caller_of_bind_exists_yet` and
+  `test_store_architecture.py::test_no_production_module_outside_the_package_imports_the_store`.
+  Task 9 Step 1 retires both. Until then, a task's `uv run pytest -q` gate is clean **when these two
+  are the only failures** — check the names, not just the count, and report any third failure rather
+  than absorbing it into this allowance.
 - Filepaths in docs and comments use `~/d/atoms/...`.
 - Conventional commits. No AI-attribution trailer or footer.
 
@@ -3459,10 +3466,23 @@ git commit -m "feat(coordinator): persist a plan prefix and stop before A7's wor
   `docs/deferred-obligation-ledger.md`, `docs/plans/2026-08-02-a5b-recovery-lease-design.md`,
   `AGENTS.md`
 
-- [ ] **Step 1: Replace the #18 guard**
+- [ ] **Step 1: Replace the two superseded "nothing here yet" guards**
 
-In `tests/test_fs_architecture.py`, replace `test_no_production_caller_of_bind_exists_yet`
-(line 364). **Do not delete it** — it is replaced, not removed. The scanner
+**These two have been red since Task 1 landed, by construction.** Both assert that the coordinator does
+not exist; Task 1 makes it exist. They are the plan's only expected interim failures, and this step is
+where they are retired:
+
+| Guard | File | Superseded by |
+| --- | --- | --- |
+| `test_no_production_caller_of_bind_exists_yet` | `tests/test_fs_architecture.py:364` | the two #18 guards below |
+| `test_no_production_module_outside_the_package_imports_the_store` | `tests/test_store_architecture.py:1182` | `test_only_the_coordinator_and_the_store_itself_import_the_store` (Step 3) |
+
+Delete the second one outright: Step 3's replacement scans the same population with the coordinator
+exemption the DAG now requires, and keeping a second copy of the same scan with a stale exemption set is
+how two guards drift apart. Say in the task report that it was removed and by what.
+
+For the first, replace `test_no_production_caller_of_bind_exists_yet` in
+`tests/test_fs_architecture.py`. **Do not delete it** — it is replaced, not removed. The scanner
 (`_production_bind_callers`) and its four self-tests stay exactly as they are.
 
 ```python
