@@ -361,11 +361,31 @@ def test_bind_caller_scanner_does_not_exempt_entire_boundary_modules(
     assert _production_bind_callers(tmp_path) == {caller}
 
 
-def test_no_production_caller_of_bind_exists_yet():
-    # A4a has no production composition root, so it cannot assert which allowlist
-    # is passed. That call-site assertion is ledger entry #18, owned by A5.
+def test_the_only_production_bind_caller_is_the_coordinator_root():
     source_root = Path(__file__).parents[1] / "src"
-    assert _production_bind_callers(source_root) == set()
+    assert _production_bind_callers(source_root) == {
+        source_root / "atoms" / "coordinator" / "root.py"
+    }
+
+
+def test_the_production_bind_call_passes_the_certified_allowlist():
+    """Ledger #18: the sole production call site names the shipping constant."""
+    path = Path(__file__).parents[1] / "src" / "atoms" / "coordinator" / "root.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and _called_name(node) == "bind_project_volume"
+    ]
+    assert len(calls) == 1
+    keywords = {keyword.arg: keyword.value for keyword in calls[0].keywords}
+    allowlist = keywords["allowlist"]
+    assert isinstance(allowlist, ast.Name)
+    assert allowlist.id == "CERTIFIED_ALLOWLIST"
+    assert "atoms.fs.volume.CERTIFIED_ALLOWLIST" in _resolved_imports(
+        tree, package="atoms.coordinator"
+    )
+    assert CERTIFIED_ALLOWLIST == DurabilityAllowlist(entries=frozenset())
 
 
 def _status_paragraph(path: Path) -> str:
@@ -978,29 +998,86 @@ def test_the_approved_spec_is_not_exported():
     assert not hasattr(package, "ProjectApprovedSpec")
 
 
-def test_no_consumer_of_the_approved_spec_exists_yet():
-    """Arms the A5-A8 boundary before there is anything to guard, as A4a armed
-    test_no_production_caller_of_bind_exists_yet. When A5 lands, this test is replaced by
-    one asserting A5-A8 accept only this proof."""
+_TRANSACTION_STAGE_ENTRY_POINTS = {
+    "atoms/coordinator/prepare.py": ("open_workspace", "prepare_transaction"),
+    "atoms/coordinator/transitions.py": ("persist_plan_prefix",),
+}
+
+
+def _first_statement(function: ast.FunctionDef) -> ast.stmt:
+    body = function.body
+    if (
+        isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        return body[1]
+    return body[0]
+
+
+_DEFINING_MODULE = SOURCE_ROOT / "fs" / "approval.py"
+
+
+def test_only_the_coordinator_consumes_the_approved_spec():
     consumers = []
-    for path in sorted((SOURCE_ROOT).rglob("*.py")):
-        if path.name in {"approval.py"}:
+    for path in sorted(SOURCE_ROOT.rglob("*.py")):
+        if path == _DEFINING_MODULE:
+            continue
+        if path.relative_to(SOURCE_ROOT).parts[0] == "coordinator":
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"))
         _, package = _source_module(SOURCE_ROOT.parent, path)
-        imports = _resolved_imports(tree, package=package)
-        if "atoms.fs.approval.ProjectApprovedSpec" in imports or any(
-            (
-                isinstance(node, ast.Name) and node.id == "ProjectApprovedSpec"
-            )
-            or (
-                isinstance(node, ast.Attribute)
-                and node.attr == "ProjectApprovedSpec"
-            )
+        if "atoms.fs.approval.ProjectApprovedSpec" in _resolved_imports(
+            tree, package=package
+        ) or any(
+            (isinstance(node, ast.Name) and node.id == "ProjectApprovedSpec")
+            or (isinstance(node, ast.Attribute) and node.attr == "ProjectApprovedSpec")
             for node in ast.walk(tree)
         ):
             consumers.append(str(path.relative_to(SOURCE_ROOT)))
     assert consumers == []
+
+
+def test_every_transaction_stage_entry_point_opens_with_the_proof_gate():
+    for relative, names in _TRANSACTION_STAGE_ENTRY_POINTS.items():
+        tree = ast.parse(
+            (SOURCE_ROOT.parent / relative).read_text(encoding="utf-8")
+        )
+        functions = {
+            node.name: node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        assert set(names) <= set(functions), relative
+        for name in names:
+            first = _first_statement(functions[name])
+            assert isinstance(first, ast.Expr), f"{relative}::{name}"
+            assert isinstance(first.value, ast.Call), f"{relative}::{name}"
+            assert _called_name(first.value) == "_require_admitted", (
+                f"{relative}::{name}"
+            )
+
+
+def test_no_unregistered_public_function_accepts_the_proof():
+    registered = {
+        f"{relative}::{name}"
+        for relative, names in _TRANSACTION_STAGE_ENTRY_POINTS.items()
+        for name in names
+    }
+    found = set()
+    for path in sorted((SOURCE_ROOT / "coordinator").glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        relative = str(path.relative_to(SOURCE_ROOT.parent))
+        for node in tree.body:
+            if not isinstance(node, ast.FunctionDef) or node.name.startswith("_"):
+                continue
+            if any(
+                isinstance(argument.annotation, ast.Name)
+                and argument.annotation.id == "ProjectApprovedSpec"
+                for argument in node.args.args
+            ):
+                found.add(f"{relative}::{node.name}")
+    assert found == registered
 
 
 def test_a4b_status_is_synchronized_across_authority_documents():

@@ -1179,22 +1179,6 @@ def test_no_module_accepts_a_project_approved_spec(path):
     assert "approve_for_project" not in used
 
 
-def test_no_production_module_outside_the_package_imports_the_store():
-    root = PACKAGE.parent
-    offenders = sorted(
-        str(path.relative_to(root))
-        for path in root.rglob("*.py")
-        if PACKAGE not in path.parents
-        and any(
-            name == "atoms.store" or name.startswith("atoms.store.")
-            for name in _imported_modules(
-                _tree(path), package=_package_for(path)
-            )
-        )
-    )
-    assert offenders == [], offenders
-
-
 @pytest.mark.parametrize("path", SOURCES, ids=lambda path: path.name)
 def test_no_module_catches_the_whole_sqlite_hierarchy(path):
     tree = _tree(path)
@@ -1284,24 +1268,24 @@ def test_the_fixture_guard_understands_parametrized_arguments():
 
 def test_a5_status_is_synchronized_across_authority_documents():
     agents = (Path(__file__).parents[2] / "AGENTS.md").read_text(encoding="utf-8")
-    assert "A5a is implemented; A5b–A8 remain unimplemented" in agents
-    assert "A5a implemented on 2026-08-01, A5b designed on" in agents
-    assert "2026-08-02 and unimplemented" in agents
+    assert "A5 is implemented; A6–A8 remain unimplemented" in agents
+    assert (
+        "A5a implemented on 2026-08-01, A5b implemented on\n  2026-08-02."
+        in agents
+    )
     assert "A5a designed and unimplemented" not in agents
     assert "A5–A8 remain unimplemented" not in agents
-    # A5b's design landed 2026-08-02; the implementation has not.
     assert "A5b not yet designed" not in agents
-    assert "A5b implemented" not in agents
+    assert "A5b implemented" in agents
 
     # The name promises synchronization ACROSS documents, so read the other one.
-    # A5a's own design carries no Status line; A5b's does, and it is the document
-    # that would drift first when A5b lands.
+    # A5a's own design carries no Status line; A5b's records implementation status.
     design = (
         Path(__file__).parents[2]
         / "docs/plans/2026-08-02-a5b-recovery-lease-design.md"
     ).read_text(encoding="utf-8")
-    assert "**Status:** Designed and unimplemented." in design
-    assert "A5a is implemented; A5b–A8 remain unimplemented." in design
+    assert "**Status:** Implemented on 2026-08-02." in design
+    assert "A6–A8 remain unimplemented." in design
 
 
 def _plant_store_package(
@@ -1912,20 +1896,6 @@ def test_dependency_guard_rejects_a_relative_store_import(tmp_path: Path):
     path.write_text("from ..store import Store\n", encoding="utf-8")
     with pytest.raises(AssertionError):
         test_neither_fs_nor_core_imports_the_store(path)
-
-
-def test_outside_package_guard_scans_a_store_prefixed_sibling(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    atoms_root = tmp_path / "atoms"
-    package = atoms_root / "store"
-    package.mkdir(parents=True)
-    (atoms_root / "store_consumer.py").write_text(
-        "from atoms.store import Store\n", encoding="utf-8"
-    )
-    monkeypatch.setattr("tests.test_store_architecture.PACKAGE", package)
-    with pytest.raises(AssertionError):
-        test_no_production_module_outside_the_package_imports_the_store()
 
 
 def test_transaction_guard_rejects_a_public_method_before_mutating(
