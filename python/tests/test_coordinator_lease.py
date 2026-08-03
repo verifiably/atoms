@@ -230,6 +230,12 @@ def _trapping_lease(coordinator_on, leased):
 
     The file is not incidental: a state comparison over an empty tree has almost nothing
     to compare, and two of the mutations below need an existing path to move.
+
+    The inner `leased(ingredients)` also leaves `root.CERTIFIED_ALLOWLIST` monkeypatched
+    for the remainder of the test, since `monkeypatch` is function-scoped and the fixture
+    patches rather than restores. That is why each caller below can drive
+    `root._recovery_lease` directly and still bind a volume the shipped empty allowlist
+    would refuse; the coupling is invisible at the call sites.
     """
     from tests.coordinator_support import make_child_directory
     from tests.store_support import one_effect_spec
@@ -306,3 +312,59 @@ def test_the_trap_releases_the_project_lock(coordinator_on, leased):
 
     assert str(caught.value) == "recovery execution is not implemented until A7"
     assert _contend(metadata_root) == 0
+
+
+def _workspaces_outside_the_lease(
+    backend, project_root: str, metadata_root: str, storage
+) -> tuple[str, ...]:
+    """Read scratch back without going through `_recovery_lease`.
+
+    Once a record is active every lease entry traps, so the lease cannot report on what
+    its own entry did. This is the plain lock/bind/open stack `tests/store_child.py`
+    already uses, minus the process boundary, with the same test allowlist the `leased`
+    fixture builds.
+    """
+    from atoms.fs.binding import bind_project_volume
+    from atoms.fs.lock import acquire_project_lock
+    from atoms.store.connection import open_store
+    from tests.fs_support import build_test_allowlist
+
+    with acquire_project_lock(backend, metadata_root) as lock:
+        allowlist = build_test_allowlist(lock, project_root, storage)
+        with bind_project_volume(
+            project_root, lock, allowlist=allowlist, storage=storage
+        ) as binding, open_store(binding) as store:
+            return store.list_workspaces()
+
+
+def test_reclamation_survives_a_trapping_lease_entry(coordinator_on, leased):
+    """`root.py`'s ordering claim, which the trap is the first thing able to test.
+
+    Ledger #23 says reclamation runs at EVERY lease entry, which holds only if it runs
+    even when resolution then refuses, halts, or traps. The two reclamation tests above
+    call `_reclaim_orphans` directly inside a lease body and so never observe the entry
+    path; swapping `_reclaim_orphans(store)` and `_resolve(store)` leaves both green and
+    breaks only this one.
+    """
+    from atoms.coordinator import root
+    from tests.store_support import one_effect_spec
+
+    ingredients = coordinator_on()
+    backend, project_root, metadata_root, storage = ingredients
+
+    with leased(ingredients) as lease:
+        lease._store.create_workspace("orphan3").close()
+        with lease._store.transaction() as txn:
+            txn.insert_record("tx1", one_effect_spec())
+            txn.set_active("tx1")
+        assert lease._store.list_workspaces() == ("orphan3",)
+
+    with pytest.raises(NotImplementedError) as caught, root._recovery_lease(
+        backend, project_root, metadata_root, storage
+    ):
+        pass
+
+    assert str(caught.value) == "recovery execution is not implemented until A7"
+    assert _workspaces_outside_the_lease(
+        backend, project_root, metadata_root, storage
+    ) == ()
