@@ -9,13 +9,36 @@ from __future__ import annotations
 
 import hashlib
 import os
+from typing import cast
 
 from atoms.coordinator.lease import Lease
 from atoms.core.canonical import canonical_json
 from atoms.core.compiler import CompiledSpec, compile_spec
 from atoms.core.effects import CreateDirectory, CreateFileNoClobber
 from atoms.core.fingerprint import ABSENT, DirectoryState
-from atoms.core.recovery import ScratchRole
+from atoms.core.recovery import (
+    OBSERVED_ABSENT,
+    CommitDecision,
+    EffectJournalState,
+    EntryIdentity,
+    FileBuildRelation,
+    JournalState,
+    ObservedEntry,
+    ObservedFile,
+    PersistentNode,
+    PersistentObservation,
+    ProjectRoot,
+    RecoverySnapshot,
+    RecoveryTopology,
+    ScratchNode,
+    ScratchObservation,
+    ScratchRole,
+    TopologyParent,
+    TransactionState,
+    build_recovery_snapshot,
+    classify_recovery,
+)
+from atoms.core.recovery.plan import ActionPlan, HaltPlan, RecoveryPlan
 from atoms.core.spec import TransactionSpec, build_spec
 from atoms.fs.approval import ProjectApprovedSpec
 from atoms.store.blobs import StagedBlob
@@ -131,6 +154,152 @@ def prepared(lease: Lease) -> ProjectApprovedSpec:
     finally:
         workspace.close()
     return approved
+
+
+def flattened_topology(approved: ProjectApprovedSpec) -> RecoveryTopology:
+    """The proof's persistent and scratch nodes, re-parented at the project root."""
+    project = ProjectRoot()
+    return RecoveryTopology(
+        parents=tuple(
+            TopologyParent(node=edge.node, parent=project)
+            for edge in approved.topology.parents
+            if type(edge.node) in (PersistentNode, ScratchNode)
+        )
+    )
+
+
+def snapshot_for(
+    approved: ProjectApprovedSpec,
+    *,
+    state: TransactionState,
+    journal: JournalState,
+    live: ObservedEntry,
+    staged: ObservedEntry,
+    relation: FileBuildRelation | None = None,
+    path: str = "d/f.txt",
+    topology: RecoveryTopology | None = None,
+) -> RecoverySnapshot:
+    """Build a recovery snapshot over the proof's compiled spec and topology."""
+    return build_recovery_snapshot(
+        compiled=approved.compiled,
+        topology=approved.topology if topology is None else topology,
+        transaction_state=state,
+        commit_decision=CommitDecision.UNCOMMITTED,
+        rollback_result=None,
+        halt_diagnostic=None,
+        active=True,
+        journals=(EffectJournalState("e1", journal),),
+        persistent_observations=(PersistentObservation(path, live),),
+        scratch_observations=(
+            ScratchObservation("e1", ScratchRole.STAGING, staged, relation),
+        ),
+    )
+
+
+def prepared_with(
+    lease: Lease,
+    *,
+    state: TransactionState = TransactionState.PREPARED,
+    journal: JournalState = JournalState.PENDING,
+    live: ObservedEntry = OBSERVED_ABSENT,
+    staged: ObservedEntry = OBSERVED_ABSENT,
+    relation: FileBuildRelation | None = None,
+) -> tuple[ProjectApprovedSpec, RecoveryPlan]:
+    """Publish a record, align its durable state, and classify its recovery plan."""
+    approved = prepared(lease)
+    if state is not TransactionState.PREPARED or journal is not JournalState.PENDING:
+        with lease._store.transaction() as txn:
+            txn.set_transaction_state(approved.txid, state)
+            txn.set_journal_state(approved.txid, "e1", journal)
+    snapshot = snapshot_for(
+        approved,
+        state=state,
+        journal=journal,
+        live=live,
+        staged=staged,
+        relation=relation,
+    )
+    return approved, classify_recovery(snapshot)
+
+
+def observed_file(content: bytes = AFTER) -> ObservedFile:
+    return ObservedFile(file_state(content), EntryIdentity())
+
+
+def other_file_spec() -> TransactionSpec:
+    """A second spec over the same existing parent."""
+    return build_spec(
+        consumer_tag="test",
+        intent_digest="sha256:" + "3" * 64,
+        initial_surface={"d/g.txt": ABSENT},
+        final_surface={"d/g.txt": POST},
+        effects=[CreateFileNoClobber(effect_id="e1", path="d/g.txt", post=POST)],
+    )
+
+
+def reapproved_under(
+    lease: Lease, txid: str, compiled: CompiledSpec
+) -> ProjectApprovedSpec:
+    """Approve a second compiled spec under an existing transaction's txid."""
+    from atoms.fs.approval import ProjectContext, approve_for_project
+
+    return approve_for_project(compiled, ProjectContext(lease._binding, txid))
+
+
+def prepared_metadata_only(
+    lease: Lease,
+) -> tuple[ProjectApprovedSpec, ActionPlan]:
+    """ActionPlan ROLL_BACK: two transitions, then DetachActive."""
+    return cast(tuple[ProjectApprovedSpec, ActionPlan], prepared_with(lease))
+
+
+def prepared_with_preserve_external(
+    lease: Lease,
+) -> tuple[ProjectApprovedSpec, ActionPlan]:
+    """ActionPlan ROLL_BACK_REFUSED with PreserveExternal at index 1."""
+    return cast(
+        tuple[ProjectApprovedSpec, ActionPlan],
+        prepared_with(lease, live=observed_file(b"someone else's bytes")),
+    )
+
+
+def prepared_with_halt(lease: Lease) -> tuple[ProjectApprovedSpec, HaltPlan]:
+    """HaltPlan with one PREPARED-to-HALTED transition."""
+    return cast(
+        tuple[ProjectApprovedSpec, HaltPlan],
+        prepared_with(lease, staged=observed_file()),
+    )
+
+
+def prepared_with_remove_scratch(
+    lease: Lease,
+) -> tuple[ProjectApprovedSpec, ActionPlan]:
+    """ActionPlan whose first mutating step is RemoveScratch at index 2."""
+    return cast(
+        tuple[ProjectApprovedSpec, ActionPlan],
+        prepared_with(
+            lease,
+            state=TransactionState.APPLYING,
+            journal=JournalState.STARTED,
+            staged=observed_file(),
+            relation=FileBuildRelation.EXACT,
+        ),
+    )
+
+
+def prepared_with_transform(
+    lease: Lease,
+) -> tuple[ProjectApprovedSpec, ActionPlan]:
+    """ActionPlan whose first mutating step is TransformEffectTuple at index 2."""
+    return cast(
+        tuple[ProjectApprovedSpec, ActionPlan],
+        prepared_with(
+            lease,
+            state=TransactionState.APPLYING,
+            journal=JournalState.DONE,
+            live=observed_file(),
+        ),
+    )
 
 
 def create_the_planned_directory(lease: Lease, approved: ProjectApprovedSpec) -> None:
