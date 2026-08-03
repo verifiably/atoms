@@ -4159,9 +4159,10 @@ built on a measured fact: `_validate_topology` constrains coverage and parentage
 intermediate directory nodes a tree uses, so the flattened arrangement is valid for the same compiled
 spec. The reclamation guard uses an absent project root rather than the empty allowlist, because
 `bind_project_volume` reclaims at `binding.py:192` *before* the allowlist match at `:194` and so cleans
-`probe/` by itself — measured, and run as a negative control. The trap's three mutations each insert
-one line before `_resolve(store)` so the trap still fires and only the asserted property moves; deleting
-the trap would fail all three at `pytest.raises` and prove nothing.
+`probe/` by itself — measured, and run as a negative control. The trap's five mutations are each
+inserted before `_resolve(store)` so the trap still fires and only the asserted property moves,
+producing six expected failures across the three trap tests; deleting the trap instead would fail all
+three at `pytest.raises` and prove nothing.
 
 **One place the implementer must read the code rather than trust this plan:** Task 4 Step 3's lift of
 `_NAMESPACE_CONTRADICTIONS` out of `PathResolver`, which touches existing code and must leave
