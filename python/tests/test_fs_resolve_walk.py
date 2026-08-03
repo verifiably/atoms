@@ -760,3 +760,69 @@ def test_observe_child_does_not_close_the_borrowed_root(ext4_bound_volume):
         before = os.fstat(binding.project_root_fd)
         observe_child(binding, "", "nothing-here")
         assert os.fstat(binding.project_root_fd) == before
+
+
+def test_observe_child_releases_the_descriptor_it_opened(ext4_bound_volume):
+    """The `owned` half of the contract Step 8 only proved the borrowed half of."""
+    from atoms.fs.resolve import observe_child
+
+    with ext4_bound_volume() as binding:
+        os.mkdir("d", dir_fd=binding.project_root_fd)
+        before = descriptor_count()
+        observe_child(binding, "d", "leaf")
+        assert descriptor_count() == before
+
+
+def test_observe_work_child_releases_the_descriptor_it_opened(ext4_bound_volume):
+    """A separate close from observe_child's, so it needs a separate witness."""
+    from atoms.fs.resolve import observe_work_child
+
+    with ext4_bound_volume() as binding:
+        before = descriptor_count()
+        observe_work_child(binding, "tx01")
+        assert descriptor_count() == before
+
+
+def test_observe_child_strands_no_intermediate_of_a_nested_parent(
+    monkeypatch, ext4_bound_volume
+):
+    """Exactly one descriptor is open when a three-component parent is observed.
+
+    Counted inside the observation core rather than after the call returns, so this
+    case answers for the intermediate releases alone: the deepest descriptor is still
+    open at that moment either way, which is what keeps it green under a mutation of
+    the final close and red only under a mutation of the intermediate one.
+    """
+    from atoms.fs import resolve
+
+    with ext4_bound_volume() as binding:
+        os.mkdir("a", dir_fd=binding.project_root_fd)
+        os.mkdir("a/b", dir_fd=binding.project_root_fd)
+        os.mkdir("a/b/c", dir_fd=binding.project_root_fd)
+        core = resolve._observe_open_child
+        open_during: list[int] = []
+
+        def counting(parent_fd: int, filesystem_type: str, leaf: str):
+            open_during.append(descriptor_count())
+            return core(parent_fd, filesystem_type, leaf)
+
+        monkeypatch.setattr(resolve, "_observe_open_child", counting)
+        before = descriptor_count()
+        observed = resolve.observe_child(binding, "a/b/c", "leaf")
+
+        assert observed.present is False
+        assert open_during == [before + 1]
+
+
+@pytest.mark.parametrize(
+    "parent_path",
+    ["../escape", "/absolute", "a//b", "a/"],
+    ids=["dotdot", "absolute", "empty-component", "trailing-slash"],
+)
+def test_observe_child_refuses_a_malformed_parent_path(ext4_bound_volume, parent_path):
+    from atoms.fs.resolve import observe_child
+
+    with ext4_bound_volume() as binding, pytest.raises(ProtocolError) as caught:
+        observe_child(binding, parent_path, "leaf")
+
+    assert "well-formed project-relative parent" in str(caught.value)
