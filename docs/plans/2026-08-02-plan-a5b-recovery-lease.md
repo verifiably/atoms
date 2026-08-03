@@ -76,7 +76,10 @@ The four measured plans, verbatim:
   test importing `atoms.coordinator.*` before that module exists reports `I001`. Between "write the
   failing test" and "write the module" this is expected; **do not reorder imports to satisfy it.**
 - **Three rules the test code here is written around**, all enabled in this project's ruff (`0.16`):
-  `SIM117` refuses nested bare `with` statements — write them as one `with A, B:`; `B018` refuses a
+  `SIM117` refuses nested bare `with` statements — write them as one `with A, B:`. Measured during
+  Task 4: it fires only when the outer body is *exactly* the nested `with`; an outer body that also
+  contains an `assert` is not combinable and ruff passes it. Do not collapse a `with` pair on the
+  assumption that SIM117 demands it — run `uv run ruff check` and find out. `B018` refuses a
   bare attribute expression, so a `pytest.raises` body that only reads an anchor is `_ = lease._store`;
   and `PYI034` refuses `def __enter__(self) -> Lease:` — annotate `Self`.
 - **A refusal test must assert which refusal fired.** Asserting only that an exception type was raised
