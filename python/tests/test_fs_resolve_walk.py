@@ -664,3 +664,99 @@ def test_the_walk_leaks_no_descriptor_on_a_refusal_path(
         with pytest.raises(ProjectApprovalRefused):
             resolver.resolve("a/b/leaf")
         assert descriptor_count() == before
+
+
+def test_observe_child_reports_absence_with_the_parent_facts(ext4_bound_volume):
+    from atoms.fs.resolve import observe_child
+
+    with ext4_bound_volume() as binding:
+        observed = observe_child(binding, "", "nothing-here")
+
+        assert observed.present is False
+        assert observed.parent_identity.device > 0
+        assert observed.parent_constraints.name_max > 0
+
+
+def test_observe_child_reports_presence_of_an_existing_leaf(ext4_bound_volume):
+    from atoms.fs.resolve import observe_child
+
+    with ext4_bound_volume() as binding:
+        os.close(
+            os.open(
+                "occupied",
+                os.O_CREAT | os.O_WRONLY,
+                0o644,
+                dir_fd=binding.project_root_fd,
+            )
+        )
+
+        assert observe_child(binding, "", "occupied").present is True
+
+
+def test_observe_child_reports_a_leaf_under_a_nested_parent(ext4_bound_volume):
+    from atoms.fs.resolve import observe_child
+
+    with ext4_bound_volume() as binding:
+        os.mkdir("d", dir_fd=binding.project_root_fd)
+        root_identity = observe_child(binding, "", "d").parent_identity
+
+        observed = observe_child(binding, "d", ".#~tx01.e1.staging")
+
+        assert observed.present is False
+        assert observed.parent_identity != root_identity
+
+
+def test_observe_child_accepts_a_leaf_the_path_grammar_refuses(ext4_bound_volume):
+    """The whole reason this function exists: `validate_path` rejects the sigil."""
+    from atoms.core.errors import SpecValidationError
+    from atoms.core.paths import require_rel_path
+    from atoms.fs.resolve import observe_child
+
+    with ext4_bound_volume() as binding:
+        with pytest.raises(SpecValidationError):
+            require_rel_path("path", ".#~tx01.e1.staging")
+
+        assert observe_child(binding, "", ".#~tx01.e1.staging").present is False
+
+
+@pytest.mark.parametrize(
+    "leaf", ["", "a/b", ".", "..", "/"], ids=["empty", "separator", "dot", "dotdot", "slash"]
+)
+def test_observe_child_refuses_a_leaf_that_is_not_one_component(ext4_bound_volume, leaf):
+    from atoms.fs.resolve import observe_child
+
+    with ext4_bound_volume() as binding, pytest.raises(ProtocolError) as caught:
+        observe_child(binding, "", leaf)
+
+    assert "single non-dot path component" in str(caught.value)
+
+
+def test_observe_child_refuses_a_vanished_parent(ext4_bound_volume):
+    from atoms.fs.resolve import observe_child
+
+    with ext4_bound_volume() as binding, pytest.raises(PreconditionRefused) as caught:
+        observe_child(binding, "gone", "leaf")
+
+    assert "gone" in str(caught.value)
+
+
+def test_observe_work_child_reads_the_engine_owned_work_base(ext4_bound_volume):
+    from atoms.fs.resolve import PathResolver, observe_work_child
+
+    with ext4_bound_volume() as binding:
+        expected = PathResolver(binding).work_base_facts()
+
+        observed = observe_work_child(binding, "tx01")
+
+        assert observed.present is False
+        assert observed.parent_identity == expected.identity
+        assert observed.parent_constraints == expected.constraints
+
+
+def test_observe_child_does_not_close_the_borrowed_root(ext4_bound_volume):
+    from atoms.fs.resolve import observe_child
+
+    with ext4_bound_volume() as binding:
+        before = os.fstat(binding.project_root_fd)
+        observe_child(binding, "", "nothing-here")
+        assert os.fstat(binding.project_root_fd) == before

@@ -27,6 +27,9 @@ from atoms.fs.lookup import DirectoryConstraints, LookupProof, read_lookup_const
 from atoms.fs.volume import read_mount_id
 
 _LINUX = "linux"
+_NAMESPACE_CONTRADICTIONS = frozenset(
+    {errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.EXDEV}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +45,56 @@ class FilesystemIdentity:
 class DirectoryFacts:
     identity: FilesystemIdentity
     constraints: DirectoryConstraints
+
+
+@dataclass(frozen=True, slots=True)
+class ChildObservation:
+    """One open parent answers both questions design §6.4 asks of it.
+
+    `DirectoryConstraints` already bundles `lookup_proof` and `name_max`, so a single
+    comparison against an approved directory covers identity, `LookupProof`, and
+    `NAME_MAX` together.
+    """
+
+    parent_identity: FilesystemIdentity
+    parent_constraints: DirectoryConstraints
+    present: bool
+
+
+def _require_leaf(leaf: str) -> None:
+    if type(leaf) is not str or not leaf or "/" in leaf or leaf in {".", ".."}:
+        raise ProtocolError(
+            f"leaf {leaf!r} must be a single non-dot path component; it is never "
+            "split, because a scratch leaf aliases the reserved sigil and the path "
+            "grammar would refuse it"
+        )
+
+
+def _filesystem_type(binding: ProjectBinding) -> str:
+    configuration = binding.evidence.configuration
+    if configuration.backend_id != _LINUX:
+        raise CapabilityUnavailable(
+            f"backend {configuration.backend_id!r} is not {_LINUX!r}; lookup "
+            "constraints are read with Linux ext4 flag semantics"
+        )
+    return configuration.filesystem_type
+
+
+def _observe_open_child(
+    parent_fd: int, filesystem_type: str, leaf: str
+) -> ChildObservation:
+    """Both observers' shared core. The descriptor is borrowed, never closed here."""
+    identity = _identity(os.fstat(parent_fd))
+    constraints = read_lookup_constraints(parent_fd, filesystem_type)
+    try:
+        os.lstat(leaf, dir_fd=parent_fd)
+    except FileNotFoundError:
+        present = False
+    else:
+        present = True
+    return ChildObservation(
+        parent_identity=identity, parent_constraints=constraints, present=present
+    )
 
 
 class EntryKind(Enum):
@@ -141,9 +194,6 @@ class PathResolver:
     )
 
     _OBSERVE_FLAGS = os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC
-    _NAMESPACE_CONTRADICTIONS = frozenset(
-        {errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.EXDEV}
-    )
 
     def __init__(self, binding: ProjectBinding) -> None:
         # Both live resources precede `evidence`, a detached value whose property
@@ -204,7 +254,7 @@ class PathResolver:
         try:
             fd = backend.open_child_directory(parent_fd, WORK_DIRECTORY)
         except OSError as caught:
-            if caught.errno in self._NAMESPACE_CONTRADICTIONS:
+            if caught.errno in _NAMESPACE_CONTRADICTIONS:
                 raise ProtocolError(
                     f"engine-owned metadata_root/{WORK_DIRECTORY} is missing or "
                     f"malformed: {caught}"
@@ -410,3 +460,91 @@ class PathResolver:
         finally:
             close_all((fd,))
         return PresentFrontier(identity, _entry_kind(info.st_mode))
+
+
+def _open_project_relative(
+    binding: ProjectBinding, parent_path: str
+) -> tuple[int, bool]:
+    """A descriptor for one project-relative directory, and whether the caller owns it.
+
+    `""` is the project root, whose descriptor the binding owns; returning it with
+    `owned=False` is what stops this function from closing a resource it borrowed.
+    """
+    root_fd = binding.project_root_fd
+    if parent_path == "":
+        return root_fd, False
+    try:
+        require_rel_path("parent_path", parent_path)
+    except SpecValidationError as caught:
+        raise ProtocolError(
+            f"observe_child requires a well-formed project-relative parent: {caught}"
+        ) from caught
+
+    backend = binding.backend
+    parent_fd = root_fd
+    owned: int | None = None
+    try:
+        for component in parent_path.split("/"):
+            try:
+                child = backend.open_child_directory(parent_fd, component)
+            except OSError as caught:
+                if caught.errno in _NAMESPACE_CONTRADICTIONS:
+                    raise PreconditionRefused(
+                        f"the approved parent {parent_path!r} no longer resolves at "
+                        f"component {component!r}: {caught}"
+                    ) from caught
+                raise
+            # Reassign before releasing, so a failing close cannot strand `child`.
+            previous, owned = owned, child
+            parent_fd = child
+            if previous is not None:
+                close_all((previous,))
+    except BaseException:
+        if owned is not None:
+            close_all((owned,))
+        raise
+    return parent_fd, True
+
+
+def observe_child(
+    binding: ProjectBinding, parent_path: str, leaf: str
+) -> ChildObservation:
+    """Observe one named child of one project-relative parent.
+
+    `parent_path` is project-relative throughout; the project root is `""`. The leaf is
+    not a path and is never split.
+    """
+    _require_leaf(leaf)
+    filesystem_type = _filesystem_type(binding)
+    parent_fd, owned = _open_project_relative(binding, parent_path)
+    try:
+        return _observe_open_child(parent_fd, filesystem_type, leaf)
+    finally:
+        if owned:
+            close_all((parent_fd,))
+
+
+def observe_work_child(binding: ProjectBinding, leaf: str) -> ChildObservation:
+    """Observe one named child of engine-owned `metadata_root/work`.
+
+    Ledger #19's mechanism for the `WorkRoot` branch: the returned parent facts are the
+    same pair `PathResolver.work_base_facts()` recorded in `ApprovedWorkBase`, so the
+    coordinator compares like with like. A separate entry point from `observe_child`
+    because this is the metadata namespace, where project containment does not apply.
+    """
+    _require_leaf(leaf)
+    filesystem_type = _filesystem_type(binding)
+    backend = binding.backend
+    try:
+        fd = backend.open_child_directory(binding.metadata_root_fd, WORK_DIRECTORY)
+    except OSError as caught:
+        if caught.errno in _NAMESPACE_CONTRADICTIONS:
+            raise ProtocolError(
+                f"engine-owned metadata_root/{WORK_DIRECTORY} is missing or "
+                f"malformed: {caught}"
+            ) from caught
+        raise
+    try:
+        return _observe_open_child(fd, filesystem_type, leaf)
+    finally:
+        close_all((fd,))
