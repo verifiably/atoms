@@ -5,7 +5,7 @@ from __future__ import annotations
 import contextlib
 from collections.abc import Iterator
 
-from atoms.coordinator.lease import Lease
+from atoms.coordinator.lease import Lease, _reclaim_orphans
 from atoms.fs.backend import Backend
 from atoms.fs.binding import bind_project_volume
 from atoms.fs.bootstrap import reclaim_probe_survivors
@@ -36,4 +36,8 @@ def _recovery_lease(
         with bind_project_volume(
             project_root, lock, allowlist=CERTIFIED_ALLOWLIST, storage=storage
         ) as binding, open_store(binding) as store:
+            # Reclamation precedes resolution: orphans are unreferenced by definition,
+            # and #23 says "at every lease entry", which holds only if it runs even
+            # when resolution then refuses, halts, or traps.
+            _reclaim_orphans(store)
             yield Lease(_binding=binding, _store=store)
