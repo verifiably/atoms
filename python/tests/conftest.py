@@ -549,6 +549,61 @@ def store_on(ext4_volume, ext4_project_root, test_storage_profile):
 
 
 @pytest.fixture
+def coordinator_on(ext4_volume, ext4_project_root, test_storage_profile):
+    """The raw ingredients `_recovery_lease` builds its own stack from.
+
+    Unlike `store_on`, this fixture binds nothing: the lease owns lock acquisition,
+    probe reclamation, binding, and store opening, and a fixture that pre-bound them
+    would leave four of the six entry-order steps unexercised. Each call names a fresh
+    metadata root under the same ext4 volume, so two calls model two projects rather
+    than a restart of one.
+    """
+    counter = itertools.count()
+
+    def ingredients():
+        from atoms.fs.linux import LinuxBackend
+
+        metadata_root = ext4_volume / f"coordinator-metadata-{next(counter)}"
+        return (
+            LinuxBackend(),
+            str(ext4_project_root),
+            str(metadata_root),
+            test_storage_profile,
+        )
+
+    return ingredients
+
+
+@pytest.fixture
+def leased(coordinator_on, monkeypatch):
+    """An entered production lease, with `CERTIFIED_ALLOWLIST` patched for the volume.
+
+    The constant ships empty and production binding fails closed, so every test drives
+    the real composition root with the module attribute replaced. Patching the constant
+    rather than threading a parameter keeps `root.py` the single bind call site that
+    ledger #18 asserts over; a test-only allowlist parameter would create a second one.
+    """
+    import contextlib
+
+    from atoms.coordinator import root
+    from atoms.fs.lock import acquire_project_lock
+    from tests.fs_support import build_test_allowlist
+
+    @contextlib.contextmanager
+    def enter(ingredients=None):
+        backend, project_root, metadata_root, storage = ingredients or coordinator_on()
+        with acquire_project_lock(backend, metadata_root) as probe:
+            allowlist = build_test_allowlist(probe, project_root, storage)
+        monkeypatch.setattr(root, "CERTIFIED_ALLOWLIST", allowlist)
+        with root._recovery_lease(
+            backend, project_root, metadata_root, storage
+        ) as lease:
+            yield lease
+
+    return enter
+
+
+@pytest.fixture
 def opened_store(store_on):
     """A live Store over a fresh ext4 project, closed on exit."""
     from atoms.store.connection import open_store
