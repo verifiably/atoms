@@ -50,6 +50,7 @@ implementation, stop and report it — do not adapt around it silently.**
 | `coherence_findings` compares a stored `HaltDiagnostic`'s `commit_decision` and `journals` against the durable rows, and **nothing else** — not `paths`, not `pre_halt_state`. `matching_diagnostic("e1")` is therefore committable against the `d/f.txt` record. | `records.py:484-492` |
 | No coherence rule couples a journal state to the transaction state, so a journal row may be advanced independently of the record's state. | `records.py:455-500` |
 | `HeldProjectLock._lock_fd` holds the `flock`. `os.dup` of it shares the open file description, so the lock survives the original's close — the one-line mutation that leaks the lock. | `lock.py:145-153` |
+| A test whose setup enters `_recovery_lease` runs any mutation placed in that function **twice**. Ungated, Task 3 Step 8's mutations 1–3 fire before the `before` snapshot and 5 deadlocks the suite against its own blocking `flock`. Gate every one on `if store.read_active() is not None:`. | Task 3 execution, 2026-08-02 |
 | `coherence_findings` requires a `blob` row for every referenced digest, and requires `rollback_result` present exactly when `ROLLED_BACK` and `halt_diagnostic` present exactly when `HALTED`. | `records.py:472-483` |
 | For `CreateFileNoClobber("e1", "d/f.txt")` with `d` existing: parent node is `TopologyDirectory(node_id=0)` (**not** `PersistentNode`), scratch leaf is `.#~<txid>.e1.staging`, `work_base` is `None`. | probe, 2026-08-02 |
 | For `CreateDirectory("e1", "d")` + `CreateFileNoClobber("e2", "d/f.txt")`: `directories` holds `ApprovedExistingDirectory(ProjectRoot())`, `ApprovedPlannedDirectory(PersistentNode('d'))`, `ApprovedPlannedDirectory(WorkRoot())`; `work_base` is populated. All three §6.4 branches come from this one spec. | probe, 2026-08-02 |
@@ -973,7 +974,17 @@ Add `import hashlib` and `import stat` to the module's import block.
 all three tests fail at `pytest.raises` before reaching a single property assertion, which proves only
 that the trap exists — something the earlier tests already prove. Each mutation below is inserted into
 `_recovery_lease` immediately **before** `_resolve(store)`, where `binding` and `lock` are both in
-scope, so the trap still raises and the property is the only thing that changes:
+scope, so the trap still raises and the property is the only thing that changes.
+
+**Every mutation must be gated on `if store.read_active() is not None:` and indented under it.**
+Measured 2026-08-02, the hard way: `_trapping_lease` reaches its live record by entering
+`_recovery_lease` itself, so an ungated mutation fires **twice** — once during setup, before `before` is
+sampled, and once at the measured entry. Ungated, mutations 1 and 2 failed *nothing* (the setup entry
+had already made the change, so the snapshot contained it), mutation 3 failed all three tests on a
+`FileNotFoundError` because `d/` does not exist yet at the setup entry, and mutation 5 **deadlocked the
+suite** — its setup-entry `os.dup(lock._lock_fd)` held the `flock` into the measured entry's blocking
+`flock(LOCK_EX)`. The gate is the trap's own condition, and the setup entry has no active record yet, so
+it fires exactly when the trap does. With it, all five behave as tabulated.
 
 | # | Mutation | Must fail | Must still pass |
 | --- | --- | --- | --- |
