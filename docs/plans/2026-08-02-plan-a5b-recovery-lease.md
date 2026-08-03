@@ -1670,13 +1670,25 @@ def create_the_planned_directory(lease: Lease, approved: ProjectApprovedSpec) ->
 def replace_the_parent_directory(lease: Lease, approved: ProjectApprovedSpec) -> None:
     """Give the approved scratch parent a new inode at the same path.
 
-    Removing and recreating is the cheapest way to change `st_ino` while leaving the
-    spelling identical, which is precisely the drift ledger #19 names.
+    Measured 2026-08-02 on the ext4 test volume: rmdir followed by mkdir returns the
+    *same* `st_ino` every time, because the inode is freed and immediately reallocated.
+    Five cycles in a row all reported 60705148, so the obvious spelling of this helper
+    leaves identity unchanged and `test_a_moved_scratch_parent_refuses_naming_identity`
+    fails with `DID NOT RAISE`. The replacement is therefore built beside `d` while `d`
+    still holds its inode -- which forces a distinct one -- and then renamed over the
+    emptied name. The spelling is identical either way; only the identity moves, which
+    is precisely the drift ledger #19 names. The assert is what keeps a future inode
+    allocator from making this test vacuous instead of failing.
     """
     _ = approved
     root_fd = lease._binding.project_root_fd
+    before = os.stat("d", dir_fd=root_fd).st_ino
+    os.mkdir("d.replacement", dir_fd=root_fd)
     os.rmdir("d", dir_fd=root_fd)
-    os.mkdir("d", dir_fd=root_fd)
+    os.rename("d.replacement", "d", src_dir_fd=root_fd, dst_dir_fd=root_fd)
+    assert os.stat("d", dir_fd=root_fd).st_ino != before, (
+        "the replacement reused the original inode, so the test would pass vacuously"
+    )
 
 
 def occupy_the_scratch_leaf(lease: Lease, approved: ProjectApprovedSpec) -> str:
@@ -2038,9 +2050,17 @@ def _parent_paths(approved: ProjectApprovedSpec) -> dict[TopologyNode, str]:
 
 
 def _parent_path(mapping: dict[TopologyNode, str], node: object) -> str:
-    if node not in mapping:
-        raise ProtocolError(f"no parent path for topology node {node!r}")
-    return mapping[node]
+    """`node` stays `object` so the unmapped-node test can pass a bare `object()`.
+
+    Scanned rather than indexed: `dict.__contains__` accepts `object` but
+    `dict.__getitem__` does not, and pyright does not narrow `object` to `TopologyNode`
+    from a `not in` test, so `return mapping[node]` after the guard is a
+    reportArgumentType error. The map holds at most four entries.
+    """
+    for candidate, path in mapping.items():
+        if candidate == node:
+            return path
+    raise ProtocolError(f"no parent path for topology node {node!r}")
 
 
 def _approved_path_for(approved: ProjectApprovedSpec, path: str) -> ApprovedPath:
