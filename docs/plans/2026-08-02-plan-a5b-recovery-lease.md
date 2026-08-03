@@ -119,13 +119,20 @@ The four measured plans, verbatim:
 - **No raw `os.fsync`.** Every durability barrier goes through `Backend.flush_file` or
   `Backend.flush_directory`.
 - **No blanket `OSError` handler** and **no `except sqlite3.Error`**, extending A5a's guards.
-- **Two tests are expected to fail from Task 1 until Task 9, and only these two.** Both assert the
-  coordinator does not exist yet, which Task 1 makes false:
-  `test_fs_architecture.py::test_no_production_caller_of_bind_exists_yet` and
-  `test_store_architecture.py::test_no_production_module_outside_the_package_imports_the_store`.
-  Task 9 Step 1 retires both. Until then, a task's `uv run pytest -q` gate is clean **when these two
-  are the only failures** — check the names, not just the count, and report any third failure rather
-  than absorbing it into this allowance.
+- **Three tests are expected to fail before Task 9 retires them, and only these three.** Each asserts
+  that some part of the coordinator does not exist yet, and each is falsified by the task named:
+
+  | Guard | Red from | Retired by |
+  | --- | --- | --- |
+  | `test_fs_architecture.py::test_no_production_caller_of_bind_exists_yet` | Task 1 | Task 9 Step 1 |
+  | `test_store_architecture.py::test_no_production_module_outside_the_package_imports_the_store` | Task 1 | Task 9 Step 1 |
+  | `test_fs_architecture.py::test_no_consumer_of_the_approved_spec_exists_yet` | **Task 5** | Task 9 Step 2 |
+
+  The third scans all of `src/atoms/` for any mention of `ProjectApprovedSpec`, and `admission.py` is
+  necessarily its first production consumer; its own docstring already says it is replaced when A5
+  lands. Until Task 9, a task's `uv run pytest -q` gate is clean **when the failures are a subset of
+  these three** — check the names, not just the count, and report any other failure rather than
+  absorbing it into this allowance. Do not touch either guard file before Task 9.
 - Filepaths in docs and comments use `~/d/atoms/...`.
 - Conventional commits. No AI-attribution trailer or footer.
 
@@ -3498,6 +3505,10 @@ where they are retired:
 Delete the second one outright: Step 3's replacement scans the same population with the coordinator
 exemption the DAG now requires, and keeping a second copy of the same scan with a stale exemption set is
 how two guards drift apart. Say in the task report that it was removed and by what.
+
+A **third** guard, `test_no_consumer_of_the_approved_spec_exists_yet`, has been red since Task 5 landed
+`admission.py` — the first production consumer of `ProjectApprovedSpec`. Step 2 below replaces it. All
+three are retired by the end of this task and the suite must be fully green at Step 8.
 
 For the first, replace `test_no_production_caller_of_bind_exists_yet` in
 `tests/test_fs_architecture.py`. **Do not delete it** — it is replaced, not removed. The scanner
