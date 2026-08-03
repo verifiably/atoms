@@ -18,7 +18,9 @@ from atoms.core.fingerprint import ABSENT, DirectoryState
 from atoms.core.recovery import ScratchRole
 from atoms.core.spec import TransactionSpec, build_spec
 from atoms.fs.approval import ProjectApprovedSpec
-from tests.store_support import file_state
+from atoms.store.blobs import StagedBlob
+from atoms.store.workspace import Workspace
+from tests.store_support import digest_of, file_state, stage
 
 AFTER = b"after"
 POST = file_state(AFTER)
@@ -97,6 +99,38 @@ def admission_for(lease: Lease) -> ProjectApprovedSpec:
     from atoms.coordinator.admission import admit
 
     return admit(lease, compiled_for(lease))
+
+
+def stage_manifest(
+    workspace: Workspace, contents: tuple[bytes, ...] = (AFTER,)
+) -> tuple[StagedBlob, ...]:
+    """Stage each content through the workspace and describe it for promotion.
+
+    A5a's coherence barrier requires a `blob` row for every digest the record
+    references, so a spec whose final surface names a file cannot be published without
+    this.
+    """
+    manifest = []
+    for index, content in enumerate(contents):
+        name = f"blob-{index}"
+        stage(workspace, name, content)
+        manifest.append(
+            StagedBlob(name=name, digest=digest_of(content), byte_len=len(content))
+        )
+    return tuple(manifest)
+
+
+def prepared(lease: Lease) -> ProjectApprovedSpec:
+    """An admitted, prepared, published transaction with its workspace released."""
+    from atoms.coordinator.prepare import open_workspace, prepare_transaction
+
+    approved = admission_for(lease)
+    workspace = open_workspace(lease, approved)
+    try:
+        prepare_transaction(lease, approved, workspace, stage_manifest(workspace))
+    finally:
+        workspace.close()
+    return approved
 
 
 def create_the_planned_directory(lease: Lease, approved: ProjectApprovedSpec) -> None:
