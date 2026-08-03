@@ -2,12 +2,26 @@
 
 from __future__ import annotations
 
+import contextlib
 import secrets
+from collections.abc import Iterator
 
 from atoms.coordinator.lease import Lease
 from atoms.core.compiler import CompiledSpec
-from atoms.core.errors import PreconditionRefused, ProtocolError
+from atoms.core.errors import (
+    CapabilityUnavailable,
+    PreconditionRefused,
+    ProjectApprovalRefused,
+    ProtocolError,
+)
+from atoms.core.recovery import PersistentNode, ProjectRoot, TopologyNode, WorkRoot
 from atoms.fs.approval import ProjectApprovedSpec, ProjectContext, approve_for_project
+from atoms.fs.resolve import ChildObservation, observe_child, observe_work_child
+from atoms.fs.topology import (
+    ApprovedExistingDirectory,
+    ApprovedPath,
+    ApprovedPlannedDirectory,
+)
 
 #: Design §6.3. A constant so a test can drive the loop to exhaustion; an unbounded
 #: loop would have no reachable refusal to test.
@@ -71,11 +85,189 @@ def admit(lease: Lease, compiled: CompiledSpec) -> ProjectApprovedSpec:
     )
 
 
-def _occupied_scratch(lease: Lease, approved: ProjectApprovedSpec) -> tuple[str, ...]:
-    """Task 6 fills this in.
+def _parent_paths(approved: ProjectApprovedSpec) -> dict[TopologyNode, str]:
+    """Design §6.4's node-to-path table, for the project-space branches only.
 
-    Returning `()` here means Task 5's tests exercise the durable-record path only,
-    which is exactly what they assert.
+    Every scratch leaf shares its target's parent, and that target is itself an
+    `ApprovedPath`, so the second assignment is what makes this table total: a parent
+    node's path is its child's path minus the child's leaf. `WorkRoot` is deliberately
+    absent -- it is metadata space and has its own branch.
+
+    Measured: the parent of `d/f.txt` under an existing `d` is
+    `TopologyDirectory(node_id=0)`, which no other rule would name.
     """
-    _ = (lease, approved)
-    return ()
+    mapping: dict[TopologyNode, str] = {ProjectRoot(): ""}
+    for entry in approved.paths:
+        mapping[PersistentNode(path=entry.path)] = entry.path
+        mapping[entry.parent_node] = entry.path.removesuffix(entry.leaf).rstrip("/")
+    return mapping
+
+
+def _parent_path(mapping: dict[TopologyNode, str], node: object) -> str:
+    for candidate, path in mapping.items():
+        if candidate == node:
+            return path
+    raise ProtocolError(f"no parent path for topology node {node!r}")
+
+
+def _approved_path_for(approved: ProjectApprovedSpec, path: str) -> ApprovedPath:
+    for entry in approved.paths:
+        if entry.path == path:
+            return entry
+    raise ProtocolError(
+        f"the proof declares no path {path!r}; a planned parent must be declared to "
+        "have been approved as planned"
+    )
+
+
+def _require_matches_approval(
+    observed: ChildObservation, entry: object, label: str
+) -> None:
+    """Ledger #19: the proof is the expected baseline, never current authority."""
+    if type(entry) is not ApprovedExistingDirectory:
+        raise ProtocolError(
+            f"parent {label!r} is not approved as an existing directory; the proof "
+            f"carries {type(entry).__name__}"
+        )
+    if observed.parent_identity != entry.identity:
+        raise PreconditionRefused(
+            f"parent {label!r} changed identity since approval: approved "
+            f"{entry.identity}, observed {observed.parent_identity}"
+        )
+    if observed.parent_constraints != entry.constraints:
+        raise PreconditionRefused(
+            f"parent {label!r} changed lookup constraints since approval: approved "
+            f"{entry.constraints}, observed {observed.parent_constraints}"
+        )
+
+
+def _require_planned_absent(
+    lease: Lease,
+    approved: ProjectApprovedSpec,
+    mapping: dict[TopologyNode, str],
+    directories: dict[TopologyNode, object],
+    node: TopologyNode,
+) -> None:
+    """Design §6.4 branch two.
+
+    An `ApprovedPlannedDirectory` carries constraints but no identity, because the
+    directory did not exist when the proof was issued. If it exists now there is
+    nothing to compare it against, so this refuses rather than observing it as a
+    parent. It observes the planned directory only as a *child* of its own parent, and
+    recurses when that parent is planned too: only the outermost planned ancestor has
+    an existing parent whose identity can be checked, and an absent ancestor makes
+    everything beneath it absent as well.
+    """
+    path = _parent_path(mapping, node)
+    declared = _approved_path_for(approved, path)
+    grandparent = directories.get(declared.parent_node)
+    if type(grandparent) is ApprovedPlannedDirectory:
+        _require_planned_absent(
+            lease, approved, mapping, directories, declared.parent_node
+        )
+        return
+
+    grandparent_path = _parent_path(mapping, declared.parent_node)
+    observed = observe_child(lease._binding, grandparent_path, declared.leaf)
+    _require_matches_approval(observed, grandparent, grandparent_path or ".")
+    if observed.present:
+        raise PreconditionRefused(
+            f"the planned parent directory {path!r} exists now but was absent when the "
+            "proof was issued; a planned directory has no approved identity, so its "
+            "lookup relation cannot be compared against anything"
+        )
+
+
+def _observe_work_slot(lease: Lease, approved: ProjectApprovedSpec) -> bool:
+    """Ledger #19 for metadata space: re-resolve `work/` against `approved.work_base`.
+
+    Returns whether `work/<txid>` is present. Identity or constraint drift raises
+    instead: a moved work base is not something a fresh txid would fix, so it must not
+    feed the regeneration loop.
+    """
+    base = approved.work_base
+    if base is None:
+        raise ProtocolError(
+            "the proof carries no approved work base, so the work-root branch has no "
+            "baseline to re-resolve against"
+        )
+    observed = observe_work_child(lease._binding, approved.txid)
+    if observed.parent_identity != base.identity:
+        raise PreconditionRefused(
+            f"metadata_root/work changed identity since approval: approved "
+            f"{base.identity}, observed {observed.parent_identity}"
+        )
+    if observed.parent_constraints != base.constraints:
+        raise PreconditionRefused(
+            f"metadata_root/work changed lookup constraints since approval: approved "
+            f"{base.constraints}, observed {observed.parent_constraints}"
+        )
+    return observed.present
+
+
+def _require_work_slot_free(lease: Lease, approved: ProjectApprovedSpec) -> None:
+    """The same re-resolution, at a point where the txid is already fixed.
+
+    Preparation cannot regenerate, so an occupied slot is a refusal there rather than a
+    reason to try again.
+    """
+    if _observe_work_slot(lease, approved):
+        raise PreconditionRefused(
+            f"work/{approved.txid} already exists; this transaction's engine-derived "
+            "work directory is occupied by pre-existing state"
+        )
+
+
+def _occupied_scratch(lease: Lease, approved: ProjectApprovedSpec) -> tuple[str, ...]:
+    """Design §6.4. The proof is the expected baseline and never current authority."""
+    mapping = _parent_paths(approved)
+    directories: dict[TopologyNode, object] = {
+        entry.node: entry for entry in approved.directories
+    }
+    occupied: list[str] = []
+
+    with _translated_resolution():
+        # Every WORK scratch leaf lives inside work/<txid>, which create_workspace has
+        # not made yet, so the slot's own presence is the whole question -- and asking
+        # once avoids naming it twice for a spec with two created directories.
+        if approved.work_base is not None and _observe_work_slot(lease, approved):
+            occupied.append(f"work/{approved.txid}")
+
+        for scratch in approved.scratch:
+            if scratch.parent_node == WorkRoot():
+                continue
+
+            entry = directories.get(scratch.parent_node)
+            if type(entry) is ApprovedPlannedDirectory:
+                _require_planned_absent(
+                    lease, approved, mapping, directories, scratch.parent_node
+                )
+                continue
+
+            parent_path = _parent_path(mapping, scratch.parent_node)
+            observed = observe_child(lease._binding, parent_path, scratch.leaf)
+            _require_matches_approval(observed, entry, parent_path or ".")
+            if observed.present:
+                occupied.append(f"{parent_path}/{scratch.leaf}".lstrip("/"))
+
+    return tuple(occupied)
+
+
+@contextlib.contextmanager
+def _translated_resolution() -> Iterator[None]:
+    """Design §6.4.
+
+    `resolve.py` raises `ProjectApprovalRefused` and `CapabilityUnavailable` -- correct
+    at approval time, wrong afterwards. A post-approval divergence is drift, and §9
+    requires `PreconditionRefused`. Stated categorically over the refusal types the
+    resolver declares, so it cannot drift as `resolve.py` grows, and it never wraps
+    `approve_for_project`, whose refusals are genuine. `PreconditionRefused` and
+    `ProtocolError` pass through untouched: the first is already the right type, and
+    the second names an engine bug that must not be recoloured as external state.
+    """
+    try:
+        yield
+    except (ProjectApprovalRefused, CapabilityUnavailable) as exc:
+        raise PreconditionRefused(
+            f"post-approval drift during re-resolution: {exc}"
+        ) from exc

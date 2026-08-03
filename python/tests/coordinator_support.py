@@ -15,7 +15,9 @@ from atoms.core.canonical import canonical_json
 from atoms.core.compiler import CompiledSpec, compile_spec
 from atoms.core.effects import CreateDirectory, CreateFileNoClobber
 from atoms.core.fingerprint import ABSENT, DirectoryState
+from atoms.core.recovery import ScratchRole
 from atoms.core.spec import TransactionSpec, build_spec
+from atoms.fs.approval import ProjectApprovedSpec
 from tests.store_support import file_state
 
 AFTER = b"after"
@@ -89,3 +91,52 @@ def compiled_creating_a_directory(lease: Lease) -> CompiledSpec:
     """`d` must NOT exist: A4b approves it as planned only while it is absent."""
     _ = lease
     return compile_spec(directory_spec())
+
+
+def admission_for(lease: Lease) -> ProjectApprovedSpec:
+    from atoms.coordinator.admission import admit
+
+    return admit(lease, compiled_for(lease))
+
+
+def create_the_planned_directory(lease: Lease, approved: ProjectApprovedSpec) -> None:
+    """Make an ApprovedPlannedDirectory exist after its proof was issued."""
+    _ = approved
+    os.mkdir("d", dir_fd=lease._binding.project_root_fd)
+
+
+def replace_the_parent_directory(lease: Lease, approved: ProjectApprovedSpec) -> None:
+    """Give the approved scratch parent a new inode at the same path.
+
+    Measured on the ext4 test volume: rmdir followed by mkdir returns the *same*
+    `st_ino` every time, because the inode is freed and immediately reallocated. So the
+    replacement is built beside `d` while `d` still holds its inode -- which forces a
+    distinct one -- and then renamed over the emptied name. The spelling is identical
+    either way; only the identity moves, which is precisely the drift ledger #19 names.
+    """
+    _ = approved
+    root_fd = lease._binding.project_root_fd
+    before = os.stat("d", dir_fd=root_fd).st_ino
+    os.mkdir("d.replacement", dir_fd=root_fd)
+    os.rmdir("d", dir_fd=root_fd)
+    os.rename("d.replacement", "d", src_dir_fd=root_fd, dst_dir_fd=root_fd)
+    assert os.stat("d", dir_fd=root_fd).st_ino != before, (
+        "the replacement reused the original inode, so the test would pass vacuously"
+    )
+
+
+def occupy_the_scratch_leaf(lease: Lease, approved: ProjectApprovedSpec) -> str:
+    """Create the file the proof's staging leaf names, and return its relative path."""
+    scratch = next(
+        entry for entry in approved.scratch if entry.role is ScratchRole.STAGING
+    )
+    relative = f"d/{scratch.leaf}"
+    os.close(
+        os.open(
+            relative,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+            0o600,
+            dir_fd=lease._binding.project_root_fd,
+        )
+    )
+    return relative
