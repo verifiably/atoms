@@ -1674,6 +1674,31 @@ remains an explicit consumer policy, never an assumed cleanup. And the spec alre
 tag and frozen-intent digest (§5.1), persisted in the durable record, so a recovery-completed publish
 remains attributable to the intent that authorized it.
 
+**Designed 2026-08-03** (science's `2026-08-03-tamper-evident-log-design.md`; its §9 enumerates the
+engine obligations, restated here so this document carries its own contract). The engine owns
+registration — a per-engine-root hash chain at a reserved in-corpus path — and the obligations land
+with A6–A8, not before:
+
+1. **Pinned registration order, idempotent under recovery.** Durable `PREPARED` → durable
+   `registered(txid, …)` chain entry → the transaction record durably stores the entry digest → first
+   apply. Recovery finding a `PREPARED` transaction with an entry already appended appends **no second
+   registration** — one registration per transaction id.
+2. **Settlement is the completion barrier, both arms.** Durable terminal decision → durable
+   `settled(committed | rolled-back)` append (ids must match the registration) → the transaction
+   record durably binds the settlement digest — the acknowledgement — and only then is the terminal
+   outcome returned and the lease released, for commit and rollback alike. Recovery backfills the
+   binding; exactly one settlement per registration.
+3. **Genesis carries a baseline.** Registering a root mints the chain genesis committing a baseline —
+   sorted typed path/state fingerprints of the registered surface at registration — so pre-log history
+   is reachable once anchored.
+4. **The intent API is serialized and durable before return.** A consumer-authored intent entry is
+   appended under the root's lease, durably, before the call returns its digest; the engine carries a
+   boundary-supplied `fulfills` reference opaquely into the fulfilling transaction's registered entry.
+5. **Terminal-record GC gates on settlement.** A terminal record is collectible only after its
+   settlement entry is appended and bound (extending §7.5's explicit-consumer-policy rule).
+6. **The log path is engine bookkeeping.** Appending the chain is not itself a registered mutation,
+   and the log path sits outside the registered surface.
+
 ## 16. Acceptance criteria
 
 The architecture is complete when:
