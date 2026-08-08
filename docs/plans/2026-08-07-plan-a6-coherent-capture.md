@@ -45,6 +45,8 @@ implementation, stop and report it — do not adapt around it silently.**
 | `_parent_paths` for that spec is `{ProjectRoot(): '', PersistentNode('d/f.txt'): 'd/f.txt', TopologyDirectory(0): 'd'}`. **No `ScratchNode` and no `WorkRoot` key.** | probe, 2026-08-07 |
 | For `CreateDirectory("e1","d")` + `CreateFileNoClobber("e2","d/f.txt")`: `directories` is `ApprovedExistingDirectory(ProjectRoot())`, `ApprovedPlannedDirectory(PersistentNode('d'))`, `ApprovedPlannedDirectory(WorkRoot())`; `work_base` populated; `_parent_paths` is `{ProjectRoot(): '', PersistentNode('d'): 'd', PersistentNode('d/f.txt'): 'd/f.txt'}`. | probe, 2026-08-07 |
 | In that spec `ScratchNode('e2', STAGING)` is parented by `PersistentNode('d')` — **a planned directory**. Its slot is unobservable at capture and absent by construction. | probe, 2026-08-07 |
+| `WorkRoot()`'s approved baseline is `ApprovedPlannedDirectory(WorkRoot(), inherited_constraints(work_base.constraints, filesystem_type))`, recorded in `approved.directories` like every other node's. `approved.work_base` describes `metadata_root/work` — the **parent** of `work/<txid>`, which is what `workspace.work_fd` names. | `approval.py:155`, `topology.py:171-180`, `workspace.py:187` |
+| `authorize_recovery_step` compares `_project_identity_relations`, i.e. pairwise `SAME`/`DIFFERENT` among the observation's own tokens — never a raw token. A **fresh** `Observation` (a new token universe) therefore authorizes correctly, which is what makes ledger #13's fresh-observation contract coherent. | `authorization.py:63-75`, `diagnostics.py:175-202` |
 | `open_child_directory` raises `ENOTDIR` on a regular file, `ELOOP` on a symlink, `ENOENT` on a missing name. **`ENOTDIR` does not distinguish a regular file from a socket, FIFO, or device node**, which is why the plan never maps an errno to a kind. | probe, 2026-08-07 |
 | `os.listdir(fd)` works on a directory descriptor and omits `.` and `..`; a fresh workspace `staging/` lists `[]`. | probe, 2026-08-07 |
 | `backend.flush_file(fd)` succeeds on a **write-only** descriptor. `os.open(name, O_WRONLY\|O_CREAT\|O_EXCL\|O_NOFOLLOW\|O_CLOEXEC, 0o600, dir_fd=staging_fd)` creates mode `0o600`; a second create raises `EEXIST`. | probe, 2026-08-07 |
@@ -1146,6 +1148,7 @@ from atoms.core.recovery.model import ObservedAbsent, ObservedFile, ObservedSyml
 from atoms.core.recovery.snapshot import ProjectRoot, TopologyDirectory, WorkRoot
 from atoms.fs.linux import LinuxBackend
 from atoms.fs.observe import Observation
+from atoms.fs.topology import ApprovedPlannedDirectory
 from tests.capture_support import BEFORE, approved_replace, state_of, write_project_file
 from tests.coordinator_support import compiled_creating_a_directory
 
@@ -1219,6 +1222,32 @@ def test_the_work_root_is_present_only_when_the_topology_has_one(leased):
                 with _table(lease, with_work, workspace, observation) as table:
                     assert with_work.work_base is not None
                     assert table.fd_for(WorkRoot()) == workspace.work_fd
+
+
+def test_the_work_root_baseline_is_its_own_record_not_the_work_base(leased):
+    """`workspace.work_fd` names work/<txid>; `approved.work_base` describes work/.
+
+    A4b records the child as `ApprovedPlannedDirectory(WorkRoot(),
+    inherited_constraints(work_base.constraints, filesystem_type))` -- so the child's
+    approved baseline lives in `approved.directories` like every other node's, and the
+    parent's retained facts are the wrong thing to compare a child descriptor against.
+    On ext4 the two happen to carry the same values, so no behavioural test separates
+    them; this pins the record `validate` must read, and breaks if A4b stops deriving it.
+    """
+    from atoms.coordinator.admission import admit
+    from atoms.fs.lookup import inherited_constraints
+    from atoms.fs.resolve import filesystem_type_of
+
+    with leased() as lease:
+        approved = admit(lease, compiled_creating_a_directory(lease))
+        record = next(
+            entry for entry in approved.directories if entry.node == WorkRoot()
+        )
+        assert type(record) is ApprovedPlannedDirectory
+        assert approved.work_base is not None
+        assert record.constraints == inherited_constraints(
+            approved.work_base.constraints, filesystem_type_of(lease._binding)
+        )
 
 
 def test_a_replaced_directory_refuses_on_identity(leased):
@@ -1559,15 +1588,17 @@ def _build_descriptor_table(
     filesystem_type = filesystem_type_of(binding)
     expected_mount = binding.evidence.mount_id
     paths = _parent_paths(approved)
+    # One map, both kinds. Every descriptor-bearing node has an approved record in
+    # `approved.directories`, including WorkRoot: A4b builds the topology with
+    # ApprovedPlannedDirectory(WorkRoot(), inherited_constraints(work_base.constraints,
+    # filesystem_type)) (`approval.py:155`, `topology.py:180`). `approved.work_base`
+    # describes metadata_root/work -- the PARENT of work/<txid>, which is what
+    # `workspace.work_fd` names -- so it is the wrong baseline to compare against here.
+    directories = {entry.node: entry for entry in approved.directories}
     planned = {
-        entry.node
-        for entry in approved.directories
+        node
+        for node, entry in directories.items()
         if type(entry) is ApprovedPlannedDirectory
-    }
-    existing = {
-        entry.node: entry
-        for entry in approved.directories
-        if type(entry) is ApprovedExistingDirectory
     }
 
     fds: dict[TopologyNode, int] = {}
@@ -1588,28 +1619,27 @@ def _build_descriptor_table(
             raise PreconditionRefused(
                 f"{node!r} is on mount {mount}, not the bound volume's {expected_mount}"
             )
-        baseline = existing.get(node)
-        if baseline is not None:
+        baseline = directories.get(node)
+        if baseline is None:
+            raise ProtocolError(
+                f"{node!r} bears a descriptor but has no record in the proof's approved "
+                "directories; the topology and the approval disagree"
+            )
+        if constraints != baseline.constraints:
+            raise PreconditionRefused(
+                f"{node!r} has constraints {constraints}, not the approved "
+                f"{baseline.constraints}"
+            )
+        # A planned directory has no approved identity -- it did not exist at approval,
+        # so there is nothing to compare an inode against. Constraints and mount are the
+        # whole of its baseline.
+        if type(baseline) is ApprovedExistingDirectory:
             info = os.fstat(fd)
             actual = FilesystemIdentity(device=info.st_dev, inode=info.st_ino)
             if actual != baseline.identity:
                 raise PreconditionRefused(
                     f"{node!r} has identity {actual}, not the approved "
                     f"{baseline.identity}; approval is not reapproved here"
-                )
-            if constraints != baseline.constraints:
-                raise PreconditionRefused(
-                    f"{node!r} has constraints {constraints}, not the approved "
-                    f"{baseline.constraints}"
-                )
-            return
-        # WorkRoot has no approved identity: A4b retained facts about metadata_root/work
-        # as ApprovedWorkBase, not as an ApprovedExistingDirectory.
-        if node == WorkRoot() and approved.work_base is not None:
-            if constraints != approved.work_base.constraints:
-                raise PreconditionRefused(
-                    f"the work root has constraints {constraints}, not the approved "
-                    f"{approved.work_base.constraints}"
                 )
 
     try:
@@ -1629,6 +1659,15 @@ def _build_descriptor_table(
             parent = _parent_of(approved, node)
             parent_fd = fds.get(parent)
             if parent_fd is None:
+                # A parent may lack a descriptor for exactly one reason: it stopped.
+                # `_walk_order` is shallowest-first, so any other absence is a walk-order
+                # defect, and calling it a stop would manufacture an absence inference
+                # out of a bug -- §8's whole basis is a *verified* blocker.
+                if parent not in stopped_nodes:
+                    raise ProtocolError(
+                        f"{node!r} was reached before its parent {parent!r} was opened "
+                        "or stopped; the walk is not visiting parents first"
+                    )
                 stopped_nodes.add(node)
                 continue
             component = _component(paths, parent, node)
@@ -1734,7 +1773,7 @@ def _component(
 - [ ] **Step 6: Run the tests to verify they pass**
 
 Run: `cd python && uv run pytest tests/test_coordinator_descriptors.py -q`
-Expected: PASS, 14 tests.
+Expected: PASS, 15 tests.
 
 - [ ] **Step 7: Run the full gate set**
 
@@ -2767,11 +2806,17 @@ def test_a_scratch_only_observation_authorizes_a_committed_cleanup_step(leased):
     """The committed-cleanup route, driven to an exact verdict.
 
     Ledger #13's contract for this route is specific: after one coherent complete
-    final-surface observation, each fresh authorization observation is *exactly the named
-    retained scratch slot, with empty persistent and occupancy coverage*. A
-    PREPARED/UNCOMMITTED snapshot carrying persistent evidence exercises a different
-    route entirely, and `assert outcome is not None` accepts a `HaltPlan` -- which is the
-    failure this arm exists to catch.
+    final-surface observation, each authorization observation is a *fresh* one covering
+    exactly the named retained scratch slot, with empty persistent and occupancy
+    coverage. A PREPARED/UNCOMMITTED snapshot carrying persistent evidence exercises a
+    different route entirely, and `assert outcome is not None` accepts a `HaltPlan` --
+    which is the failure this arm exists to catch.
+
+    The freshness is load-bearing and is asserted, not assumed: the authorization runs on
+    a second `Observation` -- a new token universe -- taken after classification, while
+    the tombstone is still on disk. Reusing the snapshot's `retained` would authorize
+    against evidence gathered before the plan existed and against an entry that the
+    cleanup has no proof is still there.
     """
     from atoms.core.recovery.plan import PlanDisposition, RemoveScratch
     from atoms.coordinator.descriptors import _build_descriptor_table
@@ -2785,10 +2830,10 @@ def test_a_scratch_only_observation_authorizes_a_committed_cleanup_step(leased):
         approved = approved_superseded(lease)
         tombstone, staging = approved.scratch
         with open_workspace(lease, approved) as workspace:
-            with Observation(LinuxBackend()) as observation:
-                table = _build_descriptor_table(lease, approved, workspace, observation)
+            with Observation(LinuxBackend()) as complete:
+                table = _build_descriptor_table(lease, approved, workspace, complete)
+                root_fd = table.fd_for(tombstone.parent_node)
                 try:
-                    root_fd = table.fd_for(tombstone.parent_node)
                     fd = os.open(
                         tombstone.leaf,
                         os.O_WRONLY | os.O_CREAT | os.O_EXCL,
@@ -2797,52 +2842,69 @@ def test_a_scratch_only_observation_authorizes_a_committed_cleanup_step(leased):
                     )
                     os.write(fd, BEFORE)
                     os.close(fd)
-                    live = observation.observe(root_fd, "a.txt")
-                    retained = observation.observe(root_fd, tombstone.leaf)
-                    consumed = observation.observe(root_fd, staging.leaf)
+                    live = complete.observe(root_fd, "a.txt")
+                    retained = complete.observe(root_fd, tombstone.leaf)
+                    consumed = complete.observe(root_fd, staging.leaf)
+
+                    snapshot = build_recovery_snapshot(
+                        compiled=approved.compiled,
+                        topology=approved.topology,
+                        transaction_state=TransactionState.COMMITTED,
+                        commit_decision=CommitDecision.COMMITTED,
+                        rollback_result=None,
+                        halt_diagnostic=None,
+                        active=True,
+                        journals=(
+                            EffectJournalState("e1", JournalState.DONE),
+                            EffectJournalState("e2", JournalState.DONE),
+                        ),
+                        persistent_observations=(
+                            PersistentObservation("a.txt", live),
+                        ),
+                        scratch_observations=(
+                            ScratchObservation("e1", tombstone.role, retained, None),
+                            ScratchObservation("e2", staging.role, consumed, None),
+                        ),
+                    )
+
+                    assert live.state.content_hash == digest_of(AFTER)
+                    plan = classify_recovery(snapshot)
+                    assert type(plan) is ActionPlan
+                    assert plan.disposition is PlanDisposition.COMMITTED_CLEANUP
+
+                    index, step = next(
+                        (i, s)
+                        for i, s in enumerate(plan.steps)
+                        if type(s) is RemoveScratch
+                    )
+                    assert step.effect_id == "e1"
+
+                    # The fresh pass. Same held descriptor, same name, new tokens.
+                    with Observation(LinuxBackend()) as authorization:
+                        reobserved = authorization.observe(root_fd, tombstone.leaf)
+
+                    # Genuinely a new universe, and genuinely the same entry.
+                    assert reobserved.identity is not retained.identity
+                    assert reobserved.state == retained.state
+
+                    # Exactly the named slot. Empty persistent and occupancy coverage is
+                    # the contract, not an omission. This authorizes because
+                    # `_project_identity_relations` compares pairwise SAME/DIFFERENT
+                    # among the observation's own tokens, never a raw token against the
+                    # snapshot's -- which is what makes a fresh pass admissible at all.
+                    joint = JointObservation(
+                        persistent=(),
+                        scratch=(
+                            ScratchObservation("e1", tombstone.role, reobserved, None),
+                        ),
+                        parent_occupancy=(),
+                    )
+                    outcome = authorize_recovery_step(plan, index, joint)
+
+                    assert type(outcome) is AuthorizedStep
                 finally:
                     os.unlink(tombstone.leaf, dir_fd=root_fd)
                     table.close()
-
-            snapshot = build_recovery_snapshot(
-                compiled=approved.compiled,
-                topology=approved.topology,
-                transaction_state=TransactionState.COMMITTED,
-                commit_decision=CommitDecision.COMMITTED,
-                rollback_result=None,
-                halt_diagnostic=None,
-                active=True,
-                journals=(
-                    EffectJournalState("e1", JournalState.DONE),
-                    EffectJournalState("e2", JournalState.DONE),
-                ),
-                persistent_observations=(PersistentObservation("a.txt", live),),
-                scratch_observations=(
-                    ScratchObservation("e1", tombstone.role, retained, None),
-                    ScratchObservation("e2", staging.role, consumed, None),
-                ),
-            )
-
-    assert live.state.content_hash == digest_of(AFTER)
-    plan = classify_recovery(snapshot)
-    assert type(plan) is ActionPlan
-    assert plan.disposition is PlanDisposition.COMMITTED_CLEANUP
-
-    index, step = next(
-        (i, s) for i, s in enumerate(plan.steps) if type(s) is RemoveScratch
-    )
-    assert step.effect_id == "e1"
-
-    # Exactly the named slot. Empty persistent and occupancy coverage is the contract,
-    # not an omission.
-    joint = JointObservation(
-        persistent=(),
-        scratch=(ScratchObservation("e1", tombstone.role, retained, None),),
-        parent_occupancy=(),
-    )
-    outcome = authorize_recovery_step(plan, index, joint)
-
-    assert type(outcome) is AuthorizedStep
 
 
 def test_a_wrong_mode_staging_directory_is_reported_with_its_actual_mode(leased):
@@ -3179,6 +3241,9 @@ git commit -m "test(fs): whitelist the recovery imports observe.py may make"
 - Modify: `docs/deferred-obligation-ledger.md`
 - Modify: `docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md`
 - Modify: `docs/plans/2026-08-07-a6-coherent-capture-design.md`
+- Modify: `docs/plans/2026-08-02-a5b-recovery-lease-design.md` — its status header still says
+  `"A6–A8 remain unimplemented."`, and `test_a5_status_is_synchronized_across_authority_documents`
+  asserts that string, so it moves with A6 or the suite is red.
 - Modify: `AGENTS.md`, `README.md`
 - Modify: `python/tests/test_store_architecture.py`
 - Modify: `python/tests/test_coordinator_architecture.py`
@@ -3223,21 +3288,85 @@ test**, so both change together.
 1. In `AGENTS.md`, change the A3 paragraph's `"A5 is implemented; A6–A8 remain unimplemented"` to
    `"A5 and A6 are implemented; A7–A8 remain unimplemented"`, and add an A6 paragraph describing
    `atoms/fs/observe.py` and `atoms/coordinator/{descriptors,capture}.py`.
-2. In `docs/plans/2026-08-02-a5b-recovery-lease-design.md`, change its status header's
+2. In `AGENTS.md`, repair the A5 paragraph's justification of the build-stage trap. It currently
+   reads *"Because A6 supplies no observations and A7 no executor yet, a live record at lease entry
+   raises a temporary build-stage trap"* — the first half stops being true here. Measured: the trap
+   is `lease.py:59`'s `if store.read_active() is not None: raise NotImplementedError`, and A6 adds
+   no executor, so the trap **stays** and only its reason narrows. Replace with:
+
+   > Because A7 has no executor yet, a live record at lease entry still raises a temporary
+   > build-stage trap, so #12 and #17 remain at their write and lease halves. A6 discharged the
+   > observation half it was waiting on.
+
+3. In `docs/plans/2026-08-02-a5b-recovery-lease-design.md`, change its status header's
    `"A6–A8 remain unimplemented."` to `"A7–A8 remain unimplemented."` **This document is easy to
    miss:** `test_a5_status_is_synchronized_across_authority_documents` reads it as its second half and
    asserts the old string, so A6 landing without touching it leaves a banked design claiming A6 does
    not exist.
-3. In `python/tests/test_store_architecture.py:1269`, update **both** halves — the `AGENTS.md`
+4. In `python/tests/test_store_architecture.py:1269`, update **both** halves — the `AGENTS.md`
    sentence and the A5b design's `"A6–A8 remain unimplemented."` assertion. Drop
    `assert "A5–A8 remain unimplemented" not in agents` only if it no longer applies.
-4. In `README.md`, add A6 to the layering note.
-5. In `docs/plans/2026-08-07-a6-coherent-capture-design.md`, change the status header from
+5. In `README.md`, repair the whole `## Status` section. It is stale by more than A6: its second
+   paragraph says the core *"has no filesystem, SQLite, or platform dependency yet — no path is
+   mutated by any code in this repository today"* (`atoms.fs` and `atoms.store` both exist and A4a
+   mutates engine-owned `metadata_root`), and its roadmap list stops at A3 and closes with
+   `"A4–A8 remain unimplemented, and no filesystem mutation code has landed."` — false for A4a, A4b,
+   A5a, and A5b, which landed before this plan. Replace the second paragraph and the A3 bullet's
+   trailing sentence, then add the missing bullets:
+
+   Second paragraph becomes:
+
+   > The pure core (`atoms.core`) is joined under `python/` by `atoms.fs` (capability backend,
+   > volume binding, project approval) and `atoms.store` (SQLite-in-WAL metadata store) beneath an
+   > `atoms.coordinator` package holding the recovery lease, admission, and preparation. No project
+   > path is mutated by any code in this repository today; the only paths written are engine-owned,
+   > under `metadata_root`.
+
+   The A3 bullet's last sentence `"A4–A8 remain unimplemented, and no filesystem mutation code has
+   landed."` is deleted — the roadmap bullets below now carry the status — and these follow it:
+
+   > - **A4 — capability backend, volume binding, and project approval (implemented):**
+   >   [`docs/plans/2026-07-29-a4a-capability-backend-design.md`](docs/plans/2026-07-29-a4a-capability-backend-design.md),
+   >   [`docs/plans/2026-07-30-a4b1-path-resolution-design.md`](docs/plans/2026-07-30-a4b1-path-resolution-design.md),
+   >   [`docs/plans/2026-07-31-a4b2-project-approval-design.md`](docs/plans/2026-07-31-a4b2-project-approval-design.md)
+   >   — the probed capability backend, anchored path resolution, and the `ProjectApprovedSpec` proof
+   >   with its approved topology and scratch binding.
+   > - **A5 — durable metadata store and recovery lease (implemented):**
+   >   [`docs/plans/2026-07-31-a5a-metadata-store-design.md`](docs/plans/2026-07-31-a5a-metadata-store-design.md),
+   >   [`docs/plans/2026-08-02-a5b-recovery-lease-design.md`](docs/plans/2026-08-02-a5b-recovery-lease-design.md)
+   >   — the SQLite-in-WAL store as a mechanism, composed into the recovery lease, admission, and
+   >   preparation.
+   > - **A6 — coherent capture and the observation mechanism (implemented):**
+   >   [`docs/plans/2026-08-07-a6-coherent-capture-design.md`](docs/plans/2026-08-07-a6-coherent-capture-design.md)
+   >   — the descriptor table, the observation pass, and preimage capture into the workspace staging
+   >   directory. A7–A8 remain unimplemented: nothing yet executes an effect against a project path.
+
+   Those five filenames were listed from `docs/plans/` on 2026-08-07 — verify they still resolve
+   before committing rather than trusting this plan for a path.
+
+6. In `docs/plans/2026-08-07-a6-coherent-capture-design.md`, change the status header from
    `"Designed on 2026-08-07, unimplemented. A7–A8 remain unimplemented."` to
    `"Implemented on 2026-08-07. A7–A8 remain unimplemented."`
 
-Run: `cd python && grep -rn "A6–A8 remain unimplemented" ../docs ../AGENTS.md ../README.md tests/`
-Expected: no matches. Every document and assertion that named A6 as unimplemented has moved together.
+Run:
+
+```bash
+cd python && grep -n "A6–A8 remain unimplemented" \
+  ../AGENTS.md ../README.md \
+  ../docs/deferred-obligation-ledger.md \
+  ../docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md \
+  ../docs/plans/2026-08-02-a5b-recovery-lease-design.md \
+  ../docs/plans/2026-08-07-a6-coherent-capture-design.md \
+  tests/test_store_architecture.py tests/test_coordinator_architecture.py
+```
+
+Expected: no matches, exit status 1.
+
+**The file list is explicit on purpose.** A `grep -rn` over `../docs` cannot pass: the historical
+`2026-08-02-plan-a5b-recovery-lease.md:4205` records what A5b's own status line said at the time, and
+*this* plan quotes the string eight times in the very steps that retire it. Both are records of past
+moments, not current claims, and rewriting either to appease a grep would falsify the record. The
+files above are the current status surface — the ones a reader consults to learn what exists.
 
 - [ ] **Step 4: Add the A6 status test**
 
@@ -3248,6 +3377,7 @@ Add to `python/tests/test_coordinator_architecture.py`, following `test_a4a_…`
 def test_a6_status_is_synchronized_across_authority_documents():
     root = Path(__file__).parents[2]
     agents = (root / "AGENTS.md").read_text(encoding="utf-8")
+    readme = (root / "README.md").read_text(encoding="utf-8")
     design = (
         root / "docs/plans/2026-08-07-a6-coherent-capture-design.md"
     ).read_text(encoding="utf-8")
@@ -3261,9 +3391,20 @@ def test_a6_status_is_synchronized_across_authority_documents():
     assert "**Status:** Implemented on 2026-08-07." in design
     # No banked document may still claim A6 is unimplemented. A5b's design carries the
     # same sentence and is the one easiest to leave behind.
-    for document in (agents, design, a5b):
+    for document in (agents, readme, design, a5b):
         assert "A6–A8 remain unimplemented" not in document
     assert "A7–A8 remain unimplemented" in a5b
+
+    # The README's roadmap is the reader's map of what exists; it was three sub-plans
+    # stale before A6 and must not be left that way.
+    assert "A4–A8 remain unimplemented" not in readme
+    assert "no filesystem mutation code has landed" not in readme
+    for heading in (
+        "**A4 — capability backend, volume binding, and project approval (implemented):**",
+        "**A5 — durable metadata store and recovery lease (implemented):**",
+        "**A6 — coherent capture and the observation mechanism (implemented):**",
+    ):
+        assert heading in readme
 ```
 
 - [ ] **Step 5: Run the full gate set**
@@ -3323,16 +3464,39 @@ sites. `StagedBlob(name, digest, byte_len)` matches `blobs.py:35`, and `Captured
 - The authorization arm builds the **committed-cleanup** fixture ledger #13 actually describes,
   selects the `RemoveScratch` step, supplies exactly the named slot with empty persistent and
   occupancy coverage, and asserts `AuthorizedStep` — not `is not None`, which accepted `HaltPlan`.
+- That arm's authorization observation is **fresh**, as ledger #13 requires: a second `Observation`
+  taken after classification, from the same held descriptor, while the tombstone is still on disk.
+  The earlier revision reused the snapshot's `retained` and unlinked the entry first, which proved
+  nothing about a re-observation. Freshness is asserted (`reobserved.identity is not
+  retained.identity`) rather than assumed, and it authorizes because
+  `_project_identity_relations` compares pairwise relations among an observation's own tokens, never
+  a raw token across passes.
+- The descriptor table validates every node against **its own** record in `approved.directories`,
+  including `WorkRoot()`. `approved.work_base` describes `metadata_root/work`, the parent of the
+  `work/<txid>` that `workspace.work_fd` names, so it was the wrong baseline; on ext4 the two carry
+  equal values, which is exactly why only a record-pinning test can catch it.
+- A missing parent descriptor is a stop **only if the parent actually stopped**; otherwise it is a
+  walk-order defect and raises `ProtocolError`. Silently calling it a stop would manufacture an
+  absence inference out of a bug, and §8's basis is a verified blocker.
 - The import whitelist reuses `_resolved_imports`, and Task 7 plants four violation forms including
   `from atoms.core import recovery` and a relative import.
 
-**Test counts are measured, not estimated:** 23, 2, 14, 23 cases from 22 functions, 4, 5, 1, 1.
+**Test counts are measured, not estimated:** 23, 2, 15, 23 cases from 22 functions, 4, 5, 1, 1.
 
 **Every commit runs the full gate set**, including Tasks 5 and 7, which previously committed after a
 single file's tests.
 
-**Status synchronization covers three documents,** not two. `AGENTS.md`, this design, and A5b's
-design all carry "A6–A8 remain unimplemented", the last of which
+**Status synchronization covers the whole current status surface.** `AGENTS.md`, the A6 design, and
+A5b's design all carry "A6–A8 remain unimplemented", the last of which
 `test_a5_status_is_synchronized_across_authority_documents` asserts — so landing A6 without touching
-it leaves a banked design claiming A6 does not exist. Task 8 ends on a `grep` that proves no
-occurrence survives anywhere.
+it leaves a banked design claiming A6 does not exist. `AGENTS.md` separately justifies the
+build-stage trap with "A6 supplies no observations", which stops being true here even though the trap
+itself stays (A7 owns the executor). And the `README.md` roadmap was already three sub-plans stale
+before A6 — it stops at A3, claims A4–A8 are unimplemented, and says no path is mutated — so Task 8
+repairs it rather than adding A6 on top of a false list.
+
+Task 8's closing `grep` names its files explicitly and is **not** a `-r` sweep. Two documents legitimately
+still contain the string: the historical A5b implementation plan, which records what A5b's status line
+said when it landed, and this plan, which quotes it in the steps that retire it. Both are records of past
+moments; rewriting either to satisfy a recursive grep would falsify the record, and a grep that can never
+pass is worse than no grep at all.

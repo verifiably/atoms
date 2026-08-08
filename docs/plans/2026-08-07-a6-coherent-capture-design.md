@@ -243,6 +243,13 @@ The logical `WorkRoot → ProjectRoot` edge is **not physically traversed**: the
 `metadata_root`, not beneath the project root. `WorkRoot` is also the one planned directory that does
 not stop the walk, because A5b has already created and opened it.
 
+Every node's baseline is **its own record in `approved.directories`**, `WorkRoot` included: A4b stores
+it as `ApprovedPlannedDirectory(WorkRoot(), inherited_constraints(work_base.constraints,
+filesystem_type))`. `approved.work_base` is a different thing — the observed facts of
+`metadata_root/work`, which is the **parent** of the `work/<txid>` that `workspace.work_fd` names — so
+it is not what a `work/<txid>` descriptor is compared against. The two carry equal values on ext4,
+which is why the distinction has to be stated rather than left to a test to discover.
+
 **`WorkRoot` is included only when the approved topology contains it** — equivalently, when
 `approved.work_base is not None`, which A5b already treats as the signal that the spec declares a
 `CreateDirectory` and so has a `WORK` scratch role. When it is absent, A4b judged `work/` irrelevant
@@ -627,6 +634,13 @@ so both routes drive the observer directly:
   `authorize_recovery_step`, whose contract is exactly the named retained scratch slot with empty
   persistent and occupancy coverage.
 
+The second route's observation must be **fresh** — a new `Observation` pass taken after
+classification, from the still-held descriptor, with the entry still on disk. Reusing the complete
+pass's entry would test a stale value and prove nothing about re-observation, which is the half of
+ledger #13 A7 inherits. This is admissible because `authorize_recovery_step` compares pairwise
+identity *relations* within an observation, never a raw token across passes; the test asserts the new
+pass really is a new token universe rather than assuming it.
+
 ### 11.5 Architecture
 
 The `core.recovery` import whitelist on `observe.py`; the existing store-import test still green; the
@@ -634,9 +648,11 @@ A6 status-synchronization test.
 
 ### 11.6 Adversarial
 
-**Scoped to A6.** Mount crossing mid-walk; a leaf swapped for a symlink between observation and use;
-`ProjectRoot` constraints changed after approval; the retained-descriptor pin and its close-pin
-sabotage (§11.1) — not inode reuse, which cannot be forced and so cannot be asserted.
+**Scoped to A6.** Mount crossing mid-walk; a leaf swapped for a symlink **between the held-directory
+walk and the leaf observation** — the only window A6 owns, since observation is the last thing it does
+to an entry and a swap after it is A7's destructive-transfer validation; `ProjectRoot` constraints
+changed after approval; the retained-descriptor pin and its close-pin sabotage (§11.1) — not inode
+reuse, which cannot be forced and so cannot be asserted.
 
 Symlink validation after a destructive transfer, and effect-staging swaps between a pre-publication
 check and the publishing rename, are **A7 obligations** — the objects do not exist until an effect
