@@ -1,0 +1,522 @@
+# A6 — coherent capture and the observation mechanism
+
+**Status:** Designed on 2026-08-07, unimplemented. A7–A8 remain unimplemented.
+
+**Authority:** [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md)
+§4.1, §4.2, §5.5, §6, §7.3, §10, §11, §13.1, §13.2, §14.
+
+**Sub-plans below it:** [`2026-08-02-a5b-recovery-lease-design.md`](2026-08-02-a5b-recovery-lease-design.md),
+[`2026-07-31-a5a-metadata-store-design.md`](2026-07-31-a5a-metadata-store-design.md),
+[`2026-07-30-a4b1-path-resolution-design.md`](2026-07-30-a4b1-path-resolution-design.md).
+
+---
+
+## 1. Decision
+
+A6 fills exactly one hole: authority §7.3 **step 1** — coherently capture and verify the complete
+initial surface, streaming each captured file into `staging/<txid>/`. A5b left that hole open by name,
+and its two neighbours already fit around it:
+
+```python
+with open_workspace(lease, approved) as workspace:            # A5b
+    with capture_initial_surface(                              # A6 — this design
+        lease, approved, workspace, payloads
+    ) as captured:
+        prepare_transaction(                                   # A5b — §7.3 steps 2-4
+            lease, approved, workspace, captured.manifest
+        )
+        # A7 — execute(lease, approved, captured.descriptors)
+```
+
+The seam that worked three times already repeats here: A4b-1 observed and A4b-2 judged; A5a stored and
+A5b decided; **A6 observes and A7 acts.** A6 produces primitive facts about the filesystem and never a
+verdict — the recovery verdict is A3's, and the mutation is A7's.
+
+Two deliverables, in two packages, because the existing dependency DAG already decides where each
+belongs:
+
+- **`atoms/fs/observe.py`** — the coherent observation mechanism. Given a held parent descriptor and a
+  leaf name, produce the `ObservedEntry` values A3 consumes, under a token discipline that makes
+  identity equality mean one thing. It imports `fs` and `core` only, so A7 gets it without dragging in
+  a lease, a store, or a workspace.
+- **`atoms/coordinator/capture.py`** — forward capture. Hold the descriptor table, drive the observer
+  over the approved surface, verify against the declared initial state, stage preimages and planned
+  postimages, and hand `prepare_transaction` the manifest it already expects.
+
+## 2. Scope and non-scope
+
+### 2.1 In scope
+
+1. The **descriptor table** (§5): one held, guarded descriptor per directory the transaction will act
+   relative to, built by single-component traversal from two physical roots, re-validated against the
+   approved baseline, and living long enough for A7 to execute against it.
+2. The **observation mechanism** (§6): file, directory, symlink, and absence observation from held
+   descriptors, with the `EntryIdentity` token discipline and directory-occupancy evidence.
+3. **Forward capture** (§7): initial-surface verification, preimage staging, planned-postimage staging
+   from a consumer-supplied payload source, and the promotion manifest.
+4. **Absence inference** (§8): §6's two cases — the missing ancestor and the non-directory ancestor —
+   as two separate code paths.
+5. The **`referenced_digests` repair** (§10.3): widening A5a's helper to every `FileState` the spec
+   states, not only those in its two surfaces.
+
+### 2.2 Not in scope
+
+1. **Any project mutation.** A6 writes only into engine-owned `staging/<txid>/`. No effect executes, no
+   staging object is published to a project path, nothing is exchanged, moved, or deleted.
+2. **Restoration and materialization.** §10's staging-object classification table — complete,
+   attributable prefix, wrong-mode staging directory, displaced preimage, undo quarantine — describes
+   objects only A7's effects create. It ships with them.
+3. **Recovery assembly.** A6 supplies observations; A7 assembles them into the `RecoverySnapshot` and
+   `JointObservation` values A3 adjudicates, sequences committed cleanup, and issues fresh
+   authorization observations.
+4. **Removing A5b's A7 trap.** A live record at lease entry still raises. A6 supplies no executor, and
+   the trap's removal remains the signal that the A6/A7 seam closed.
+5. **`CERTIFIED_ALLOWLIST`.** It stays empty until A8 crash-certifies a configuration tuple.
+
+### 2.3 Relationship to the layers below
+
+| Layer | A6 uses it for |
+| --- | --- |
+| A4a `Backend` | Guarded traversal, no-follow reads, symlink fingerprints, directory flush |
+| A4a `ProjectBinding` | The borrowed project-root descriptor and `evidence.mount_id` |
+| A4b-1 `read_lookup_constraints`, `read_mount_id`, `EntryKind` | Re-validation and blocker classification |
+| A4b-1 `ResolvedPrefix` | The deepest existing directory prefix, for the missing-ancestor case |
+| A4b-2 `ProjectApprovedSpec` | The approved topology, directories, paths, and scratch slots |
+| A5a `Workspace` | `staging_fd` as the capture sink; `work_fd` as the physical work root |
+| A5a `StagedBlob` | The promotion manifest's element type |
+| A3 `core.recovery.model` | The observation value types and `EntryIdentity` |
+
+A6 enters the **same** lease A5b holds rather than taking its own lock, which is what keeps resolution,
+capture, and mutation one critical section (authority §7.1).
+
+## 3. Seam review against the deferred-obligation ledger
+
+### 3.1 Existing entries
+
+**This table states the expected ledger state _after_ implementation.** The design commit discharges
+nothing.
+
+| # | Expected outcome | Why |
+| --- | --- | --- |
+| 1 | **Open (capture half discharged)** | Capture hashes the actual stream from one descriptor and compares against the frozen `FileState`, refusing on mismatch (§7). Materialization's half is A7's. |
+| 3 | **Open (capture/inference half discharged)** | §8's two branches infer descendant absence from the ancestor's verified state. A7 still owns handing §9.5's published-directory descriptor down to descendants at execution. |
+| 13 | **Open (observation-mechanism half discharged)** | §6 produces state, identity, prefix relation, and occupancy coherently from held descriptors under the token discipline, and cannot name a verdict. A7 still owns complete recovery assembly, committed-cleanup sequencing, and fresh authorization observations. |
+| 19 | **Open (A6's half discharged)** | The descriptor table re-resolves identity, constraints, and mount against the approved baseline before relying on any of it, and refuses on mismatch (§5). A7's execution half remains. |
+| 9 | **Open** | A6 extends the entry-point gate set to its own entries; A7–A8 extend it further as they land. |
+| 12, 17 | **Open** | Unchanged by A6; both wait on A7's executor. |
+
+### 3.2 New entries this design creates
+
+**None.** Three candidates were considered and rejected:
+
+- *The `referenced_digests` widening.* An immediate repair inside A5a's surface, landing in the same
+  commit as the code that needs it (§10.3). A deferred-obligation entry records a shape a boundary
+  admits but does not execute; this one is executed.
+- *Scratch observation without a producing effect.* A6 delivers the mechanism and exercises it over
+  real files and real descriptors (§11.3). It is not an admitted-but-unhandled shape; it is a handled
+  shape whose production caller arrives later, which is what #13's retained A7 residue already records.
+- *Payload supply.* The `PayloadSource` contract refuses every malformed or divergent case at capture
+  (§9). Nothing is admitted and deferred.
+
+### 3.3 Authority amendments in this commit
+
+**Authority §14, Plan A item 4.** The current text reads "Coherent capture and restartable atomic
+materialization (§6, §10)". Most of §10 is rollback restoration over objects only A7's effects create,
+and building the classifier before its inputs exist repeats the error A5b avoided at the A7 trap. The
+item becomes:
+
+> 4. Coherent capture and the observation mechanism (§6, and §10's coherent-observation contract).
+>    Restartable materialization's staging-object classification ships with the effects that create the
+>    objects it classifies (item 5).
+
+**Authority §6, the second absence-capture case.** The current text says guarded traversal "fails at
+`p` itself with `ENOTDIR`", which selects the regular-file branch by errno alone. `ENOTDIR` does not
+distinguish a regular file from a socket, FIFO, or device node. A4b rejects `OTHER` at approval, but
+capture-time drift can introduce one between approval and capture. The paragraph gains:
+
+> `ENOTDIR` establishes only that the blocker is not a directory — it does not distinguish a regular
+> file from a socket, FIFO, or device node. The regular-file branch is selected by verifying the
+> blocker against the timeline's first `FileState`, not by the errno. A blocker that is neither a
+> regular file matching that state nor a symlink refuses.
+
+**Status synchronization.** `AGENTS.md`'s A3 and A5 paragraphs and the `README.md` layering note gain
+A6's state, and a new `test_a6_status_is_synchronized_across_authority_documents` asserts the strings,
+following `test_a4a_…`, `test_a4b_…`, and `test_a5_…`.
+
+## 4. Architecture and ownership
+
+### 4.1 Module layout
+
+| Module | Owns |
+| --- | --- |
+| `atoms/fs/observe.py` | `Observation` — the token universe, per-kind observation, occupancy evidence, and the planned-blob prefix comparison |
+| `atoms/coordinator/descriptors.py` | `DescriptorTable` — the held, re-validated, node-keyed descriptor set |
+| `atoms/coordinator/capture.py` | `capture_initial_surface`, `Captured`, `PayloadSource`, and the staging loop |
+
+`DescriptorTable` lives in `coordinator/` rather than `fs/` because building it needs
+`workspace.work_fd`, and `Workspace` is a store type. `Observation` needs neither, which is what keeps
+it in `fs/` and reusable by A7.
+
+There is no new `errors.py` and no new exception type. The existing hierarchy already carries every
+meaning A6 needs (§9).
+
+### 4.2 Dependency direction
+
+The DAG is unchanged:
+
+```
+coordinator → {store, fs, core}
+store       → {fs, core}
+fs          → {core}
+```
+
+`observe.py` adds one narrower rule of its own, asserted by an architecture test: **within
+`atoms.core.recovery`, it may import `model` and nothing else.** A blacklist on `snapshot` would be
+insufficient — `atoms/core/recovery/__init__.py` re-exports `classify_recovery` and
+`authorize_recovery_step`, so a classifier is reachable through the package facade. The whitelist is
+how ledger #13's "may not pre-classify them into a recovery outcome" becomes a mechanical property
+instead of a review promise.
+
+### 4.3 New backend surface
+
+`Backend` gains two methods, both plain POSIX rather than §5.5 capabilities, so neither is probed and
+neither can refuse a volume:
+
+| Method | Why |
+| --- | --- |
+| `list_children(parent_fd) -> tuple[str, ...]` | Descriptor-relative enumeration for directory occupancy |
+| `create_regular_noclobber(parent_fd, name, mode) -> int` | The staging sink: `O_WRONLY\|O_CREAT\|O_EXCL\|O_NOFOLLOW\|O_CLOEXEC` |
+
+Reads and `fstat` need no new method: `open_regular_nofollow` already returns the descriptor, and
+`os.read`/`os.fstat` operate on it directly.
+
+## 5. The descriptor table
+
+### 5.1 What it is
+
+`RecoveryTopology.parents` is already a rooted tree — `snapshot.py`'s `_validate_topology` enforces
+single parenthood, forbids a parent for `ProjectRoot`, requires `WorkRoot` to be parented by
+`ProjectRoot`, and ends on "topology must be an acyclic tree rooted at the project root". The
+descriptor table is a walk of that tree, opening each directory node from its parent's held descriptor
+with **one** `open_child_directory` call, which is already
+`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV`. No multi-component path is ever assembled,
+which is precisely §6's rule: passing a multi-component name to a syscall reopens the check/use race,
+because the kernel re-resolves intermediate components at the syscall.
+
+### 5.2 Which nodes bear a descriptor
+
+**Selected by role, from `approved.directories` plus the two physical roots — never by node class.**
+`CreateDirectory("p")` followed by `CreateFileNoClobber("p/q")` makes `PersistentNode("p")` both a
+declared path and the parent of a declared descendant, and `expected_persistent` in `_validate_topology`
+is built from every timeline, so a class-based selection would miss exactly the case §8's second branch
+exists for.
+
+| Node | Descriptor | Re-validated on entry |
+| --- | --- | --- |
+| `ProjectRoot` | **borrowed** `approved.binding.project_root_fd` | identity, constraints, mount |
+| `WorkRoot` | **borrowed** `workspace.work_fd` | constraints, mount — there is no approved identity |
+| `ApprovedExistingDirectory` | **owned**, one `open_child_directory` from its parent | identity, constraints, mount |
+| `ApprovedPlannedDirectory` (project) | none — the walk stops here | capture proves absence or the blocker (§8) |
+
+The logical `WorkRoot → ProjectRoot` edge is **not physically traversed**: the work root lives under
+`metadata_root`, not beneath the project root. `WorkRoot` is also the one planned directory that does
+not stop the walk, because A5b has already created and opened it.
+
+### 5.3 Why `ProjectRoot` is re-validated too
+
+Its descriptor is retained by the binding across approval, so its identity cannot drift. Re-validation
+is still required, because **retention is not discharge**: `DirectoryConstraints` carries
+`lookup_proof` and `name_max`, both of which are mutable directory properties, and ledger #19's rule is
+that a resolved fact is compared against its approved baseline before being relied on. A held
+descriptor is not an exception the ledger grants.
+
+### 5.4 Mount membership is checked by hand
+
+`DirectoryConstraints` is `lookup_proof` and `name_max` only. Mount membership is a separate
+`read_mount_id(fd)` against `binding.evidence.mount_id`, exactly as `resolve.py` does at every hop. A
+constraints comparison alone would pass a directory that had been replaced by a bind mount.
+
+### 5.5 Ownership and lifetime
+
+The table **borrows** the two root descriptors and **owns** only those it opened itself; `close()`
+closes only the latter. `ProjectBinding`'s own docstring states that every descriptor it exposes is
+borrowed and a consumer must never close one, and `Workspace` owns and spends its two.
+
+`workspace.staging_fd` is **not** a topology root. It is the capture sink, and `promote_staging` spends
+it — which is why capture must complete before preparation runs, and why the table, not the staging
+descriptor, is what A7 receives.
+
+The table outlives capture. §6 requires the engine to hold a descriptor to the project root "for the
+transaction's lifetime" and §9.5 hands each published directory's descriptor down to its descendants.
+A table that died at capture's return would force A7 to re-resolve, reopening the race the whole
+section exists to close.
+
+## 6. The observation mechanism
+
+### 6.1 One pass, one token universe
+
+`Observation` is a **live resource**, not a value. It owns a `(st_dev, st_ino) → EntryIdentity` map and
+a descriptor per observed identity:
+
+```python
+class Observation:
+    def observe(self, parent_fd: int, leaf: str, *, sink_fd: int | None = None) -> ObservedEntry: ...
+    def occupancy(self, dir_fd: int, modeled: frozenset[str]) -> bool: ...
+    def build_relation(self, staged_fd: int, planned_fd: int) -> FileBuildRelation: ...
+    def close(self) -> None: ...
+```
+
+One underlying entry reached through two slots yields the **same** token; distinct entries yield
+distinct tokens; a fresh `Observation` mints a fresh universe. That is what makes A3's identity
+equality mean "the same entry, within one pass" and nothing else.
+
+**The descriptors are the pin.** `(st_dev, st_ino)` identifies an entry uniquely only while its inode
+stays allocated. If the observer opened a file, recorded its key, and closed it, a subsequent unlink
+and create could recycle that inode and map two sequentially distinct entries onto one token — an
+identity equality A3 would believe. Retaining one descriptor per observed identity until the pass
+closes makes the reuse impossible rather than unlikely.
+
+### 6.2 Per-kind observation
+
+- **Regular file** — `open_regular_nofollow`, then type and mode from `fstat` on **that** descriptor,
+  and the content hash streamed from **that** descriptor. One coherent observation, never a name
+  resolved twice (Guarantee 3). An optional `sink_fd` lets the same single read also stream the bytes
+  into `staging/`, so a retained preimage is never read twice and the retained bytes and the fingerprint
+  provably derive from one descriptor.
+- **Directory** — `open_child_directory`, `fstat` for mode, and **one** descriptor-relative
+  enumeration reconciled against the modeled child names to produce `has_unmodeled_child`.
+- **Symlink** — `symlink_fingerprint` (`lstat` + `readlink`) and nothing else. `ObservedSymlink` has no
+  `identity` field, so §6's rule that a symlink never carries descriptor identity is *unrepresentable*
+  rather than merely forbidden. `O_NOFOLLOW` fails by design on a symlink leaf, so no descriptor to the
+  link itself exists to be coherent about.
+- **Absent** — `OBSERVED_ABSENT`.
+
+### 6.3 The prefix relation
+
+`ScratchObservation.file_build_relation` compares a staged object against the planned blob. The
+observer streams both and returns exact, prefix, or diverged. It takes the planned blob as an **open
+descriptor supplied by the caller**, never a digest it resolves itself — which is both the coherence
+rule and what keeps `atoms.store` out of `atoms/fs/`.
+
+Per ledger #13, the observer does not stream-compare displaced preimages, reverse quarantines, or
+committed-cleanup scratch. A3 decides those from exact fingerprints, and computing a relation A3 will
+not read would be work whose only effect is to invite reliance on it.
+
+## 7. Capture
+
+```python
+capture_initial_surface(lease, approved, workspace, payloads) -> Captured
+```
+
+`Captured` is a live resource owning the descriptor table and exposing `manifest` and `descriptors`.
+The `Observation` and its pinned descriptors close when the pass ends; the table does not.
+
+1. **Build the descriptor table** (§5). Any re-validation mismatch refuses.
+2. **Observe and verify.** Every declared path is observed against its parent's held descriptor and
+   compared with **its timeline's first precondition** — equivalently, the declared initial surface.
+   Later occurrence-local preconditions describe intermediate states that no initial capture can
+   observe, and checking them here would refuse correct transactions.
+3. **Stage file preimages.** Every *regular-file* preimage an effect must retain — `ReplaceFile.pre`,
+   a `FileState` `DeletePath.pre`, `MoveNoClobber.source_pre` — is streamed into `staging/` through
+   step 2's descriptor, hashed once.
+
+   A **symlink** preimage is not staged. §6 retains no content for one, `referenced_digests` filters on
+   `FileState` and so never names it, and §10's rollback material for a symlink is the atomically
+   transferred tombstone, which only A7 creates. Capture verifies its `lstat` + `readlink` fingerprint
+   and retains nothing. Directories and absence likewise carry a fingerprint and no content.
+4. **Stage planned postimages.** For each distinct required digest, `payloads.open(digest)` supplies a
+   byte source; capture streams it into `staging/` and verifies hash and length against the declared
+   `FileState`. Mode is not a blob property — A7 applies it at publication.
+5. **Return.** On success `staging/` holds exactly the manifest's entries.
+
+Steps 3 and 4 are why capture sits above the store: both concern the `blob` surface, which `fs/` may
+not import.
+
+### 7.1 The payload source
+
+Authority §4.1 forbids the engine from reaching back into consumer plan formats; §4.2 reserves
+staging-path derivation to the engine. A declared `FileState` is a postcondition with a hash and no
+bytes (ledger #1), so the bytes must arrive at a seam that violates neither rule:
+
+```python
+class PayloadSource(Protocol):
+    def open(self, digest: str) -> IO[bytes]: ...
+```
+
+Content-addressed, so two effects writing identical content are supplied once and the consumer never
+learns a staging path. The source is an **external source promised by the frozen spec**, which is what
+makes §9's two-way error split principled rather than arbitrary.
+
+**Every distinct required digest is staged once; there is no blob-index skip in v1.**
+`promote_staging` already handles a pre-existing blob by verifying the indexed leaf and unlinking the
+duplicate, so skipping is an optimisation, not correctness. If it is ever added, a `blob` row lookup is
+insufficient on its own — the indexed leaf must be opened and verified, because a row asserts the
+bytes were durable once, not that they are intact now.
+
+### 7.2 Cleanliness is scoped to success
+
+`promote_staging` asserts `staging/` is empty after its rename loop and refuses on any remainder, so a
+**successful** capture must leave exactly the manifest's entries and nothing else.
+
+A **refusal** may leave partial workspace scratch. That is correct and deliberate: the scratch is
+mutation-free, no durable record exists, and A5b's reclamation removes orphan `staging/`, `work/`, and
+unreferenced blobs under the held lock at the next lease entry, regardless of count (§7.3).
+
+## 8. Absence inference
+
+§6 gives two routes to a declared-absent path. They reach the same conclusion by different evidence
+and are **two separate functions with separate tests**, because conflating them would silently grant a
+symlink the file branch's coherence.
+
+### 8.1 Missing ancestor
+
+The path lies beneath an ancestor an earlier `CreateDirectory` will create, so its parent does not
+exist and cannot be opened. The walk stops at the `ApprovedPlannedDirectory`; `resolve.py`'s
+`ResolvedPrefix` already models the deepest existing directory prefix. Absence is confirmed by a
+no-follow lookup of the **first missing component** relative to that deepest held descriptor.
+
+The compiler orders ancestor creation outer-to-inner (§5.4, §9.5), so at execution each
+`CreateDirectory` has already retained a descriptor to the directory it published and hands it down —
+descendants never re-resolve the ancestor chain. That hand-down is A7's, and is why ledger #3 keeps an
+A7 residue.
+
+### 8.2 Non-directory ancestor
+
+`DeletePath("p")`, `CreateDirectory("p")`, `CreateFileNoClobber("p/q")`. Compilation admits this: `p`'s
+timeline is continuous (`FILE → ABSENT → DIRECTORY`), and `p/q` is absent precisely *because* `p` is a
+file. §8.1 does not apply, because no component of `p/q` is missing where traversal stops — it fails at
+`p` itself, and there is no descriptor against which `q` could be looked up. Absence is therefore
+**inferred from the ancestor's verified state rather than probed**.
+
+**The errno does not select the branch.** `resolve.py`'s `_BLOCKER_KINDS` maps
+`ENOTDIR → (REGULAR_FILE, OTHER)` and `ELOOP → (SYMLINK,)`. `ENOTDIR` establishes only that the blocker
+is not a directory; a socket, FIFO, or device node produces it too. A4b rejects `OTHER` at approval,
+but capture-time drift can introduce one afterwards. The regular-file branch is selected by verifying
+the blocker against the timeline's first `FileState`; a blocker that is neither that file nor a symlink
+refuses.
+
+- **Regular-file ancestor — descriptor-coherent.** Opened `O_RDONLY|O_NOFOLLOW`; type, mode, and hash
+  all from that one descriptor. The inference is *stronger* than the negative lookup it replaces,
+  because it rests on one descriptor's coherent observation rather than on a name resolved twice.
+- **Symlink ancestor — not.** `lstat` + `readlink`, no descriptor, no identity. The absence inference
+  still holds, since a symlink holds no directory entries, but its identity contract is deferred to
+  A7's destructive transfer validating the moved object against the frozen fingerprint.
+
+In neither branch is capture-time verification compare-and-swap authority. If the ancestor is swapped
+before execution, A7's destructive transfer validates the transferred object and refuses or halts.
+
+## 9. Errors
+
+No new exception type. Capture precedes the durable record, so **every A6 failure refuses and none
+halts** — ledger #19's rule in its "before durable transaction authority exists" branch. Authority §11
+already names capture as a `PreconditionRefused` site.
+
+| Condition | Error |
+| --- | --- |
+| Observed state diverges from the declared initial state | `PreconditionRefused` |
+| Re-resolution mismatch: identity, constraints, or mount | `PreconditionRefused` |
+| Blocker is neither the declared file nor a symlink (§8.2) | `PreconditionRefused` |
+| A well-formed payload source whose bytes changed or disagree with the declared `FileState` | `PreconditionRefused` |
+| A missing, extra, or malformed payload binding | `ProtocolError` |
+| Backend cannot supply a required capability | `CapabilityUnavailable` |
+| Workspace/txid mismatch, spent descriptor, closed table, engine misuse | `ProtocolError` |
+
+The payload split follows from what `PayloadSource` **is**. A binding that is absent, extra, or
+malformed is a broken submission — the consumer did not supply what the frozen spec promised, and no
+external state is involved. A well-formed source whose bytes disagree is external state diverging from
+frozen intent, which is the definition of what capture exists to detect (§4.1).
+
+## 10. Changes to existing code
+
+### 10.1 `atoms/fs/backend.py` and `atoms/fs/linux.py`
+
+The two methods of §4.3. Both are plain POSIX and are added below the capability comments, not among
+them, so the probe and `CERTIFIED_ALLOWLIST` are untouched.
+
+### 10.2 `atoms/coordinator/admission.py`
+
+The entry-point gate set gains A6's two entries, per ledger #9. `capture_initial_surface` requires an
+admitted proof and a workspace whose txid matches it, exactly as `prepare_transaction` does.
+
+### 10.3 `atoms/store/records.py` — the `referenced_digests` repair
+
+Today the helper scans `spec.initial_surface` and `spec.final_surface` only, and `connection.py` raises
+`ProtocolError` for any promoted digest outside that set. An **intermediate** postimage appears in
+neither surface: `ReplaceFile("p", A→B)` followed by `ReplaceFile("p", B→C)` has `A` in the initial
+surface and `C` in the final, and `B` in neither. Staging `B` would refuse at the barrier; not staging
+it would leave A7 without the bytes it must publish.
+
+The helper widens to every `FileState` the spec states — both surfaces **and** every effect occurrence.
+This does not weaken the barrier: an intermediate postimage is genuinely referenced by the record, and
+the barrier's purpose is to reject digests the record does not reference at all. Its name stays;
+its docstring, `test_referenced_digests_include_initial_and_final_file_surfaces`, and
+`tests/coordinator_child.py` are updated in the same commit.
+
+## 11. Verification strategy
+
+Six tiers, all on the real ext4 test volume.
+
+### 11.1 Observation
+
+Token identity across two slots naming one entry; distinct tokens for distinct entries; a fresh
+universe per pass. An explicit **inode-reuse** test unlinks and recreates to prove the descriptor pin
+holds and two sequentially distinct entries never collapse onto one token. Symlinks carry no identity —
+asserted structurally, since `ObservedSymlink` has no field for one.
+
+### 11.2 Capture, real filesystem
+
+Precondition match and every divergence shape; both §8 branches, including a blocker that is `OTHER`
+rather than a regular file; payload mismatch and malformed binding; `staging/` contents exactly the
+manifest on success; partial scratch on refusal reclaimed at the next lease entry.
+
+### 11.3 Scratch observation
+
+**Over real files and real descriptors**, not hand-built model values. Building a `ScratchObservation`
+by hand and feeding it to A3 tests A3, not A6. The suite creates the actual staging shapes on disk —
+complete, attributable prefix, diverged, wrong-mode directory — and asserts the observer's
+`FileBuildRelation` over them.
+
+### 11.4 Conformance — two routes, not one
+
+A6's output feeds two different A3 entry points, and one route cannot exercise both:
+
+- **Complete observations** → `build_recovery_snapshot`, which must accept them. This proves the
+  observer satisfies A3's coverage and shape validators without A7 existing.
+- **Scratch-only committed-cleanup observations** → `JointObservation` consumed by
+  `authorize_recovery_step`, whose contract is exactly the named retained scratch slot with empty
+  persistent and occupancy coverage.
+
+### 11.5 Architecture
+
+The `core.recovery` import whitelist on `observe.py`; the existing store-import test still green; the
+A6 status-synchronization test.
+
+### 11.6 Adversarial
+
+**Scoped to A6.** Mount crossing mid-walk; a leaf swapped for a symlink between observation and use;
+`ProjectRoot` constraints changed after approval; inode reuse under the token map.
+
+Symlink validation after a destructive transfer, and effect-staging swaps between a pre-publication
+check and the publishing rename, are **A7 obligations** — the objects do not exist until an effect
+creates them, and asserting them here would prove nothing about the code that will own them.
+
+## 12. Acceptance criteria
+
+1. `capture_initial_surface` fills authority §7.3 step 1, and `open_workspace` → capture →
+   `prepare_transaction` composes without any intervening re-resolution.
+2. Every mutation is a single-component leaf operation against a held, re-validated, guarded parent
+   descriptor. No multi-component path reaches a syscall.
+3. The descriptor table outlives capture and is what A7 will execute against.
+4. `atoms/fs/observe.py` imports `atoms.core.recovery.model` and no other `core.recovery` module, and
+   the architecture test proves it.
+5. One `EntryIdentity` per underlying entry per pass, pinned by a retained descriptor; symlinks have
+   none, structurally.
+6. Both §8 branches are separate code paths, and the regular-file branch is selected by the declared
+   `FileState`, never by `ENOTDIR`.
+7. Every A6 failure is a refusal; no path raises `TransactionHalted`.
+8. A successful capture leaves `staging/` holding exactly the manifest.
+9. `referenced_digests` covers every `FileState` the spec states, and an intermediate postimage
+   promotes without tripping the barrier.
+10. No project path is mutated by any A6 code path, asserted by the mutation-surface suite
+    (authority §13.5).
+11. A5b's A7 trap still raises, unchanged.
