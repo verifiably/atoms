@@ -77,7 +77,7 @@ belongs:
 
 | Layer | A6 uses it for |
 | --- | --- |
-| A4a `Backend` | Guarded traversal, no-follow reads, symlink fingerprints, directory flush |
+| A4a `Backend` | Guarded traversal, no-follow reads, symlink fingerprints, and `flush_file` for staged bytes (§7.3) |
 | A4a `ProjectBinding` | The borrowed project-root descriptor and `evidence.mount_id` |
 | A4b-1 `read_lookup_constraints`, `read_mount_id`, `EntryKind` | Re-validation and blocker classification |
 | A4b-2 `ProjectApprovedSpec` | The approved topology, directories, paths, and scratch slots |
@@ -138,9 +138,11 @@ distinguish a regular file from a socket, FIFO, or device node. A4b rejects `OTH
 capture-time drift can introduce one between approval and capture. The paragraph gains:
 
 > `ENOTDIR` establishes only that the blocker is not a directory — it does not distinguish a regular
-> file from a socket, FIFO, or device node. The regular-file branch is selected by verifying the
-> blocker against the timeline's first `FileState`, not by the errno. A blocker that is neither a
-> regular file matching that state nor a symlink refuses.
+> file from a socket, FIFO, or device node. Neither branch is selected by the errno: the regular-file
+> branch is selected by verifying the blocker against the timeline's first `FileState`, and the symlink
+> branch by verifying it against the timeline's first `SymlinkState`. A blocker matching neither
+> declared state refuses — including a symlink whose target or mode has drifted, which is a symlink but
+> not the declared one.
 
 **Status synchronization.** `AGENTS.md`'s A3 and A5 paragraphs and the `README.md` layering note gain
 A6's state, and a new `test_a6_status_is_synchronized_across_authority_documents` asserts the strings,
@@ -474,9 +476,13 @@ before execution, A7's destructive transfer validates the transferred object and
 
 ## 9. Errors
 
-No new exception type. Capture precedes the durable record, so **every A6 failure refuses and none
-halts** — ledger #19's rule in its "before durable transaction authority exists" branch. Authority §11
-already names capture as a `PreconditionRefused` site.
+No new exception type. Capture precedes the durable record, so **no A6 failure halts** — ledger #19's
+rule in its "before durable transaction authority exists" branch. Authority §11 already names capture
+as a `PreconditionRefused` site.
+
+The table below is the set of conditions with a defined domain meaning. It is not exhaustive over
+everything that can go wrong: §9.1 states which errnos are translated and why the rest propagate as
+themselves.
 
 | Condition | Error |
 | --- | --- |
@@ -501,16 +507,28 @@ that harms nothing: an unrequested payload is never opened, never staged, and ne
 
 ### 9.1 Translating direct lookups
 
-The traversal, lookup, and staging calls A6 makes raise `OSError` with a raw errno — `ENOENT`,
-`ENOTDIR`, `ELOOP`, `EXDEV`, `EEXIST` — and §9's table promises A6 errors, so every direct call site
-translates rather than letting one escape:
+The traversal, lookup, and staging calls A6 makes raise `OSError` with a raw errno, and §9's table
+names A6 errors, so each call site translates the errnos that carry a **defined domain meaning**:
 
-| Errno class | Meaning after approval | Error |
+| Errno | Meaning after approval | Error |
 | --- | --- | --- |
-| `ENOENT`, `ENOTDIR`, `ELOOP`, `EXDEV`, and namespace contradictions generally | The namespace no longer matches what approval established | `PreconditionRefused` |
+| `ENOENT`, `ENOTDIR`, `ELOOP`, `EXDEV` | The namespace no longer matches what approval established | `PreconditionRefused` |
 | `EEXIST` on a staging leaf | External occupancy of an engine-derived scratch name | `PreconditionRefused` |
 | `ENOSYS`, `EOPNOTSUPP`, `ENOTSUP` | The backend cannot supply the semantics | `CapabilityUnavailable` |
-| `EBADF`, and any errno reachable only through engine misuse | An internal contract was violated | `ProtocolError` |
+| `EBADF` | An internal contract was violated | `ProtocolError` |
+
+**Every other `OSError` propagates unchanged**, keeping its own class and its traceback. This is A5a's
+rule for SQLite result codes, applied to errno: `translated()`'s docstring requires wrapping a single
+statement rather than a protocol, "so an unrecognized code keeps its own class *and* its traceback and
+a future SQLite code is propagated rather than guessed at."
+
+The reason is not economy. Reads, writes, flushes, closes, and consumer payload streams can raise
+`EIO`, `ENOSPC`, `EROFS`, `EDQUOT`, and more; none of them is external state contradicting the frozen
+spec, and reporting a failing disk as `PreconditionRefused` would tell a consumer its intent had
+drifted when the hardware had failed. A6 therefore does **not** promise that every failure is one of
+its own error classes. It promises what is actually true and load-bearing: **no A6 path halts.** A
+propagated `OSError` leaves no durable record and no project mutation, exactly as a refusal does, so
+A5b reclaims its orphan scratch at the next lease entry either way.
 
 The staging row is worth stating explicitly: authority §11, as amended by A5b, already names
 "pre-existing external occupancy of an engine-derived scratch leaf" as a `PreconditionRefused` case
@@ -605,7 +623,8 @@ A6 status-synchronization test.
 ### 11.6 Adversarial
 
 **Scoped to A6.** Mount crossing mid-walk; a leaf swapped for a symlink between observation and use;
-`ProjectRoot` constraints changed after approval; inode reuse under the token map.
+`ProjectRoot` constraints changed after approval; the retained-descriptor pin and its close-pin
+sabotage (§11.1) — not inode reuse, which cannot be forced and so cannot be asserted.
 
 Symlink validation after a destructive transfer, and effect-staging swaps between a pre-publication
 check and the publishing rename, are **A7 obligations** — the objects do not exist until an effect
@@ -625,8 +644,8 @@ creates them, and asserting them here would prove nothing about the code that wi
 6. Both §8 branches are separate code paths, and each is selected by the declared state — the
    regular-file branch by its first `FileState`, the symlink branch by its first `SymlinkState` —
    never by an errno.
-7. Every A6 failure is a refusal; no path raises `TransactionHalted`, and no raw `OSError` escapes an
-   A6 entry point untranslated (§9.1).
+7. No A6 path raises `TransactionHalted`. Errnos with a defined domain meaning are translated per
+   §9.1; every other `OSError` propagates with its own class and traceback.
 8. Every staged file is flushed with `backend.flush_file` after its hash and length verify and before
    its sink closes, asserted by an ordering test.
 9. One `byte_len` per digest is required across the whole set, raising `ProtocolError` before anything
