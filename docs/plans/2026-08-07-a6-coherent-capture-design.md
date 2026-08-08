@@ -144,9 +144,18 @@ capture-time drift can introduce one between approval and capture. The paragraph
 > declared state refuses — including a symlink whose target or mode has drifted, which is a symlink but
 > not the declared one.
 
-**Status synchronization.** `AGENTS.md`'s A3 and A5 paragraphs and the `README.md` layering note gain
-A6's state, and a new `test_a6_status_is_synchronized_across_authority_documents` asserts the strings,
-following `test_a4a_…`, `test_a4b_…`, and `test_a5_…`.
+**Authority status header.** It reads "A1–A5b are implemented … A6–A8 (coherent capture,
+effect/recovery execution, synthetic exerciser) remain", and becomes "A1–A6 are implemented …
+A7–A8 (effect/recovery execution, synthetic exerciser) remain". Its wording is its own — it does not
+contain the `"A6–A8 remain unimplemented"` sentence every other document uses — so a grep for that
+string leaves the authority document, the one that outranks all the others, still denying A6 exists.
+The status test asserts this header positively for that reason.
+
+**Status synchronization.** `AGENTS.md`'s A3 and A5 paragraphs (the latter justifies the A7 build-stage
+trap partly by "A6 supplies no observations", which stops being true while the trap itself stays) and
+the `README.md` `## Status` section — already three sub-plans stale, stopping at A3 — gain A6's state,
+and a new `test_a6_status_is_synchronized_across_authority_documents` asserts the strings, following
+`test_a4a_…`, `test_a4b_…`, and `test_a5_…`.
 
 ## 4. Architecture and ownership
 
@@ -500,7 +509,8 @@ themselves.
 | A missing or malformed payload binding | `ProtocolError` |
 | One digest declared at two lengths (§7.2) | `ProtocolError` |
 | Backend cannot supply a required capability | `CapabilityUnavailable` |
-| Workspace/txid mismatch, spent descriptor, closed table, engine misuse | `ProtocolError` |
+| Workspace that is not exactly `Workspace`, or belongs to another `Store`, or whose txid differs | `ProtocolError` |
+| Spent descriptor, closed table, other engine misuse | `ProtocolError` |
 
 The payload split follows from what `PayloadSource` **is**. A binding that is absent or malformed is a
 broken submission — the consumer did not supply what the frozen spec promised, and no external state is
@@ -551,6 +561,16 @@ The entry-point gate set gains **one** entry, per ledger #9: `capture_initial_su
 an admitted proof and a workspace whose txid matches it, exactly as `prepare_transaction` does. The
 descriptor-table builder stays package-private and is reached only through that entry, so it is not a
 second gate site.
+
+It requires **more** than `prepare_transaction` does about the workspace, and must, because it is the
+first function that writes into one. `prepare_transaction` touches the workspace only by handing it to
+`promote_staging`, whose first two statements are `type(workspace) is Workspace` and
+`workspace._store is store`; nothing has been written when they run. Capture streams preimages and
+payloads into `workspace.staging_fd` long before `promote_staging` is reached, so a duck-typed value —
+or a real `Workspace` issued by a different `Store` under the same txid, which `create_workspace` will
+mint on request — would receive this transaction's bytes and be refused only afterwards. Capture makes
+both checks itself, before the first write, in addition to the txid comparison. This is not a second
+gate; it is the ownership precondition of the sink, asserted where the sink is first used.
 
 `_parent_paths` gains a second in-package consumer (§5.1). It stays private and stays where it is;
 `descriptors.py` sits in the same package.

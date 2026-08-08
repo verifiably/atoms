@@ -1228,26 +1228,73 @@ def test_the_work_root_baseline_is_its_own_record_not_the_work_base(leased):
     """`workspace.work_fd` names work/<txid>; `approved.work_base` describes work/.
 
     A4b records the child as `ApprovedPlannedDirectory(WorkRoot(),
-    inherited_constraints(work_base.constraints, filesystem_type))` -- so the child's
-    approved baseline lives in `approved.directories` like every other node's, and the
-    parent's retained facts are the wrong thing to compare a child descriptor against.
-    On ext4 the two happen to carry the same values, so no behavioural test separates
-    them; this pins the record `validate` must read, and breaks if A4b stops deriving it.
+    inherited_constraints(work_base.constraints, filesystem_type))` (`approval.py:155`,
+    `topology.py:180`), so the child's baseline lives in `approved.directories` like every
+    other node's, and the parent's retained facts are the wrong thing to compare a child
+    descriptor against.
+
+    On ext4 the two carry equal values, so the only way to make the choice observable is
+    to make them differ -- which means editing the proof. `ProjectApprovedSpec` is
+    token-guarded so that nothing outside A4b constructs one, and `dataclasses.replace`
+    refuses for the same reason (`approval.py:69-84`); a sabotage fixture is the one place
+    that has to go around it. `object.__setattr__` is what the factory's own `__init__`
+    uses, and each doctored proof is discarded with its lease.
+
+    Both directions are asserted, because either alone is satisfiable by the wrong code:
+    a wrong parent must NOT refuse, and a wrong child record MUST.
     """
+    import dataclasses
+
     from atoms.coordinator.admission import admit
+    from atoms.coordinator.prepare import open_workspace
     from atoms.fs.lookup import inherited_constraints
     from atoms.fs.resolve import filesystem_type_of
+    from atoms.fs.topology import ApprovedWorkBase
 
+    # Arm 1: sabotage the PARENT's retained facts. The table must still build.
     with leased() as lease:
         approved = admit(lease, compiled_creating_a_directory(lease))
-        record = next(
-            entry for entry in approved.directories if entry.node == WorkRoot()
-        )
-        assert type(record) is ApprovedPlannedDirectory
         assert approved.work_base is not None
+        record = next(e for e in approved.directories if e.node == WorkRoot())
+        assert type(record) is ApprovedPlannedDirectory
         assert record.constraints == inherited_constraints(
             approved.work_base.constraints, filesystem_type_of(lease._binding)
         )
+
+        wrong = dataclasses.replace(record.constraints, name_max=8)
+        assert wrong != record.constraints
+        with open_workspace(lease, approved) as workspace:
+            object.__setattr__(
+                approved,
+                "work_base",
+                ApprovedWorkBase(
+                    identity=approved.work_base.identity, constraints=wrong
+                ),
+            )
+            with Observation(LinuxBackend()) as observation:
+                with _table(lease, approved, workspace, observation) as table:
+                    assert table.fd_for(WorkRoot()) == workspace.work_fd
+
+    # Arm 2: sabotage the CHILD's own record. The table must refuse -- proving the record
+    # is read, and not skipped merely because a planned directory has no identity.
+    with leased() as lease:
+        approved = admit(lease, compiled_creating_a_directory(lease))
+        record = next(e for e in approved.directories if e.node == WorkRoot())
+        wrong = dataclasses.replace(record.constraints, name_max=8)
+        with open_workspace(lease, approved) as workspace:
+            object.__setattr__(
+                approved,
+                "directories",
+                tuple(
+                    ApprovedPlannedDirectory(node=WorkRoot(), constraints=wrong)
+                    if entry.node == WorkRoot()
+                    else entry
+                    for entry in approved.directories
+                ),
+            )
+            with Observation(LinuxBackend()) as observation:
+                with pytest.raises(PreconditionRefused, match="name_max=8"):
+                    _table(lease, approved, workspace, observation)
 
 
 def test_a_replaced_directory_refuses_on_identity(leased):
@@ -2298,6 +2345,72 @@ def test_a_refusal_leaves_reclaimable_scratch_and_no_record(leased):
                 with capture_initial_surface(lease, approved, workspace, payloads):
                     pass
         assert lease._store.read_active() is None
+
+
+# --- workspace authentication, before the first write --------------------------------
+
+
+def test_a_workspace_from_another_store_refuses_before_anything_is_staged(leased):
+    """A matching txid is not a matching workspace.
+
+    `promote_staging` makes exactly this check (`blobs.py:334`), but it runs inside
+    `prepare_transaction` -- by then capture has already streamed this transaction's
+    preimages into a foreign store's staging directory. Two `leased()` contexts are two
+    independent projects and metadata roots, so the foreign store is real, and
+    `create_workspace` takes the txid it is given: the collision is constructible.
+    """
+    from atoms.coordinator.capture import capture_initial_surface
+
+    with leased() as lease:
+        approved = approved_replace(lease)
+        with leased() as other:
+            foreign = other._store.create_workspace(approved.txid)
+            try:
+                assert foreign.txid == approved.txid
+                assert foreign._store is not lease._store
+                with pytest.raises(ProtocolError, match="different Store"):
+                    capture_initial_surface(
+                        lease, approved, foreign, payloads_for_replace()
+                    )
+                # The refusal came before the first write, not after it.
+                assert os.listdir(foreign.staging_fd) == []
+            finally:
+                foreign.close()
+
+
+def test_a_duck_typed_workspace_refuses_before_anything_is_staged(leased):
+    """The impostor satisfies every duck check, so only the exact-type gate stops it.
+
+    It carries the lease's own store, the proof's own txid, and the real descriptors --
+    which is the point: `workspace._store is lease._store` and the txid comparison both
+    pass, and capture would write through `staging_fd` into a workspace whose `close`
+    and spent-flag discipline nothing owns.
+    """
+    from typing import cast
+
+    from atoms.coordinator.capture import capture_initial_surface
+    from atoms.coordinator.prepare import open_workspace
+    from atoms.store.workspace import Workspace
+
+    class Impostor:
+        def __init__(self, real: Workspace) -> None:
+            self._store = real._store
+            self.txid = real.txid
+            self.staging_fd = real.staging_fd
+            self.work_fd = real.work_fd
+
+    with leased() as lease:
+        approved = approved_replace(lease)
+        with open_workspace(lease, approved) as workspace:
+            impostor = Impostor(workspace)
+            with pytest.raises(ProtocolError, match="exactly Workspace"):
+                capture_initial_surface(
+                    lease,
+                    approved,
+                    cast(Workspace, impostor),
+                    payloads_for_replace(),
+                )
+            assert os.listdir(workspace.staging_fd) == []
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -2394,6 +2507,18 @@ def capture_initial_surface(
 ) -> Captured:
     """Authority §7.3 step 1 (design §7)."""
     _require_admitted(lease, approved)
+    # The workspace is authenticated before anything is written into it. `promote_staging`
+    # already makes exactly these two checks (`blobs.py:332-335`), but it runs inside
+    # `prepare_transaction`, long after capture has streamed preimages and payloads into
+    # `workspace.staging_fd`. A duck-typed value, or a real Workspace issued by a
+    # different Store with the same txid, would receive those bytes and only be rejected
+    # afterwards -- so the check belongs at the first function that writes.
+    if type(workspace) is not Workspace:
+        raise ProtocolError(
+            f"expected exactly Workspace, got {type(workspace).__name__}"
+        )
+    if workspace._store is not lease._store:
+        raise ProtocolError("this workspace belongs to a different Store")
     if workspace.txid != approved.txid:
         raise ProtocolError(
             f"workspace txid {workspace.txid!r} does not match the proof's "
@@ -2700,7 +2825,7 @@ as the first statement after the docstring. `capture_initial_surface` satisfies 
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `cd python && uv run pytest tests/test_coordinator_capture.py tests/test_fs_architecture.py -q`
-Expected: PASS, 23 capture cases (22 test functions; one is parametrized over two falsy stream values) plus the architecture tier.
+Expected: PASS, 25 capture cases (24 test functions; one is parametrized over two falsy stream values) plus the architecture tier.
 
 - [ ] **Step 6: Run the full gate set**
 
@@ -3248,9 +3373,29 @@ git commit -m "test(fs): whitelist the recovery imports observe.py may make"
 - Modify: `python/tests/test_store_architecture.py`
 - Modify: `python/tests/test_coordinator_architecture.py`
 
-- [ ] **Step 1: Land the two authority amendments**
+- [ ] **Step 1: Land the authority amendments**
 
 In `docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md`:
+
+**The status header** (line 4) — it currently reads:
+
+> **Status:** Approved — authority design for `atoms`. Plan A implementation underway; A1–A5b are
+> implemented (pure model and compilation, recovery reference model, capability backend, path
+> resolution and project approval, SQLite-WAL metadata store, recovery-resolve lease); A6–A8
+> (coherent capture, effect/recovery execution, synthetic exerciser) remain.
+
+Replace with:
+
+> **Status:** Approved — authority design for `atoms`. Plan A implementation underway; A1–A6 are
+> implemented (pure model and compilation, recovery reference model, capability backend, path
+> resolution and project approval, SQLite-WAL metadata store, recovery-resolve lease, coherent
+> capture and the observation mechanism); A7–A8 (effect/recovery execution, synthetic exerciser)
+> remain.
+
+Note the wording differs from every other document's — it spells the remainder as
+`"A6–A8 (coherent capture, …) remain"`, not `"A6–A8 remain unimplemented"`, so the closing grep
+would **not** have caught it. This is why the status test asserts the authority header positively
+rather than relying on a single forbidden string.
 
 **§14, Plan A item 4** — replace with:
 
@@ -3351,7 +3496,7 @@ test**, so both change together.
 Run:
 
 ```bash
-cd python && grep -n "A6–A8 remain unimplemented" \
+cd python && grep -nE "A6–A8 remain unimplemented|A1–A5b are" \
   ../AGENTS.md ../README.md \
   ../docs/deferred-obligation-ledger.md \
   ../docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md \
@@ -3360,7 +3505,8 @@ cd python && grep -n "A6–A8 remain unimplemented" \
   tests/test_store_architecture.py tests/test_coordinator_architecture.py
 ```
 
-Expected: no matches, exit status 1.
+Expected: no matches, exit status 1. The second alternative catches the authority header, whose
+wording is its own and which the first alternative would sail past.
 
 **The file list is explicit on purpose.** A `grep -rn` over `../docs` cannot pass: the historical
 `2026-08-02-plan-a5b-recovery-lease.md:4205` records what A5b's own status line said at the time, and
@@ -3385,15 +3531,28 @@ def test_a6_status_is_synchronized_across_authority_documents():
     a5b = (
         root / "docs/plans/2026-08-02-a5b-recovery-lease-design.md"
     ).read_text(encoding="utf-8")
+    authority = (
+        root / "docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md"
+    ).read_text(encoding="utf-8")
 
     assert "A5 and A6 are implemented; A7–A8 remain unimplemented" in agents
     assert "A6 — coherent capture" in agents
     assert "**Status:** Implemented on 2026-08-07." in design
     # No banked document may still claim A6 is unimplemented. A5b's design carries the
     # same sentence and is the one easiest to leave behind.
-    for document in (agents, readme, design, a5b):
+    for document in (agents, readme, design, a5b, authority):
         assert "A6–A8 remain unimplemented" not in document
     assert "A7–A8 remain unimplemented" in a5b
+
+    # The authority header spells its remainder differently -- "A6–A8 (coherent capture,
+    # ...) remain" -- so the shared forbidden string cannot police it. Assert the header
+    # positively, and forbid the span it replaces. Whitespace is flattened because the
+    # header wraps across lines and a reflow must not break this.
+    flat = " ".join(authority.split())
+    assert "A1–A6 are implemented" in flat
+    assert "A7–A8 (effect/recovery execution, synthetic exerciser) remain." in flat
+    assert "A1–A5b are implemented" not in flat
+    assert "A6–A8 (coherent capture" not in flat
 
     # The README's roadmap is the reader's map of what exists; it was three sub-plans
     # stale before A6 and must not be left that way.
@@ -3473,15 +3632,23 @@ sites. `StagedBlob(name, digest, byte_len)` matches `blobs.py:35`, and `Captured
   a raw token across passes.
 - The descriptor table validates every node against **its own** record in `approved.directories`,
   including `WorkRoot()`. `approved.work_base` describes `metadata_root/work`, the parent of the
-  `work/<txid>` that `workspace.work_fd` names, so it was the wrong baseline; on ext4 the two carry
-  equal values, which is exactly why only a record-pinning test can catch it.
+  `work/<txid>` that `workspace.work_fd` names, so it was the wrong baseline. On ext4 the two carry
+  equal values, so the test doctors the proof to make them differ and then drives `_table` **both
+  ways**: a wrong parent must not refuse, a wrong child record must. An assertion-only test over
+  `approved.directories` passed against the old implementation too, which is why it was replaced.
+- `capture_initial_surface` authenticates the workspace — exact type and owning store — **before the
+  first write**. `promote_staging` makes the same two checks (`blobs.py:332-335`) but runs inside
+  `prepare_transaction`, after capture has already streamed preimages and payloads into
+  `staging_fd`. A foreign-store workspace under the same txid is constructible (`create_workspace`
+  takes the txid it is given), and both tests assert the staging directory is still empty after the
+  refusal.
 - A missing parent descriptor is a stop **only if the parent actually stopped**; otherwise it is a
   walk-order defect and raises `ProtocolError`. Silently calling it a stop would manufacture an
   absence inference out of a bug, and §8's basis is a verified blocker.
 - The import whitelist reuses `_resolved_imports`, and Task 7 plants four violation forms including
   `from atoms.core import recovery` and a relative import.
 
-**Test counts are measured, not estimated:** 23, 2, 15, 23 cases from 22 functions, 4, 5, 1, 1.
+**Test counts are measured, not estimated:** 23, 2, 15, 25 cases from 24 functions, 4, 5, 1, 1.
 
 **Every commit runs the full gate set**, including Tasks 5 and 7, which previously committed after a
 single file's tests.
@@ -3494,6 +3661,12 @@ build-stage trap with "A6 supplies no observations", which stops being true here
 itself stays (A7 owns the executor). And the `README.md` roadmap was already three sub-plans stale
 before A6 — it stops at A3, claims A4–A8 are unimplemented, and says no path is mutated — so Task 8
 repairs it rather than adding A6 on top of a false list.
+
+The authority design is the fifth document, and the one a forbidden-string grep would have missed: its
+header spells the remainder as "A6–A8 (coherent capture, effect/recovery execution, synthetic
+exerciser) remain", not "A6–A8 remain unimplemented". Step 1 rewrites it alongside the §6 and §14
+amendments, the grep gained a second alternative for it, and the status test asserts the new header
+positively over whitespace-flattened text so a reflow cannot break the check.
 
 Task 8's closing `grep` names its files explicitly and is **not** a `-r` sweep. Two documents legitimately
 still contain the string: the historical A5b implementation plan, which records what A5b's status line
