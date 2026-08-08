@@ -235,6 +235,16 @@ def project_root(test_volume):
 
 
 @pytest.fixture
+def project(tmp_path):
+    """A plain directory descriptor. Tier 1 needs no lease, store, or approval."""
+    fd = os.open(str(tmp_path), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        yield tmp_path, fd
+    finally:
+        os.close(fd)
+
+
+@pytest.fixture
 def held_lock(linux_backend):
     def acquire(metadata_root):
         return acquire_project_lock(linux_backend, str(metadata_root))
