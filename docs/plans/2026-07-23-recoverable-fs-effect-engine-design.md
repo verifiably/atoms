@@ -1684,7 +1684,7 @@ remains attributable to the intent that authorized it.
 **Designed 2026-08-03** (science's `2026-08-03-tamper-evident-log-design.md`; its §9 enumerates the
 engine obligations, restated here so this document carries its own contract). The engine owns
 registration — a per-engine-root hash chain at a reserved in-corpus path — and the obligations land
-with A6–A8, not before:
+with A7–A8, not before (written as A6–A8; A6 landed 2026-08-08 carrying none of them):
 
 1. **Pinned registration order, idempotent under recovery.** Durable `PREPARED` → durable
    `registered(txid, …)` chain entry → the transaction record durably stores the entry digest → first
