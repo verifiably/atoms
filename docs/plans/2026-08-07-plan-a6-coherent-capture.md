@@ -98,7 +98,8 @@ implementation, stop and report it — do not adapt around it silently.**
 | `python/tests/test_coordinator_capture_conformance.py` | **Create.** Tier 4. |
 | `python/tests/test_coordinator_capture_adversarial.py` | **Create.** Tier 5. |
 | `python/tests/test_fs_architecture.py` | **Modify.** Import whitelist; register the entry point. |
-| `python/tests/test_store_architecture.py` | **Modify.** The A5 status assertion. |
+| `python/tests/test_store_architecture.py` | **Modify.** The A5 status assertion, both halves. |
+| `docs/plans/2026-08-02-a5b-recovery-lease-design.md` | **Modify.** Its status header still says A6 is unimplemented. |
 | `python/tests/test_coordinator_architecture.py` | **Modify.** The A6 status test. |
 | `python/tests/test_store_records.py` | **Modify.** The widened helper's tests. |
 
@@ -740,7 +741,7 @@ def _write_all(fd: int, chunk: bytes) -> None:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cd python && uv run pytest tests/test_fs_observe.py -q`
-Expected: PASS, 22 tests.
+Expected: PASS, 23 tests.
 
 - [ ] **Step 5: Run the full gate set**
 
@@ -1077,6 +1078,37 @@ def approved_delete_symlink(lease: Lease, target: str = "elsewhere"):
     return admit(lease, compile_spec(delete_symlink_spec(target)))
 
 
+def superseded_spec() -> TransactionSpec:
+    """`DeletePath("a.txt")` then `CreateFileNoClobber("a.txt")`.
+
+    Committed, this is the committed-cleanup shape: e1's tombstone is retained scratch
+    awaiting removal while the live path already holds the final surface. It mirrors
+    `recovery_support.make_committed_superseded_cleanup_case("delete_then_create")`,
+    but over real approved scratch names and real files.
+    """
+    pre, post = state_of(BEFORE), state_of(AFTER)
+    return build_spec(
+        consumer_tag="test",
+        intent_digest="sha256:" + "d" * 64,
+        initial_surface={"a.txt": pre},
+        final_surface={"a.txt": post},
+        effects=[
+            DeletePath(effect_id="e1", path="a.txt", pre=pre),
+            CreateFileNoClobber(effect_id="e2", path="a.txt", post=post),
+        ],
+    )
+
+
+def approved_superseded(lease: Lease):
+    """Approved with the FINAL surface already live, as after a committed run."""
+    from atoms.coordinator.admission import admit
+
+    write_project_file(lease, "a.txt", BEFORE)
+    approved = admit(lease, compile_spec(superseded_spec()))
+    write_project_file(lease, "a.txt", AFTER)
+    return approved
+
+
 class DictPayloads:
     """A PayloadSource over an in-memory map.
 
@@ -1104,6 +1136,7 @@ Create `python/tests/test_coordinator_descriptors.py`:
 
 from __future__ import annotations
 
+import errno
 import os
 
 import pytest
@@ -1302,6 +1335,70 @@ def test_a_symlink_blocker_is_reported_as_a_symlink(leased):
                     assert type(stop.observed) is ObservedSymlink
 
 
+def test_a_vanished_existing_directory_refuses_rather_than_becoming_a_stop(leased):
+    """Only PLANNED directories produce stops.
+
+    A `TopologyDirectory` has no declared state, so §8's branches could never rule on
+    one. Approval said it exists; if it no longer opens, that is drift and it refuses.
+    """
+    from atoms.coordinator.prepare import open_workspace
+
+    with leased() as lease:
+        approved = approved_replace(lease)
+        root_fd = lease._binding.project_root_fd
+        os.unlink("d/f.txt", dir_fd=root_fd)
+        os.rmdir("d", dir_fd=root_fd)
+
+        with open_workspace(lease, approved) as workspace:
+            with Observation(LinuxBackend()) as observation:
+                with pytest.raises(PreconditionRefused, match="namespace"):
+                    _table(lease, approved, workspace, observation)
+
+
+def test_an_undefined_errno_from_the_walk_propagates(leased, monkeypatch):
+    """§9.1: only errnos with a defined domain meaning translate.
+
+    Swallowing every OSError would report a failing disk as drift.
+    """
+    from atoms.coordinator.prepare import open_workspace
+
+    with leased() as lease:
+        approved = approved_replace(lease)
+        real_open = LinuxBackend.open_child_directory
+
+        def flaky(self, parent_fd, name):
+            if name == "d":
+                raise OSError(errno.EIO, "I/O error")
+            return real_open(self, parent_fd, name)
+
+        monkeypatch.setattr(LinuxBackend, "open_child_directory", flaky)
+        with open_workspace(lease, approved) as workspace:
+            with Observation(LinuxBackend()) as observation:
+                with pytest.raises(OSError) as caught:
+                    _table(lease, approved, workspace, observation)
+                assert caught.value.errno == errno.EIO
+
+
+def test_an_occupied_planned_directory_stops_the_walk_for_its_descendants(leased):
+    """The occupied branch must stop too.
+
+    A file holds no directory entries, so `p/q` is absent -- which is exactly §8.2's
+    inference. Leaving the node unstopped would make `p/q` neither resolvable nor
+    unreachable, and capture would raise ProtocolError on the case §8.2 accepts.
+    """
+    from atoms.core.recovery.snapshot import PersistentNode
+    from atoms.coordinator.prepare import open_workspace
+
+    with leased() as lease:
+        write_project_file(lease, "p", BEFORE)
+        approved = approved_blocked_file(lease)
+        with open_workspace(lease, approved) as workspace:
+            with Observation(LinuxBackend()) as observation:
+                with _table(lease, approved, workspace, observation) as table:
+                    assert table.is_unreachable(PersistentNode(path="p"))
+                    assert table.is_unreachable(PersistentNode(path="p/q"))
+
+
 def test_a_node_beneath_a_stop_is_unreachable_not_missing(leased):
     """Two different facts. The table must not conflate them.
 
@@ -1349,10 +1446,14 @@ check/use race, because the kernel re-resolves intermediate components at the sy
 The tree gives structure, not spelling: `TopologyDirectory(node_id)` carries no name, so
 the walk reads its components from A5b's `_parent_paths`.
 
-Nothing here classifies. Where the walk stops it records the ObservedEntry it actually
-found, and capture adjudicates that against the timeline's first declared state. No
-errno is ever mapped to a kind: ENOTDIR does not distinguish a regular file from a
-socket, FIFO, or device node.
+Nothing here classifies. Only a PLANNED directory produces a `WalkStop`, recording the
+ObservedEntry actually found there, and capture adjudicates that against the timeline's
+first declared state. No errno is ever mapped to a kind: ENOTDIR does not distinguish a
+regular file from a socket, FIFO, or device node.
+
+An approved-EXISTING directory that no longer opens is drift, not a stop -- a
+`TopologyDirectory` has no declared state for §8 to rule against -- so it refuses through
+the narrow errno translation, and an undefined errno such as EIO propagates as itself.
 """
 
 from __future__ import annotations
@@ -1361,13 +1462,13 @@ import os
 from dataclasses import dataclass
 
 from atoms.core.errors import PreconditionRefused, ProtocolError
-from atoms.core.recovery.model import ObservedAbsent, ObservedEntry
+from atoms.core.recovery.model import ObservedEntry
 from atoms.core.recovery.snapshot import ProjectRoot, TopologyNode, WorkRoot
-from atoms.coordinator.admission import _parent_paths, _require_admitted
+from atoms.coordinator.admission import _parent_paths
 from atoms.coordinator.lease import Lease
 from atoms.fs.approval import ProjectApprovedSpec
 from atoms.fs.lookup import read_lookup_constraints
-from atoms.fs.observe import Observation
+from atoms.fs.observe import Observation, translated_lookup
 from atoms.fs.resolve import FilesystemIdentity, filesystem_type_of
 from atoms.fs.topology import ApprovedExistingDirectory, ApprovedPlannedDirectory
 from atoms.fs.volume import read_mount_id
@@ -1545,26 +1646,19 @@ def _build_descriptor_table(
                         observed=observed,
                     )
                 )
-                if type(observed) is not ObservedAbsent:
-                    continue
+                # BOTH outcomes stop the walk. Absent, nothing is below it; occupied by
+                # a file or symlink, nothing is below it either -- neither holds
+                # directory entries, which is the whole basis of §8.2's inference. A
+                # planned node left unstopped would leave its descendants neither
+                # resolvable nor unreachable, and capture would raise ProtocolError on
+                # the very case §8.2 exists to accept.
                 stopped_nodes.add(node)
                 continue
-            fd = _open_existing(binding, parent_fd, component)
-            if fd is None:
-                observed = observation.observe(
-                    parent_fd, component, modeled=_modeled_children(paths, node)
-                )
-                stops.append(
-                    WalkStop(
-                        node=node,
-                        path=paths[node],
-                        parent_fd=parent_fd,
-                        component=component,
-                        observed=observed,
-                    )
-                )
-                stopped_nodes.add(node)
-                continue
+            # An approved-EXISTING directory that no longer opens is drift, not a stop.
+            # There is no declared state for a TopologyDirectory to be adjudicated
+            # against, so §8's branches could never rule on it; it refuses here.
+            with translated_lookup(f"opening {component!r} for {node!r}"):
+                fd = binding.backend.open_child_directory(parent_fd, component)
             owned.append(fd)
             validate(fd, node)
             fds[node] = fd
@@ -1577,18 +1671,6 @@ def _build_descriptor_table(
     return DescriptorTable(
         fds=fds, owned=tuple(owned), stops=tuple(stops), unreachable=unreachable
     )
-
-
-def _open_existing(binding, parent_fd: int, component: str) -> int | None:
-    """Open a directory that approval said exists, or report that it no longer does.
-
-    `None` means "something else is there now" -- the caller observes what, coherently.
-    The errno is not consulted for a kind.
-    """
-    try:
-        return binding.backend.open_child_directory(parent_fd, component)
-    except OSError:
-        return None
 
 
 def _modeled_children(paths: dict[TopologyNode, str], node: TopologyNode) -> frozenset[str]:
@@ -1652,7 +1734,7 @@ def _component(
 - [ ] **Step 6: Run the tests to verify they pass**
 
 Run: `cd python && uv run pytest tests/test_coordinator_descriptors.py -q`
-Expected: PASS, 11 tests.
+Expected: PASS, 14 tests.
 
 - [ ] **Step 7: Run the full gate set**
 
@@ -2087,6 +2169,61 @@ def test_a_payload_stream_yielding_text_refuses(leased):
                     pass
 
 
+@pytest.mark.parametrize("first", [None, ""])
+def test_a_payload_stream_yielding_a_falsy_non_bytes_refuses(leased, first):
+    """The type check must precede the falsiness check.
+
+    `None` and `""` are both falsy, so a `if not chunk: break` placed first accepts a
+    malformed stream as a clean end of file -- and for a declared EMPTY file that hashes
+    to the empty digest at length 0 and validates. The bug is invisible in every test
+    whose payload is non-empty.
+    """
+    from atoms.coordinator.capture import capture_initial_surface
+    from atoms.coordinator.prepare import open_workspace
+
+    class FalsySource:
+        def open(self, digest):
+            class Stream:
+                def read(self, size):
+                    return first
+
+                def close(self):
+                    return None
+
+            return Stream()
+
+    with leased() as lease:
+        approved = approved_replace(lease)
+        with open_workspace(lease, approved) as workspace:
+            with pytest.raises(ProtocolError, match="bytes"):
+                with capture_initial_surface(lease, approved, workspace, FalsySource()):
+                    pass
+
+
+def test_a_declared_file_that_drifted_into_a_directory_refuses(leased):
+    """External state diverging from frozen intent is a refusal, not a protocol error.
+
+    `Observation` requires `modeled` for a directory, so a preimage route that omitted it
+    would surface this drift as ProtocolError("modeled...") -- blaming the engine for the
+    filesystem.
+    """
+    from atoms.coordinator.capture import capture_initial_surface
+    from atoms.coordinator.prepare import open_workspace
+
+    with leased() as lease:
+        approved = approved_replace(lease)
+        root_fd = lease._binding.project_root_fd
+        os.unlink("d/f.txt", dir_fd=root_fd)
+        os.mkdir("d/f.txt", dir_fd=root_fd)
+
+        with open_workspace(lease, approved) as workspace:
+            with pytest.raises(PreconditionRefused, match="declared initial"):
+                with capture_initial_surface(
+                    lease, approved, workspace, payloads_for_replace()
+                ):
+                    pass
+
+
 def test_an_extra_payload_binding_is_not_an_error(leased):
     """§9: `open(digest)` cannot be enumerated, so capture never learns of extras.
 
@@ -2340,7 +2477,16 @@ def _stage_preimages(
             name = digest_to_leaf(expected.content_hash)
             sink = _open_sink(workspace, name)
             try:
-                entry = observation.observe(parent_fd, path_entry.leaf, sink_fd=sink)
+                # `modeled` is passed on this route too. A declared file that drifted
+                # into a directory would otherwise make `Observation` raise
+                # ProtocolError for a missing argument, when the honest answer is that
+                # external state diverged from the frozen spec -- PreconditionRefused.
+                entry = observation.observe(
+                    parent_fd,
+                    path_entry.leaf,
+                    sink_fd=sink,
+                    modeled=_modeled_under(approved, path_entry.path),
+                )
                 _require_state(path_entry.path, entry, expected)
                 backend.flush_file(sink)
             finally:
@@ -2433,12 +2579,15 @@ def _stream_into(stream: IO[bytes], sink_fd: int) -> tuple[str, int]:
     length = 0
     while True:
         chunk = stream.read(_READ_CHUNK)
-        if not chunk:
-            break
+        # Type BEFORE falsiness. A stream returning None or "" is malformed, not at end
+        # of file, and testing falsiness first would accept it as a clean EOF -- which
+        # for an empty declared file hashes to the empty digest and validates.
         if type(chunk) is not bytes:
             raise ProtocolError(
                 f"a payload stream yielded {type(chunk).__name__}, not bytes"
             )
+        if not chunk:
+            break
         digest.update(chunk)
         length += len(chunk)
         view = memoryview(chunk)
@@ -2512,7 +2661,7 @@ as the first statement after the docstring. `capture_initial_surface` satisfies 
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `cd python && uv run pytest tests/test_coordinator_capture.py tests/test_fs_architecture.py -q`
-Expected: PASS, 20 capture tests plus the architecture tier.
+Expected: PASS, 23 capture cases (22 test functions; one is parametrized over two falsy stream values) plus the architecture tier.
 
 - [ ] **Step 6: Run the full gate set**
 
@@ -2556,17 +2705,16 @@ from atoms.core.recovery import (
     JournalState,
     PersistentObservation,
     ScratchObservation,
-    ScratchRole,
     TransactionState,
     authorize_recovery_step,
     build_recovery_snapshot,
     classify_recovery,
 )
 from atoms.core.recovery.model import FileBuildRelation
-from atoms.core.recovery.plan import ActionPlan, JointObservation
+from atoms.core.recovery.plan import ActionPlan, AuthorizedStep, JointObservation
 from atoms.fs.linux import LinuxBackend
 from atoms.fs.observe import Observation
-from tests.capture_support import approved_replace
+from tests.capture_support import approved_replace, digest_of
 
 
 def _observed(lease, approved, workspace):
@@ -2615,48 +2763,120 @@ def test_a_complete_observation_is_accepted_by_build_recovery_snapshot(leased):
     assert snapshot.persistent_observations[0].entry is live
 
 
-def test_a_joint_observation_is_accepted_by_authorize_recovery_step(leased):
-    """The committed-cleanup route, driven to a VERDICT.
+def test_a_scratch_only_observation_authorizes_a_committed_cleanup_step(leased):
+    """The committed-cleanup route, driven to an exact verdict.
 
-    Constructing a JointObservation and asserting its fields would test the dataclass.
-    `authorize_recovery_step` is the function whose contract A6's output has to satisfy,
-    so the test calls it and asserts it did not halt on the shape.
+    Ledger #13's contract for this route is specific: after one coherent complete
+    final-surface observation, each fresh authorization observation is *exactly the named
+    retained scratch slot, with empty persistent and occupancy coverage*. A
+    PREPARED/UNCOMMITTED snapshot carrying persistent evidence exercises a different
+    route entirely, and `assert outcome is not None` accepts a `HaltPlan` -- which is the
+    failure this arm exists to catch.
     """
+    from atoms.core.recovery.plan import PlanDisposition, RemoveScratch
+    from atoms.coordinator.descriptors import _build_descriptor_table
     from atoms.coordinator.prepare import open_workspace
+    from tests.capture_support import AFTER, BEFORE, approved_superseded
 
     with leased() as lease:
-        approved = approved_replace(lease)
+        # DeletePath("a.txt") then CreateFileNoClobber("a.txt"): committed, so e1's
+        # tombstone is retained scratch awaiting cleanup while the live path already
+        # holds the final surface.
+        approved = approved_superseded(lease)
+        tombstone, staging = approved.scratch
         with open_workspace(lease, approved) as workspace:
-            path_entry, scratch, live, slot = _observed(lease, approved, workspace)
+            with Observation(LinuxBackend()) as observation:
+                table = _build_descriptor_table(lease, approved, workspace, observation)
+                try:
+                    root_fd = table.fd_for(tombstone.parent_node)
+                    fd = os.open(
+                        tombstone.leaf,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o644,
+                        dir_fd=root_fd,
+                    )
+                    os.write(fd, BEFORE)
+                    os.close(fd)
+                    live = observation.observe(root_fd, "a.txt")
+                    retained = observation.observe(root_fd, tombstone.leaf)
+                    consumed = observation.observe(root_fd, staging.leaf)
+                finally:
+                    os.unlink(tombstone.leaf, dir_fd=root_fd)
+                    table.close()
 
             snapshot = build_recovery_snapshot(
                 compiled=approved.compiled,
                 topology=approved.topology,
-                transaction_state=TransactionState.PREPARED,
-                commit_decision=CommitDecision.UNCOMMITTED,
+                transaction_state=TransactionState.COMMITTED,
+                commit_decision=CommitDecision.COMMITTED,
                 rollback_result=None,
                 halt_diagnostic=None,
                 active=True,
-                journals=(EffectJournalState("e1", JournalState.PENDING),),
-                persistent_observations=(PersistentObservation(path_entry.path, live),),
+                journals=(
+                    EffectJournalState("e1", JournalState.DONE),
+                    EffectJournalState("e2", JournalState.DONE),
+                ),
+                persistent_observations=(PersistentObservation("a.txt", live),),
                 scratch_observations=(
-                    ScratchObservation("e1", scratch.role, slot, None),
+                    ScratchObservation("e1", tombstone.role, retained, None),
+                    ScratchObservation("e2", staging.role, consumed, None),
                 ),
             )
-            plan = classify_recovery(snapshot)
-            assert type(plan) is ActionPlan
 
-            joint = JointObservation(
-                persistent=(PersistentObservation(path_entry.path, live),),
-                scratch=(ScratchObservation("e1", scratch.role, slot, None),),
-                parent_occupancy=(),
-            )
-            outcome = authorize_recovery_step(plan, 0, joint)
+    assert live.state.content_hash == digest_of(AFTER)
+    plan = classify_recovery(snapshot)
+    assert type(plan) is ActionPlan
+    assert plan.disposition is PlanDisposition.COMMITTED_CLEANUP
 
-    # A6's obligation is that its observation is a well-formed input, not that a
-    # particular step authorizes. A HaltPlan citing a malformed observation would fail
-    # here; one citing genuine state is A7's business.
-    assert outcome is not None
+    index, step = next(
+        (i, s) for i, s in enumerate(plan.steps) if type(s) is RemoveScratch
+    )
+    assert step.effect_id == "e1"
+
+    # Exactly the named slot. Empty persistent and occupancy coverage is the contract,
+    # not an omission.
+    joint = JointObservation(
+        persistent=(),
+        scratch=(ScratchObservation("e1", tombstone.role, retained, None),),
+        parent_occupancy=(),
+    )
+    outcome = authorize_recovery_step(plan, index, joint)
+
+    assert type(outcome) is AuthorizedStep
+
+
+def test_a_wrong_mode_staging_directory_is_reported_with_its_actual_mode(leased):
+    """§10's wrong-mode staging directory, observed rather than judged.
+
+    A6's obligation is to report the mode and occupancy it actually found; deciding that
+    the mode is *wrong* is A3's, and an observer that normalised or corrected it would
+    hide the case A7 has to repair.
+    """
+    from atoms.core.recovery.model import ObservedDirectory
+    from atoms.coordinator.descriptors import _build_descriptor_table
+    from atoms.coordinator.prepare import open_workspace
+    from tests.capture_support import DIRECTORY_POST
+
+    with leased() as lease:
+        approved = approved_replace(lease)
+        scratch = approved.scratch[0]
+        with open_workspace(lease, approved) as workspace:
+            with Observation(LinuxBackend()) as observation:
+                table = _build_descriptor_table(lease, approved, workspace, observation)
+                try:
+                    parent_fd = table.fd_for(scratch.parent_node)
+                    os.mkdir(scratch.leaf, 0o700, dir_fd=parent_fd)
+                    entry = observation.observe(
+                        parent_fd, scratch.leaf, modeled=frozenset()
+                    )
+                finally:
+                    os.rmdir(scratch.leaf, dir_fd=parent_fd)
+                    table.close()
+
+    assert type(entry) is ObservedDirectory
+    assert entry.state.mode == 0o700
+    assert entry.state.mode != DIRECTORY_POST.mode
+    assert entry.has_unmodeled_child is False
 
 
 def test_the_prefix_relation_comes_from_real_files(leased):
@@ -2690,13 +2910,19 @@ def test_the_prefix_relation_comes_from_real_files(leased):
 - [ ] **Step 2: Run the tests**
 
 Run: `cd python && uv run pytest tests/test_coordinator_capture_conformance.py -q`
-Expected: PASS, 3 tests. **If `classify_recovery` returns a `HaltPlan` for this snapshot, stop and
-report it** — the fixture is a clean PREPARED/PENDING transaction and should classify as a rollback.
+Expected: PASS, 4 tests. **If `classify_recovery` returns a `HaltPlan` for this snapshot, stop and
+report it** — the first fixture is a clean PREPARED/PENDING transaction and should classify as a
+rollback, and the second is a committed supersede that should classify as `COMMITTED_CLEANUP`.
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 3: Run the full gate set**
+
+Run: `cd python && uv run ruff format && uv run ruff check && uv run pyright && uv run pytest -q`
+Expected: all green.
+
+- [ ] **Step 4: Commit**
 
 ```bash
-git add python/tests/test_coordinator_capture_conformance.py
+git add python/tests/test_coordinator_capture_conformance.py python/tests/capture_support.py
 git commit -m "test(capture): conform the observer to A3's snapshot and authorization routes"
 ```
 
@@ -2899,42 +3125,46 @@ def test_observe_imports_only_the_recovery_model():
     re-exports `classify_recovery` and `authorize_recovery_step`, so a classifier is
     reachable through the package facade.
 
-    BOTH import forms are checked. Inspecting only `ImportFrom` would let a plain
-    `import atoms.core.recovery` walk straight past the whitelist and reach every
-    classifier through attribute access.
+    The scan reuses `_resolved_imports`, which already resolves plain `import`, aliased
+    `from atoms.core import recovery`, and relative forms through `resolve_name`. A
+    hand-rolled scanner over `node.module` alone would miss all three: `from atoms.core
+    import recovery` names the parent package, and a relative import names nothing that
+    starts with `atoms`.
     """
     source = SOURCE_ROOT / "fs" / "observe.py"
     tree = ast.parse(source.read_text(encoding="utf-8"))
     permitted = "atoms.core.recovery.model"
-    offenders = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom):
-            module = node.module or ""
-            if module.startswith("atoms.core.recovery") and module != permitted:
-                offenders.append(module)
-        elif isinstance(node, ast.Import):
-            offenders.extend(
-                alias.name
-                for alias in node.names
-                if alias.name.startswith("atoms.core.recovery")
-                and alias.name != permitted
-            )
+    offenders = sorted(
+        name
+        for name in _resolved_imports(tree, package="atoms.fs")
+        if name.startswith("atoms.core.recovery")
+        and name != permitted
+        and not name.startswith(f"{permitted}.")
+    )
     assert offenders == []
 ```
 
-- [ ] **Step 2: Verify it fails on a planted violation**
+- [ ] **Step 2: Verify it fails on all four planted violations**
 
-Temporarily add `from atoms.core.recovery import classify_recovery` to `observe.py`.
+Plant each of these in `observe.py` in turn, run the test, and confirm it FAILS each time. **A test
+that passes on any one of them is not guarding anything — stop and fix it before removing the plant.**
+Remove every plant afterwards.
 
-Run: `cd python && uv run pytest tests/test_fs_architecture.py -q -k observe_imports`
-Expected: FAIL, listing `atoms.core.recovery`. Then add `import atoms.core.recovery` instead and
-confirm it fails again. **A test that passes on either planted violation is not guarding anything —
-stop and fix it before removing the plant.** Remove both plants afterwards.
+| Plant | Why it must be caught |
+| --- | --- |
+| `from atoms.core.recovery import classify_recovery` | The package facade re-exports the classifier |
+| `import atoms.core.recovery` | Attribute access reaches everything |
+| `from atoms.core import recovery` | Names the parent package, not the module |
+| `from ..core.recovery import classify_recovery` | Relative; the raw `node.module` is `core.recovery` |
 
-- [ ] **Step 3: Run and commit**
+Run each time: `cd python && uv run pytest tests/test_fs_architecture.py -q -k observe_imports`
 
-Run: `cd python && uv run pytest tests/test_fs_architecture.py -q`
-Expected: PASS.
+- [ ] **Step 3: Run the full gate set**
+
+Run: `cd python && uv run ruff format && uv run ruff check && uv run pyright && uv run pytest -q`
+Expected: all green.
+
+- [ ] **Step 4: Commit**
 
 ```bash
 git add python/tests/test_fs_architecture.py
@@ -2993,12 +3223,21 @@ test**, so both change together.
 1. In `AGENTS.md`, change the A3 paragraph's `"A5 is implemented; A6–A8 remain unimplemented"` to
    `"A5 and A6 are implemented; A7–A8 remain unimplemented"`, and add an A6 paragraph describing
    `atoms/fs/observe.py` and `atoms/coordinator/{descriptors,capture}.py`.
-2. In `python/tests/test_store_architecture.py:1269`, update the A5 assertions to the new sentence and
-   drop `assert "A5–A8 remain unimplemented" not in agents` only if it no longer applies.
-3. In `README.md`, add A6 to the layering note.
-4. In `docs/plans/2026-08-07-a6-coherent-capture-design.md`, change the status header from
+2. In `docs/plans/2026-08-02-a5b-recovery-lease-design.md`, change its status header's
+   `"A6–A8 remain unimplemented."` to `"A7–A8 remain unimplemented."` **This document is easy to
+   miss:** `test_a5_status_is_synchronized_across_authority_documents` reads it as its second half and
+   asserts the old string, so A6 landing without touching it leaves a banked design claiming A6 does
+   not exist.
+3. In `python/tests/test_store_architecture.py:1269`, update **both** halves — the `AGENTS.md`
+   sentence and the A5b design's `"A6–A8 remain unimplemented."` assertion. Drop
+   `assert "A5–A8 remain unimplemented" not in agents` only if it no longer applies.
+4. In `README.md`, add A6 to the layering note.
+5. In `docs/plans/2026-08-07-a6-coherent-capture-design.md`, change the status header from
    `"Designed on 2026-08-07, unimplemented. A7–A8 remain unimplemented."` to
    `"Implemented on 2026-08-07. A7–A8 remain unimplemented."`
+
+Run: `cd python && grep -rn "A6–A8 remain unimplemented" ../docs ../AGENTS.md ../README.md tests/`
+Expected: no matches. Every document and assertion that named A6 as unimplemented has moved together.
 
 - [ ] **Step 4: Add the A6 status test**
 
@@ -3013,11 +3252,18 @@ def test_a6_status_is_synchronized_across_authority_documents():
         root / "docs/plans/2026-08-07-a6-coherent-capture-design.md"
     ).read_text(encoding="utf-8")
 
+    a5b = (
+        root / "docs/plans/2026-08-02-a5b-recovery-lease-design.md"
+    ).read_text(encoding="utf-8")
+
     assert "A5 and A6 are implemented; A7–A8 remain unimplemented" in agents
-    assert "A6–A8 remain unimplemented" not in agents
     assert "A6 — coherent capture" in agents
     assert "**Status:** Implemented on 2026-08-07." in design
-    assert "A7–A8 remain unimplemented." in design
+    # No banked document may still claim A6 is unimplemented. A5b's design carries the
+    # same sentence and is the one easiest to leave behind.
+    for document in (agents, design, a5b):
+        assert "A6–A8 remain unimplemented" not in document
+    assert "A7–A8 remain unimplemented" in a5b
 ```
 
 - [ ] **Step 5: Run the full gate set**
@@ -3059,7 +3305,34 @@ different question. `_build_descriptor_table` is private in both its definition 
 sites. `StagedBlob(name, digest, byte_len)` matches `blobs.py:35`, and `Captured.manifest` is the
 `tuple[StagedBlob, ...]` `prepare_transaction` takes.
 
-**Three claims the earlier revision made that the code now actually supports.** A descriptor is owned
-or closed, never neither (`_open_and_pin`). A directory is never described without enumeration
-(`modeled` is required). And no errno selects a state branch — `_open_existing` returns `None` and the
-caller observes what is really there.
+**Claims the earlier revisions made that the code now actually supports.**
+
+- A descriptor is owned or closed, never neither (`_open_and_pin`).
+- A directory is never described without enumeration (`modeled` is required — and passed on the
+  file-preimage route too, so a file that drifted into a directory refuses rather than raising
+  `ProtocolError` for a missing argument).
+- No errno selects a state branch. Only a **planned** directory produces a `WalkStop`, and its
+  observed entry is what §8 adjudicates. An approved-existing directory that no longer opens is drift
+  and refuses through `translated_lookup`, so `EIO` propagates as itself rather than being swallowed
+  into a stop.
+- **Both** planned-directory outcomes stop the walk. The occupied branch previously did not, which
+  left `p/q` neither resolvable nor unreachable and made the plan's own matching-blocker test end in
+  `ProtocolError` — the one case §8.2 exists to accept.
+- `_stream_into` checks type before falsiness, so a stream returning `None` or `""` is malformed
+  rather than an end of file that would validate against a declared empty file.
+- The authorization arm builds the **committed-cleanup** fixture ledger #13 actually describes,
+  selects the `RemoveScratch` step, supplies exactly the named slot with empty persistent and
+  occupancy coverage, and asserts `AuthorizedStep` — not `is not None`, which accepted `HaltPlan`.
+- The import whitelist reuses `_resolved_imports`, and Task 7 plants four violation forms including
+  `from atoms.core import recovery` and a relative import.
+
+**Test counts are measured, not estimated:** 23, 2, 14, 23 cases from 22 functions, 4, 5, 1, 1.
+
+**Every commit runs the full gate set**, including Tasks 5 and 7, which previously committed after a
+single file's tests.
+
+**Status synchronization covers three documents,** not two. `AGENTS.md`, this design, and A5b's
+design all carry "A6–A8 remain unimplemented", the last of which
+`test_a5_status_is_synchronized_across_authority_documents` asserts — so landing A6 without touching
+it leaves a banked design claiming A6 does not exist. Task 8 ends on a `grep` that proves no
+occurrence survives anywhere.
