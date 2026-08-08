@@ -1,6 +1,6 @@
 # A5a — the durable metadata store
 
-**Status:** design, unimplemented.
+**Status:** Implemented on 2026-08-01. A7–A8 remain unimplemented.
 **Authority:** [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md)
 authority §7, §7.2, §11. Where this design and the authority disagreed, the authority was amended in the same
 commit; §3.3 lists every amendment.
@@ -972,6 +972,8 @@ published. A5a supplies the mechanism for the second and still ships nothing for
 **Calling them is A5b's, and that is a tracked obligation.** A5a never invokes either operation — it
 has no lease, no entry point, and no way to know a crash occurred. Ledger #23 records that A5a supplies
 enumeration and removal for both survivor kinds while nothing yet runs them at lease entry (§3.2).
+A5b discharged #23 on 2026-08-02: every lease entry now enumerates and reclaims both survivor
+kinds under the held lock.
 
 ### 7.4 Reads take one snapshot
 
@@ -2538,7 +2540,9 @@ table shapes, and §11 refusal vocabulary (§3.3).
     fresh process, including every initial- and final-surface blob.
 40. No `ProjectApprovedSpec` is accepted anywhere in `atoms.store`, so ledger #9's enforcement cannot
     be satisfied at this layer by accident.
-41. No consumer of `atoms.store` exists yet, asserted rather than assumed.
+41. No consumer of `atoms.store` exists yet, asserted rather than assumed. (True at A5a's
+    landing. `atoms.coordinator` became that consumer on 2026-08-02 and the guard was retired
+    with it; ledger #9's entry-point registry in `test_fs_architecture.py` replaces it.)
 42. Every caller-supplied pathname component — txid, manifest leaf, digest — is validated against
     §5.5 before any filesystem mutation, with exact types required and **`ProtocolError` raised**,
     never a bare `TypeError` or `SpecValidationError`.

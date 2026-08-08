@@ -1,6 +1,6 @@
 # A4b-2 — rooted project approval
 
-**Status:** Implemented on 2026-07-31. A5–A8 remain unimplemented. A4b-2 reads project space
+**Status:** Implemented on 2026-07-31. A7–A8 remain unimplemented. A4b-2 reads project space
 and never writes to it.
 
 **Authority:** [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md).
@@ -70,8 +70,11 @@ than a lint.
 
 Toward A5, the proof is the whole interface. A5 receives a `ProjectApprovedSpec` and may not
 reconstruct any part of it. Ledger #19 constrains what A5 may *do* with the retained facts: compare,
-never authorize. Ledger #9 remains open until the future A5–A8 entry points enforce that interface;
-A4b can prove only the factory half and that no consumer exists yet.
+never authorize. Ledger #9 remains open until every A5–A8 entry point enforces that interface;
+A4b can prove only the factory half, and at A4b's landing no consumer existed at all. A5b and
+A6 have since supplied four — `open_workspace`, `prepare_transaction`, `persist_plan_prefix`,
+and `capture_initial_surface` — each registered in `_TRANSACTION_STAGE_ENTRY_POINTS` and
+asserted to gate on `ProjectApprovedSpec`; A7–A8's entry points remain.
 
 ## 3. Seam review against the deferred-obligation ledger
 

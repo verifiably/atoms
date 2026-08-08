@@ -608,7 +608,9 @@ On a real ext4 volume, using the existing binding fixtures.
 - No module outside `atoms/coordinator/` imports `_recovery_lease` or `Lease`, and none of
   `Lease`, `ProjectBinding`, or `Store` appears in `atoms.coordinator.__all__`. The guard speaks for
   in-tree callers, which is the population it can speak for; the leading underscore states the rest.
-- `test_a5_status_is_synchronized_across_authority_documents` reflects "A5b designed, unimplemented."
+- A5b's status is reflected in the corpus status guard. (At A5b's landing that guard was
+  `test_a5_status_is_synchronized_across_authority_documents`, one of four per-sub-plan guards; they
+  were replaced on 2026-08-08 by the derived `tests/test_docs_status.py`.)
 
 ## 11. Acceptance criteria
 

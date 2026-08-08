@@ -1,7 +1,7 @@
 # A4b-1 Path Resolution Implementation Plan
 
-**Status:** Implemented 2026-07-30; final-review fixes applied 2026-07-31. A4b-2 and
-A5–A8 remain unimplemented. Per the approved design §9, injected Tier 2 uses the
+**Status:** Implemented 2026-07-30; final-review fixes applied 2026-07-31.
+A7–A8 remain unimplemented. Per the approved design §9, injected Tier 2 uses the
 generic A4a binding; ext4-only fixtures are reserved for Tier 3 and Tier 4.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

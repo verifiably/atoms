@@ -21,8 +21,8 @@ A7 must consume these decisions later and may not duplicate them.
 which refines [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md)
 §§5.4, 7.2, 8.1–8.4, 9, 10, and 13.1. Where they disagree, the authority design wins.
 
-**Status:** Implemented on 2026-07-29. A4–A8 remain unimplemented; no code
-in this repository mutates a filesystem path.
+**Status:** Implemented on 2026-07-29. A7–A8 remain unimplemented; no code
+in this repository mutates a project path.
 
 ## Global Constraints
 

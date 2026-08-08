@@ -36,7 +36,7 @@ Plan B is written only after Plan A's interfaces settle.
   A4b-2 owns the judgment in `atoms/fs/approval.py`, `atoms/fs/judgment.py`, and
   `atoms/fs/topology.py`: `approve_for_project`, `ProjectApprovedSpec`, and ledger entries #2,
   #3 (its part), #4, #5, #6, #10, #11, #16, and #20 are discharged. The factory half of #9
-  is complete; enforcement at the future A5–A8 entry points remains open.
+  is complete; A5's and A6's entry points enforce it and A7–A8's remain open.
   It admits #21, the txid binding, owned by A5.
   A4b-1 approves only non-casefold ext4; XFS, Btrfs, and casefold directories fail closed.
 - **A5 — durable metadata store and recovery lease: A5a implemented on 2026-08-01, A5b implemented on
@@ -58,11 +58,13 @@ Plan B is written only after Plan A's interfaces settle.
   (absence inference over both §6 branches, preimage streaming into workspace staging, flush, and the
   manifest `prepare_transaction` consumes). Its design is
   [`docs/plans/2026-08-07-a6-coherent-capture-design.md`](docs/plans/2026-08-07-a6-coherent-capture-design.md).
-  Ledger entries #1, #3, #13, and #19 are half-discharged; each keeps an A7 half open.
+  Ledger entries #1, #3, #13, and #19 are half-discharged; each keeps an A7 half open,
+  and the design's §13 lists six further gaps A7 inherits.
 
 Work lives under `python/` (`uv run pytest`, `uv run ruff check`, `uv run pyright`, all from
 `python/`).
-A4a mutates only engine-owned `metadata_root`, never project paths.
+No project path is mutated by any code in this repository; A4a, A5a, and A6 write only to
+engine-owned paths under `metadata_root`.
 
 ## Authority order
 
@@ -83,7 +85,8 @@ entry in the same commit as the admission that creates it; remove one only when 
 **and** its verification suite covers it. A sub-plan is not ready for review until every entry naming it
 as owner has a stated required behavior.
 
-Sub-plans A3 and A4 get a seam review against this ledger *before* their plans are written, not after.
+Every sub-plan from A3 on gets a seam review against this ledger *before* its plan is written, not
+after; it is §3 of each design.
 
 ## Conventions
 
@@ -91,3 +94,7 @@ Sub-plans A3 and A4 get a seam review against this ledger *before* their plans a
 - Composition over inheritance.
 - Filepaths in docs use `~/d/atoms/...`.
 - No AI-attribution trailers in commit messages, PRs, or comments.
+- The roadmap is one fact, in `python/tests/test_docs_status.py`. Landing a sub-plan means moving
+  `FIRST_UNIMPLEMENTED` there; the guard then names every document that still disagrees. Do not
+  add a per-sub-plan status test — four of those existed, and two ended up pinning claims the next
+  sub-plan falsified.

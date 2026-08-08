@@ -388,42 +388,6 @@ def test_the_production_bind_call_passes_the_certified_allowlist():
     assert CERTIFIED_ALLOWLIST == DurabilityAllowlist(entries=frozenset())
 
 
-def _status_paragraph(path: Path) -> str:
-    lines = path.read_text(encoding="utf-8").splitlines()
-    start = next(
-        index for index, line in enumerate(lines) if line.startswith("**Status:**")
-    )
-    paragraph: list[str] = []
-    for line in lines[start:]:
-        if not line:
-            break
-        paragraph.append(line)
-    return " ".join(paragraph).removeprefix("**Status:** ")
-
-
-def test_a4a_status_is_synchronized_across_authority_documents():
-    root = Path(__file__).parents[2]
-    expected = (
-        "Implemented on 2026-07-30. A4b and A5–A8 remain unimplemented; "
-        "A4a mutates only engine-owned `metadata_root`, never project paths."
-    )
-    assert _status_paragraph(
-        root / "docs" / "plans" / "2026-07-29-a4a-capability-backend-design.md"
-    ) == expected
-    assert _status_paragraph(
-        root / "docs" / "plans" / "2026-07-29-plan-a4a-capability-backend.md"
-    ) == expected
-
-    agents = (root / "AGENTS.md").read_text(encoding="utf-8")
-    assert (
-        "**A4a — capability backend and project volume binding: implemented on "
-        "2026-07-30.**"
-    ) in agents
-    assert (
-        "A4a mutates only engine-owned `metadata_root`, never project paths."
-    ) in agents
-
-
 def test_verified_child_path_is_not_exported():
     assert not hasattr(atoms.fs, "verified_child_path")
 
@@ -1107,22 +1071,14 @@ def test_no_unregistered_public_function_accepts_the_proof():
     assert found == registered
 
 
-def test_a4b_status_is_synchronized_across_authority_documents():
-    root = Path(__file__).parents[2]
-    expected = (
-        "Implemented on 2026-07-31. A5–A8 remain unimplemented. "
-        "A4b-2 reads project space and never writes to it."
-    )
-    assert _status_paragraph(
-        root / "docs" / "plans" / "2026-07-31-a4b2-project-approval-design.md"
-    ) == expected
-    assert _status_paragraph(
-        root / "docs" / "plans" / "2026-07-31-plan-a4b2-project-approval.md"
-    ) == expected
+def test_ledger_entry_nine_stays_open_against_the_stages_that_owe_it():
+    """#9's enforcement is A5-A8's, and AGENTS.md must keep naming the two halves.
 
+    Status wording lives in `test_docs_status.py`; what this asserts is the ledger's own
+    shape -- entry #9 open, owned by A5, scoped to A5-A8 -- which no status guard covers.
+    """
+    root = Path(__file__).parents[2]
     agents = (root / "AGENTS.md").read_text(encoding="utf-8")
-    assert "**A4b — rooted project approval: implemented on 2026-07-31.**" in agents
-    assert "A4b and A5–A8 remain unimplemented" not in agents
     assert "It admits #21, the txid binding, owned by A5." in agents
     assert "factory half of #9" in agents
 
@@ -1135,6 +1091,4 @@ def test_a4b_status_is_synchronized_across_authority_documents():
     )
     assert "| A5 |" in row
     assert "A5–A8" in row
-    assert not any(
-        line.startswith("| 9 |") for line in discharged.splitlines()
-    )
+    assert not any(line.startswith("| 9 |") for line in discharged.splitlines())

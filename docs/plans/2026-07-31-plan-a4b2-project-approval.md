@@ -1,6 +1,6 @@
 # A4b-2 Rooted Project Approval Implementation Plan
 
-**Status:** Implemented on 2026-07-31. A5–A8 remain unimplemented. A4b-2 reads project
+**Status:** Implemented on 2026-07-31. A7–A8 remain unimplemented. A4b-2 reads project
 space and never writes to it.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
