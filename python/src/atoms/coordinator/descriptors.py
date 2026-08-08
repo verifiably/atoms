@@ -7,7 +7,12 @@ multi-component path is ever assembled -- passing one to a syscall would reopen 
 check/use race, because the kernel re-resolves intermediate components at the syscall.
 
 The tree gives structure, not spelling: `TopologyDirectory(node_id)` carries no name, so
-the walk reads its components from A5b's `_parent_paths`.
+the walk builds its own node-to-path table, `_directory_paths`, by climbing
+`approved.topology.parents` from each declared path up to a node it has already
+recorded. A5b's `_parent_paths` looks similar but is scoped to admission's own job
+(design §6.4): it maps only declared paths and their direct parent, not every
+undeclared intermediate directory `approved.directories` also names. Borrowing it here
+left the walk unable to name an ordinary undeclared ancestor directory at all.
 
 Nothing here classifies. Only a PLANNED directory produces a `WalkStop`, recording the
 ObservedEntry actually found there, and capture adjudicates that against the timeline's
@@ -25,11 +30,10 @@ import os
 from dataclasses import dataclass
 from typing import Self
 
-from atoms.coordinator.admission import _parent_paths
 from atoms.coordinator.lease import Lease
 from atoms.core.errors import PreconditionRefused, ProtocolError
 from atoms.core.recovery.model import ObservedEntry
-from atoms.core.recovery.snapshot import ProjectRoot, TopologyNode, WorkRoot
+from atoms.core.recovery.snapshot import PersistentNode, ProjectRoot, TopologyNode, WorkRoot
 from atoms.fs.approval import ProjectApprovedSpec
 from atoms.fs.lookup import read_lookup_constraints
 from atoms.fs.observe import Observation, translated_lookup
@@ -122,7 +126,7 @@ def _build_descriptor_table(
     binding = lease._binding
     filesystem_type = filesystem_type_of(binding)
     expected_mount = binding.evidence.mount_id
-    paths = _parent_paths(approved)
+    paths = _directory_paths(approved)
     # One map, both kinds. Every descriptor-bearing node has an approved record in
     # `approved.directories`, including WorkRoot: A4b builds the topology with
     # ApprovedPlannedDirectory(WorkRoot(), inherited_constraints(work_base.constraints,
@@ -258,6 +262,34 @@ def _modeled_children(paths: dict[TopologyNode, str], node: TopologyNode) -> fro
     )
 
 
+def _directory_paths(approved: ProjectApprovedSpec) -> dict[TopologyNode, str]:
+    """Every directory node's path, total over `approved.directories` -- project space
+    only; `WorkRoot` is excluded by construction, never reached by this climb (its only
+    edge is `TopologyParent(WorkRoot(), ProjectRoot())`, and no declared path is ever
+    parented by it).
+
+    A5b's `_parent_paths` looks like this table but is not one: it maps only declared
+    paths and their direct parent (design §6.4's scope), so an intermediate directory
+    that is nobody's own declared path -- an ordinary undeclared ancestor -- has no
+    entry there. `approved.directories` names every directory prefix regardless, so
+    this climbs `approved.topology.parents` from each declared path's parent up to a
+    node already recorded, filling in every undeclared ancestor along the way. The
+    climb always terminates: the tree is rooted at `ProjectRoot()`, seeded below, and
+    every non-root node has exactly one parent edge (`RecoveryTopology`'s own
+    invariant).
+    """
+    parents = {edge.node: edge.parent for edge in approved.topology.parents}
+    paths: dict[TopologyNode, str] = {ProjectRoot(): ""}
+    for entry in approved.paths:
+        paths[PersistentNode(entry.path)] = entry.path
+        node, prefix = entry.parent_node, entry.path.rpartition("/")[0]
+        while node not in paths:
+            paths[node] = prefix
+            node = parents[node]
+            prefix = prefix.rpartition("/")[0]
+    return paths
+
+
 def _walk_order(
     approved: ProjectApprovedSpec, paths: dict[TopologyNode, str]
 ) -> tuple[TopologyNode, ...]:
@@ -267,6 +299,12 @@ def _walk_order(
         for entry in approved.directories
         if entry.node not in (ProjectRoot(), WorkRoot())
     ]
+    missing = [node for node in directories if node not in paths]
+    if missing:
+        raise ProtocolError(
+            f"{missing[0]!r} has no path in the walk's directory table; the topology "
+            "and the approved directories disagree"
+        )
     return tuple(sorted(directories, key=lambda node: paths[node].count("/")))
 
 

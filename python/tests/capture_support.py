@@ -80,6 +80,33 @@ def approved_replace(lease: Lease):
     return admit(lease, compiled_replace(lease))
 
 
+def deep_replace_spec() -> TransactionSpec:
+    """One `ReplaceFile` three directories deep, under `a/b/c`.
+
+    None of `a`, `a/b`, or `a/b/c` is itself declared -- only `a/b/c/f.txt` is -- so
+    each is an undeclared `TopologyDirectory` rather than a `PersistentNode`.
+    """
+    pre, post = state_of(BEFORE), state_of(AFTER)
+    return build_spec(
+        consumer_tag="test",
+        intent_digest="sha256:" + "e" * 64,
+        initial_surface={"a/b/c/f.txt": pre},
+        final_surface={"a/b/c/f.txt": post},
+        effects=[ReplaceFile(effect_id="e1", path="a/b/c/f.txt", pre=pre, post=post)],
+    )
+
+
+def compiled_deep_replace(lease: Lease) -> CompiledSpec:
+    write_project_file(lease, "a/b/c/f.txt", BEFORE)
+    return compile_spec(deep_replace_spec())
+
+
+def approved_deep_replace(lease: Lease):
+    from atoms.coordinator.admission import admit
+
+    return admit(lease, compiled_deep_replace(lease))
+
+
 def blocker_spec(pre) -> TransactionSpec:
     """`DeletePath("p")`, `CreateDirectory("p")`, `CreateFileNoClobber("p/q")`.
 

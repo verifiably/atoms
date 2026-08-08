@@ -39,6 +39,37 @@ def test_the_table_holds_one_descriptor_per_approved_directory(leased):
             assert isinstance(table.fd_for(TopologyDirectory(node_id=0)), int)
 
 
+def test_the_walk_opens_every_intermediate_directory_even_when_undeclared(leased):
+    """A5b's `_parent_paths` is scoped to admission's own job (design §6.4): it maps
+    only declared paths and their direct parent. `approved.directories` holds an entry
+    for every directory prefix, declared or not, so the walk's own node-to-path table
+    must be total over all of them -- borrowing admission's is not enough.
+
+    `a`, `a/b`, and `a/b/c` all exist on disk and none of the three is itself
+    declared -- only `a/b/c/f.txt` is -- so each is an undeclared `TopologyDirectory`
+    the walk must still open a descriptor for.
+    """
+    from atoms.coordinator.prepare import open_workspace
+    from atoms.core.recovery.snapshot import TopologyDirectory
+    from tests.capture_support import approved_deep_replace
+
+    with leased() as lease:
+        approved = approved_deep_replace(lease)
+        intermediate = [
+            entry.node
+            for entry in approved.directories
+            if type(entry.node) is TopologyDirectory
+        ]
+        assert len(intermediate) == 3
+        with (
+            open_workspace(lease, approved) as workspace,
+            Observation(LinuxBackend()) as observation,
+            _table(lease, approved, workspace, observation) as table,
+        ):
+            for node in intermediate:
+                assert isinstance(table.fd_for(node), int)
+
+
 def test_the_root_descriptors_are_borrowed_and_survive_close(leased):
     """§5.5: ProjectBinding and Workspace own theirs; the table closes only its own."""
     from atoms.coordinator.prepare import open_workspace
