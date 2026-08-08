@@ -999,6 +999,7 @@ def test_the_approved_spec_is_not_exported():
 
 
 _TRANSACTION_STAGE_ENTRY_POINTS = {
+    "atoms/coordinator/capture.py": ("capture_initial_surface",),
     "atoms/coordinator/prepare.py": ("open_workspace", "prepare_transaction"),
     "atoms/coordinator/transitions.py": ("persist_plan_prefix",),
 }
