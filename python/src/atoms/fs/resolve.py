@@ -70,7 +70,7 @@ def _require_leaf(leaf: str) -> None:
         )
 
 
-def _filesystem_type(binding: ProjectBinding) -> str:
+def filesystem_type_of(binding: ProjectBinding) -> str:
     configuration = binding.evidence.configuration
     if configuration.backend_id != _LINUX:
         raise CapabilityUnavailable(
@@ -515,7 +515,7 @@ def observe_child(
     not a path and is never split.
     """
     _require_leaf(leaf)
-    filesystem_type = _filesystem_type(binding)
+    filesystem_type = filesystem_type_of(binding)
     parent_fd, owned = _open_project_relative(binding, parent_path)
     try:
         return _observe_open_child(parent_fd, filesystem_type, leaf)
@@ -533,7 +533,7 @@ def observe_work_child(binding: ProjectBinding, leaf: str) -> ChildObservation:
     because this is the metadata namespace, where project containment does not apply.
     """
     _require_leaf(leaf)
-    filesystem_type = _filesystem_type(binding)
+    filesystem_type = filesystem_type_of(binding)
     backend = binding.backend
     try:
         fd = backend.open_child_directory(binding.metadata_root_fd, WORK_DIRECTORY)
