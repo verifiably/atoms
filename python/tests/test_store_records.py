@@ -604,17 +604,6 @@ def _plant_halted(raw, diagnostic):
     )
 
 
-def _plant_non_compiling_spec(raw) -> None:
-    """The planted spec states a postimage in neither surface, so it references a
-    digest the committed record never wrote. Insert the row it needs: this case
-    corrupts `spec_json_compiles` and nothing else."""
-    _plant_spec_json(raw, canonical_json(non_compiling_spec()), CREATE_FILE_ROW)
-    raw.execute(
-        "INSERT INTO blob VALUES (?, ?)",
-        (digest_of(b"after"), len(b"after")),
-    )
-
-
 def _plant_blob_for_non_compiling_spec(raw) -> None:
     """Stage the blob row for the digest referenced by non_compiling_spec's effect.
     This is for the write-side test where insert_record is called inside a transaction."""
@@ -622,6 +611,14 @@ def _plant_blob_for_non_compiling_spec(raw) -> None:
         "INSERT INTO blob VALUES (?, ?)",
         (digest_of(b"after"), len(b"after")),
     )
+
+
+def _plant_non_compiling_spec(raw) -> None:
+    """The planted spec states a postimage in neither surface, so it references a
+    digest the committed record never wrote. Insert the row it needs: this case
+    corrupts `spec_json_compiles` and nothing else."""
+    _plant_spec_json(raw, canonical_json(non_compiling_spec()), CREATE_FILE_ROW)
+    _plant_blob_for_non_compiling_spec(raw)
 
 
 ONE_EFFECT_ROW = (("only", "create_directory"),)
