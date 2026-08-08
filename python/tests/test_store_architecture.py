@@ -1268,7 +1268,7 @@ def test_the_fixture_guard_understands_parametrized_arguments():
 
 def test_a5_status_is_synchronized_across_authority_documents():
     agents = (Path(__file__).parents[2] / "AGENTS.md").read_text(encoding="utf-8")
-    assert "A5 is implemented; A6–A8 remain unimplemented" in agents
+    assert "A5 and A6 are implemented; A7–A8 remain unimplemented" in agents
     assert (
         "A5a implemented on 2026-08-01, A5b implemented on\n  2026-08-02."
         in agents
@@ -1285,7 +1285,7 @@ def test_a5_status_is_synchronized_across_authority_documents():
         / "docs/plans/2026-08-02-a5b-recovery-lease-design.md"
     ).read_text(encoding="utf-8")
     assert "**Status:** Implemented on 2026-08-02." in design
-    assert "A6–A8 remain unimplemented." in design
+    assert "A7–A8 remain unimplemented." in design
 
 
 def _plant_store_package(

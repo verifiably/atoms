@@ -1,6 +1,6 @@
 # A6 — coherent capture and the observation mechanism
 
-**Status:** Designed on 2026-08-07, unimplemented. A7–A8 remain unimplemented.
+**Status:** Implemented on 2026-08-07. A7–A8 remain unimplemented.
 
 **Authority:** [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md)
 §4.1, §4.2, §5.5, §6, §7.3, §10, §11, §13.1, §13.2, §14.

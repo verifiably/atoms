@@ -1,10 +1,10 @@
 # Recoverable filesystem effect engine — design
 
 **Date:** 2026-07-23
-**Status:** Approved — authority design for `atoms`. Plan A implementation underway; A1–A5b are
+**Status:** Approved — authority design for `atoms`. Plan A implementation underway; A1–A6 are
 implemented (pure model and compilation, recovery reference model, capability backend, path resolution
-and project approval, SQLite-WAL metadata store, recovery-resolve lease); A6–A8 (coherent capture,
-effect/recovery execution, synthetic exerciser) remain.
+and project approval, SQLite-WAL metadata store, recovery-resolve lease, coherent capture and the
+observation mechanism); A7–A8 (effect/recovery execution, synthetic exerciser) remain.
 **Repository:** `atoms` (`~/d/atoms`) — Python-first physical durability substrate below `nodes`
 **Supersedes:** the science-framed [`2026-07-20-recoverable-fs-effect-engine-design.md`](2026-07-20-recoverable-fs-effect-engine-design.md), retained as the historical, review-hardened record.
 
@@ -561,7 +561,12 @@ place, then act on a path beneath it — for example `DeletePath("p")`, `CreateD
 be declared absent is satisfied, since `p/q` is absent precisely *because* `p` is a file. The
 first-missing-component procedure above does not apply, because no component of `p/q` is missing where
 traversal stops — guarded traversal fails at `p` itself with `ENOTDIR`, and there is no descriptor
-against which `q` could be looked up.
+against which `q` could be looked up. `ENOTDIR` establishes only that the blocker is not a directory —
+it does not distinguish a regular file from a socket, FIFO, or device node. Neither branch is selected
+by the errno: the regular-file branch is selected by verifying the blocker against the timeline's first
+`FileState`, and the symlink branch by verifying it against the timeline's first `SymlinkState`. A
+blocker matching neither declared state refuses — including a symlink whose target or mode has drifted,
+which is a symlink but not the declared one.
 
 The descendant's absence is therefore **inferred from the ancestor's verified state rather than probed**.
 Neither a regular file nor a symlink can contain directory entries, so an ancestor verified to be either
@@ -1615,7 +1620,9 @@ transaction model.
    (§5.5) that precedes capability approval, and the **metadata-store I/O-layer decision** (§7): stdlib
    `sqlite3` with verified-directory resolution and an allowlisted-surface audit, versus an optional
    custom VFS (`openat`-anchored, `O_NOFOLLOW`, interposer-visible).
-4. Coherent capture and restartable atomic materialization (§6, §10).
+4. Coherent capture and the observation mechanism (§6, and §10's coherent-observation contract).
+   Restartable materialization's staging-object classification ships with the effects that create the
+   objects it classifies (item 5).
 5. Five effects and the recovery executor (§8–§9).
 6. Model, real-filesystem, subprocess-recovery, and persistence-cut suites, run on both backends (§13).
 7. The synthetic exerciser and the end-to-end recovery matrix (§12.1, §13.4).

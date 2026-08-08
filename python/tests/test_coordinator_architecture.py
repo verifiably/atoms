@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import re
 from importlib.util import resolve_name
 from pathlib import Path
 
@@ -142,3 +143,85 @@ def test_the_coordinator_fixture_registry_covers_every_test_argument():
         )
     )
     assert misplaced == [], f"fixtures must be declared in conftest.py: {misplaced}"
+
+
+def _flat(lines: list[str]) -> str:
+    return " ".join(" ".join(lines).split())
+
+
+def _status_section(text: str) -> str:
+    """The `## Status…` section: its heading through the next `## ` heading.
+
+    Whitespace is flattened because both AGENTS.md and README.md wrap their status
+    sentences across lines, and a reflow must not silently disable a guard.
+    """
+    lines = text.splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith("## Status"))
+    end = next(
+        (i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")),
+        len(lines),
+    )
+    return _flat(lines[start:end])
+
+
+def _status_field(text: str) -> str:
+    """A design's `**Status:**` header field, bounded by a blank line or the next field.
+
+    Scoped to the header on purpose. A design's status is a claim about the present; its
+    body may legitimately QUOTE a status string while recording an amendment, and A6's
+    §3.3 does exactly that -- it prints the authority's old header verbatim so the
+    before/after is auditable. A whole-file scan conflates the claim with the record of
+    the claim changing, and would force the record to be edited to keep the guard green:
+    the precise inversion this guard exists to prevent.
+    """
+    lines = text.splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith("**Status:**"))
+    field = [lines[start]]
+    for line in lines[start + 1 :]:
+        if not line.strip() or re.match(r"\*\*[A-Za-z][^*]*:\*\*", line):
+            break
+        field.append(line)
+    return _flat(field)
+
+
+def test_a6_status_is_synchronized_across_authority_documents():
+    root = Path(__file__).parents[2]
+
+    def read(name: str) -> str:
+        return (root / name).read_text(encoding="utf-8")
+
+    agents = _status_section(read("AGENTS.md"))
+    readme = _status_section(read("README.md"))
+    a6 = _status_field(read("docs/plans/2026-08-07-a6-coherent-capture-design.md"))
+    a5b = _status_field(read("docs/plans/2026-08-02-a5b-recovery-lease-design.md"))
+    authority = _status_field(
+        read("docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md")
+    )
+
+    assert "A5 and A6 are implemented; A7–A8 remain unimplemented" in agents
+    assert "A6 — coherent capture" in agents
+    assert "**Status:** Implemented on 2026-08-07." in a6
+    # No current status claim may still say A6 is unimplemented. A5b's design carries the
+    # same sentence and is the one easiest to leave behind.
+    for region in (agents, readme, a6, a5b, authority):
+        assert "A6–A8 remain unimplemented" not in region
+    assert "A7–A8 remain unimplemented" in a5b
+
+    # The authority header spells its remainder differently -- "A6–A8 (coherent capture,
+    # ...) remain" -- so the shared forbidden string cannot police it. Assert the header
+    # positively, and forbid the span it replaces.
+    assert "A1–A6 are implemented" in authority
+    assert "A7–A8 (effect/recovery execution, synthetic exerciser) remain." in authority
+    assert "A1–A5b are implemented" not in authority
+    assert "A6–A8 (coherent capture" not in authority
+
+    # The README's roadmap is the reader's map of what exists; it was three sub-plans
+    # stale before A6 and must not be left that way.
+    assert "A4–A8 remain unimplemented" not in readme
+    assert "no filesystem mutation code has landed" not in readme
+    for heading in (
+        "**A4 — capability backend, volume binding, and project approval (implemented):**",
+        "**A5 — durable metadata store and recovery lease (implemented):**",
+        "**A6 — coherent capture and the observation mechanism (implemented):**",
+    ):
+        assert heading in readme

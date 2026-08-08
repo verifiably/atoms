@@ -20,7 +20,7 @@ Plan B is written only after Plan A's interfaces settle.
 - **A3 — executable recovery reference model: implemented.** The pure production authority exposes
   `build_recovery_snapshot`, `classify_recovery`, `authorize_recovery_step`,
   `reduce_recovery_plan_prefix`, and `apply_recovery_plan` with the closed recovery model, fresh-step
-  authorization, and abstract reducer. A5 is implemented; A6–A8 remain unimplemented, and no
+  authorization, and abstract reducer. A5 and A6 are implemented; A7–A8 remain unimplemented, and no
   project mutation code has landed.
 - **A4a — capability backend and project volume binding: implemented on 2026-07-30.**
   `python/src/atoms/fs/`
@@ -47,9 +47,18 @@ Plan B is written only after Plan A's interfaces settle.
   lease, discharging #7, #18, #21, #22, and #23 while leaving #9, #12, #17, and #19 open for later stages.
   Its design is [`docs/plans/2026-08-02-a5b-recovery-lease-design.md`](docs/plans/2026-08-02-a5b-recovery-lease-design.md):
   a new `atoms/coordinator/` package holding the lease, the admission gate, preparation, and A3
-  transition persistence. Because A6 supplies no observations and A7 no executor yet, a live record at
-  lease entry raises a temporary build-stage trap, so #12 and #17 will land as their write and lease
-  halves only.
+  transition persistence. Because A7 has no executor yet, a live record at lease entry still raises a
+  temporary build-stage trap, so #12 and #17 remain at their write and lease halves. A6 discharged the
+  observation half it was waiting on.
+- **A6 — coherent capture and the observation mechanism: implemented on 2026-08-07.**
+  `python/src/atoms/fs/observe.py` holds `Observation.observe`, the coherent single-descriptor read of
+  a held file, directory, or symlink used throughout capture. `python/src/atoms/coordinator/` gains
+  `descriptors.py` (`DescriptorTable`, walking guarded traversal from the approved topology and
+  re-validating identity, constraints, and mount before handing a descriptor down) and `capture.py`
+  (absence inference over both §6 branches, preimage streaming into workspace staging, flush, and the
+  manifest `prepare_transaction` consumes). Its design is
+  [`docs/plans/2026-08-07-a6-coherent-capture-design.md`](docs/plans/2026-08-07-a6-coherent-capture-design.md).
+  Ledger entries #1, #3, #13, and #19 are half-discharged; each keeps an A7 half open.
 
 Work lives under `python/` (`uv run pytest`, `uv run ruff check`, `uv run pyright`, all from
 `python/`).

@@ -1,6 +1,6 @@
 # A5b — the recovery-resolve lease
 
-**Status:** Implemented on 2026-08-02. A6–A8 remain unimplemented.
+**Status:** Implemented on 2026-08-02. A7–A8 remain unimplemented.
 
 **Authority:** [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md)
 §4.2, §5.4, §7.1, §7.3, §7.4, §11, §13.3, §13.5.
@@ -569,9 +569,13 @@ On a real ext4 volume, using the existing binding fixtures.
 - **#19 mismatches**, one case each: directory identity, lookup constraints, `LookupProof`, mount
   membership, and work-base re-resolution before workspace creation.
 - **The three parent branches**, each reached and each refusing for its own reason: an existing parent
-  whose identity or constraints moved; a *planned* parent that is present when approval said it would
-  not be; and a `WorkRoot` whose `work/<txid>` already exists. The planned-parent case additionally
-  asserts no `ChildObservation` is constructed, since there is no identity to put in one.
+  whose identity or constraints moved; a *planned* parent present when the proof's own timeline
+  declares nothing there; and a `WorkRoot` whose `work/<txid>` already exists. A planned parent whose
+  slot the timeline declares occupied is **not** refused: A4b approves that shape deliberately (design
+  §8.2's `DeletePath` + `CreateDirectory` + child), and admission holds only a presence bit, so
+  verifying the occupant's kind belongs to capture, which does it against the timeline's first declared
+  state. The planned-parent case additionally asserts no `ChildObservation` is constructed, since there
+  is no identity to put in one.
 - **Resolver translation**, covering every refusal type `resolve.py` declares rather than an
   enumerated subset: each surfaces as `PreconditionRefused` with the original chained, and
   `approve_for_project`'s own refusals pass through untranslated.

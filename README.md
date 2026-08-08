@@ -25,10 +25,11 @@ dozen rounds of adversarial contract review; that review capital is carried into
 standalone authority design below. The design is approved and its roadmap (§14) decomposes
 Plan A into eight sub-plans, A1–A8.
 
-The pure core (`atoms.core`) exists under `python/`: the transaction model, the five effect
-variants, the semantic capability vocabulary, the reserved scratch grammar, and the durable
-canonical format with a strict round-trippable decoder. It has no filesystem, SQLite, or
-platform dependency yet — no path is mutated by any code in this repository today.
+The pure core (`atoms.core`) is joined under `python/` by `atoms.fs` (capability backend,
+volume binding, project approval) and `atoms.store` (SQLite-in-WAL metadata store) beneath an
+`atoms.coordinator` package holding the recovery lease, admission, and preparation. No project
+path is mutated by any code in this repository today; the only paths written are engine-owned,
+under `metadata_root`.
 
 - **Authority design:** [`docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md`](docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md)
   — standalone `atoms` engine, SQLite-in-WAL metadata store, `nodes`/science as deferred consumers.
@@ -41,7 +42,21 @@ platform dependency yet — no path is mutated by any code in this repository to
   — pure production recovery authority through `build_recovery_snapshot`, `classify_recovery`,
   `authorize_recovery_step`, `reduce_recovery_plan_prefix`, and `apply_recovery_plan`; implementation plan:
   [`docs/plans/2026-07-28-plan-a3-recovery-reference-model.md`](docs/plans/2026-07-28-plan-a3-recovery-reference-model.md).
-  A4–A8 remain unimplemented, and no filesystem mutation code has landed.
+- **A4 — capability backend, volume binding, and project approval (implemented):**
+  [`docs/plans/2026-07-29-a4a-capability-backend-design.md`](docs/plans/2026-07-29-a4a-capability-backend-design.md),
+  [`docs/plans/2026-07-30-a4b1-path-resolution-design.md`](docs/plans/2026-07-30-a4b1-path-resolution-design.md),
+  [`docs/plans/2026-07-31-a4b2-project-approval-design.md`](docs/plans/2026-07-31-a4b2-project-approval-design.md)
+  — the probed capability backend, anchored path resolution, and the `ProjectApprovedSpec` proof
+  with its approved topology and scratch binding.
+- **A5 — durable metadata store and recovery lease (implemented):**
+  [`docs/plans/2026-07-31-a5a-metadata-store-design.md`](docs/plans/2026-07-31-a5a-metadata-store-design.md),
+  [`docs/plans/2026-08-02-a5b-recovery-lease-design.md`](docs/plans/2026-08-02-a5b-recovery-lease-design.md)
+  — the SQLite-in-WAL store as a mechanism, composed into the recovery lease, admission, and
+  preparation.
+- **A6 — coherent capture and the observation mechanism (implemented):**
+  [`docs/plans/2026-08-07-a6-coherent-capture-design.md`](docs/plans/2026-08-07-a6-coherent-capture-design.md)
+  — the descriptor table, the observation pass, and preimage capture into the workspace staging
+  directory. A7–A8 remain unimplemented: nothing yet executes an effect against a project path.
 - Historical (superseded): the science-framed [`2026-07-20-*`](docs/plans/2026-07-20-recoverable-fs-effect-engine-design.md)
   design + roadmap, retained as the record of the review that hardened the effect/recovery contracts.
 
