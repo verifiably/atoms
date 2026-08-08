@@ -163,7 +163,9 @@ architecture test files, which name these strings as the strings they forbid.
 trap partly by "A6 supplies no observations", which stops being true while the trap itself stays) and
 the `README.md` `## Status` section — already three sub-plans stale, stopping at A3 — gain A6's state,
 and a new `test_a6_status_is_synchronized_across_authority_documents` asserts the strings, following
-`test_a4a_…`, `test_a4b_…`, and `test_a5_…`.
+`test_a4a_…`, `test_a4b_…`, and `test_a5_…`. (Those four were replaced on 2026-08-08 by
+`tests/test_docs_status.py`: two of them had begun pinning claims later sub-plans falsified, which
+is the failure mode a per-sub-plan snapshot cannot avoid.)
 
 ## 4. Architecture and ownership
 
@@ -542,6 +544,11 @@ names A6 errors, so each call site translates the errnos that carry a **defined 
 | `ENOSYS`, `EOPNOTSUPP`, `ENOTSUP` | The backend cannot supply the semantics | `CapabilityUnavailable` |
 | `EBADF` | An internal contract was violated | `ProtocolError` |
 
+The table is honored by `translated_lookup`, which each **lookup** site wraps around a single
+statement. The streaming read/write loops and `build_relation` do not wrap, so an `EBADF` raised
+there propagates as `OSError` rather than `ProtocolError` — §13 records the gap. No other row is
+affected: the namespace and capability rows describe lookups by construction.
+
 **Every other `OSError` propagates unchanged**, keeping its own class and its traceback. This is A5a's
 rule for SQLite result codes, applied to errno: `translated()`'s docstring requires wrapping a single
 statement rather than a protocol, "so an unrecognized code keeps its own class *and* its traceback and
@@ -583,6 +590,23 @@ gate; it is the ownership precondition of the sink, asserted where the sink is f
 `_parent_paths` gains a second in-package consumer (§5.1). It stays private and stays where it is;
 `descriptors.py` sits in the same package.
 
+**`_require_planned_absent` is relaxed — the one behavior change A6 makes to a gate that already
+shipped.** A5b's branch refused whenever an `ApprovedPlannedDirectory`'s slot was occupied at
+admission time, reasoning that a planned directory carries no approved identity to compare the
+occupant against. That is right for drift and wrong for §8.2: `DeletePath("p")` +
+`CreateDirectory("p")` + a declared child is a shape A4b approves against a **present** `p`
+deliberately, and two A4b conformance tests do exactly that. Left alone, the gate would refuse every
+§8.2 timeline before capture ran, making §8.2 unreachable in production and its conformance coverage
+a test of a branch nothing could enter.
+
+The branch therefore consults the timeline's first declared state for the path — a
+`_declared_first_state` helper over `approved.compiled.timelines` — and returns instead of refusing
+when that state is not `AbsentState`. Presence the proof's own timeline already accounts for is the
+proof being right, not the world having moved. Admission holds only the presence bit `observe_child`
+returns and must not judge the occupant's *kind*; capture judges it coherently, through a descriptor,
+against that same first declared state (§8.2). The relaxation is narrow in exactly that sense: it
+moves one question one layer down, to the layer holding the evidence to answer it.
+
 ### 10.2 `atoms/fs/resolve.py` — one helper becomes public
 
 `read_lookup_constraints(fd, filesystem_type)` takes the filesystem type as a string, and the only
@@ -612,6 +636,16 @@ its docstring, `test_referenced_digests_include_initial_and_final_file_surfaces`
 **It keeps returning `(digest, byte_len)` pairs.** Collapsing to digests would erase the contradiction
 §7.2 must detect, and would do so in the one helper positioned to see every declared `FileState` at
 once.
+
+**The helper has two consumers of opposite polarity, and the widening moves both.** `connection.py`
+is a *ceiling* — a promoted digest must appear in the set, or promotion raises — and that is the
+consumer the paragraphs above argue. `records.py`'s coherence check is a *floor*: every pair in the
+set must have a `blob` row, or the record reads back incoherent. Widening therefore does not only
+admit more promotions; it also **requires** intermediate postimage blobs to be present. That is the
+correct reading of authority §7.3 — a record does reference its intermediate postimages, and A6
+stages them — so a durable record missing one is genuinely incoherent and should say so. The one
+fixture that planted a record without them — `test_store_records.py`'s non-compiling-spec planter —
+was split so that it plants the blob as well.
 
 ## 11. Verification strategy
 
@@ -672,7 +706,9 @@ pass really is a new token universe rather than assuming it.
 ### 11.5 Architecture
 
 The `core.recovery` import whitelist on `observe.py`; the existing store-import test still green; the
-A6 status-synchronization test.
+corpus status guard. (A6 shipped `test_a6_status_is_synchronized_across_authority_documents`, the
+fourth per-sub-plan guard; all four were replaced on 2026-08-08 by the derived
+`tests/test_docs_status.py`, which holds the roadmap once and derives every check from it.)
 
 ### 11.6 Adversarial
 
@@ -713,3 +749,45 @@ creates them, and asserting them here would prove nothing about the code that wi
 13. No project path is mutated by any A6 code path, asserted by the mutation-surface suite
     (authority §13.5).
 14. A5b's A7 trap still raises, unchanged.
+
+## 13. Known gaps carried to A7
+
+None of these blocked A6, and none is a defect in what A6 promises. Each is a place where the
+implementation is narrower than this design, or where A6 built something A7 is the first to depend
+on. They are recorded here rather than in the deferred-obligation ledger because that file tracks
+*admitted shapes* at trust boundaries, and these are ordinary gaps — filing them there would dilute
+the register that A2's three review rounds justified.
+
+1. **`DescriptorTable.stops` is readable after `close()`.** `fd_for` and `is_unreachable` both raise
+   `ProtocolError` when `_closed`; `stops` is a bare slot and does not. It hands out
+   `WalkStop.parent_fd`, a descriptor the table has already closed, and A7 is its first real
+   consumer. Guard it the same way.
+
+2. **`close()` abandons the descriptors after the first failure.** Both `DescriptorTable.close` and
+   `Observation.close` set `_closed`, then loop over `os.close`. A raise part-way through leaves the
+   remaining descriptors open with no second attempt possible, because the flag already says closed.
+   The two are the same shape and should be fixed together.
+
+3. **`fd_for` raises a bare `KeyError`.** §9 puts engine misuse at `ProtocolError`, and `capture.py`
+   translates it back at its one call site — machinery that exists only because the raise is wrong.
+   A7 adds call sites; each would need the same wrapper.
+
+4. **`_verify_stops`' final `else` is untested.** It is the branch for a blocker that no declared
+   file or symlink state describes: `declared.get(stop.path)` returns `None` or `AbsentState` while
+   the walk was blocked there. Admission refuses that shape when it holds at admission time, so
+   reaching it means the entry appeared between admission and the walk — which the cooperating-process
+   assumption (authority §7) makes rare rather than impossible. Of the branches A6 left uncovered it
+   is the one whose trigger is a real state of the world rather than engine misuse.
+
+5. **"Modeled children" has two definitions.** `descriptors._modeled_children` derives the set from
+   the walk's path table; `capture._modeled_under` derives it from `approved.paths`. They agree
+   today. Nothing forces them to, and A7 is the first stage to act on `has_unmodeled_child` rather
+   than merely record it.
+
+6. **`EBADF` is translated at lookup sites only.** `translated_lookup` honors §9.1's table, and every
+   lookup wraps it; the streaming read/write loops and `build_relation` do not, so an `EBADF` from
+   those propagates as `OSError`. §9.1 now says so. Either the loops wrap or the table's row narrows
+   — A7 touches both kinds of call and is the right place to settle it.
+
+One item is not A6's and is noted only so it is not rediscovered: `coordinator_on`'s docstring says
+two calls model two projects, and they share one `ext4_project_root`. It predates A6.
