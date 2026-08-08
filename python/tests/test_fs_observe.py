@@ -109,7 +109,10 @@ def test_a_directory_requires_its_modeled_children(project):
     root, fd = project
     (root / "sub").mkdir()
 
-    with Observation(LinuxBackend()) as observation, pytest.raises(ProtocolError, match="modeled"):
+    with (
+        Observation(LinuxBackend()) as observation,
+        pytest.raises(ProtocolError, match="modeled"),
+    ):
         observation.observe(fd, "sub")
 
 
@@ -133,7 +136,9 @@ def test_a_fully_modeled_directory_reports_no_unmodeled_child(project):
     (root / "sub" / "modeled").write_bytes(b"")
 
     with Observation(LinuxBackend()) as observation:
-        entry = observation.observe(fd, "sub", modeled=frozenset({"modeled", "not-present-yet"}))
+        entry = observation.observe(
+            fd, "sub", modeled=frozenset({"modeled", "not-present-yet"})
+        )
 
     assert type(entry) is ObservedDirectory
     assert entry.has_unmodeled_child is False
@@ -162,7 +167,10 @@ def test_a_kind_with_no_declarable_state_refuses(project):
     root, fd = project
     os.mkfifo(root / "pipe")
 
-    with Observation(LinuxBackend()) as observation, pytest.raises(PreconditionRefused, match="neither"):
+    with (
+        Observation(LinuxBackend()) as observation,
+        pytest.raises(PreconditionRefused, match="neither"),
+    ):
         observation.observe(fd, "pipe")
 
 
@@ -275,7 +283,10 @@ def test_a_staging_object_longer_than_the_plan_is_diverged(project):
 
 
 def test_a_namespace_contradiction_refuses():
-    with pytest.raises(PreconditionRefused, match="while probing"), translated_lookup("probing"):
+    with (
+        pytest.raises(PreconditionRefused, match="while probing"),
+        translated_lookup("probing"),
+    ):
         raise OSError(errno.ELOOP, "symlink")
 
 

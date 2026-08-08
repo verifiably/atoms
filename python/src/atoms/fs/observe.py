@@ -36,7 +36,9 @@ _READ_CHUNK = 1 << 20
 # propagates with its own class and traceback -- A5a's rule for SQLite result codes,
 # applied to errno. Reads, writes, and flushes raise EIO, ENOSPC, EROFS and more, and
 # none of those is external state contradicting the frozen spec.
-_NAMESPACE_CONTRADICTIONS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.EXDEV})
+_NAMESPACE_CONTRADICTIONS = frozenset(
+    {errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.EXDEV}
+)
 _UNSUPPORTED = frozenset({errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP})
 
 
@@ -47,13 +49,17 @@ def translated_lookup(context: str) -> Iterator[None]:
         yield
     except OSError as caught:
         if caught.errno in _NAMESPACE_CONTRADICTIONS:
-            raise PreconditionRefused(f"the namespace no longer matches approval while {context}: {caught}") from caught
+            raise PreconditionRefused(
+                f"the namespace no longer matches approval while {context}: {caught}"
+            ) from caught
         if caught.errno in _UNSUPPORTED:
             raise CapabilityUnavailable(
                 f"the backend cannot supply the semantics needed while {context}: {caught}"
             ) from caught
         if caught.errno == errno.EBADF:
-            raise ProtocolError(f"a descriptor was already closed while {context}: {caught}") from caught
+            raise ProtocolError(
+                f"a descriptor was already closed while {context}: {caught}"
+            ) from caught
         raise
 
 
@@ -145,7 +151,11 @@ class Observation:
                 return FileBuildRelation.DIVERGED
             # One side ran out first. A short read cannot cause this: `_read_exactly`
             # returns fewer bytes only at end of file.
-            return FileBuildRelation.STRICT_PREFIX if len(staged) < len(planned) else FileBuildRelation.DIVERGED
+            return (
+                FileBuildRelation.STRICT_PREFIX
+                if len(staged) < len(planned)
+                else FileBuildRelation.DIVERGED
+            )
 
     def close(self) -> None:
         if self._closed:
@@ -192,7 +202,9 @@ class Observation:
             identity=identity,
         )
 
-    def _observe_directory(self, parent_fd: int, leaf: str, modeled: frozenset[str]) -> ObservedDirectory:
+    def _observe_directory(
+        self, parent_fd: int, leaf: str, modeled: frozenset[str]
+    ) -> ObservedDirectory:
         identity, info = self._open_and_pin(
             lambda: self._backend.open_child_directory(parent_fd, leaf),
             leaf,
@@ -212,16 +224,22 @@ class Observation:
             info, target = self._backend.symlink_fingerprint(parent_fd, leaf)
         # No descriptor and no identity: O_NOFOLLOW fails by design on a symlink leaf,
         # so there is nothing to be coherent about (design §6.2).
-        return ObservedSymlink(state=SymlinkState(target=target, mode=stat.S_IMODE(info.st_mode)))
+        return ObservedSymlink(
+            state=SymlinkState(target=target, mode=stat.S_IMODE(info.st_mode))
+        )
 
-    def _open_and_pin(self, opener, leaf: str, predicate, description: str) -> tuple[EntryIdentity, os.stat_result]:
+    def _open_and_pin(
+        self, opener, leaf: str, predicate, description: str
+    ) -> tuple[EntryIdentity, os.stat_result]:
         """Open, confirm the kind, and transfer ownership -- or close and raise."""
         with translated_lookup(f"opening {leaf!r}"):
             fd = opener()
         try:
             info = os.fstat(fd)
             if not predicate(info.st_mode):
-                raise PreconditionRefused(f"{leaf!r} stopped being {description} between lookup and open")
+                raise PreconditionRefused(
+                    f"{leaf!r} stopped being {description} between lookup and open"
+                )
         except BaseException:
             os.close(fd)
             raise
