@@ -79,8 +79,13 @@ implementation, stop and report it — do not adapt around it silently.**
 - Exact-type checks, not `isinstance`, at trust boundaries — the house `_require_exact` pattern.
 - Docs use `~/d/atoms/...` for filepaths.
 - Conventional commits. **No AI-attribution trailer or footer.**
-- Gates, all from `python/`: `uv run pytest`, `uv run ruff format`, `uv run ruff check`,
-  `uv run pyright`.
+- Gates, all from `python/`: `uv run pytest`, `uv run ruff check`, `uv run pyright` — the three
+  `AGENTS.md` names. **`ruff format` is not a gate here.** `line-length` is configured at 120 but
+  the tree is hand-wrapped: `ruff format --check` reports 86 of 124 files would be reformatted,
+  and no module in `atoms/fs/` or `atoms/coordinator/` exceeds 92 columns. Running the formatter
+  over a new file makes it the only 120-column file in its package. **New code is hand-wrapped to
+  match its neighbours — 92 columns is the ceiling.** Closing that repo-wide drift is its own
+  change, not A6's.
 
 ## File Structure
 
