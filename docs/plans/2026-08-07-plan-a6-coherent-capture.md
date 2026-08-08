@@ -992,11 +992,19 @@ without a lookup would mean a matching file or symlink blocker is never reported
 
 - [ ] **Step 1: Make the filesystem-type helper public**
 
-In `python/src/atoms/fs/resolve.py`, rename `_filesystem_type` to `filesystem_type_of` and update its
-two in-module call sites (`observe_child`, `observe_work_child`).
+In `python/src/atoms/fs/resolve.py`, rename the module-level function `_filesystem_type` to
+`filesystem_type_of` and update its two in-module call sites (`observe_child` at `resolve.py:518`,
+`observe_work_child` at `resolve.py:536`). Three sites in one file — the definition and those two.
 
-Run: `cd python && grep -rn "_filesystem_type" src/ tests/ && echo FOUND || echo CLEAN`
-Expected: `CLEAN`.
+**Two similarly-spelled names are NOT part of this rename and must not be touched.**
+`PathResolution._filesystem_type` is a `__slots__` instance attribute (`resolve.py:190`, assigned at
+`:211`, read at `:216`, `:271`, `:408`) and has nothing to do with the function.
+`tests/fs_support.py:122`'s `_filesystem_type_for` is an unrelated test helper. A bare substring
+search hits all of them, which is why the check below anchors on the call parenthesis.
+
+Run: `cd python && grep -rnE "(^|[^_a-zA-Z])_filesystem_type\(" src/ tests/`
+Expected: no output, exit status 1. Before the rename this prints exactly the three sites above, so
+run it first to confirm the check discriminates.
 
 - [ ] **Step 2: Write the shared builders**
 
