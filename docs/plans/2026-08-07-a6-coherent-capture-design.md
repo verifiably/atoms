@@ -56,7 +56,7 @@ belongs:
    from a consumer-supplied payload source, and the promotion manifest.
 4. **Absence inference** (§8): §6's two cases — the missing ancestor and the non-directory ancestor —
    as two separate code paths.
-5. The **`referenced_digests` repair** (§10.2): widening A5a's helper to every `FileState` the spec
+5. The **`referenced_digests` repair** (§10.3): widening A5a's helper to every `FileState` the spec
    states, not only those in its two surfaces.
 
 ### 2.2 Not in scope
@@ -79,7 +79,7 @@ belongs:
 | --- | --- |
 | A4a `Backend` | Guarded traversal, no-follow reads, symlink fingerprints, and `flush_file` for staged bytes (§7.3) |
 | A4a `ProjectBinding` | The borrowed project-root descriptor and `evidence.mount_id` |
-| A4b-1 `read_lookup_constraints`, `read_mount_id`, `EntryKind` | Re-validation and blocker classification |
+| A4b-1 `read_lookup_constraints`, `filesystem_type_of`, `read_mount_id`, `EntryKind` | Re-validation and blocker classification (§10.2) |
 | A4b-2 `ProjectApprovedSpec` | The approved topology, directories, paths, and scratch slots |
 | A5b `_parent_paths` | The node-to-path table the walk is spelled from (§5.2) |
 | A5a `Workspace` | `staging_fd` as the capture sink; `work_fd` as the physical work root |
@@ -110,7 +110,7 @@ nothing.
 **None.** Three candidates were considered and rejected:
 
 - *The `referenced_digests` widening.* An immediate repair inside A5a's surface, landing in the same
-  commit as the code that needs it (§10.2). A deferred-obligation entry records a shape a boundary
+  commit as the code that needs it (§10.3). A deferred-obligation entry records a shape a boundary
   admits but does not execute; this one is executed.
 - *Scratch observation without a producing effect.* A6 delivers the mechanism and exercises it over
   real files and real descriptors (§11.3). It is not an admitted-but-unhandled shape; it is a handled
@@ -401,7 +401,7 @@ publish a blob one effect's `FileState` disagrees with.
 So capture **first requires exactly one length per digest across the whole required set, raising
 `ProtocolError` before writing anything.** This is engine misuse surfacing at the first layer that can
 see it, not external drift: the contradiction is in the frozen spec, and no filesystem state is
-involved. The widened `referenced_digests` (§10.2) keeps its pair semantics for the same reason.
+involved. The widened `referenced_digests` (§10.3) keeps its pair semantics for the same reason.
 
 ### 7.3 Staged bytes must be flushed
 
@@ -548,7 +548,19 @@ second gate site.
 `_parent_paths` gains a second in-package consumer (§5.1). It stays private and stays where it is;
 `descriptors.py` sits in the same package.
 
-### 10.2 `atoms/store/records.py` — the `referenced_digests` repair
+### 10.2 `atoms/fs/resolve.py` — one helper becomes public
+
+`read_lookup_constraints(fd, filesystem_type)` takes the filesystem type as a string, and the only
+route to it that also checks the backend is `resolve._filesystem_type(binding)`, which is private.
+`observe_child` calls it internally, but A6 re-validates directories it has already opened and has no
+name to observe a child of.
+
+It is renamed `filesystem_type_of` and made public. Reading
+`binding.evidence.configuration.filesystem_type` directly would work and is the wrong fix: it skips the
+Linux-backend check that gives the flag semantics their meaning, and would put a second copy of that
+decision in the coordinator.
+
+### 10.3 `atoms/store/records.py` — the `referenced_digests` repair
 
 Today the helper scans `spec.initial_surface` and `spec.final_surface` only, and `connection.py` raises
 `ProtocolError` for any promoted digest outside that set. An **intermediate** postimage appears in
