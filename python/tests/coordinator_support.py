@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+import stat
+from pathlib import Path
 from typing import cast
 
 from atoms.coordinator.lease import Lease
@@ -326,6 +328,47 @@ def replace_the_parent_directory(lease: Lease, approved: ProjectApprovedSpec) ->
     assert os.stat("d", dir_fd=root_fd).st_ino != before, (
         "the replacement reused the original inode, so the test would pass vacuously"
     )
+
+
+def project_state(project_root: str) -> dict[str, tuple[object, ...]]:
+    """The project root and every path under it, with the state a mutation would move.
+
+    Three things beyond kind/mode/content, each closing a hole the others leave open:
+
+    * `st_dev` and `st_ino`, because a path replaced by an inode of identical kind,
+      mode, and content is otherwise invisible. These are already how A4b states path
+      identity, so this is the project's own vocabulary rather than a new one.
+    * the root itself, keyed `"."`, because nothing under it records a `chmod` on it --
+      and against an empty root, nothing under it records anything at all.
+    * `lstat` throughout, so a symlink is compared as a symlink rather than followed.
+
+    Content is hashed rather than compared inline so a failure message stays readable.
+    """
+    state: dict[str, tuple[object, ...]] = {}
+
+    def record(full: str) -> None:
+        info = os.lstat(full)
+        if stat.S_ISLNK(info.st_mode):
+            payload: object = os.readlink(full)
+        elif stat.S_ISDIR(info.st_mode):
+            payload = None
+        else:
+            payload = hashlib.sha256(Path(full).read_bytes()).hexdigest()
+        state[os.path.relpath(full, project_root)] = (
+            stat.S_IFMT(info.st_mode),
+            stat.S_IMODE(info.st_mode),
+            info.st_dev,
+            info.st_ino,
+            info.st_size,
+            payload,
+        )
+
+    record(project_root)
+    for directory, directories, files in os.walk(project_root):
+        directories.sort()
+        for name in sorted(directories) + sorted(files):
+            record(os.path.join(directory, name))
+    return state
 
 
 def occupy_the_scratch_leaf(lease: Lease, approved: ProjectApprovedSpec) -> str:
