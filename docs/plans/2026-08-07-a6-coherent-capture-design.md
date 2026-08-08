@@ -48,7 +48,7 @@ belongs:
 ### 2.1 In scope
 
 1. The **descriptor table** (§5): one held, guarded descriptor per directory the transaction will act
-   relative to, built by single-component traversal from two physical roots, re-validated against the
+   relative to, built by single-component traversal from the physical roots, re-validated against the
    approved baseline, and living long enough for A7 to execute against it.
 2. The **observation mechanism** (§6): file, directory, symlink, and absence observation from held
    descriptors, with the `EntryIdentity` token discipline and directory-occupancy evidence.
@@ -56,7 +56,7 @@ belongs:
    from a consumer-supplied payload source, and the promotion manifest.
 4. **Absence inference** (§8): §6's two cases — the missing ancestor and the non-directory ancestor —
    as two separate code paths.
-5. The **`referenced_digests` repair** (§10.3): widening A5a's helper to every `FileState` the spec
+5. The **`referenced_digests` repair** (§10.2): widening A5a's helper to every `FileState` the spec
    states, not only those in its two surfaces.
 
 ### 2.2 Not in scope
@@ -80,8 +80,8 @@ belongs:
 | A4a `Backend` | Guarded traversal, no-follow reads, symlink fingerprints, directory flush |
 | A4a `ProjectBinding` | The borrowed project-root descriptor and `evidence.mount_id` |
 | A4b-1 `read_lookup_constraints`, `read_mount_id`, `EntryKind` | Re-validation and blocker classification |
-| A4b-1 `ResolvedPrefix` | The deepest existing directory prefix, for the missing-ancestor case |
 | A4b-2 `ProjectApprovedSpec` | The approved topology, directories, paths, and scratch slots |
+| A5b `_parent_paths` | The node-to-path table the walk is spelled from (§5.2) |
 | A5a `Workspace` | `staging_fd` as the capture sink; `work_fd` as the physical work root |
 | A5a `StagedBlob` | The promotion manifest's element type |
 | A3 `core.recovery.model` | The observation value types and `EntryIdentity` |
@@ -102,7 +102,7 @@ nothing.
 | 3 | **Open (capture/inference half discharged)** | §8's two branches infer descendant absence from the ancestor's verified state. A7 still owns handing §9.5's published-directory descriptor down to descendants at execution. |
 | 13 | **Open (observation-mechanism half discharged)** | §6 produces state, identity, prefix relation, and occupancy coherently from held descriptors under the token discipline, and cannot name a verdict. A7 still owns complete recovery assembly, committed-cleanup sequencing, and fresh authorization observations. |
 | 19 | **Open (A6's half discharged)** | The descriptor table re-resolves identity, constraints, and mount against the approved baseline before relying on any of it, and refuses on mismatch (§5). A7's execution half remains. |
-| 9 | **Open** | A6 extends the entry-point gate set to its own entries; A7–A8 extend it further as they land. |
+| 9 | **Open** | A6 extends the entry-point gate set to its one new entry (§10.1); A7–A8 extend it further as they land. |
 | 12, 17 | **Open** | Unchanged by A6; both wait on A7's executor. |
 
 ### 3.2 New entries this design creates
@@ -110,7 +110,7 @@ nothing.
 **None.** Three candidates were considered and rejected:
 
 - *The `referenced_digests` widening.* An immediate repair inside A5a's surface, landing in the same
-  commit as the code that needs it (§10.3). A deferred-obligation entry records a shape a boundary
+  commit as the code that needs it (§10.2). A deferred-obligation entry records a shape a boundary
   admits but does not execute; this one is executed.
 - *Scratch observation without a producing effect.* A6 delivers the mechanism and exercises it over
   real files and real descriptors (§11.3). It is not an admitted-but-unhandled shape; it is a handled
@@ -118,7 +118,10 @@ nothing.
 - *Payload supply.* The `PayloadSource` contract refuses every malformed or divergent case at capture
   (§9). Nothing is admitted and deferred.
 
-### 3.3 Authority amendments in this commit
+### 3.3 Authority amendments required at implementation
+
+**This commit contains the design only.** The amendments below land with the implementation, in the
+same commit as the code that depends on them.
 
 **Authority §14, Plan A item 4.** The current text reads "Coherent capture and restartable atomic
 materialization (§6, §10)". Most of §10 is rollback restoration over objects only A7's effects create,
@@ -177,18 +180,24 @@ insufficient — `atoms/core/recovery/__init__.py` re-exports `classify_recovery
 how ledger #13's "may not pre-classify them into a recovery outcome" becomes a mechanical property
 instead of a review promise.
 
-### 4.3 New backend surface
+### 4.3 `Backend` is not extended
 
-`Backend` gains two methods, both plain POSIX rather than §5.5 capabilities, so neither is probed and
-neither can refuse a volume:
+Two additions were considered — descriptor-relative enumeration for occupancy, and a no-clobber
+create for the staging sink — and both are rejected. `backend.py`'s own docstring states the rule:
+"exactly one operation set per design §5.5 capability, and every method is called by the probe that
+reports it." Neither addition is a probed semantic capability, so adding them would break the
+invariant that makes the probe's evidence non-circular.
 
-| Method | Why |
+Both are plain stdlib operations on descriptors A6 already holds:
+
+| Need | Call |
 | --- | --- |
-| `list_children(parent_fd) -> tuple[str, ...]` | Descriptor-relative enumeration for directory occupancy |
-| `create_regular_noclobber(parent_fd, name, mode) -> int` | The staging sink: `O_WRONLY\|O_CREAT\|O_EXCL\|O_NOFOLLOW\|O_CLOEXEC` |
+| Directory occupancy | `os.listdir(dir_fd)` |
+| The staging sink | `os.open(name, O_WRONLY\|O_CREAT\|O_EXCL\|O_NOFOLLOW\|O_CLOEXEC, mode=0o600, dir_fd=staging_fd)` |
+| Reads and `fstat` | `os.read` / `os.fstat` on the descriptor `open_regular_nofollow` returns |
 
-Reads and `fstat` need no new method: `open_regular_nofollow` already returns the descriptor, and
-`os.read`/`os.fstat` operate on it directly.
+Staged-byte durability is *not* in that list: `flush_file` is an existing `Backend` method and the
+§5.5 `durable_publish` capability, so §7.3 below uses it rather than `os.fsync`.
 
 ## 5. The descriptor table
 
@@ -203,6 +212,16 @@ with **one** `open_child_directory` call, which is already
 which is precisely §6's rule: passing a multi-component name to a syscall reopens the check/use race,
 because the kernel re-resolves intermediate components at the syscall.
 
+**The tree gives structure, not spelling.** `TopologyDirectory(node_id)` carries no name, so the walk
+needs a node-to-path table to know which single component to open at each hop. That table is
+`_parent_paths(approved)` in `admission.py:88`, built from `approved.paths` — a parent node's path is
+its child's path minus the child's leaf — and A6 reuses it rather than restating the derivation. Each
+hop's component is the child's path minus the parent's, and the walk asserts it is a single component.
+
+`ProjectApprovedSpec` retains no `ResolvedPrefix`: A4b-1's resolution closed every descriptor it
+opened, and what survives approval is `paths`, `topology`, `directories`, `scratch`, and `work_base`.
+A6 rebuilds the walk from those, which is ledger #19's requirement rather than an inconvenience.
+
 ### 5.2 Which nodes bear a descriptor
 
 **Selected by role, from `approved.directories` plus the two physical roots — never by node class.**
@@ -214,13 +233,20 @@ exists for.
 | Node | Descriptor | Re-validated on entry |
 | --- | --- | --- |
 | `ProjectRoot` | **borrowed** `approved.binding.project_root_fd` | identity, constraints, mount |
-| `WorkRoot` | **borrowed** `workspace.work_fd` | constraints, mount — there is no approved identity |
+| `WorkRoot`, when present | **borrowed** `workspace.work_fd` | constraints, mount — there is no approved identity |
 | `ApprovedExistingDirectory` | **owned**, one `open_child_directory` from its parent | identity, constraints, mount |
 | `ApprovedPlannedDirectory` (project) | none — the walk stops here | capture proves absence or the blocker (§8) |
 
 The logical `WorkRoot → ProjectRoot` edge is **not physically traversed**: the work root lives under
 `metadata_root`, not beneath the project root. `WorkRoot` is also the one planned directory that does
 not stop the walk, because A5b has already created and opened it.
+
+**`WorkRoot` is included only when the approved topology contains it** — equivalently, when
+`approved.work_base is not None`, which A5b already treats as the signal that the spec declares a
+`CreateDirectory` and so has a `WORK` scratch role. When it is absent, A4b judged `work/` irrelevant
+to this transaction and there is no approved constraints baseline to compare against; admitting the
+node anyway would let a fresh observation authorize itself, the exact shape ledger #19 forbids.
+`_parent_paths` omits `WorkRoot` for the same reason, so the two agree by construction.
 
 ### 5.3 Why `ProjectRoot` is re-validated too
 
@@ -324,10 +350,12 @@ The `Observation` and its pinned descriptors close when the pass ends; the table
    `FileState` and so never names it, and §10's rollback material for a symlink is the atomically
    transferred tombstone, which only A7 creates. Capture verifies its `lstat` + `readlink` fingerprint
    and retains nothing. Directories and absence likewise carry a fingerprint and no content.
-4. **Stage planned postimages.** For each distinct required digest, `payloads.open(digest)` supplies a
-   byte source; capture streams it into `staging/` and verifies hash and length against the declared
-   `FileState`. Mode is not a blob property — A7 applies it at publication.
-5. **Return.** On success `staging/` holds exactly the manifest's entries.
+4. **Stage planned postimages.** For each distinct required `(digest, byte_len)` pair,
+   `payloads.open(digest)` supplies a byte source; capture streams it into `staging/` and verifies hash
+   and length against the declared `FileState`. Mode is not a blob property — A7 applies it at
+   publication.
+5. **Flush every staged file** (§7.3) before closing its sink.
+6. **Return.** On success `staging/` holds exactly the manifest's entries.
 
 Steps 3 and 4 are why capture sits above the store: both concern the `blob` surface, which `fs/` may
 not import.
@@ -347,20 +375,55 @@ Content-addressed, so two effects writing identical content are supplied once an
 learns a staging path. The source is an **external source promised by the frozen spec**, which is what
 makes §9's two-way error split principled rather than arbitrary.
 
+`open()` returns a **fresh binary stream, owned by capture**, which closes it whether the stream is
+consumed, refused, or abandoned by an earlier failure. A source that hands back a shared or already-read
+stream would make a second staging attempt silently produce a short blob.
+
 **Every distinct required digest is staged once; there is no blob-index skip in v1.**
 `promote_staging` already handles a pre-existing blob by verifying the indexed leaf and unlinking the
 duplicate, so skipping is an optimisation, not correctness. If it is ever added, a `blob` row lookup is
 insufficient on its own — the indexed leaf must be opened and verified, because a row asserts the
 bytes were durable once, not that they are intact now.
 
-### 7.2 Cleanliness is scoped to success
+### 7.2 One length per digest, checked before writing
+
+`referenced_digests` returns `(digest, byte_len)` **pairs**, not digests, and that is deliberate:
+`compile_spec` validates each `byte_len`'s range and the empty-hash correspondence, but never
+cross-checks that one `content_hash` carries one `byte_len` across entries. A spec may therefore
+declare `sha256:…` at two different lengths.
+
+The natural staging name is `digest_to_leaf(digest)` — the leaf `promote_staging` will rename it to —
+and it is a single name per digest. Two lengths would collide on it, and whichever wrote second would
+publish a blob one effect's `FileState` disagrees with.
+
+So capture **first requires exactly one length per digest across the whole required set, raising
+`ProtocolError` before writing anything.** This is engine misuse surfacing at the first layer that can
+see it, not external drift: the contradiction is in the frozen spec, and no filesystem state is
+involved. The widened `referenced_digests` (§10.2) keeps its pair semantics for the same reason.
+
+### 7.3 Staged bytes must be flushed
+
+`promote_staging` flushes **directories** — `flush_directory(blobs_fd)` and
+`flush_directory(staging_fd)` — which makes the *names* durable. Nothing flushes the file contents.
+After power loss the record could reference a blob whose directory entry survived and whose data blocks
+did not, which is precisely the cross-substrate rule of authority §7.3 failing: "anything the database references
+must be durable on the filesystem before the COMMIT that references it."
+
+Capture calls `backend.flush_file(sink_fd)` on **every** staged preimage and payload, after its hash
+and length verify and before its sink is closed. Doing it before verification would flush bytes that
+are about to be refused; doing it after close is not possible.
+
+The ordering is asserted by a test, not left to the code's shape, because a lost flush is invisible
+until a crash.
+
+### 7.4 Cleanliness is scoped to success
 
 `promote_staging` asserts `staging/` is empty after its rename loop and refuses on any remainder, so a
 **successful** capture must leave exactly the manifest's entries and nothing else.
 
 A **refusal** may leave partial workspace scratch. That is correct and deliberate: the scratch is
 mutation-free, no durable record exists, and A5b's reclamation removes orphan `staging/`, `work/`, and
-unreferenced blobs under the held lock at the next lease entry, regardless of count (§7.3).
+unreferenced blobs under the held lock at the next lease entry, regardless of count (authority §7.3).
 
 ## 8. Absence inference
 
@@ -371,9 +434,10 @@ symlink the file branch's coherence.
 ### 8.1 Missing ancestor
 
 The path lies beneath an ancestor an earlier `CreateDirectory` will create, so its parent does not
-exist and cannot be opened. The walk stops at the `ApprovedPlannedDirectory`; `resolve.py`'s
-`ResolvedPrefix` already models the deepest existing directory prefix. Absence is confirmed by a
-no-follow lookup of the **first missing component** relative to that deepest held descriptor.
+exist and cannot be opened. The walk stops at the `ApprovedPlannedDirectory`, and the deepest existing
+ancestor is simply the last node the walk opened before stopping — the table already holds its
+descriptor, and §5.1's node-to-path table already names the component below it. Absence is confirmed by
+a no-follow lookup of that **first missing component** relative to that held descriptor.
 
 The compiler orders ancestor creation outer-to-inner (§5.4, §9.5), so at execution each
 `CreateDirectory` has already retained a descriptor to the directory it published and hands it down —
@@ -391,16 +455,19 @@ file. §8.1 does not apply, because no component of `p/q` is missing where trave
 **The errno does not select the branch.** `resolve.py`'s `_BLOCKER_KINDS` maps
 `ENOTDIR → (REGULAR_FILE, OTHER)` and `ELOOP → (SYMLINK,)`. `ENOTDIR` establishes only that the blocker
 is not a directory; a socket, FIFO, or device node produces it too. A4b rejects `OTHER` at approval,
-but capture-time drift can introduce one afterwards. The regular-file branch is selected by verifying
-the blocker against the timeline's first `FileState`; a blocker that is neither that file nor a symlink
-refuses.
+but capture-time drift can introduce one afterwards. **Each branch is selected by verifying the blocker
+against the timeline's first declared state, never by the errno**: the regular-file branch against its
+first `FileState`, the symlink branch against its first `SymlinkState`. A blocker matching neither
+refuses — including a symlink whose target or mode has drifted, which is a symlink but not *this*
+symlink.
 
 - **Regular-file ancestor — descriptor-coherent.** Opened `O_RDONLY|O_NOFOLLOW`; type, mode, and hash
   all from that one descriptor. The inference is *stronger* than the negative lookup it replaces,
   because it rests on one descriptor's coherent observation rather than on a name resolved twice.
-- **Symlink ancestor — not.** `lstat` + `readlink`, no descriptor, no identity. The absence inference
-  still holds, since a symlink holds no directory entries, but its identity contract is deferred to
-  A7's destructive transfer validating the moved object against the frozen fingerprint.
+- **Symlink ancestor — not.** `lstat` + `readlink`, no descriptor, no identity, and the observed
+  target and mode must equal the declared first `SymlinkState`. The absence inference still holds,
+  since a symlink holds no directory entries, but its identity contract is deferred to A7's destructive
+  transfer validating the moved object against the frozen fingerprint.
 
 In neither branch is capture-time verification compare-and-swap authority. If the ancestor is swapped
 before execution, A7's destructive transfer validates the transferred object and refuses or halts.
@@ -415,30 +482,55 @@ already names capture as a `PreconditionRefused` site.
 | --- | --- |
 | Observed state diverges from the declared initial state | `PreconditionRefused` |
 | Re-resolution mismatch: identity, constraints, or mount | `PreconditionRefused` |
-| Blocker is neither the declared file nor a symlink (§8.2) | `PreconditionRefused` |
+| Blocker matches neither declared state (§8.2) | `PreconditionRefused` |
 | A well-formed payload source whose bytes changed or disagree with the declared `FileState` | `PreconditionRefused` |
-| A missing, extra, or malformed payload binding | `ProtocolError` |
+| A missing or malformed payload binding | `ProtocolError` |
+| One digest declared at two lengths (§7.2) | `ProtocolError` |
 | Backend cannot supply a required capability | `CapabilityUnavailable` |
 | Workspace/txid mismatch, spent descriptor, closed table, engine misuse | `ProtocolError` |
 
-The payload split follows from what `PayloadSource` **is**. A binding that is absent, extra, or
-malformed is a broken submission — the consumer did not supply what the frozen spec promised, and no
-external state is involved. A well-formed source whose bytes disagree is external state diverging from
-frozen intent, which is the definition of what capture exists to detect (§4.1).
+The payload split follows from what `PayloadSource` **is**. A binding that is absent or malformed is a
+broken submission — the consumer did not supply what the frozen spec promised, and no external state is
+involved. A well-formed source whose bytes disagree is external state diverging from frozen intent,
+which is the definition of what capture exists to detect (§4.1).
+
+An **extra** binding is deliberately not an error. `PayloadSource` exposes only `open(digest)` and
+cannot be enumerated, so capture asks for what it needs and never learns what else the consumer could
+have supplied. Detecting extras would mean adding enumeration machinery to the protocol for a condition
+that harms nothing: an unrequested payload is never opened, never staged, and never promoted.
+
+### 9.1 Translating direct lookups
+
+The traversal, lookup, and staging calls A6 makes raise `OSError` with a raw errno — `ENOENT`,
+`ENOTDIR`, `ELOOP`, `EXDEV`, `EEXIST` — and §9's table promises A6 errors, so every direct call site
+translates rather than letting one escape:
+
+| Errno class | Meaning after approval | Error |
+| --- | --- | --- |
+| `ENOENT`, `ENOTDIR`, `ELOOP`, `EXDEV`, and namespace contradictions generally | The namespace no longer matches what approval established | `PreconditionRefused` |
+| `EEXIST` on a staging leaf | External occupancy of an engine-derived scratch name | `PreconditionRefused` |
+| `ENOSYS`, `EOPNOTSUPP`, `ENOTSUP` | The backend cannot supply the semantics | `CapabilityUnavailable` |
+| `EBADF`, and any errno reachable only through engine misuse | An internal contract was violated | `ProtocolError` |
+
+The staging row is worth stating explicitly: authority §11, as amended by A5b, already names
+"pre-existing external occupancy of an engine-derived scratch leaf" as a `PreconditionRefused` case
+that need not be concurrent, because such a leaf may predate this attempt entirely.
 
 ## 10. Changes to existing code
 
-### 10.1 `atoms/fs/backend.py` and `atoms/fs/linux.py`
+`atoms/fs/backend.py` and `atoms/fs/linux.py` are **not** changed — see §4.3.
 
-The two methods of §4.3. Both are plain POSIX and are added below the capability comments, not among
-them, so the probe and `CERTIFIED_ALLOWLIST` are untouched.
+### 10.1 `atoms/coordinator/admission.py`
 
-### 10.2 `atoms/coordinator/admission.py`
+The entry-point gate set gains **one** entry, per ledger #9: `capture_initial_surface`, which requires
+an admitted proof and a workspace whose txid matches it, exactly as `prepare_transaction` does. The
+descriptor-table builder stays package-private and is reached only through that entry, so it is not a
+second gate site.
 
-The entry-point gate set gains A6's two entries, per ledger #9. `capture_initial_surface` requires an
-admitted proof and a workspace whose txid matches it, exactly as `prepare_transaction` does.
+`_parent_paths` gains a second in-package consumer (§5.1). It stays private and stays where it is;
+`descriptors.py` sits in the same package.
 
-### 10.3 `atoms/store/records.py` — the `referenced_digests` repair
+### 10.2 `atoms/store/records.py` — the `referenced_digests` repair
 
 Today the helper scans `spec.initial_surface` and `spec.final_surface` only, and `connection.py` raises
 `ProtocolError` for any promoted digest outside that set. An **intermediate** postimage appears in
@@ -452,6 +544,10 @@ the barrier's purpose is to reject digests the record does not reference at all.
 its docstring, `test_referenced_digests_include_initial_and_final_file_surfaces`, and
 `tests/coordinator_child.py` are updated in the same commit.
 
+**It keeps returning `(digest, byte_len)` pairs.** Collapsing to digests would erase the contradiction
+§7.2 must detect, and would do so in the one helper positioned to see every declared `FileState` at
+once.
+
 ## 11. Verification strategy
 
 Six tiers, all on the real ext4 test volume.
@@ -459,15 +555,28 @@ Six tiers, all on the real ext4 test volume.
 ### 11.1 Observation
 
 Token identity across two slots naming one entry; distinct tokens for distinct entries; a fresh
-universe per pass. An explicit **inode-reuse** test unlinks and recreates to prove the descriptor pin
-holds and two sequentially distinct entries never collapse onto one token. Symlinks carry no identity —
-asserted structurally, since `ObservedSymlink` has no field for one.
+universe per pass. Symlinks carry no identity — asserted structurally, since `ObservedSymlink` has no
+field for one.
+
+**The inode-pin test asserts the pin, not the reuse.** Unlinking an entry and recreating one does not
+*force* the kernel to hand back the same inode, so a test that unlinked, recreated, and asserted
+distinct tokens would pass just as readily on a build with no pin at all — it would be testing the
+allocator's mood. What is actually assertable is the mechanism: after the entry is unlinked, the
+observation's retained descriptor is still open and still reads the original bytes, so the inode cannot
+be reallocated while the pass lives. The invariant that no live inode is reused is the kernel's, and
+the test's job is to prove A6 holds the reference that invokes it. A sabotage variant closes the
+retained descriptor and asserts the mechanism, not the outcome, is what changed.
 
 ### 11.2 Capture, real filesystem
 
 Precondition match and every divergence shape; both §8 branches, including a blocker that is `OTHER`
-rather than a regular file; payload mismatch and malformed binding; `staging/` contents exactly the
-manifest on success; partial scratch on refusal reclaimed at the next lease entry.
+rather than a regular file, and a symlink blocker whose target has drifted; payload mismatch and
+malformed binding; one digest declared at two lengths refusing before anything is written; `staging/`
+contents exactly the manifest on success; partial scratch on refusal reclaimed at the next lease entry.
+
+**A flush-ordering test.** `backend.flush_file` is observed for every staged file, after that file's
+hash and length verify and before its sink closes. A lost flush is invisible until a crash, so the
+ordering is asserted directly rather than inferred from the code's shape.
 
 ### 11.3 Scratch observation
 
@@ -478,7 +587,9 @@ complete, attributable prefix, diverged, wrong-mode directory — and asserts th
 
 ### 11.4 Conformance — two routes, not one
 
-A6's output feeds two different A3 entry points, and one route cannot exercise both:
+The **`Observation` mechanism's** outputs feed two different A3 entry points, and one route cannot
+exercise both. `Captured` exposes no observations — it carries the manifest and the descriptor table —
+so both routes drive the observer directly:
 
 - **Complete observations** → `build_recovery_snapshot`, which must accept them. This proves the
   observer satisfies A3's coverage and shape validators without A7 existing.
@@ -511,12 +622,19 @@ creates them, and asserting them here would prove nothing about the code that wi
    the architecture test proves it.
 5. One `EntryIdentity` per underlying entry per pass, pinned by a retained descriptor; symlinks have
    none, structurally.
-6. Both §8 branches are separate code paths, and the regular-file branch is selected by the declared
-   `FileState`, never by `ENOTDIR`.
-7. Every A6 failure is a refusal; no path raises `TransactionHalted`.
-8. A successful capture leaves `staging/` holding exactly the manifest.
-9. `referenced_digests` covers every `FileState` the spec states, and an intermediate postimage
-   promotes without tripping the barrier.
-10. No project path is mutated by any A6 code path, asserted by the mutation-surface suite
+6. Both §8 branches are separate code paths, and each is selected by the declared state — the
+   regular-file branch by its first `FileState`, the symlink branch by its first `SymlinkState` —
+   never by an errno.
+7. Every A6 failure is a refusal; no path raises `TransactionHalted`, and no raw `OSError` escapes an
+   A6 entry point untranslated (§9.1).
+8. Every staged file is flushed with `backend.flush_file` after its hash and length verify and before
+   its sink closes, asserted by an ordering test.
+9. One `byte_len` per digest is required across the whole set, raising `ProtocolError` before anything
+   is written.
+10. A successful capture leaves `staging/` holding exactly the manifest.
+11. `referenced_digests` covers every `FileState` the spec states, still as `(digest, byte_len)` pairs,
+    and an intermediate postimage promotes without tripping the barrier.
+12. `Backend` gains no method; the probe and `CERTIFIED_ALLOWLIST` are untouched.
+13. No project path is mutated by any A6 code path, asserted by the mutation-surface suite
     (authority §13.5).
-11. A5b's A7 trap still raises, unchanged.
+14. A5b's A7 trap still raises, unchanged.
