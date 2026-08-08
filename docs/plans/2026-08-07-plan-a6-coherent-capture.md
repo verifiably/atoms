@@ -3688,6 +3688,29 @@ test**, so both change together.
    > build-stage trap, so #12 and #17 remain at their write and lease halves. A6 discharged the
    > observation half it was waiting on.
 
+2b. **In `docs/plans/2026-08-02-a5b-recovery-lease-design.md`, correct the planned-parent branch
+   description at lines 571-574.** This is drift Task 3 created and did not close. That bullet reads:
+
+   > **The three parent branches**, each reached and each refusing for its own reason: an existing
+   > parent whose identity or constraints moved; a *planned* parent that is present when approval
+   > said it would not be; and a `WorkRoot` whose `work/<txid>` already exists.
+
+   The middle clause stopped being true when Task 3 landed `caf5102`. A planned parent that is
+   present now refuses **only when nothing in the proof accounts for it**; a slot the timeline
+   declares occupied is admitted, because A4b approves design §8.2's shape on disk and capture — not
+   admission — verifies the blocker's kind. Rewrite the clause as:
+
+   > a *planned* parent present when the proof's own timeline declares nothing there;
+
+   and add a sentence after the bullet:
+
+   > A planned parent whose slot the timeline declares occupied is **not** refused: A4b approves that
+   > shape deliberately (design §8.2's `DeletePath` + `CreateDirectory` + child), and admission holds
+   > only a presence bit, so verifying the occupant's kind belongs to capture, which does it against
+   > the timeline's first declared state.
+
+   Leave the following sentence about `ChildObservation` alone — it is still true.
+
 3. In `docs/plans/2026-08-02-a5b-recovery-lease-design.md`, change its status header's
    `"A6–A8 remain unimplemented."` to `"A7–A8 remain unimplemented."` **This document is easy to
    miss:** `test_a5_status_is_synchronized_across_authority_documents` reads it as its second half and
