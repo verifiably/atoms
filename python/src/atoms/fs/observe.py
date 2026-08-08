@@ -4,7 +4,10 @@ One `Observation` is one pass and owns one token universe. It produces the primi
 facts A3 consumes and never a verdict: this module may import `atoms.core.recovery.model`
 and no other `core.recovery` module, which is how ledger #13's "may not pre-classify them
 into a recovery outcome" becomes a mechanical property rather than a review promise. An
-architecture test asserts the whitelist over both import forms.
+architecture test asserts the whitelist over every form the import can take: a direct
+`from atoms.core.recovery import ...`, a plain `import atoms.core.recovery`, a
+`from atoms.core import recovery` that names the parent package, and the relative
+equivalent of any of these.
 """
 
 from __future__ import annotations

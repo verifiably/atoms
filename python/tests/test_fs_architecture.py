@@ -526,6 +526,32 @@ def test_resolution_internals_are_not_exported(name):
     assert not hasattr(package, name)
 
 
+def test_observe_imports_only_the_recovery_model():
+    """Ledger #13's "may not pre-classify" as a mechanical property.
+
+    A blacklist on `snapshot` would be insufficient: `atoms/core/recovery/__init__.py`
+    re-exports `classify_recovery` and `authorize_recovery_step`, so a classifier is
+    reachable through the package facade.
+
+    The scan reuses `_resolved_imports`, which already resolves plain `import`, aliased
+    `from atoms.core import recovery`, and relative forms through `resolve_name`. A
+    hand-rolled scanner over `node.module` alone would miss all three: `from atoms.core
+    import recovery` names the parent package, and a relative import names nothing that
+    starts with `atoms`.
+    """
+    source = SOURCE_ROOT / "fs" / "observe.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    permitted = "atoms.core.recovery.model"
+    offenders = sorted(
+        name
+        for name in _resolved_imports(tree, package="atoms.fs")
+        if name.startswith("atoms.core.recovery")
+        and name != permitted
+        and not name.startswith(f"{permitted}.")
+    )
+    assert offenders == []
+
+
 @pytest.mark.parametrize("module_name", ["resolve", "lookup"])
 def test_no_blanket_oserror_handler(module_name):
     """Every OSError handler either discriminates or delegates to the discriminator."""
