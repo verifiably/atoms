@@ -82,7 +82,13 @@ def test_a_regular_file_blocker_matching_its_declared_state_justifies_absence(le
         with open_workspace(lease, approved) as workspace, capture_initial_surface(
             lease, approved, workspace, payloads_for_replace()
         ) as captured:
-            assert captured.manifest
+            # The blocker's own content (BEFORE) plus the payload capture stages
+            # (AFTER) -- proving the file branch actually ran, not just that
+            # something did.
+            assert {e.digest for e in captured.manifest} == {
+                digest_of(BEFORE),
+                digest_of(AFTER),
+            }
 
 
 def test_a_drifted_regular_file_blocker_refuses(leased):
@@ -95,10 +101,34 @@ def test_a_drifted_regular_file_blocker_refuses(leased):
         write_project_file(lease, "p", b"drifted")
         with (
             open_workspace(lease, approved) as workspace,
-            pytest.raises(PreconditionRefused, match="declared"),
+            pytest.raises(
+                PreconditionRefused, match="blocks traversal but is not the declared"
+            ),
             capture_initial_surface(lease, approved, workspace, payloads_for_replace()),
         ):
             pass
+
+
+def test_a_symlink_blocker_matching_its_declared_state_justifies_absence(leased):
+    """The symlink twin of the file branch's justified-absence test (design §8.2).
+
+    Without this, `_verify_stops`'s whole `elif type(expected) is SymlinkState:`
+    branch is dead code as far as the suite can tell: deleting it leaves every other
+    test green.
+    """
+    from atoms.coordinator.capture import capture_initial_surface
+    from atoms.coordinator.prepare import open_workspace
+
+    with leased() as lease:
+        root_fd = lease._binding.project_root_fd
+        os.symlink("elsewhere", "p", dir_fd=root_fd)
+        approved = approved_blocked(lease, SymlinkState(target="elsewhere", mode=0o777))
+        with open_workspace(lease, approved) as workspace, capture_initial_surface(
+            lease, approved, workspace, payloads_for_replace()
+        ) as captured:
+            # A symlink retains no content (design §7 step 3): only the payload
+            # capture stages, never the blocker itself.
+            assert {e.digest for e in captured.manifest} == {digest_of(AFTER)}
 
 
 def test_a_drifted_symlink_blocker_refuses(leased):
@@ -115,7 +145,9 @@ def test_a_drifted_symlink_blocker_refuses(leased):
 
         with (
             open_workspace(lease, approved) as workspace,
-            pytest.raises(PreconditionRefused, match="declared"),
+            pytest.raises(
+                PreconditionRefused, match="blocks traversal but is not the declared"
+            ),
             capture_initial_surface(lease, approved, workspace, payloads_for_replace()),
         ):
             pass
