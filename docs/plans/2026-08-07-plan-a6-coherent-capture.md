@@ -62,6 +62,9 @@ implementation, stop and report it — do not adapt around it silently.**
 | `ProjectBinding.project_root_fd` and `Workspace.staging_fd`/`work_fd` are public properties returning **borrowed** descriptors. `promote_staging` spends `staging_fd`. | `binding.py:121`, `workspace.py:78-93`, `blobs.py:366` |
 | A5a's translation rule: "the default is a bare `raise`, so an unrecognized code keeps its own class *and* its traceback." | `store/errors.py:26-46` |
 | The test volume resolves to `<repo>/.atoms-test-volume` on ext4 with no env var set. | probe, 2026-08-07 |
+| A4b **approves** design §8.2's shape with `p` a real file on disk — two dedicated conformance tests, the `DeletePath` form and the `MoveNoClobber` form. | `test_fs_approval_conformance.py:174`, `:186` |
+| `admit` nonetheless **refuses** it: `_occupied_scratch` reaches `_require_planned_absent` for `p/q`'s scratch and raises on presence without consulting the timeline. A5b contradicts A4b's own suite; Task 3 Step 0c repairs it. | `admission.py:172-178`, `:236-245`; measured 2026-08-08 |
+| `ChildObservation` is `(parent_identity, parent_constraints, present)` — a bare presence bit. Admission **cannot** tell a file from a symlink, which is why the declared-occupant branch defers kind verification to capture. | `resolve.py:51-61` |
 
 ## Global Constraints
 
@@ -968,13 +971,20 @@ git commit -m "fix(store): reference every declared FileState, not only the two 
 
 ---
 
-## Task 3: `DescriptorTable` — the walk, re-validation, and coherent blockers
+## Task 3: Admission's declared-occupant branch, then `DescriptorTable`
 
 **Files:**
+- Modify: `python/src/atoms/coordinator/admission.py`
+- Modify: `python/tests/test_coordinator_admission.py`
 - Modify: `python/src/atoms/fs/resolve.py`
 - Create: `python/src/atoms/coordinator/descriptors.py`
 - Create: `python/tests/capture_support.py`
 - Create: `python/tests/test_coordinator_descriptors.py`
+
+**Two deliverables, two commits.** Steps 0a–0c repair an A5b over-refusal that makes design §8.2's
+shape unadmittable; everything from Step 1 builds the walk. They are one task because the walk's
+blocker tests cannot run at all until the first lands, and a reviewer judging one needs the other in
+view. Commit them separately.
 
 **Interfaces:**
 - Produces:
@@ -989,6 +999,169 @@ Two rulings from the design shape this task. **No errno selects a state branch**
 the blocker's actual kind through the same `Observation` pass and reports the `ObservedEntry`, leaving
 adjudication to Task 4. And **a planned directory is looked up, not assumed** — recording it as absent
 without a lookup would mean a matching file or symlink blocker is never reported at all.
+
+### The admission defect, measured
+
+Design §8.2 is built on one shape: `DeletePath("p")`, `CreateDirectory("p")`,
+`CreateFileNoClobber("p/q")`, with `p` a real file on disk. A4b approves it deliberately —
+`test_fs_approval_conformance.py:174` (`test_a_file_ancestor_the_timeline_converts_approves_on_disk`)
+and `:186` (the `MoveNoClobber` variant) create `p` as a regular file and assert
+`approve_for_project` succeeds.
+
+`admit` then refuses it. After approval it runs `_occupied_scratch`, which for `p/q`'s STAGING
+scratch finds the parent `PersistentNode('p')` approved as `ApprovedPlannedDirectory` and calls
+`_require_planned_absent`. That function observes `p`, finds it present, and raises
+`PreconditionRefused` unconditionally (`admission.py:172-178`) — it never asks whether the proof's
+own timeline declares an occupant there. So the only shape §8.2 exists for cannot be admitted, and
+A5b contradicts A4b's own conformance suite.
+
+**The narrow repair: a slot the timeline declares occupied is not drift.** Approval has already
+validated the declared state against disk; capture will verify it coherently under §8.2, against the
+timeline's first declared state, through a descriptor. Admission's §6.4 job is to detect *drift from
+the proof*, and a present `p` that the proof says is a file is the proof being right. Admission does
+not verify the occupant's kind and must not try: `ChildObservation` is
+`(parent_identity, parent_constraints, present)` — a bare presence bit that cannot tell a file from a
+symlink. Duplicating the check with a real observation would put §8.2's branch selection in two
+places, which is exactly what the design forbids ("conflating them would silently grant a symlink the
+file branch's coherence").
+
+An occupant the timeline declares **absent** still refuses, unconditionally, as now. That is the
+existing guard's real subject and
+`test_a_present_planned_parent_refuses_without_comparing_its_identity`
+(`test_coordinator_admission.py:173`) keeps proving it.
+
+- [ ] **Step 0a: Write the failing tests**
+
+In `python/tests/test_coordinator_admission.py`, next to the existing planned-parent tests:
+
+```python
+def test_a_planned_directory_the_timeline_declares_occupied_is_admitted(leased):
+    """Design §8.2's shape. A4b approves it on purpose; admission must not refuse it.
+
+    `p`'s timeline is FILE -> ABSENT -> DIRECTORY, so `p` being a file right now is the
+    proof being right, not drift. Capture verifies the blocker against that first
+    declared state under a descriptor; admission only asks whether the world still
+    matches the proof.
+    """
+    from atoms.coordinator.admission import admit
+    from atoms.core.compiler import compile_spec
+
+    with leased() as lease:
+        write_project_file(lease, "p", BEFORE)
+        approved = admit(lease, compile_spec(blocker_spec(state_of(BEFORE))))
+
+    assert approved.txid
+
+
+def test_a_planned_directory_occupied_by_an_undeclared_entry_still_refuses(leased):
+    """The declared-occupant branch must not weaken the guard it sits inside.
+
+    Here the timeline declares `a` ABSENT initially -- nothing accounts for the
+    directory that is there -- so this is drift and refuses as it always has.
+    """
+    from atoms.coordinator.admission import admit
+    from atoms.core.compiler import compile_spec
+
+    with leased() as lease:
+        os.mkdir("a", dir_fd=lease._binding.project_root_fd)
+        with pytest.raises(PreconditionRefused, match="exists now but was absent"):
+            admit(lease, compile_spec(planned_directory_spec()))
+```
+
+`blocker_spec`, `write_project_file`, `state_of`, and `BEFORE` come from
+`tests/capture_support.py`, which Step 2 creates. Write Step 2's file first, then come back — Step 2
+is a pure test-support module with no dependency on anything in Step 0.
+
+`planned_directory_spec` is new; add it to `capture_support.py` beside `blocker_spec`:
+
+```python
+def planned_directory_spec() -> TransactionSpec:
+    """`CreateDirectory("a")` + `CreateFileNoClobber("a/f")`, both declared ABSENT.
+
+    The contrast case for `blocker_spec`: nothing in this timeline accounts for an
+    entry at `a`, so one being there is drift and admission refuses it.
+    """
+    return build_spec(
+        consumer_tag="test",
+        intent_digest="sha256:" + "c" * 64,
+        initial_surface={"a": ABSENT, "a/f": ABSENT},
+        final_surface={"a": DIRECTORY_POST, "a/f": state_of(AFTER)},
+        effects=[
+            CreateDirectory(effect_id="mk", path="a", post=DIRECTORY_POST),
+            CreateFileNoClobber(effect_id="e1", path="a/f", post=state_of(AFTER)),
+        ],
+    )
+```
+
+- [ ] **Step 0b: Run them and watch them fail**
+
+Run: `cd python && uv run pytest tests/test_coordinator_admission.py -q -k "declares_occupied or undeclared_entry"`
+Expected: the first FAILS with `PreconditionRefused: the planned parent directory 'p' exists now but
+was absent when the proof was issued`. The second PASSES already — it pins behaviour Step 0c must
+preserve, and a test that only passes after the change would not prove that.
+
+- [ ] **Step 0c: Add the declared-occupant branch**
+
+In `python/src/atoms/coordinator/admission.py`, add a module-level helper beside the other
+`_require_*` functions:
+
+```python
+def _declared_first_state(approved: ProjectApprovedSpec, path: str) -> object | None:
+    """The timeline's first declared state for `path`, or None if it has no timeline.
+
+    `PathTimeline` is `(path, occurrences)` and `TimelineOccurrence` is
+    `(effect_id, effect_index, role, pre, post)`, so the first occurrence's `pre` is the
+    state the spec says the path is in before anything runs.
+    """
+    for timeline in approved.compiled.timelines:
+        if timeline.path == path:
+            return timeline.occurrences[0].pre
+    return None
+```
+
+Then, in `_require_planned_absent`, replace the unconditional refusal. The existing local `declared`
+already names the `ApprovedPath`, so do not shadow it:
+
+```python
+    if observed.present:
+        first_state = _declared_first_state(approved, path)
+        if first_state is not None and type(first_state) is not AbsentState:
+            # Design §8.2. The timeline declares an occupant here and A4b already
+            # approved that state against disk, so presence is the proof being right.
+            # Capture verifies the blocker against this same first declared state,
+            # through a descriptor; admission holds only a presence bit and must not
+            # second-guess the kind.
+            return
+        raise PreconditionRefused(
+            f"the planned parent directory {path!r} exists now but was absent when the "
+            "proof was issued; a planned directory has no approved identity, so its "
+            "lookup relation cannot be compared against anything"
+        )
+```
+
+`AbsentState` comes from `atoms.core.fingerprint`; add the import if `admission.py` lacks it. Use the
+exact-type check, not `== ABSENT` — the house rule at trust boundaries.
+
+Extend `_require_planned_absent`'s docstring with a sentence naming the new branch, so the function's
+contract still reads true from its own text.
+
+- [ ] **Step 0d: Run the tests, then the suite**
+
+Run: `cd python && uv run pytest tests/test_coordinator_admission.py -q`
+Expected: PASS, including both new tests.
+
+Run: `cd python && uv run pytest -q`
+Expected: all green. The suite stands at 5433 passed, 7 skipped before this task. **If any existing
+admission or coordinator test now fails, stop and report it** — that would mean something depended on
+the over-refusal.
+
+- [ ] **Step 0e: Commit**
+
+```bash
+git add python/src/atoms/coordinator/admission.py python/tests/test_coordinator_admission.py \
+        python/tests/capture_support.py
+git commit -m "fix(admission): a slot the timeline declares occupied is not drift"
+```
 
 - [ ] **Step 1: Make the filesystem-type helper public**
 
