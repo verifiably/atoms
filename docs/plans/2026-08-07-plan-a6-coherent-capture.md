@@ -3584,13 +3584,22 @@ Run each time: `cd python && uv run pytest tests/test_fs_architecture.py -q -k o
 
 - [ ] **Step 3: Run the full gate set**
 
-Run: `cd python && uv run ruff format && uv run ruff check && uv run pyright && uv run pytest -q`
-Expected: all green.
+Run, from `python/`: `uv run ruff check && uv run pyright && uv run pytest`
+Expected: all green. **Do not run `uv run ruff format`** — it is not a gate here (see Global
+Constraints) and it reformats most of the tree.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 4: Confirm `observe.py`'s docstring is now true**
+
+`observe.py` says "An architecture test asserts the whitelist over both import forms." That
+sentence was written forward-looking in Task 1 and this task is what makes it true. Read it against
+the test you just added and confirm it describes what the test actually does — including "both
+import forms," which must mean the four planted violations Step 2 covers. If the sentence overstates
+the guard, correct the sentence; do not widen the test to match a docstring.
+
+- [ ] **Step 5: Commit**
 
 ```bash
-git add python/tests/test_fs_architecture.py
+git add python/tests/test_fs_architecture.py python/src/atoms/fs/observe.py
 git commit -m "test(fs): whitelist the recovery imports observe.py may make"
 ```
 
