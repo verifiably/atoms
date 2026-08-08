@@ -777,6 +777,17 @@ git commit -m "feat(observe): add the coherent observation pass and its token pi
 This lands before capture because the staging set is exactly what this helper returns. It has no
 dependency on Task 1.
 
+**The helper has two callers of opposite polarity, and widening it moves both.** This plan
+originally reasoned about only one. `connection.py:552` is an **admission ceiling** — a promoted
+digest must be *in* the set, so widening admits an intermediate postimage that was previously
+refused. `records.py:492` is a **presence floor** — every digest *in* the set must have a blob
+row, so widening makes those same bytes *mandatory* for coherence. Ruled during execution:
+**one helper, and the floor widens with it.** A record whose effects name bytes with no blob row
+cannot be executed by A7, so flagging it is the coherence check doing its job, not collateral
+damage. The measured blast radius is one fixture — `non_compiling_spec()` declares `a.txt` ABSENT
+in both surfaces while its `CreateFileNoClobber` carries `post=file_state(b"after")`, a postimage
+in no surface — and Step 5 below repairs it. Nothing else in the suite moves.
+
 - [ ] **Step 1: Write the failing test**
 
 In `python/tests/test_store_records.py`, rename
@@ -901,15 +912,54 @@ Measured: the helper is named `occurrences` and is a `singledispatch` returning
 Run: `cd python && uv run pytest tests/test_store_records.py -q`
 Expected: PASS.
 
-- [ ] **Step 5: Run the full suite**
+- [ ] **Step 5: Repair the one corruption fixture the widened floor moves**
+
+`CROSS_ROW_CASES`' `RULE_SPEC_COMPILES` row plants `non_compiling_spec()`, whose
+`CreateFileNoClobber` states `post=file_state(b"after")` while both surfaces say `ABSENT`. The
+record it overwrites was committed from `_only_spec()`, which references nothing and therefore
+wrote no blob. Widened, the planted spec references `digest_of(b"after")` with no blob row, so
+`coherence_findings` returns two findings and `test_cross_row_corruption_refuses_on_load` fails its
+`assert len(findings) == 1`.
+
+That assertion is the matrix's whole point: one planted corruption, one finding, so each row proves
+its own rule fires and no other. Keep it. The fixture, not the assertion, is what is now
+incomplete — it must leave the record coherent in every respect *except* the rule under test, and
+that now includes the blob row its planted spec references. Give the row's `corrupt` lambda a named
+function that plants the spec and then inserts the blob:
+
+```python
+def _plant_non_compiling_spec(raw) -> None:
+    """The planted spec states a postimage in neither surface, so it references a
+    digest the committed record never wrote. Insert the row it needs: this case
+    corrupts `spec_json_compiles` and nothing else."""
+    _plant_spec_json(raw, canonical_json(non_compiling_spec()), CREATE_FILE_ROW)
+    raw.execute(
+        "INSERT INTO blob VALUES (?, ?)",
+        (digest_of(b"after"), len(b"after")),
+    )
+```
+
+and reference it in `CROSS_ROW_CASES` in place of the inline lambda:
+
+```python
+    (RULE_SPEC_COMPILES, _only_spec, _plant_non_compiling_spec),
+```
+
+`blob` is `(digest TEXT PRIMARY KEY, byte_len INTEGER NOT NULL CHECK (byte_len >= 0))`
+(`schema.py:62-65`).
+
+- [ ] **Step 6: Run the full suite**
 
 `python/tests/coordinator_child.py:48` already unpacks `(digest, byte_len)` pairs and needs no change.
 
 Run: `cd python && uv run pytest -q`
-Expected: all green. **If a store or coordinator test now fails because more digests are referenced,
-stop and report it** — that would mean the barrier was relying on the narrow set.
+Expected: all green. Exactly two parametrizations moved —
+`test_cross_row_corruption_refuses_on_load[spec_json_compiles-…]` and
+`test_every_reachable_cross_row_rule_refuses_on_a_write[spec_json_compiles-…]` — and Step 5 repairs
+both. **If any other store or coordinator test fails because more digests are referenced, stop and
+report it**; that would mean something beyond this fixture was relying on the narrow set.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add python/src/atoms/store/records.py python/tests/test_store_records.py
