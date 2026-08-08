@@ -236,11 +236,80 @@ def test_insert_record_derives_every_effect_row_from_the_spec(opened_store, stor
     assert rows == [("only", "create_directory", "pending")]
 
 
-def test_referenced_digests_include_initial_and_final_file_surfaces():
+def test_referenced_digests_include_every_declared_file_state():
     spec = replace_spec(before=b"before", after=b"after")
     assert referenced_digests(spec) == tuple(
         sorted(((digest_of(b"before"), 6), (digest_of(b"after"), 5)))
     )
+
+
+def _state(payload: bytes, byte_len: int | None = None):
+    import hashlib
+
+    from atoms.core.fingerprint import FileState
+
+    return FileState(
+        content_hash="sha256:" + hashlib.sha256(payload).hexdigest(),
+        mode=0o644,
+        byte_len=len(payload) if byte_len is None else byte_len,
+    )
+
+
+def test_referenced_digests_include_an_intermediate_postimage():
+    """Measured: `ReplaceFile(p, A->B)` + `ReplaceFile(p, B->C)` puts B in neither surface.
+
+    The initial surface has A and the final has C. Before this repair the helper missed B
+    entirely, so `connection.py`'s barrier refused a promoted B as unreferenced -- and not
+    promoting it would leave A7 without the bytes it must publish.
+    """
+    from atoms.core.effects import ReplaceFile
+    from atoms.core.spec import build_spec
+
+    a, b, c = _state(b"aaa"), _state(b"bbb"), _state(b"ccc")
+    spec = build_spec(
+        consumer_tag="test",
+        intent_digest="sha256:" + "3" * 64,
+        initial_surface={"p": a},
+        final_surface={"p": c},
+        effects=[
+            ReplaceFile(effect_id="e1", path="p", pre=a, post=b),
+            ReplaceFile(effect_id="e2", path="p", pre=b, post=c),
+        ],
+    )
+
+    assert {digest for digest, _ in referenced_digests(spec)} == {
+        a.content_hash,
+        b.content_hash,
+        c.content_hash,
+    }
+
+
+def test_referenced_digests_keep_conflicting_lengths_as_distinct_pairs():
+    """Measured: `compile_spec` accepts one content_hash at two byte_len values.
+
+    Collapsing to digests would erase the contradiction capture must detect (A6 design
+    §7.2), in the one helper positioned to see every declared FileState at once.
+    """
+    from atoms.core.effects import ReplaceFile
+    from atoms.core.spec import build_spec
+
+    honest = _state(b"aaa")
+    liar = _state(b"aaa", byte_len=99)
+    other = _state(b"zzz")
+    spec = build_spec(
+        consumer_tag="test",
+        intent_digest="sha256:" + "5" * 64,
+        initial_surface={"p": other, "q": other},
+        final_surface={"p": honest, "q": liar},
+        effects=[
+            ReplaceFile(effect_id="e1", path="p", pre=other, post=honest),
+            ReplaceFile(effect_id="e2", path="q", pre=other, post=liar),
+        ],
+    )
+
+    assert sorted(
+        n for d, n in referenced_digests(spec) if d == honest.content_hash
+    ) == [3, 99]
 
 
 def test_one_digest_with_conflicting_lengths_across_surfaces_keeps_both_pairs():
@@ -535,6 +604,26 @@ def _plant_halted(raw, diagnostic):
     )
 
 
+def _plant_non_compiling_spec(raw) -> None:
+    """The planted spec states a postimage in neither surface, so it references a
+    digest the committed record never wrote. Insert the row it needs: this case
+    corrupts `spec_json_compiles` and nothing else."""
+    _plant_spec_json(raw, canonical_json(non_compiling_spec()), CREATE_FILE_ROW)
+    raw.execute(
+        "INSERT INTO blob VALUES (?, ?)",
+        (digest_of(b"after"), len(b"after")),
+    )
+
+
+def _plant_blob_for_non_compiling_spec(raw) -> None:
+    """Stage the blob row for the digest referenced by non_compiling_spec's effect.
+    This is for the write-side test where insert_record is called inside a transaction."""
+    raw.execute(
+        "INSERT INTO blob VALUES (?, ?)",
+        (digest_of(b"after"), len(b"after")),
+    )
+
+
 ONE_EFFECT_ROW = (("only", "create_directory"),)
 CREATE_FILE_ROW = (("only", "create_file_no_clobber"),)
 
@@ -546,7 +635,7 @@ def _only_spec():
 CROSS_ROW_CASES = (
         (RULE_SPEC_DECODES, _only_spec, lambda raw: _plant_spec_json(raw, '{"nope": 1}', ())),
         (RULE_SPEC_CANONICAL, _only_spec, lambda raw: _plant_spec_json(raw, " " + canonical_json(_only_spec()), ONE_EFFECT_ROW)),
-        (RULE_SPEC_COMPILES, _only_spec, lambda raw: _plant_spec_json(raw, canonical_json(non_compiling_spec()), CREATE_FILE_ROW)),
+        (RULE_SPEC_COMPILES, _only_spec, _plant_non_compiling_spec),
         (RULE_EFFECT_COVERAGE, _only_spec, lambda raw: _plant(raw, "DELETE FROM effect")),
         (RULE_EFFECT_VARIANT, _only_spec, lambda raw: _plant(raw, "UPDATE effect SET variant = 'delete_path'")),
         (RULE_BLOB_ROW_PRESENT, replace_spec, lambda raw: _plant(raw, "DELETE FROM blob WHERE digest = ?", (digest_of(b"before"),))),
@@ -623,7 +712,7 @@ def _plant_replace_blob_rows(raw, *, before_len: int | None) -> None:
 
 
 WRITE_SIDE_INCOHERENCE = (
-    (RULE_SPEC_COMPILES, None, lambda txn: txn.insert_record("tx3", non_compiling_spec())),
+    (RULE_SPEC_COMPILES, _plant_blob_for_non_compiling_spec, lambda txn: txn.insert_record("tx3", non_compiling_spec())),
     (RULE_BLOB_ROW_PRESENT, lambda raw: _plant_replace_blob_rows(raw, before_len=None), lambda txn: txn.insert_record("tx3", replace_spec())),
     (RULE_BLOB_BYTE_LEN, lambda raw: _plant_replace_blob_rows(raw, before_len=999), lambda txn: txn.insert_record("tx3", replace_spec())),
     (RULE_ROLLBACK_RESULT, None, lambda txn: txn.set_transaction_state("tx2", TransactionState.ROLLED_BACK)),

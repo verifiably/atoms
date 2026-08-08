@@ -9,6 +9,7 @@ from typing import Any
 
 from atoms.core.canonical import canonical_json, from_canonical_json
 from atoms.core.compiler import compile_spec
+from atoms.core.effects import occurrences
 from atoms.core.errors import ProtocolError, SpecValidationError
 from atoms.core.fingerprint import (
     AbsentState,
@@ -410,11 +411,30 @@ def _finding(rule: str, detail: str) -> str:
 
 
 def referenced_digests(spec: TransactionSpec) -> tuple[tuple[str, int], ...]:
-    return tuple(sorted({
-        (entry.state.content_hash, entry.state.byte_len)
+    """Every FileState the spec states, as (digest, byte_len) pairs.
+
+    Both surfaces AND every effect occurrence. An intermediate postimage -- the B of
+    `ReplaceFile(p, A->B)` followed by `ReplaceFile(p, B->C)` -- appears in neither
+    surface, so a surfaces-only scan made `connection.py`'s barrier refuse a promoted B
+    as unreferenced while A7 still needed the bytes.
+
+    Pairs, not digests: `compile_spec` validates each byte_len's range and the empty-hash
+    correspondence but never cross-checks that one content_hash carries one byte_len, so
+    a spec may declare the same digest at two lengths. Collapsing here would erase the
+    contradiction capture refuses on (A6 design §7.2).
+    """
+    states = [
+        entry.state
         for surface in (spec.initial_surface, spec.final_surface)
         for entry in surface
-        if isinstance(entry.state, FileState)
+    ]
+    for effect in spec.effects:
+        for occurrence in occurrences(effect):
+            states.extend((occurrence.pre, occurrence.post))
+    return tuple(sorted({
+        (state.content_hash, state.byte_len)
+        for state in states
+        if isinstance(state, FileState)
     }))
 
 
