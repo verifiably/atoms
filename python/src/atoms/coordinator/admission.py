@@ -14,6 +14,7 @@ from atoms.core.errors import (
     ProjectApprovalRefused,
     ProtocolError,
 )
+from atoms.core.fingerprint import AbsentState
 from atoms.core.recovery import PersistentNode, ProjectRoot, TopologyNode, WorkRoot
 from atoms.fs.approval import ProjectApprovedSpec, ProjectContext, approve_for_project
 from atoms.fs.resolve import ChildObservation, observe_child, observe_work_child
@@ -141,6 +142,19 @@ def _require_matches_approval(
         )
 
 
+def _declared_first_state(approved: ProjectApprovedSpec, path: str) -> object | None:
+    """The timeline's first declared state for `path`, or None if it has no timeline.
+
+    `PathTimeline` is `(path, occurrences)` and `TimelineOccurrence` is
+    `(effect_id, effect_index, role, pre, post)`, so the first occurrence's `pre` is the
+    state the spec says the path is in before anything runs.
+    """
+    for timeline in approved.compiled.timelines:
+        if timeline.path == path:
+            return timeline.occurrences[0].pre
+    return None
+
+
 def _require_planned_absent(
     lease: Lease,
     approved: ProjectApprovedSpec,
@@ -153,10 +167,13 @@ def _require_planned_absent(
     An `ApprovedPlannedDirectory` carries constraints but no identity, because the
     directory did not exist when the proof was issued. If it exists now there is
     nothing to compare it against, so this refuses rather than observing it as a
-    parent. It observes the planned directory only as a *child* of its own parent, and
-    recurses when that parent is planned too: only the outermost planned ancestor has
-    an existing parent whose identity can be checked, and an absent ancestor makes
-    everything beneath it absent as well.
+    parent -- UNLESS the timeline itself declares an occupant there (design §8.2): a
+    present entry that the proof's own first declared state already accounts for is the
+    proof being right, not drift, and capture verifies it coherently against that same
+    declared state through a descriptor. It observes the planned directory only as a
+    *child* of its own parent, and recurses when that parent is planned too: only the
+    outermost planned ancestor has an existing parent whose identity can be checked, and
+    an absent ancestor makes everything beneath it absent as well.
     """
     path = _parent_path(mapping, node)
     declared = _approved_path_for(approved, path)
@@ -171,6 +188,14 @@ def _require_planned_absent(
     observed = observe_child(lease._binding, grandparent_path, declared.leaf)
     _require_matches_approval(observed, grandparent, grandparent_path or ".")
     if observed.present:
+        first_state = _declared_first_state(approved, path)
+        if first_state is not None and type(first_state) is not AbsentState:
+            # Design §8.2. The timeline declares an occupant here and A4b already
+            # approved that state against disk, so presence is the proof being right.
+            # Capture verifies the blocker against this same first declared state,
+            # through a descriptor; admission holds only a presence bit and must not
+            # second-guess the kind.
+            return
         raise PreconditionRefused(
             f"the planned parent directory {path!r} exists now but was absent when the "
             "proof was issued; a planned directory has no approved identity, so its "

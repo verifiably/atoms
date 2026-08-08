@@ -192,6 +192,43 @@ def test_a_present_planned_parent_refuses_without_comparing_its_identity(leased)
         assert "no approved identity" in message
 
 
+def test_a_planned_directory_the_timeline_declares_occupied_is_admitted(leased):
+    """Design §8.2's shape. A4b approves it on purpose; admission must not refuse it.
+
+    `p`'s timeline is FILE -> ABSENT -> DIRECTORY, so `p` being a file right now is the
+    proof being right, not drift. Capture verifies the blocker against that first
+    declared state under a descriptor; admission only asks whether the world still
+    matches the proof.
+    """
+    from atoms.coordinator.admission import admit
+    from atoms.core.compiler import compile_spec
+    from tests.capture_support import BEFORE, blocker_spec, state_of, write_project_file
+
+    with leased() as lease:
+        write_project_file(lease, "p", BEFORE)
+        approved = admit(lease, compile_spec(blocker_spec(state_of(BEFORE))))
+
+    assert approved.txid
+
+
+def test_a_planned_directory_occupied_by_an_undeclared_entry_still_refuses(leased):
+    """The declared-occupant branch must not weaken the guard it sits inside.
+
+    Here the timeline declares `a` ABSENT initially -- nothing accounts for the
+    directory that is there -- so this is drift and refuses as it always has.
+    """
+    import os
+
+    from atoms.coordinator.admission import admit
+    from atoms.core.compiler import compile_spec
+    from tests.capture_support import planned_directory_spec
+
+    with leased() as lease:
+        os.mkdir("a", dir_fd=lease._binding.project_root_fd)
+        with pytest.raises(PreconditionRefused, match="exists now but was absent"):
+            admit(lease, compile_spec(planned_directory_spec()))
+
+
 def test_a_moved_scratch_parent_refuses_naming_identity(leased):
     from atoms.coordinator import admission
     from tests.coordinator_support import replace_the_parent_directory
