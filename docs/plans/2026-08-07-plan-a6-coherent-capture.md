@@ -14,10 +14,10 @@ that outlives capture and becomes A7's execution anchor. `coordinator/capture.py
 `capture_initial_surface`, which drives the observer over the approved surface, stages preimages and
 consumer-supplied postimages, and returns the manifest `prepare_transaction` already accepts.
 
-**Tech Stack:** Python 3.11+, stdlib only (`os`, `hashlib`, `errno`, `contextlib`, `dataclasses`,
-`typing`), `pytest`, `ruff`, `pyright`. Builds on A4a's `Backend`/`ProjectBinding`, A4b's
-`ProjectApprovedSpec` and `read_lookup_constraints`, A5a's `Workspace`/`StagedBlob`/`verify_leaf`,
-A5b's `Lease` and `_parent_paths`, and A3's `core.recovery.model`.
+**Tech Stack:** Python 3.11+, stdlib only (`os`, `stat`, `hashlib`, `errno`, `contextlib`,
+`dataclasses`, `typing`), `pytest`, `ruff`, `pyright`. Builds on A4a's `Backend`/`ProjectBinding`,
+A4b's `ProjectApprovedSpec` and `read_lookup_constraints`, A5a's `Workspace`/`StagedBlob`, A5b's
+`Lease` and `_parent_paths`, and A3's `core.recovery.model`.
 
 **Design:** [`2026-08-07-a6-coherent-capture-design.md`](2026-08-07-a6-coherent-capture-design.md).
 **Authority:** [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md).
@@ -32,66 +32,75 @@ implementation, stop and report it — do not adapt around it silently.**
 
 | Fact | Where measured |
 | --- | --- |
-| For `CreateFileNoClobber("e1", "d/f.txt")` with `d` existing: `paths` is one `ApprovedPath(path='d/f.txt', parent_node=TopologyDirectory(node_id=0), leaf='f.txt')`; `directories` holds `ApprovedExistingDirectory(ProjectRoot())` and `ApprovedExistingDirectory(TopologyDirectory(0))`; `work_base` is `None`. | probe, 2026-08-07 |
+| `FileBuildRelation` is `EXACT \| STRICT_PREFIX \| DIVERGED`. **There is no `PREFIX`.** | probe, 2026-08-07; `model.py:55` |
+| The occurrence expander is `occurrences`, a `singledispatch` returning `Occurrence(path, pre, post, role)`. There is no `occurrences_of`. | probe, 2026-08-07; `effects.py:69` |
+| `TimelineOccurrence` is `(effect_id, effect_index, role, pre, post)`; `PathTimeline` is `(path, occurrences)`. | probe, 2026-08-07; `timeline.py:15` |
+| `ABSENT` is `AbsentState()`, a distinct dataclass — **not** `None`, and never equal to a missing attribute. | probe, 2026-08-07; `fingerprint.py` |
+| `test_no_unregistered_public_function_accepts_the_proof` asserts `found == registered` over every public `coordinator/*.py` function annotating a `ProjectApprovedSpec` parameter. A new public one **fails the suite** unless registered. | `test_fs_architecture.py:1061-1080` |
+| Each name in `_TRANSACTION_STAGE_ENTRY_POINTS` must have `_require_admitted(...)` as its **first statement after the docstring**. | `test_fs_architecture.py:1040-1058` |
+| `_TRANSACTION_STAGE_ENTRY_POINTS` is `{"atoms/coordinator/prepare.py": ("open_workspace", "prepare_transaction"), "atoms/coordinator/transitions.py": ("persist_plan_prefix",)}`. | `test_fs_architecture.py:1001` |
+| `test_a5_status_is_synchronized_across_authority_documents` asserts the literal `"A5 is implemented; A6–A8 remain unimplemented"` in `AGENTS.md`. Editing that sentence **breaks it**. | `test_store_architecture.py:1269-1288` |
+| `_project_state(project_root)` in `test_coordinator_lease.py:186` already records the root itself as `"."`, uses `lstat` throughout, and keys on `(S_IFMT, S_IMODE, st_dev, st_ino, st_size, payload)` — the correct mutation-surface snapshot. | `test_coordinator_lease.py:186` |
+| For `CreateFileNoClobber("e1", "d/f.txt")` with `d` existing: one `ApprovedPath(path='d/f.txt', parent_node=TopologyDirectory(node_id=0), leaf='f.txt')`; `directories` is `ApprovedExistingDirectory(ProjectRoot())` and `ApprovedExistingDirectory(TopologyDirectory(0))`; `work_base` is `None`. | probe, 2026-08-07 |
 | `_parent_paths` for that spec is `{ProjectRoot(): '', PersistentNode('d/f.txt'): 'd/f.txt', TopologyDirectory(0): 'd'}`. **No `ScratchNode` and no `WorkRoot` key.** | probe, 2026-08-07 |
-| For `CreateDirectory("e1","d")` + `CreateFileNoClobber("e2","d/f.txt")`: `directories` holds `ApprovedExistingDirectory(ProjectRoot())`, `ApprovedPlannedDirectory(PersistentNode('d'))`, `ApprovedPlannedDirectory(WorkRoot())`; `work_base` is populated; `_parent_paths` is `{ProjectRoot(): '', PersistentNode('d'): 'd', PersistentNode('d/f.txt'): 'd/f.txt'}`. | probe, 2026-08-07 |
+| For `CreateDirectory("e1","d")` + `CreateFileNoClobber("e2","d/f.txt")`: `directories` is `ApprovedExistingDirectory(ProjectRoot())`, `ApprovedPlannedDirectory(PersistentNode('d'))`, `ApprovedPlannedDirectory(WorkRoot())`; `work_base` populated; `_parent_paths` is `{ProjectRoot(): '', PersistentNode('d'): 'd', PersistentNode('d/f.txt'): 'd/f.txt'}`. | probe, 2026-08-07 |
 | In that spec `ScratchNode('e2', STAGING)` is parented by `PersistentNode('d')` — **a planned directory**. Its slot is unobservable at capture and absent by construction. | probe, 2026-08-07 |
-| `open_child_directory(root_fd, name)` raises `ENOTDIR` on a regular file, `ELOOP` on a symlink, `ENOENT` on a missing name. | probe, 2026-08-07 |
-| `os.listdir(fd)` works on a directory descriptor; a fresh workspace `staging/` lists `[]`. | probe, 2026-08-07 |
+| `open_child_directory` raises `ENOTDIR` on a regular file, `ELOOP` on a symlink, `ENOENT` on a missing name. **`ENOTDIR` does not distinguish a regular file from a socket, FIFO, or device node**, which is why the plan never maps an errno to a kind. | probe, 2026-08-07 |
+| `os.listdir(fd)` works on a directory descriptor and omits `.` and `..`; a fresh workspace `staging/` lists `[]`. | probe, 2026-08-07 |
 | `backend.flush_file(fd)` succeeds on a **write-only** descriptor. `os.open(name, O_WRONLY\|O_CREAT\|O_EXCL\|O_NOFOLLOW\|O_CLOEXEC, 0o600, dir_fd=staging_fd)` creates mode `0o600`; a second create raises `EEXIST`. | probe, 2026-08-07 |
 | `compile_spec` **accepts** one `content_hash` declared at two `byte_len` values, and `referenced_digests` returns both pairs. | probe, 2026-08-07 |
-| `referenced_digests` scans only `spec.initial_surface` and `spec.final_surface`. For `ReplaceFile(p, A→B)` + `ReplaceFile(p, B→C)` it returns A and C; **B is absent.** | probe, 2026-08-07; `records.py:412` |
+| `referenced_digests` scans only the two surfaces. For `ReplaceFile(p, A→B)` + `ReplaceFile(p, B→C)` it returns A and C; **B is absent.** | probe, 2026-08-07; `records.py:412` |
 | `connection.py:555` raises `ProtocolError` for any promoted digest outside `referenced_digests`. | `connection.py:547-559` |
 | `_preflight` already refuses two `byte_len` for one digest **in one manifest**, and requires `set(os.listdir(staging_fd)) == {entry.name}` exactly. Both fire *after* capture has written the bytes. | `blobs.py:273-285` |
-| `verify_leaf(fd, digest, byte_len)` exists in `blobs.py` and is importable by the coordinator. | `blobs.py`, used at `:293` |
 | `EntryIdentity()` instances are distinct, `==`-comparable, and hashable. `ObservedSymlink` has **no** `identity` field. | probe, 2026-08-07; `model.py:82-104` |
-| `JointObservation(persistent, scratch, parent_occupancy)`; `authorize_recovery_step(plan, step_index, observed)`. | probe, 2026-08-07 |
-| `_validate_topology` enforces a **rooted tree**: single parent per node, no parent for `ProjectRoot`, `WorkRoot` parented by `ProjectRoot`, ending on "topology must be an acyclic tree rooted at the project root". | `snapshot.py:276-350` |
-| `expected_persistent` is built from **every** timeline, so a declared directory is a `PersistentNode` that can also be a parent. | `snapshot.py:307` |
-| `DirectoryConstraints` is `lookup_proof` and `name_max` only — no mount. `read_mount_id(fd)` vs `binding.evidence.mount_id` is a separate check. | `lookup.py:45-47`, `resolve.py:448-453` |
+| `JointObservation(persistent, scratch, parent_occupancy)`; `authorize_recovery_step(plan, step_index, observed) -> AuthorizedStep \| HaltPlan`. | probe, 2026-08-07 |
+| `_validate_topology` enforces a **rooted tree** and builds `expected_persistent` from every timeline, so a declared directory is a `PersistentNode` that can also be a parent. | `snapshot.py:276-350` |
+| `DirectoryConstraints` is `lookup_proof` and `name_max` only. `read_mount_id(fd)` vs `binding.evidence.mount_id` is a separate check. | `lookup.py:45-47`, `resolve.py:448-453` |
 | `resolve._filesystem_type(binding)` is private and is the only route to the type string that also checks the backend is Linux. | `resolve.py:73-81` |
-| `ProjectBinding.project_root_fd` and `Workspace.staging_fd`/`work_fd` are public properties returning **borrowed** descriptors. `promote_staging` spends `staging_fd`. | `binding.py:121-124`, `workspace.py:78-93`, `blobs.py:366` |
-| `backend.py`'s docstring: "exactly one operation set per design §5.5 capability, and every method is called by the probe that reports it." | `backend.py:1-9` |
-| `atoms/core/recovery/__init__.py` re-exports `classify_recovery` and `authorize_recovery_step`, so a blacklist on `snapshot` is insufficient. | `recovery/__init__.py:1-2` |
+| `ProjectBinding.project_root_fd` and `Workspace.staging_fd`/`work_fd` are public properties returning **borrowed** descriptors. `promote_staging` spends `staging_fd`. | `binding.py:121`, `workspace.py:78-93`, `blobs.py:366` |
 | A5a's translation rule: "the default is a bare `raise`, so an unrecognized code keeps its own class *and* its traceback." | `store/errors.py:26-46` |
 | The test volume resolves to `<repo>/.atoms-test-volume` on ext4 with no env var set. | probe, 2026-08-07 |
-| The `leased` fixture patches `root.CERTIFIED_ALLOWLIST` and yields an entered production lease. Test builders live in `tests/coordinator_support.py` as **plain functions**, because the fixture-registry guard requires every fixture to live in `tests/conftest.py`. | `conftest.py:606`, `coordinator_support.py:1-8` |
 
 ## Global Constraints
 
 - **Python 3.11+, stdlib only.** No new third-party dependency.
-- **Fail early; no silent fallbacks.** Every refusal states what was expected and what was found.
+- **Fail early; no silent fallbacks.** A failure to look is never a finding of absence.
 - **Composition over inheritance.**
 - **`Backend` gains no method.** Occupancy and the staging sink are `os.listdir` and `os.open`.
 - **No project path is mutated.** A6 writes only into `staging/<txid>/`.
 - **No new exception type.** `ProtocolError`, `PreconditionRefused`, `CapabilityUnavailable` only.
-- **No A6 path raises `TransactionHalted`.**
+- **No A6 path raises `TransactionHalted`.** Errnos with a defined domain meaning translate; every
+  other `OSError` propagates with its own class and traceback.
+- **No errno ever selects a state branch.** The declared state does.
 - **`atoms/fs/observe.py` may import `atoms.core.recovery.model` and no other `core.recovery` module.**
-- **Exact-type checks**, not `isinstance`, at trust boundaries — the house pattern (`_require_exact`).
+- **Every commit leaves `uv run pytest` green.** No task commits a test whose subject does not exist.
+- Exact-type checks, not `isinstance`, at trust boundaries — the house `_require_exact` pattern.
 - Docs use `~/d/atoms/...` for filepaths.
 - Conventional commits. **No AI-attribution trailer or footer.**
-- Gates, all run from `python/`: `uv run pytest`, `uv run ruff format`, `uv run ruff check`,
+- Gates, all from `python/`: `uv run pytest`, `uv run ruff format`, `uv run ruff check`,
   `uv run pyright`.
 
 ## File Structure
 
 | File | Responsibility |
 | --- | --- |
-| `python/src/atoms/fs/observe.py` | **Create.** `Observation` (token universe, pinned descriptors, per-kind observation, occupancy, prefix relation) and `translated_lookup`. |
+| `python/src/atoms/fs/observe.py` | **Create.** `Observation` and `translated_lookup`. |
 | `python/src/atoms/fs/resolve.py` | **Modify.** `_filesystem_type` → public `filesystem_type_of`. |
-| `python/src/atoms/coordinator/descriptors.py` | **Create.** `DescriptorTable`, `WalkStop`, `build_descriptor_table`. |
+| `python/src/atoms/coordinator/descriptors.py` | **Create.** `DescriptorTable`, `WalkStop`, `_build_descriptor_table`. |
 | `python/src/atoms/coordinator/capture.py` | **Create.** `PayloadSource`, `Captured`, `capture_initial_surface`. |
-| `python/src/atoms/coordinator/admission.py` | **Modify.** One new gate site. |
 | `python/src/atoms/store/records.py` | **Modify.** Widen `referenced_digests`. |
-| `python/tests/test_fs_observe.py` | **Create.** Tier 1 — the observation mechanism. |
-| `python/tests/test_coordinator_descriptors.py` | **Create.** Tier 2 — the walk and re-validation. |
-| `python/tests/test_coordinator_capture.py` | **Create.** Tier 3 — capture, staging, refusals. |
-| `python/tests/test_coordinator_capture_conformance.py` | **Create.** Tier 4 — A3's two routes. |
-| `python/tests/capture_support.py` | **Create.** Plain-function builders shared by the capture tiers. |
-| `python/tests/test_fs_architecture.py` | **Modify.** The `core.recovery` import whitelist. |
-| `python/tests/test_store_records.py` | **Modify.** The widened helper's test. |
-| `python/tests/coordinator_child.py` | **Modify.** Its `referenced_digests` call site. |
-| `python/tests/test_coordinator_architecture.py` | **Modify.** The A6 status-synchronization test. |
+| `python/tests/capture_support.py` | **Create.** Plain-function builders for the capture tiers. |
+| `python/tests/coordinator_support.py` | **Modify.** Receives `project_state`, moved from the lease tier. |
+| `python/tests/test_coordinator_lease.py` | **Modify.** Imports the moved `project_state`. |
+| `python/tests/test_fs_observe.py` | **Create.** Tier 1. |
+| `python/tests/test_coordinator_descriptors.py` | **Create.** Tier 2. |
+| `python/tests/test_coordinator_capture.py` | **Create.** Tier 3. |
+| `python/tests/test_coordinator_capture_conformance.py` | **Create.** Tier 4. |
+| `python/tests/test_coordinator_capture_adversarial.py` | **Create.** Tier 5. |
+| `python/tests/test_fs_architecture.py` | **Modify.** Import whitelist; register the entry point. |
+| `python/tests/test_store_architecture.py` | **Modify.** The A5 status assertion. |
+| `python/tests/test_coordinator_architecture.py` | **Modify.** The A6 status test. |
+| `python/tests/test_store_records.py` | **Modify.** The widened helper's tests. |
 
 ---
 
@@ -102,12 +111,21 @@ implementation, stop and report it — do not adapt around it silently.**
 - Create: `python/tests/test_fs_observe.py`
 
 **Interfaces:**
-- Consumes: `atoms.fs.backend.Backend`; `atoms.core.recovery.model`'s `ObservedAbsent`,
-  `ObservedFile`, `ObservedDirectory`, `ObservedSymlink`, `ObservedEntry`, `EntryIdentity`,
+- Consumes: `atoms.fs.backend.Backend`; `atoms.core.recovery.model`'s `ObservedAbsent`, `ObservedFile`,
+  `ObservedDirectory`, `ObservedSymlink`, `ObservedEntry`, `EntryIdentity`, `FileBuildRelation`,
   `OBSERVED_ABSENT`; `atoms.core.fingerprint`'s `FileState`, `DirectoryState`, `SymlinkState`.
 - Produces:
   - `translated_lookup(context: str) -> ContextManager[None]`
-  - `class Observation:` with `__init__(self, backend: Backend)`, `observe(self, parent_fd: int, leaf: str, *, sink_fd: int | None = None) -> ObservedEntry`, `close(self) -> None`, `__enter__`, `__exit__`.
+  - `class Observation:` — `__init__(self, backend: Backend)`;
+    `observe(self, parent_fd: int, leaf: str, *, sink_fd: int | None = None, modeled: frozenset[str] | None = None) -> ObservedEntry`;
+    `pinned_descriptor(self, identity: EntryIdentity) -> int`;
+    `build_relation(self, staged_fd: int, planned_fd: int) -> FileBuildRelation`;
+    `close(self)`, `__enter__`, `__exit__`.
+
+Two rules this task exists to make structural. **A descriptor is either owned by the pass or closed —
+never neither**, so every failure between opening and pinning closes what it opened. And **a directory
+is never described without being enumerated**: `has_unmodeled_child=False` produced by not looking is a
+failure to look reported as a finding of absence, so the route refuses instead.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -126,6 +144,7 @@ import pytest
 
 from atoms.core.errors import CapabilityUnavailable, PreconditionRefused, ProtocolError
 from atoms.core.recovery.model import (
+    FileBuildRelation,
     ObservedAbsent,
     ObservedDirectory,
     ObservedFile,
@@ -147,6 +166,10 @@ def project(tmp_path):
         yield tmp_path, fd
     finally:
         os.close(fd)
+
+
+def open_descriptors() -> int:
+    return len(os.listdir("/proc/self/fd"))
 
 
 def test_a_regular_file_is_observed_from_one_descriptor(project):
@@ -173,6 +196,7 @@ def test_one_entry_reached_twice_yields_one_token(project):
         second = observation.observe(fd, "same.txt")
 
     assert first.identity == second.identity
+    assert first.state == second.state
 
 
 def test_distinct_entries_yield_distinct_tokens(project):
@@ -181,10 +205,9 @@ def test_distinct_entries_yield_distinct_tokens(project):
     (root / "b.txt").write_bytes(b"b")
 
     with Observation(LinuxBackend()) as observation:
-        a = observation.observe(fd, "a.txt")
-        b = observation.observe(fd, "b.txt")
-
-    assert a.identity != b.identity
+        assert observation.observe(fd, "a.txt").identity != observation.observe(
+            fd, "b.txt"
+        ).identity
 
 
 def test_each_pass_mints_a_fresh_token_universe(project):
@@ -196,8 +219,8 @@ def test_each_pass_mints_a_fresh_token_universe(project):
     with Observation(LinuxBackend()) as second_pass:
         second = second_pass.observe(fd, "f.txt")
 
-    # Same file, two passes. A3's identity equality means "same entry, same pass";
-    # a token that survived the pass would let A3 conclude more than was observed.
+    # A3's identity equality means "same entry, same pass". A token that survived the
+    # pass would let A3 conclude more than was observed.
     assert first.identity != second.identity
 
 
@@ -210,20 +233,59 @@ def test_a_symlink_carries_a_fingerprint_and_no_identity(project):
 
     assert type(entry) is ObservedSymlink
     assert entry.state.target == "target"
-    # Structural, not conventional: the type has no field for one, so §6's rule that a
-    # symlink never carries descriptor identity cannot be violated by later code.
+    # Structural, not conventional: the type has no field for one.
     assert not hasattr(entry, "identity")
 
 
-def test_a_directory_is_observed_with_its_mode(project):
+def test_a_directory_requires_its_modeled_children(project):
+    """Failure to look is not a finding of absence.
+
+    `has_unmodeled_child` is evidence. Producing `False` without enumerating would put a
+    fabricated fact into A3's input, so the route refuses rather than guessing.
+    """
     root, fd = project
-    (root / "sub").mkdir(mode=0o750)
+    (root / "sub").mkdir()
 
     with Observation(LinuxBackend()) as observation:
-        entry = observation.observe(fd, "sub")
+        with pytest.raises(ProtocolError, match="modeled"):
+            observation.observe(fd, "sub")
+
+
+def test_a_directory_observed_with_modeled_children_reports_occupancy(project):
+    root, fd = project
+    (root / "sub").mkdir(mode=0o750)
+    (root / "sub" / "modeled").write_bytes(b"")
+    (root / "sub" / "stranger").write_bytes(b"")
+
+    with Observation(LinuxBackend()) as observation:
+        entry = observation.observe(fd, "sub", modeled=frozenset({"modeled"}))
 
     assert type(entry) is ObservedDirectory
     assert entry.state.mode == 0o750
+    assert entry.has_unmodeled_child is True
+
+
+def test_a_fully_modeled_directory_reports_no_unmodeled_child(project):
+    root, fd = project
+    (root / "sub").mkdir()
+    (root / "sub" / "modeled").write_bytes(b"")
+
+    with Observation(LinuxBackend()) as observation:
+        entry = observation.observe(
+            fd, "sub", modeled=frozenset({"modeled", "not-present-yet"})
+        )
+
+    assert entry.has_unmodeled_child is False
+
+
+def test_an_empty_directory_reports_no_unmodeled_child(project):
+    root, fd = project
+    (root / "sub").mkdir()
+
+    with Observation(LinuxBackend()) as observation:
+        entry = observation.observe(fd, "sub", modeled=frozenset())
+
+    assert entry.has_unmodeled_child is False
 
 
 def test_an_absent_name_is_observed_as_absent(project):
@@ -231,6 +293,16 @@ def test_an_absent_name_is_observed_as_absent(project):
 
     with Observation(LinuxBackend()) as observation:
         assert type(observation.observe(fd, "missing")) is ObservedAbsent
+
+
+def test_a_kind_with_no_declarable_state_refuses(project):
+    """A socket, FIFO, or device node. No declared state can describe one."""
+    root, fd = project
+    os.mkfifo(root / "pipe")
+
+    with Observation(LinuxBackend()) as observation:
+        with pytest.raises(PreconditionRefused, match="neither"):
+            observation.observe(fd, "pipe")
 
 
 def test_a_sink_receives_the_bytes_from_the_same_read(project):
@@ -248,13 +320,29 @@ def test_a_sink_receives_the_bytes_from_the_same_read(project):
     assert entry.state.content_hash == digest_of(b"payload")
 
 
+def test_a_failing_sink_leaks_no_descriptor(project):
+    """Ownership is transferred or the descriptor is closed -- never neither."""
+    root, fd = project
+    (root / "f.txt").write_bytes(b"payload")
+    readonly = os.open(str(root / "readonly"), os.O_RDONLY | os.O_CREAT, 0o400)
+    try:
+        before = open_descriptors()
+        observation = Observation(LinuxBackend())
+        with pytest.raises(OSError):
+            observation.observe(fd, "f.txt", sink_fd=readonly)
+        observation.close()
+        assert open_descriptors() == before
+    finally:
+        os.close(readonly)
+
+
 def test_the_retained_descriptor_pins_the_inode(project):
     """§11.1: assert the pin, not the reuse.
 
     Unlinking and recreating does not *force* the kernel to reallocate the inode, so a
     test that asserted distinct tokens after a recreate would pass just as readily with
     no pin at all -- it would be testing the allocator's mood. What is assertable is the
-    mechanism: while the pass lives, the observation still holds the entry open, so the
+    mechanism: while the pass lives the observation still holds the entry open, so the
     inode cannot be reallocated and the kernel's own no-live-reuse invariant applies.
     """
     root, fd = project
@@ -270,29 +358,71 @@ def test_the_retained_descriptor_pins_the_inode(project):
 
 def test_closing_the_pass_releases_every_pinned_descriptor(project):
     root, fd = project
-    (root / "f.txt").write_bytes(b"payload")
+    (root / "a.txt").write_bytes(b"a")
+    (root / "b.txt").write_bytes(b"b")
 
+    before = open_descriptors()
     observation = Observation(LinuxBackend())
-    entry = observation.observe(fd, "f.txt")
+    entry = observation.observe(fd, "a.txt")
+    observation.observe(fd, "b.txt")
     observation.close()
 
+    assert open_descriptors() == before
     with pytest.raises(ProtocolError, match="closed"):
         observation.pinned_descriptor(entry.identity)
 
 
-def test_a_namespace_contradiction_refuses(project):
+def _relation(root, staged: bytes, planned: bytes) -> FileBuildRelation:
+    (root / "staged").write_bytes(staged)
+    (root / "planned").write_bytes(planned)
+    staged_fd = os.open(str(root / "staged"), os.O_RDONLY)
+    planned_fd = os.open(str(root / "planned"), os.O_RDONLY)
+    try:
+        with Observation(LinuxBackend()) as observation:
+            return observation.build_relation(staged_fd, planned_fd)
+    finally:
+        os.close(staged_fd)
+        os.close(planned_fd)
+
+
+def test_identical_bytes_are_exact(project):
+    root, _ = project
+    assert _relation(root, b"payload", b"payload") is FileBuildRelation.EXACT
+
+
+def test_a_truncated_staging_object_is_a_strict_prefix(project):
+    root, _ = project
+    assert _relation(root, b"pay", b"payload") is FileBuildRelation.STRICT_PREFIX
+
+
+def test_an_empty_staging_object_is_a_strict_prefix(project):
+    root, _ = project
+    assert _relation(root, b"", b"payload") is FileBuildRelation.STRICT_PREFIX
+
+
+def test_differing_bytes_are_diverged(project):
+    root, _ = project
+    assert _relation(root, b"paZload", b"payload") is FileBuildRelation.DIVERGED
+
+
+def test_a_staging_object_longer_than_the_plan_is_diverged(project):
+    root, _ = project
+    assert _relation(root, b"payload+", b"payload") is FileBuildRelation.DIVERGED
+
+
+def test_a_namespace_contradiction_refuses():
     with pytest.raises(PreconditionRefused, match="while probing"):
         with translated_lookup("probing"):
             raise OSError(errno.ELOOP, "symlink")
 
 
-def test_an_unsupported_semantic_is_a_capability_refusal(project):
+def test_an_unsupported_semantic_is_a_capability_refusal():
     with pytest.raises(CapabilityUnavailable):
         with translated_lookup("probing"):
             raise OSError(errno.EOPNOTSUPP, "no")
 
 
-def test_an_undefined_errno_propagates_as_itself(project):
+def test_an_undefined_errno_propagates_as_itself():
     """Design §9.1: A5a's rule, applied to errno.
 
     ENOSPC is not external state contradicting the frozen spec -- it is a full disk.
@@ -321,7 +451,7 @@ One `Observation` is one pass and owns one token universe. It produces the primi
 facts A3 consumes and never a verdict: this module may import `atoms.core.recovery.model`
 and no other `core.recovery` module, which is how ledger #13's "may not pre-classify them
 into a recovery outcome" becomes a mechanical property rather than a review promise. An
-architecture test asserts the whitelist.
+architecture test asserts the whitelist over both import forms.
 """
 
 from __future__ import annotations
@@ -338,6 +468,7 @@ from atoms.core.fingerprint import DirectoryState, FileState, SymlinkState
 from atoms.core.recovery.model import (
     OBSERVED_ABSENT,
     EntryIdentity,
+    FileBuildRelation,
     ObservedDirectory,
     ObservedEntry,
     ObservedFile,
@@ -348,9 +479,9 @@ from atoms.fs.backend import Backend
 _READ_CHUNK = 1 << 20
 
 # Errnos with a defined domain meaning after approval (design §9.1). Everything else
-# propagates with its own class and traceback, which is A5a's rule for SQLite result
-# codes applied to errno: reads, writes, and flushes raise EIO, ENOSPC, EROFS and more,
-# and none of those is external state contradicting the frozen spec.
+# propagates with its own class and traceback -- A5a's rule for SQLite result codes,
+# applied to errno. Reads, writes, and flushes raise EIO, ENOSPC, EROFS and more, and
+# none of those is external state contradicting the frozen spec.
 _NAMESPACE_CONTRADICTIONS = frozenset(
     {errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.EXDEV}
 )
@@ -369,7 +500,8 @@ def translated_lookup(context: str) -> Iterator[None]:
             ) from caught
         if caught.errno in _UNSUPPORTED:
             raise CapabilityUnavailable(
-                f"the backend cannot supply the semantics needed while {context}: {caught}"
+                f"the backend cannot supply the semantics needed while {context}: "
+                f"{caught}"
             ) from caught
         if caught.errno == errno.EBADF:
             raise ProtocolError(
@@ -386,6 +518,9 @@ class Observation:
     create recycle that inode and map two sequentially distinct entries onto one token --
     an identity equality A3 would believe. The retained descriptor makes the reuse
     impossible rather than unlikely.
+
+    Every descriptor this class opens is either handed to `_pin` -- which owns it from
+    that moment -- or closed on the way out. There is no path on which one is neither.
     """
 
     __slots__ = ("_backend", "_closed", "_pins", "_tokens")
@@ -397,8 +532,19 @@ class Observation:
         self._closed = False
 
     def observe(
-        self, parent_fd: int, leaf: str, *, sink_fd: int | None = None
+        self,
+        parent_fd: int,
+        leaf: str,
+        *,
+        sink_fd: int | None = None,
+        modeled: frozenset[str] | None = None,
     ) -> ObservedEntry:
+        """One entry, observed coherently.
+
+        `modeled` is REQUIRED when the entry turns out to be a directory: occupancy is
+        evidence, and reporting `has_unmodeled_child=False` without enumerating would be
+        a failure to look recorded as a finding of absence.
+        """
         self._require_open()
         _require_leaf(leaf)
         with translated_lookup(f"looking up {leaf!r}"):
@@ -406,11 +552,15 @@ class Observation:
                 info = os.lstat(leaf, dir_fd=parent_fd)
             except FileNotFoundError:
                 return OBSERVED_ABSENT
-        mode = stat.S_IMODE(info.st_mode)
         if stat.S_ISLNK(info.st_mode):
             return self._observe_symlink(parent_fd, leaf)
         if stat.S_ISDIR(info.st_mode):
-            return self._observe_directory(parent_fd, leaf, mode)
+            if modeled is None:
+                raise ProtocolError(
+                    f"{leaf!r} is a directory; observing one requires its modeled child "
+                    "names, because occupancy evidence may not be fabricated"
+                )
+            return self._observe_directory(parent_fd, leaf, modeled)
         if stat.S_ISREG(info.st_mode):
             return self._observe_file(parent_fd, leaf, sink_fd)
         raise PreconditionRefused(
@@ -425,6 +575,34 @@ class Observation:
         if pinned is None:
             raise ProtocolError("that identity was not observed in this pass")
         return pinned
+
+    def build_relation(self, staged_fd: int, planned_fd: int) -> FileBuildRelation:
+        """Compare a staged object with the planned blob (design §6.3).
+
+        The planned blob arrives as an OPEN DESCRIPTOR supplied by the caller, never a
+        digest this module resolves: that is both the coherence rule and what keeps
+        `atoms.store` out of `atoms/fs/`.
+        """
+        self._require_open()
+        os.lseek(staged_fd, 0, os.SEEK_SET)
+        os.lseek(planned_fd, 0, os.SEEK_SET)
+        while True:
+            staged = _read_exactly(staged_fd, _READ_CHUNK)
+            planned = _read_exactly(planned_fd, _READ_CHUNK)
+            if staged == planned:
+                if not staged:
+                    return FileBuildRelation.EXACT
+                continue
+            shortest = min(len(staged), len(planned))
+            if staged[:shortest] != planned[:shortest]:
+                return FileBuildRelation.DIVERGED
+            # One side ran out first. A short read cannot cause this: `_read_exactly`
+            # returns fewer bytes only at end of file.
+            return (
+                FileBuildRelation.STRICT_PREFIX
+                if len(staged) < len(planned)
+                else FileBuildRelation.DIVERGED
+            )
 
     def close(self) -> None:
         if self._closed:
@@ -444,44 +622,50 @@ class Observation:
     def _observe_file(
         self, parent_fd: int, leaf: str, sink_fd: int | None
     ) -> ObservedFile:
-        with translated_lookup(f"opening {leaf!r}"):
-            fd = self._backend.open_regular_nofollow(parent_fd, leaf)
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            os.close(fd)
-            raise PreconditionRefused(
-                f"{leaf!r} stopped being a regular file between lookup and open"
-            )
+        identity, info = self._open_and_pin(
+            lambda: self._backend.open_regular_nofollow(parent_fd, leaf),
+            leaf,
+            stat.S_ISREG,
+            "a regular file",
+        )
+        # Stream from the PINNED descriptor: one descriptor per identity, and any
+        # failure below leaves it owned by the pass rather than orphaned.
+        pinned = self._pins[identity]
+        os.lseek(pinned, 0, os.SEEK_SET)
         digest = hashlib.sha256()
         length = 0
         while True:
-            chunk = os.read(fd, _READ_CHUNK)
+            chunk = os.read(pinned, _READ_CHUNK)
             if not chunk:
                 break
             digest.update(chunk)
             length += len(chunk)
             if sink_fd is not None:
                 _write_all(sink_fd, chunk)
-        state = FileState(
-            content_hash="sha256:" + digest.hexdigest(),
-            mode=stat.S_IMODE(info.st_mode),
-            byte_len=length,
+        return ObservedFile(
+            state=FileState(
+                content_hash="sha256:" + digest.hexdigest(),
+                mode=stat.S_IMODE(info.st_mode),
+                byte_len=length,
+            ),
+            identity=identity,
         )
-        return ObservedFile(state=state, identity=self._pin(info, fd))
 
     def _observe_directory(
-        self, parent_fd: int, leaf: str, mode: int
+        self, parent_fd: int, leaf: str, modeled: frozenset[str]
     ) -> ObservedDirectory:
-        with translated_lookup(f"opening directory {leaf!r}"):
-            fd = self._backend.open_child_directory(parent_fd, leaf)
-        info = os.fstat(fd)
+        identity, info = self._open_and_pin(
+            lambda: self._backend.open_child_directory(parent_fd, leaf),
+            leaf,
+            stat.S_ISDIR,
+            "a directory",
+        )
+        with translated_lookup(f"enumerating {leaf!r}"):
+            present = os.listdir(self._pins[identity])
         return ObservedDirectory(
             state=DirectoryState(mode=stat.S_IMODE(info.st_mode)),
-            identity=self._pin(info, fd),
-            # Occupancy needs the modeled child names, which only the caller knows.
-            # Task 2 replaces this with `occupancy`; a directory observed without one
-            # reports no unmodeled child rather than guessing.
-            has_unmodeled_child=False,
+            identity=identity,
+            has_unmodeled_child=any(name not in modeled for name in present),
         )
 
     def _observe_symlink(self, parent_fd: int, leaf: str) -> ObservedSymlink:
@@ -493,7 +677,25 @@ class Observation:
             state=SymlinkState(target=target, mode=stat.S_IMODE(info.st_mode))
         )
 
+    def _open_and_pin(
+        self, opener, leaf: str, predicate, description: str
+    ) -> tuple[EntryIdentity, os.stat_result]:
+        """Open, confirm the kind, and transfer ownership -- or close and raise."""
+        with translated_lookup(f"opening {leaf!r}"):
+            fd = opener()
+        try:
+            info = os.fstat(fd)
+            if not predicate(info.st_mode):
+                raise PreconditionRefused(
+                    f"{leaf!r} stopped being {description} between lookup and open"
+                )
+        except BaseException:
+            os.close(fd)
+            raise
+        return self._pin(info, fd), info
+
     def _pin(self, info: os.stat_result, fd: int) -> EntryIdentity:
+        """Takes ownership of `fd` unconditionally: it is retained or closed here."""
         key = (info.st_dev, info.st_ino)
         existing = self._tokens.get(key)
         if existing is not None:
@@ -516,6 +718,19 @@ def _require_leaf(leaf: str) -> None:
         raise ProtocolError(f"{leaf!r} is not a single pathname component")
 
 
+def _read_exactly(fd: int, size: int) -> bytes:
+    """Read up to `size`, returning short only at end of file."""
+    parts: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = os.read(fd, remaining)
+        if not chunk:
+            break
+        parts.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(parts)
+
+
 def _write_all(fd: int, chunk: bytes) -> None:
     view = memoryview(chunk)
     while view:
@@ -525,7 +740,7 @@ def _write_all(fd: int, chunk: bytes) -> None:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cd python && uv run pytest tests/test_fs_observe.py -q`
-Expected: PASS, 13 tests.
+Expected: PASS, 22 tests.
 
 - [ ] **Step 5: Run the full gate set**
 
@@ -541,746 +756,49 @@ git commit -m "feat(observe): add the coherent observation pass and its token pi
 
 ---
 
-## Task 2: Occupancy evidence and the planned-blob prefix relation
-
-**Files:**
-- Modify: `python/src/atoms/fs/observe.py`
-- Modify: `python/tests/test_fs_observe.py`
-
-**Interfaces:**
-- Consumes: Task 1's `Observation`.
-- Produces:
-  - `Observation.occupancy(self, dir_fd: int, modeled: frozenset[str]) -> bool`
-  - `Observation.observe_directory_with_occupancy(self, parent_fd: int, leaf: str, modeled: frozenset[str]) -> ObservedEntry`
-  - `Observation.build_relation(self, staged_fd: int, planned_fd: int) -> FileBuildRelation`
-
-- [ ] **Step 1: Write the failing test**
-
-Append to `python/tests/test_fs_observe.py`:
-
-```python
-from atoms.core.recovery.model import FileBuildRelation
-
-
-def test_occupancy_reports_an_unmodeled_child(project):
-    root, fd = project
-    (root / "sub").mkdir()
-    (root / "sub" / "modeled").write_bytes(b"")
-    (root / "sub" / "stranger").write_bytes(b"")
-
-    with Observation(LinuxBackend()) as observation:
-        entry = observation.observe_directory_with_occupancy(
-            fd, "sub", frozenset({"modeled"})
-        )
-
-    assert entry.has_unmodeled_child is True
-
-
-def test_occupancy_reports_none_when_every_child_is_modeled(project):
-    root, fd = project
-    (root / "sub").mkdir()
-    (root / "sub" / "modeled").write_bytes(b"")
-
-    with Observation(LinuxBackend()) as observation:
-        entry = observation.observe_directory_with_occupancy(
-            fd, "sub", frozenset({"modeled", "not-present-yet"})
-        )
-
-    assert entry.has_unmodeled_child is False
-
-
-def test_an_empty_directory_has_no_unmodeled_child(project):
-    root, fd = project
-    (root / "sub").mkdir()
-
-    with Observation(LinuxBackend()) as observation:
-        entry = observation.observe_directory_with_occupancy(fd, "sub", frozenset())
-
-    assert entry.has_unmodeled_child is False
-
-
-def _relation(root, staged: bytes, planned: bytes) -> FileBuildRelation:
-    (root / "staged").write_bytes(staged)
-    (root / "planned").write_bytes(planned)
-    staged_fd = os.open(str(root / "staged"), os.O_RDONLY)
-    planned_fd = os.open(str(root / "planned"), os.O_RDONLY)
-    try:
-        with Observation(LinuxBackend()) as observation:
-            return observation.build_relation(staged_fd, planned_fd)
-    finally:
-        os.close(staged_fd)
-        os.close(planned_fd)
-
-
-def test_identical_bytes_are_an_exact_relation(project):
-    root, _ = project
-    assert _relation(root, b"payload", b"payload") is FileBuildRelation.EXACT
-
-
-def test_a_truncated_staging_object_is_a_prefix(project):
-    root, _ = project
-    assert _relation(root, b"pay", b"payload") is FileBuildRelation.PREFIX
-
-
-def test_differing_bytes_are_diverged(project):
-    root, _ = project
-    assert _relation(root, b"paZload", b"payload") is FileBuildRelation.DIVERGED
-
-
-def test_a_staging_object_longer_than_the_plan_is_diverged(project):
-    root, _ = project
-    assert _relation(root, b"payload+", b"payload") is FileBuildRelation.DIVERGED
-```
-
-- [ ] **Step 2: Run the tests to verify they fail**
-
-Run: `cd python && uv run pytest tests/test_fs_observe.py -q -k "occupancy or relation or prefix or diverged or exact"`
-Expected: FAIL, `AttributeError: 'Observation' object has no attribute 'occupancy'`.
-
-- [ ] **Step 3: Confirm the `FileBuildRelation` member names before writing code**
-
-Run: `cd python && uv run python -c "from atoms.core.recovery.model import FileBuildRelation as R; print(list(R))"`
-Expected: three members. **If the names are not `EXACT`, `PREFIX`, `DIVERGED`, stop and report it** —
-the test above and the code below both assume those, and inventing a fourth state would put A6 in the
-business of classifying, which ledger #13 forbids.
-
-- [ ] **Step 4: Write the implementation**
-
-Add to `python/src/atoms/fs/observe.py`, inside `Observation`:
-
-```python
-    def observe_directory_with_occupancy(
-        self, parent_fd: int, leaf: str, modeled: frozenset[str]
-    ) -> ObservedEntry:
-        """A directory observed with its occupancy evidence in the same pass."""
-        entry = self.observe(parent_fd, leaf)
-        if type(entry) is not ObservedDirectory:
-            return entry
-        pinned = self.pinned_descriptor(entry.identity)
-        return ObservedDirectory(
-            state=entry.state,
-            identity=entry.identity,
-            has_unmodeled_child=self.occupancy(pinned, modeled),
-        )
-
-    def occupancy(self, dir_fd: int, modeled: frozenset[str]) -> bool:
-        """One descriptor-relative enumeration, reconciled against the modeled names.
-
-        `os.listdir` on a descriptor omits `.` and `..`, so no filtering is needed --
-        measured, not assumed.
-        """
-        self._require_open()
-        with translated_lookup("enumerating a directory"):
-            present = os.listdir(dir_fd)
-        return any(name not in modeled for name in present)
-
-    def build_relation(self, staged_fd: int, planned_fd: int) -> FileBuildRelation:
-        """Compare a staged object with the planned blob (design §6.3).
-
-        The planned blob arrives as an OPEN DESCRIPTOR supplied by the caller, never a
-        digest this module resolves: that is both the coherence rule and what keeps
-        `atoms.store` out of `atoms/fs/`.
-        """
-        self._require_open()
-        os.lseek(staged_fd, 0, os.SEEK_SET)
-        os.lseek(planned_fd, 0, os.SEEK_SET)
-        while True:
-            staged = os.read(staged_fd, _READ_CHUNK)
-            planned = os.read(planned_fd, _READ_CHUNK)
-            if not staged and not planned:
-                return FileBuildRelation.EXACT
-            if not staged:
-                return FileBuildRelation.PREFIX
-            if not planned:
-                return FileBuildRelation.DIVERGED
-            shortest = min(len(staged), len(planned))
-            if staged[:shortest] != planned[:shortest]:
-                return FileBuildRelation.DIVERGED
-            if len(staged) < len(planned):
-                # A short read is not end-of-file; re-align by seeking the planned side
-                # back to where the staged side actually reached.
-                os.lseek(planned_fd, shortest - len(planned), os.SEEK_CUR)
-            elif len(planned) < len(staged):
-                os.lseek(staged_fd, shortest - len(staged), os.SEEK_CUR)
-```
-
-Extend the import from `atoms.core.recovery.model` to include `FileBuildRelation`.
-
-- [ ] **Step 5: Run the tests to verify they pass**
-
-Run: `cd python && uv run pytest tests/test_fs_observe.py -q`
-Expected: PASS, 21 tests.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add python/src/atoms/fs/observe.py python/tests/test_fs_observe.py
-git commit -m "feat(observe): add occupancy evidence and the planned-blob prefix relation"
-```
-
----
-
-## Task 3: `DescriptorTable` — the walk, re-validation, and ownership
-
-**Files:**
-- Modify: `python/src/atoms/fs/resolve.py` (rename `_filesystem_type` → `filesystem_type_of`)
-- Create: `python/src/atoms/coordinator/descriptors.py`
-- Create: `python/tests/capture_support.py`
-- Create: `python/tests/test_coordinator_descriptors.py`
-
-**Interfaces:**
-- Consumes: `Lease`, `ProjectApprovedSpec`, `Workspace`, `_parent_paths`,
-  `read_lookup_constraints`, `read_mount_id`, `filesystem_type_of`.
-- Produces:
-  - `class WalkStop:` frozen, `node: TopologyNode`, `parent_fd: int`, `component: str`, `blocker: EntryKind | None`
-  - `class DescriptorTable:` with `fd_for(self, node: TopologyNode) -> int`, `stops: tuple[WalkStop, ...]`, `close(self)`, `__enter__`, `__exit__`
-  - `build_descriptor_table(lease: Lease, approved: ProjectApprovedSpec, workspace: Workspace) -> DescriptorTable`
-
-- [ ] **Step 1: Make the filesystem-type helper public**
-
-In `python/src/atoms/fs/resolve.py`, rename `_filesystem_type` to `filesystem_type_of` and update its
-two in-module call sites (`observe_child`, `observe_work_child`).
-
-Run: `cd python && grep -rn "_filesystem_type" src/ tests/`
-Expected: no matches remain.
-
-- [ ] **Step 2: Write the failing test**
-
-Create `python/tests/capture_support.py`:
-
-```python
-"""Builders shared by the A6 capture tiers.
-
-Plain functions, not fixtures: the fixture-registry guard requires every fixture to live
-in `tests/conftest.py`, and these are values a test constructs rather than resources a
-test needs torn down. Same rule `tests/coordinator_support.py` follows.
-"""
-
-from __future__ import annotations
-
-import hashlib
-import os
-
-from atoms.core.compiler import CompiledSpec, compile_spec
-from atoms.core.effects import CreateDirectory, CreateFileNoClobber, DeletePath, ReplaceFile
-from atoms.core.fingerprint import ABSENT, DirectoryState, FileState
-from atoms.core.spec import TransactionSpec, build_spec
-from atoms.coordinator.lease import Lease
-
-DIRECTORY_POST = DirectoryState(mode=0o755)
-
-
-def digest_of(payload: bytes) -> str:
-    return "sha256:" + hashlib.sha256(payload).hexdigest()
-
-
-def state_of(payload: bytes, mode: int = 0o644) -> FileState:
-    return FileState(content_hash=digest_of(payload), mode=mode, byte_len=len(payload))
-
-
-def write_project_file(lease: Lease, path: str, payload: bytes, mode: int = 0o644) -> None:
-    """Create a real file in project space, making its parents as needed."""
-    root_fd = lease._binding.project_root_fd
-    parts = path.split("/")
-    for index in range(1, len(parts)):
-        try:
-            os.mkdir("/".join(parts[:index]), dir_fd=root_fd)
-        except FileExistsError:
-            pass
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode, dir_fd=root_fd)
-    try:
-        os.write(fd, payload)
-    finally:
-        os.close(fd)
-    os.chmod(path, mode, dir_fd=root_fd)
-
-
-BEFORE = b"before"
-AFTER = b"after"
-
-
-def replace_spec() -> TransactionSpec:
-    """One `ReplaceFile` under an existing directory `d`.
-
-    The preimage is real and must be captured; the postimage must be supplied.
-    """
-    pre, post = state_of(BEFORE), state_of(AFTER)
-    return build_spec(
-        consumer_tag="test",
-        intent_digest="sha256:" + "a" * 64,
-        initial_surface={"d/f.txt": pre},
-        final_surface={"d/f.txt": post},
-        effects=[ReplaceFile(effect_id="e1", path="d/f.txt", pre=pre, post=post)],
-    )
-
-
-def compiled_replace(lease: Lease) -> CompiledSpec:
-    write_project_file(lease, "d/f.txt", BEFORE)
-    return compile_spec(replace_spec())
-
-
-def approved_replace(lease: Lease):
-    from atoms.coordinator.admission import admit
-
-    return admit(lease, compiled_replace(lease))
-```
-
-Create `python/tests/test_coordinator_descriptors.py`:
-
-```python
-"""A6 tier 2 -- the descriptor table (design §5)."""
-
-from __future__ import annotations
-
-import os
-
-import pytest
-
-from atoms.core.errors import PreconditionRefused
-from atoms.core.recovery.model import ProjectRoot, WorkRoot
-from atoms.core.recovery.snapshot import TopologyDirectory
-from tests.capture_support import approved_replace
-from tests.coordinator_support import admission_for, compiled_creating_a_directory
-
-
-def test_the_table_holds_one_descriptor_per_approved_directory(leased):
-    from atoms.coordinator.descriptors import build_descriptor_table
-    from atoms.coordinator.prepare import open_workspace
-
-    with leased() as lease:
-        approved = approved_replace(lease)
-        with open_workspace(lease, approved) as workspace:
-            with build_descriptor_table(lease, approved, workspace) as table:
-                # Measured: this spec's directories are ProjectRoot and
-                # TopologyDirectory(0) for `d`.
-                assert isinstance(table.fd_for(ProjectRoot()), int)
-                assert isinstance(table.fd_for(TopologyDirectory(node_id=0)), int)
-
-
-def test_the_root_descriptors_are_borrowed_and_survive_close(leased):
-    """§5.5: ProjectBinding and Workspace own theirs; the table closes only its own."""
-    from atoms.coordinator.descriptors import build_descriptor_table
-    from atoms.coordinator.prepare import open_workspace
-
-    with leased() as lease:
-        approved = approved_replace(lease)
-        with open_workspace(lease, approved) as workspace:
-            with build_descriptor_table(lease, approved, workspace) as table:
-                assert table.fd_for(ProjectRoot()) == lease._binding.project_root_fd
-            # Still usable: closing the table must not have closed the binding's fd.
-            assert os.fstat(lease._binding.project_root_fd).st_ino > 0
-
-
-def test_the_work_root_is_present_only_when_the_topology_has_one(leased):
-    from atoms.coordinator.admission import admit
-    from atoms.coordinator.descriptors import build_descriptor_table
-    from atoms.coordinator.prepare import open_workspace
-
-    with leased() as lease:
-        without = approved_replace(lease)
-        with open_workspace(lease, without) as workspace:
-            with build_descriptor_table(lease, without, workspace) as table:
-                assert without.work_base is None
-                with pytest.raises(KeyError):
-                    table.fd_for(WorkRoot())
-
-    with leased() as lease:
-        with_work = admit(lease, compiled_creating_a_directory(lease))
-        with open_workspace(lease, with_work) as workspace:
-            with build_descriptor_table(lease, with_work, workspace) as table:
-                assert with_work.work_base is not None
-                assert table.fd_for(WorkRoot()) == workspace.work_fd
-
-
-def test_a_replaced_directory_refuses_on_identity(leased):
-    """Ledger #19: compare against the approved baseline, never reapprove."""
-    from atoms.coordinator.descriptors import build_descriptor_table
-    from atoms.coordinator.prepare import open_workspace
-
-    with leased() as lease:
-        approved = approved_replace(lease)
-        root_fd = lease._binding.project_root_fd
-        os.rename("d", "d-moved", src_dir_fd=root_fd, dst_dir_fd=root_fd)
-        os.mkdir("d", dir_fd=root_fd)
-
-        with open_workspace(lease, approved) as workspace:
-            with pytest.raises(PreconditionRefused, match="identity"):
-                build_descriptor_table(lease, approved, workspace)
-
-
-def test_the_walk_stops_at_a_planned_directory(leased):
-    from atoms.coordinator.admission import admit
-    from atoms.coordinator.descriptors import build_descriptor_table
-    from atoms.coordinator.prepare import open_workspace
-
-    with leased() as lease:
-        approved = admit(lease, compiled_creating_a_directory(lease))
-        with open_workspace(lease, approved) as workspace:
-            with build_descriptor_table(lease, approved, workspace) as table:
-                stopped = {stop.component for stop in table.stops}
-                assert stopped == {"d"}
-                assert all(stop.blocker is None for stop in table.stops)
-
-
-def test_a_non_directory_blocker_is_reported_not_raised(leased):
-    """§8.2: the walk reports the blocker; capture adjudicates it against the timeline."""
-    from atoms.coordinator.admission import admit
-    from atoms.coordinator.descriptors import build_descriptor_table
-    from atoms.coordinator.prepare import open_workspace
-    from atoms.fs.resolve import EntryKind
-
-    with leased() as lease:
-        approved = admit(lease, compiled_creating_a_directory(lease))
-        root_fd = lease._binding.project_root_fd
-        fd = os.open("d", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644, dir_fd=root_fd)
-        os.close(fd)
-
-        with open_workspace(lease, approved) as workspace:
-            with build_descriptor_table(lease, approved, workspace) as table:
-                (stop,) = [s for s in table.stops if s.component == "d"]
-                assert stop.blocker in (EntryKind.REGULAR_FILE, EntryKind.OTHER)
-
-
-def test_closing_the_table_releases_only_what_it_opened(leased):
-    from atoms.coordinator.descriptors import build_descriptor_table
-    from atoms.coordinator.prepare import open_workspace
-    from tests.fs_support import descriptor_count
-
-    with leased() as lease:
-        approved = approved_replace(lease)
-        with open_workspace(lease, approved) as workspace:
-            before = descriptor_count()
-            table = build_descriptor_table(lease, approved, workspace)
-            assert descriptor_count() > before
-            table.close()
-            assert descriptor_count() == before
-```
-
-- [ ] **Step 3: Run the tests to verify they fail**
-
-Run: `cd python && uv run pytest tests/test_coordinator_descriptors.py -q`
-Expected: collection error, `ModuleNotFoundError: No module named 'atoms.coordinator.descriptors'`.
-
-- [ ] **Step 4: Write the implementation**
-
-Create `python/src/atoms/coordinator/descriptors.py`:
-
-```python
-"""The held, re-validated descriptor table (design §5).
-
-`RecoveryTopology.parents` is a rooted tree, so the table is a walk of it: each directory
-node is opened from its parent's held descriptor with ONE `open_child_directory` call,
-which is already RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV. No
-multi-component path is ever assembled -- passing one to a syscall would reopen the
-check/use race, because the kernel re-resolves intermediate components at the syscall.
-
-The tree gives structure, not spelling: `TopologyDirectory(node_id)` carries no name, so
-the walk reads its components from A5b's `_parent_paths`.
-"""
-
-from __future__ import annotations
-
-import errno
-import os
-from dataclasses import dataclass
-
-from atoms.core.errors import PreconditionRefused, ProtocolError
-from atoms.core.recovery.snapshot import (
-    ProjectRoot,
-    TopologyNode,
-    WorkRoot,
-)
-from atoms.coordinator.admission import _parent_paths, _require_admitted
-from atoms.coordinator.lease import Lease
-from atoms.fs.approval import ProjectApprovedSpec
-from atoms.fs.lookup import read_lookup_constraints
-from atoms.fs.observe import translated_lookup
-from atoms.fs.resolve import EntryKind, FilesystemIdentity, filesystem_type_of
-from atoms.fs.topology import ApprovedExistingDirectory, ApprovedPlannedDirectory
-from atoms.fs.volume import read_mount_id
-from atoms.store.workspace import Workspace
-
-# Measured: open_child_directory raises ENOTDIR on a regular file and ELOOP on a symlink.
-_BLOCKER_KINDS = {
-    errno.ENOTDIR: EntryKind.REGULAR_FILE,
-    errno.ELOOP: EntryKind.SYMLINK,
-}
-
-
-@dataclass(frozen=True, slots=True)
-class WalkStop:
-    """Where the walk stopped, and why.
-
-    `blocker is None` means the node is a planned directory that does not exist yet.
-    A blocker kind means something occupies the name. Neither is adjudicated here:
-    capture verifies both against the timeline's first declared state (design §8).
-    """
-
-    node: TopologyNode
-    parent_fd: int
-    component: str
-    blocker: EntryKind | None
-
-
-class DescriptorTable:
-    """A live resource. Borrows the roots; owns only what it opened.
-
-    It outlives capture: §6 requires the engine to hold a descriptor to the project root
-    for the transaction's lifetime, and §9.5 hands each published directory's descriptor
-    down to its descendants. A table that died at capture's return would force A7 to
-    re-resolve, reopening the race the whole section exists to close.
-    """
-
-    __slots__ = ("_borrowed", "_closed", "_fds", "_owned", "stops")
-
-    def __init__(
-        self,
-        *,
-        fds: dict[TopologyNode, int],
-        owned: tuple[int, ...],
-        stops: tuple[WalkStop, ...],
-    ) -> None:
-        self._fds = fds
-        self._owned = owned
-        self.stops = stops
-        self._closed = False
-
-    def fd_for(self, node: TopologyNode) -> int:
-        if self._closed:
-            raise ProtocolError("this descriptor table is closed")
-        return self._fds[node]
-
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        for fd in self._owned:
-            os.close(fd)
-        self._fds.clear()
-
-    def __enter__(self) -> DescriptorTable:
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        self.close()
-
-
-def build_descriptor_table(
-    lease: Lease, approved: ProjectApprovedSpec, workspace: Workspace
-) -> DescriptorTable:
-    _require_admitted(lease, approved)
-    if workspace.txid != approved.txid:
-        raise ProtocolError(
-            f"workspace txid {workspace.txid!r} does not match the proof's "
-            f"{approved.txid!r}"
-        )
-
-    binding = lease._binding
-    filesystem_type = filesystem_type_of(binding)
-    expected_mount = binding.evidence.mount_id
-    paths = _parent_paths(approved)
-    planned = {
-        entry.node
-        for entry in approved.directories
-        if type(entry) is ApprovedPlannedDirectory
-    }
-    existing = {
-        entry.node: entry
-        for entry in approved.directories
-        if type(entry) is ApprovedExistingDirectory
-    }
-
-    fds: dict[TopologyNode, int] = {}
-    owned: list[int] = []
-    stops: list[WalkStop] = []
-
-    def validate(fd: int, node: TopologyNode) -> None:
-        """Ledger #19: identity, constraints, and mount, against the approved baseline.
-
-        DirectoryConstraints carries lookup_proof and name_max only, so mount membership
-        is a separate read -- a constraints comparison alone would pass a directory
-        replaced by a bind mount.
-        """
-        constraints = read_lookup_constraints(fd, filesystem_type)
-        mount = read_mount_id(fd)
-        if mount != expected_mount:
-            raise PreconditionRefused(
-                f"{node!r} is on mount {mount}, not the bound volume's {expected_mount}"
-            )
-        baseline = existing.get(node)
-        if baseline is not None:
-            info = os.fstat(fd)
-            actual = FilesystemIdentity(device=info.st_dev, inode=info.st_ino)
-            if actual != baseline.identity:
-                raise PreconditionRefused(
-                    f"{node!r} has identity {actual}, not the approved "
-                    f"{baseline.identity}; approval is not reapproved here"
-                )
-            if constraints != baseline.constraints:
-                raise PreconditionRefused(
-                    f"{node!r} has constraints {constraints}, not the approved "
-                    f"{baseline.constraints}"
-                )
-            return
-        # WorkRoot has no approved identity -- A4b retained facts about metadata_root/work
-        # as ApprovedWorkBase, not as an ApprovedExistingDirectory. Constraints and mount
-        # are what there is to check.
-        if approved.work_base is not None and node == WorkRoot():
-            if constraints != approved.work_base.constraints:
-                raise PreconditionRefused(
-                    f"the work root has constraints {constraints}, not the approved "
-                    f"{approved.work_base.constraints}"
-                )
-
-    try:
-        # Root 1: the project root, borrowed. Retention is not discharge -- lookup_proof
-        # and name_max are mutable directory properties, so it is re-validated too.
-        root_fd = binding.project_root_fd
-        validate(root_fd, ProjectRoot())
-        fds[ProjectRoot()] = root_fd
-
-        # Root 2: the work root, borrowed, and present only when the topology has one.
-        # The logical WorkRoot -> ProjectRoot edge is NOT physically traversed: the work
-        # root lives under metadata_root, not beneath the project root.
-        if approved.work_base is not None:
-            validate(workspace.work_fd, WorkRoot())
-            fds[WorkRoot()] = workspace.work_fd
-
-        for node in _walk_order(approved, paths):
-            parent = _parent_of(approved, node)
-            parent_fd = fds.get(parent)
-            if parent_fd is None:
-                # An ancestor already stopped; this node is unreachable by construction.
-                continue
-            component = _component(paths, parent, node)
-            if node in planned:
-                stops.append(
-                    WalkStop(
-                        node=node, parent_fd=parent_fd, component=component, blocker=None
-                    )
-                )
-                continue
-            try:
-                fd = binding.backend.open_child_directory(parent_fd, component)
-            except OSError as caught:
-                blocker = _BLOCKER_KINDS.get(caught.errno)
-                if blocker is None:
-                    with translated_lookup(f"opening {component!r}"):
-                        raise
-                stops.append(
-                    WalkStop(
-                        node=node,
-                        parent_fd=parent_fd,
-                        component=component,
-                        blocker=blocker,
-                    )
-                )
-                continue
-            owned.append(fd)
-            validate(fd, node)
-            fds[node] = fd
-    except BaseException:
-        for fd in owned:
-            os.close(fd)
-        raise
-
-    return DescriptorTable(fds=fds, owned=tuple(owned), stops=tuple(stops))
-
-
-def _walk_order(
-    approved: ProjectApprovedSpec, paths: dict[TopologyNode, str]
-) -> tuple[TopologyNode, ...]:
-    """Directory nodes, shallowest first, so every parent is open before its child."""
-    directories = [
-        entry.node
-        for entry in approved.directories
-        if entry.node not in (ProjectRoot(), WorkRoot())
-    ]
-    return tuple(sorted(directories, key=lambda node: paths[node].count("/")))
-
-
-def _parent_of(approved: ProjectApprovedSpec, node: TopologyNode) -> TopologyNode:
-    for edge in approved.topology.parents:
-        if edge.node == node:
-            return edge.parent
-    raise ProtocolError(f"{node!r} has no parent edge in the approved topology")
-
-
-def _component(
-    paths: dict[TopologyNode, str], parent: TopologyNode, node: TopologyNode
-) -> str:
-    child_path, parent_path = paths[node], paths[parent]
-    remainder = child_path[len(parent_path) :].lstrip("/")
-    if not remainder or "/" in remainder:
-        raise ProtocolError(
-            f"{child_path!r} is not one component below {parent_path!r}; the walk "
-            "would have to assemble a multi-component path"
-        )
-    return remainder
-```
-
-- [ ] **Step 5: Run the tests to verify they pass**
-
-Run: `cd python && uv run pytest tests/test_coordinator_descriptors.py -q`
-Expected: PASS, 7 tests.
-
-- [ ] **Step 6: Run the full gate set**
-
-Run: `cd python && uv run ruff format && uv run ruff check && uv run pyright && uv run pytest -q`
-Expected: all green.
-
-- [ ] **Step 7: Commit**
-
-```bash
-git add python/src/atoms/fs/resolve.py python/src/atoms/coordinator/descriptors.py \
-        python/tests/capture_support.py python/tests/test_coordinator_descriptors.py
-git commit -m "feat(coordinator): hold a re-validated descriptor table across the walk"
-```
-
----
-
-## Task 4: The `referenced_digests` repair
+## Task 2: The `referenced_digests` repair
 
 **Files:**
 - Modify: `python/src/atoms/store/records.py:412`
 - Modify: `python/tests/test_store_records.py:239`
-- Modify: `python/tests/coordinator_child.py:48`
 
 **Interfaces:**
-- Produces: `referenced_digests(spec: TransactionSpec) -> tuple[tuple[str, int], ...]` covering
-  every `FileState` the spec states — both surfaces **and** every effect occurrence — still as pairs.
+- Produces: `referenced_digests(spec) -> tuple[tuple[str, int], ...]` covering every `FileState` the
+  spec states — both surfaces **and** every effect occurrence — still as pairs.
 
-This task comes before capture because Task 6 stages "every distinct required digest", and that set is
-exactly what this helper returns.
+This lands before capture because the staging set is exactly what this helper returns. It has no
+dependency on Task 1.
 
 - [ ] **Step 1: Write the failing test**
 
 In `python/tests/test_store_records.py`, rename
 `test_referenced_digests_include_initial_and_final_file_surfaces` to
-`test_referenced_digests_include_every_declared_file_state` and add:
+`test_referenced_digests_include_every_declared_file_state`, then add:
 
 ```python
+def _state(payload: bytes, byte_len: int | None = None):
+    import hashlib
+
+    from atoms.core.fingerprint import FileState
+
+    return FileState(
+        content_hash="sha256:" + hashlib.sha256(payload).hexdigest(),
+        mode=0o644,
+        byte_len=len(payload) if byte_len is None else byte_len,
+    )
+
+
 def test_referenced_digests_include_an_intermediate_postimage():
     """Measured: `ReplaceFile(p, A->B)` + `ReplaceFile(p, B->C)` puts B in neither surface.
 
-    The initial surface has A and the final has C. Before this repair the helper missed
-    B entirely, so `connection.py`'s barrier refused a promoted B as unreferenced -- and
-    not promoting it would leave A7 without the bytes it must publish.
+    The initial surface has A and the final has C. Before this repair the helper missed B
+    entirely, so `connection.py`'s barrier refused a promoted B as unreferenced -- and not
+    promoting it would leave A7 without the bytes it must publish.
     """
-    import hashlib
-
     from atoms.core.effects import ReplaceFile
-    from atoms.core.fingerprint import FileState
     from atoms.core.spec import build_spec
 
-    def state(payload: bytes) -> FileState:
-        return FileState(
-            content_hash="sha256:" + hashlib.sha256(payload).hexdigest(),
-            mode=0o644,
-            byte_len=len(payload),
-        )
-
-    a, b, c = state(b"aaa"), state(b"bbb"), state(b"ccc")
+    a, b, c = _state(b"aaa"), _state(b"bbb"), _state(b"ccc")
     spec = build_spec(
         consumer_tag="test",
         intent_digest="sha256:" + "3" * 64,
@@ -1292,34 +810,25 @@ def test_referenced_digests_include_an_intermediate_postimage():
         ],
     )
 
-    digests = {digest for digest, _ in referenced_digests(spec)}
-    assert digests == {a.content_hash, b.content_hash, c.content_hash}
+    assert {digest for digest, _ in referenced_digests(spec)} == {
+        a.content_hash,
+        b.content_hash,
+        c.content_hash,
+    }
 
 
 def test_referenced_digests_keep_conflicting_lengths_as_distinct_pairs():
     """Measured: `compile_spec` accepts one content_hash at two byte_len values.
 
-    Collapsing to digests would erase the contradiction capture must detect (design
-    §7.2), and would do so in the one helper positioned to see every declared FileState.
+    Collapsing to digests would erase the contradiction capture must detect (A6 design
+    §7.2), in the one helper positioned to see every declared FileState at once.
     """
-    import hashlib
-
     from atoms.core.effects import ReplaceFile
-    from atoms.core.fingerprint import FileState
     from atoms.core.spec import build_spec
 
-    payload = b"aaa"
-    honest = FileState(
-        content_hash="sha256:" + hashlib.sha256(payload).hexdigest(),
-        mode=0o644,
-        byte_len=3,
-    )
-    liar = FileState(content_hash=honest.content_hash, mode=0o644, byte_len=99)
-    other = FileState(
-        content_hash="sha256:" + hashlib.sha256(b"zzz").hexdigest(),
-        mode=0o644,
-        byte_len=3,
-    )
+    honest = _state(b"aaa")
+    liar = _state(b"aaa", byte_len=99)
+    other = _state(b"zzz")
     spec = build_spec(
         consumer_tag="test",
         intent_digest="sha256:" + "5" * 64,
@@ -1331,8 +840,9 @@ def test_referenced_digests_keep_conflicting_lengths_as_distinct_pairs():
         ],
     )
 
-    lengths = sorted(n for d, n in referenced_digests(spec) if d == honest.content_hash)
-    assert lengths == [3, 99]
+    assert sorted(
+        n for d, n in referenced_digests(spec) if d == honest.content_hash
+    ) == [3, 99]
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -1365,7 +875,7 @@ def referenced_digests(spec: TransactionSpec) -> tuple[tuple[str, int], ...]:
         for entry in surface
     ]
     for effect in spec.effects:
-        for occurrence in occurrences_of(effect):
+        for occurrence in occurrences(effect):
             states.extend((occurrence.pre, occurrence.post))
     return tuple(sorted({
         (state.content_hash, state.byte_len)
@@ -1374,111 +884,155 @@ def referenced_digests(spec: TransactionSpec) -> tuple[tuple[str, int], ...]:
     }))
 ```
 
-Import `occurrences_of` from `atoms.core.effects` at the top of the module.
+Add `occurrences` to the existing `from atoms.core.effects import ...` at the top of the module.
+Measured: the helper is named `occurrences` and is a `singledispatch` returning
+`Occurrence(path, pre, post, role)`.
 
-- [ ] **Step 4: Confirm the occurrence helper's name**
-
-Run: `cd python && uv run python -c "import atoms.core.effects as e; print([n for n in dir(e) if 'occur' in n.lower()])"`
-Expected: the exported helper that expands one effect into its `Occurrence` values. **If it is named
-something other than `occurrences_of`, use the real name** and correct the import above.
-
-- [ ] **Step 5: Run the tests to verify they pass**
+- [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cd python && uv run pytest tests/test_store_records.py -q`
 Expected: PASS.
 
-- [ ] **Step 6: Fix the downstream call site and run the full suite**
+- [ ] **Step 5: Run the full suite**
 
-`python/tests/coordinator_child.py:48` iterates `referenced_digests(active.spec)`. It needs no change
-if it already unpacks pairs; confirm and adjust only if it does not.
+`python/tests/coordinator_child.py:48` already unpacks `(digest, byte_len)` pairs and needs no change.
 
 Run: `cd python && uv run pytest -q`
 Expected: all green. **If a store or coordinator test now fails because more digests are referenced,
 stop and report it** — that would mean the barrier was relying on the narrow set.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add python/src/atoms/store/records.py python/tests/test_store_records.py \
-        python/tests/coordinator_child.py
+git add python/src/atoms/store/records.py python/tests/test_store_records.py
 git commit -m "fix(store): reference every declared FileState, not only the two surfaces"
 ```
 
 ---
 
-## Task 5: Absence inference — the two branches
+## Task 3: `DescriptorTable` — the walk, re-validation, and coherent blockers
 
 **Files:**
-- Create: `python/src/atoms/coordinator/capture.py` (the inference half only)
-- Create: `python/tests/test_coordinator_capture.py`
+- Modify: `python/src/atoms/fs/resolve.py`
+- Create: `python/src/atoms/coordinator/descriptors.py`
+- Create: `python/tests/capture_support.py`
+- Create: `python/tests/test_coordinator_descriptors.py`
 
 **Interfaces:**
-- Consumes: Task 3's `DescriptorTable` and `WalkStop`; Task 1's `Observation`.
-- Produces: `verify_absence_below(observation: Observation, table: DescriptorTable, approved: ProjectApprovedSpec) -> None` — refuses if any stop cannot justify the absence of what lies below it.
+- Produces:
+  - `@dataclass(frozen=True, slots=True) class WalkStop:` — `node: TopologyNode`, `path: str`,
+    `parent_fd: int`, `component: str`, `observed: ObservedEntry`
+  - `class DescriptorTable:` — `fd_for(self, node: TopologyNode) -> int`,
+    `is_unreachable(self, node: TopologyNode) -> bool`, `stops: tuple[WalkStop, ...]`,
+    `close(self)`, `__enter__`, `__exit__`
+  - `_build_descriptor_table(lease, approved, workspace, observation) -> DescriptorTable`
 
-- [ ] **Step 1: Write the failing test**
+Two rulings from the design shape this task. **No errno selects a state branch** — the walk observes
+the blocker's actual kind through the same `Observation` pass and reports the `ObservedEntry`, leaving
+adjudication to Task 4. And **a planned directory is looked up, not assumed** — recording it as absent
+without a lookup would mean a matching file or symlink blocker is never reported at all.
 
-Create `python/tests/test_coordinator_capture.py`:
+- [ ] **Step 1: Make the filesystem-type helper public**
+
+In `python/src/atoms/fs/resolve.py`, rename `_filesystem_type` to `filesystem_type_of` and update its
+two in-module call sites (`observe_child`, `observe_work_child`).
+
+Run: `cd python && grep -rn "_filesystem_type" src/ tests/ && echo FOUND || echo CLEAN`
+Expected: `CLEAN`.
+
+- [ ] **Step 2: Write the shared builders**
+
+Create `python/tests/capture_support.py`:
 
 ```python
-"""A6 tier 3 -- capture: absence inference, staging, and refusals (design §7, §8)."""
+"""Builders shared by the A6 capture tiers.
+
+Plain functions, not fixtures: the fixture-registry guard requires every fixture to live
+in `tests/conftest.py`, and these are values a test constructs rather than resources a
+test needs torn down. Same rule `tests/coordinator_support.py` follows.
+"""
 
 from __future__ import annotations
 
+import hashlib
+import io
 import os
 
-import pytest
+from atoms.core.compiler import CompiledSpec, compile_spec
+from atoms.core.effects import (
+    CreateDirectory,
+    CreateFileNoClobber,
+    DeletePath,
+    ReplaceFile,
+)
+from atoms.core.fingerprint import ABSENT, DirectoryState, FileState, SymlinkState
+from atoms.core.spec import TransactionSpec, build_spec
+from atoms.coordinator.lease import Lease
 
-from atoms.core.errors import PreconditionRefused
-from tests.capture_support import approved_replace, state_of
+DIRECTORY_POST = DirectoryState(mode=0o755)
+BEFORE = b"before"
+AFTER = b"after"
 
 
-def test_a_missing_ancestor_justifies_its_descendants_absence(leased):
-    """§8.1: the walk stops at the planned directory; the first missing component is
-    confirmed by a no-follow lookup relative to the deepest held descriptor."""
+def digest_of(payload: bytes) -> str:
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def state_of(payload: bytes, mode: int = 0o644) -> FileState:
+    return FileState(content_hash=digest_of(payload), mode=mode, byte_len=len(payload))
+
+
+def write_project_file(
+    lease: Lease, path: str, payload: bytes, mode: int = 0o644
+) -> None:
+    """Create a real file in project space, making its parents as needed."""
+    root_fd = lease._binding.project_root_fd
+    parts = path.split("/")
+    for index in range(1, len(parts)):
+        try:
+            os.mkdir("/".join(parts[:index]), dir_fd=root_fd)
+        except FileExistsError:
+            pass
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode, dir_fd=root_fd)
+    try:
+        os.write(fd, payload)
+    finally:
+        os.close(fd)
+    os.chmod(path, mode, dir_fd=root_fd)
+
+
+def replace_spec() -> TransactionSpec:
+    """One `ReplaceFile` under an existing directory `d`.
+
+    The preimage is real and must be captured; the postimage must be supplied.
+    """
+    pre, post = state_of(BEFORE), state_of(AFTER)
+    return build_spec(
+        consumer_tag="test",
+        intent_digest="sha256:" + "a" * 64,
+        initial_surface={"d/f.txt": pre},
+        final_surface={"d/f.txt": post},
+        effects=[ReplaceFile(effect_id="e1", path="d/f.txt", pre=pre, post=post)],
+    )
+
+
+def compiled_replace(lease: Lease) -> CompiledSpec:
+    write_project_file(lease, "d/f.txt", BEFORE)
+    return compile_spec(replace_spec())
+
+
+def approved_replace(lease: Lease):
     from atoms.coordinator.admission import admit
-    from atoms.coordinator.capture import verify_absence_below
-    from atoms.coordinator.descriptors import build_descriptor_table
-    from atoms.coordinator.prepare import open_workspace
-    from atoms.fs.observe import Observation
-    from tests.coordinator_support import compiled_creating_a_directory
 
-    with leased() as lease:
-        approved = admit(lease, compiled_creating_a_directory(lease))
-        with open_workspace(lease, approved) as workspace:
-            with build_descriptor_table(lease, approved, workspace) as table:
-                with Observation(lease._binding.backend) as observation:
-                    verify_absence_below(observation, table, approved)
+    return admit(lease, compiled_replace(lease))
 
 
-def test_an_occupied_planned_name_refuses(leased):
-    from atoms.coordinator.admission import admit
-    from atoms.coordinator.capture import verify_absence_below
-    from atoms.coordinator.descriptors import build_descriptor_table
-    from atoms.coordinator.prepare import open_workspace
-    from atoms.fs.observe import Observation
-    from tests.coordinator_support import compiled_creating_a_directory
-
-    with leased() as lease:
-        approved = admit(lease, compiled_creating_a_directory(lease))
-        os.mkdir("d", dir_fd=lease._binding.project_root_fd)
-        with open_workspace(lease, approved) as workspace:
-            with pytest.raises(PreconditionRefused):
-                with build_descriptor_table(lease, approved, workspace) as table:
-                    with Observation(lease._binding.backend) as observation:
-                        verify_absence_below(observation, table, approved)
-```
-
-The remaining §8.2 cases need a spec whose timeline is `FILE → ABSENT → DIRECTORY`. Add to
-`python/tests/capture_support.py`:
-
-```python
 def blocker_spec(pre) -> TransactionSpec:
     """`DeletePath("p")`, `CreateDirectory("p")`, `CreateFileNoClobber("p/q")`.
 
-    `p`'s timeline is continuous (FILE -> ABSENT -> DIRECTORY), and `p/q` is absent
-    precisely BECAUSE `p` is a file -- the shape design §8.2 exists for. `pre` is either
-    a FileState or a SymlinkState, which selects the branch under test.
+    `p`'s timeline is continuous (FILE -> ABSENT -> DIRECTORY) and `p/q` is absent
+    precisely BECAUSE `p` is a file -- the shape design §8.2 exists for. `pre` is either a
+    FileState or a SymlinkState, which selects the branch under test.
     """
     post = state_of(AFTER)
     return build_spec(
@@ -1492,278 +1046,699 @@ def blocker_spec(pre) -> TransactionSpec:
             CreateFileNoClobber(effect_id="e3", path="p/q", post=post),
         ],
     )
-```
 
-Then add to `python/tests/test_coordinator_capture.py`:
 
-```python
-def _blocked(lease, pre):
+def approved_blocked(lease: Lease, pre):
     from atoms.coordinator.admission import admit
-    from atoms.core.compiler import compile_spec
-    from tests.capture_support import blocker_spec
 
     return admit(lease, compile_spec(blocker_spec(pre)))
 
 
-def test_a_regular_file_blocker_matching_its_declared_state_justifies_absence(leased):
-    from atoms.coordinator.capture import verify_absence_below
-    from atoms.coordinator.descriptors import build_descriptor_table
-    from atoms.coordinator.prepare import open_workspace
-    from atoms.fs.observe import Observation
-    from tests.capture_support import BEFORE, write_project_file
-
-    with leased() as lease:
-        write_project_file(lease, "p", BEFORE)
-        approved = _blocked(lease, state_of(BEFORE))
-        with open_workspace(lease, approved) as workspace:
-            with build_descriptor_table(lease, approved, workspace) as table:
-                with Observation(lease._binding.backend) as observation:
-                    verify_absence_below(observation, table, approved)
-
-
-def test_a_blocker_that_is_not_the_declared_file_refuses(leased):
-    """§8.2: ENOTDIR does not distinguish a regular file from a socket or FIFO.
-
-    A4b rejects OTHER at approval, but capture-time drift introduces one here. The
-    branch is selected by the declared FileState, never by the errno.
-    """
-    from atoms.coordinator.capture import verify_absence_below
-    from atoms.coordinator.descriptors import build_descriptor_table
-    from atoms.coordinator.prepare import open_workspace
-    from atoms.fs.observe import Observation
-    from tests.capture_support import BEFORE, write_project_file
-
-    with leased() as lease:
-        write_project_file(lease, "p", BEFORE)
-        approved = _blocked(lease, state_of(BEFORE))
-        root_fd = lease._binding.project_root_fd
-        os.unlink("p", dir_fd=root_fd)
-        os.mkfifo("p", 0o644, dir_fd=root_fd)
-
-        with open_workspace(lease, approved) as workspace:
-            with pytest.raises(PreconditionRefused, match="declared"):
-                with build_descriptor_table(lease, approved, workspace) as table:
-                    with Observation(lease._binding.backend) as observation:
-                        verify_absence_below(observation, table, approved)
-
-
-def test_a_symlink_blocker_must_match_its_declared_symlink_state(leased):
-    """A drifted symlink is a symlink but not THIS symlink."""
-    from atoms.core.fingerprint import SymlinkState
-    from atoms.coordinator.capture import verify_absence_below
-    from atoms.coordinator.descriptors import build_descriptor_table
-    from atoms.coordinator.prepare import open_workspace
-    from atoms.fs.observe import Observation
-
-    with leased() as lease:
-        root_fd = lease._binding.project_root_fd
-        os.symlink("elsewhere", "p", dir_fd=root_fd)
-        declared = SymlinkState(target="elsewhere", mode=0o777)
-        approved = _blocked(lease, declared)
-
-        os.unlink("p", dir_fd=root_fd)
-        os.symlink("drifted", "p", dir_fd=root_fd)
-
-        with open_workspace(lease, approved) as workspace:
-            with pytest.raises(PreconditionRefused, match="declared"):
-                with build_descriptor_table(lease, approved, workspace) as table:
-                    with Observation(lease._binding.backend) as observation:
-                        verify_absence_below(observation, table, approved)
-```
-
-- [ ] **Step 2: Run the tests to verify they fail**
-
-Run: `cd python && uv run pytest tests/test_coordinator_capture.py -q`
-Expected: collection error, `ModuleNotFoundError: No module named 'atoms.coordinator.capture'`.
-
-- [ ] **Step 3: Write the implementation**
-
-Create `python/src/atoms/coordinator/capture.py` with the inference half:
-
-```python
-"""Authority §7.3 step 1 -- coherent capture (design §7, §8)."""
-
-from __future__ import annotations
-
-import os
-import stat
-
-from atoms.core.errors import PreconditionRefused
-from atoms.core.fingerprint import FileState, SymlinkState
-from atoms.core.recovery.model import ObservedFile, ObservedSymlink
-from atoms.coordinator.descriptors import DescriptorTable, WalkStop
-from atoms.fs.approval import ProjectApprovedSpec
-from atoms.fs.observe import Observation, translated_lookup
-from atoms.fs.resolve import EntryKind
-
-
-def verify_absence_below(
-    observation: Observation, table: DescriptorTable, approved: ProjectApprovedSpec
-) -> None:
-    """Justify the absence of everything beneath each stop (design §8).
-
-    Two routes, two code paths. Conflating them would silently grant a symlink the file
-    branch's descriptor coherence.
-    """
-    declared = _first_states(approved)
-    for stop in table.stops:
-        if stop.blocker is None:
-            _confirm_missing(observation, stop)
-        else:
-            _confirm_blocker(observation, stop, declared)
-
-
-def _confirm_missing(observation: Observation, stop: WalkStop) -> None:
-    """§8.1: a no-follow lookup of the first missing component.
-
-    The deepest existing ancestor is the last node the walk opened before stopping, and
-    the table already holds its descriptor.
-    """
-    entry = observation.observe(stop.parent_fd, stop.component)
-    if type(entry).__name__ != "ObservedAbsent":
-        raise PreconditionRefused(
-            f"{stop.component!r} was approved as a planned directory but something "
-            f"occupies it now: {entry!r}"
-        )
-
-
-def _confirm_blocker(
-    observation: Observation, stop: WalkStop, declared: dict[str, object]
-) -> None:
-    """§8.2: absence is INFERRED from the ancestor's verified state, not probed.
-
-    Traversal failed at the blocker itself, so there is no descriptor against which the
-    descendant could be looked up. Neither a regular file nor a symlink can hold
-    directory entries, so an ancestor verified to be either one proves nothing exists
-    beneath it -- but the two verifications differ in strength and must not be conflated.
-    """
-    expected = declared.get(_path_of(stop))
-    entry = observation.observe(stop.parent_fd, stop.component)
-
-    if type(expected) is FileState:
-        # Descriptor-coherent: type, mode, and hash all from one open descriptor. The
-        # inference is STRONGER than the negative lookup it replaces.
-        if type(entry) is not ObservedFile or entry.state != expected:
-            raise PreconditionRefused(
-                f"{stop.component!r} blocks traversal but is not the declared "
-                f"{expected!r}; observed {entry!r}"
-            )
-        return
-
-    if type(expected) is SymlinkState:
-        # NOT descriptor-coherent: lstat + readlink, no descriptor, no identity. The
-        # absence inference holds because a symlink holds no entries; the identity
-        # contract is deferred to A7's destructive transfer.
-        if type(entry) is not ObservedSymlink or entry.state != expected:
-            raise PreconditionRefused(
-                f"{stop.component!r} blocks traversal but is not the declared "
-                f"{expected!r}; observed {entry!r}"
-            )
-        return
-
-    raise PreconditionRefused(
-        f"{stop.component!r} blocks traversal ({stop.blocker}) and no declared file or "
-        "symlink state describes it"
+def delete_symlink_spec(target: str = "elsewhere") -> TransactionSpec:
+    pre = SymlinkState(target=target, mode=0o777)
+    return build_spec(
+        consumer_tag="test",
+        intent_digest="sha256:" + "c" * 64,
+        initial_surface={"link": pre},
+        final_surface={"link": ABSENT},
+        effects=[DeletePath(effect_id="e1", path="link", pre=pre)],
     )
 
 
-def _path_of(stop: WalkStop) -> str:
-    node = stop.node
-    return getattr(node, "path", stop.component)
+def approved_delete_symlink(lease: Lease, target: str = "elsewhere"):
+    from atoms.coordinator.admission import admit
+
+    root_fd = lease._binding.project_root_fd
+    try:
+        os.unlink("link", dir_fd=root_fd)
+    except FileNotFoundError:
+        pass
+    os.symlink(target, "link", dir_fd=root_fd)
+    return admit(lease, compile_spec(delete_symlink_spec(target)))
 
 
-def _first_states(approved: ProjectApprovedSpec) -> dict[str, object]:
-    """Each path's FIRST precondition -- the declared initial surface.
-
-    Later occurrence-local preconditions describe intermediate states no initial capture
-    can observe, and checking them here would refuse correct transactions.
-    """
-    return {
-        timeline.path: timeline.occurrences[0].pre
-        for timeline in approved.compiled.timelines
-    }
-```
-
-- [ ] **Step 4: Confirm the timeline field names**
-
-Run: `cd python && uv run python -c "
-import dataclasses as d
-from atoms.core.timeline import PathTimeline, TimelineOccurrence
-print([f.name for f in d.fields(PathTimeline)])
-print([f.name for f in d.fields(TimelineOccurrence)])"`
-Expected: `['path', 'occurrences']` and a field holding the precondition. **If the precondition field
-is not named `pre`, correct `_first_states` to the real name.**
-
-- [ ] **Step 5: Run the tests to verify they pass**
-
-Run: `cd python && uv run pytest tests/test_coordinator_capture.py -q`
-Expected: PASS, 5 tests.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add python/src/atoms/coordinator/capture.py python/tests/capture_support.py \
-        python/tests/test_coordinator_capture.py
-git commit -m "feat(capture): infer descendant absence from a verified ancestor"
-```
-
----
-
-## Task 6: `PayloadSource`, the digest-length precheck, and preimage staging
-
-**Files:**
-- Modify: `python/src/atoms/coordinator/capture.py`
-- Modify: `python/tests/test_coordinator_capture.py`
-- Modify: `python/tests/capture_support.py`
-
-**Interfaces:**
-- Produces:
-  - `class PayloadSource(Protocol):` with `open(self, digest: str) -> IO[bytes]`
-  - `require_one_length_per_digest(pairs: tuple[tuple[str, int], ...]) -> dict[str, int]`
-  - `stage_preimages(...) -> list[StagedBlob]` (module-private; exercised through Task 7's entry point)
-
-- [ ] **Step 1: Write the failing test**
-
-Add to `python/tests/capture_support.py`:
-
-```python
 class DictPayloads:
     """A PayloadSource over an in-memory map.
 
     `open` returns a FRESH stream each call, which capture owns and closes. A source that
     handed back a shared or already-read stream would make a second staging attempt
-    silently produce a short blob.
+    silently produce a short blob. An unknown digest raises `KeyError` -- the one signal
+    capture translates into `ProtocolError`.
     """
 
     def __init__(self, contents: dict[str, bytes]) -> None:
         self._contents = contents
         self.requested: list[str] = []
 
-    def open(self, digest: str):
-        import io
-
+    def open(self, digest: str) -> io.BytesIO:
         self.requested.append(digest)
-        payload = self._contents.get(digest)
-        if payload is None:
-            raise KeyError(digest)
-        return io.BytesIO(payload)
+        return io.BytesIO(self._contents[digest])
 ```
 
-Add to `python/tests/test_coordinator_capture.py`:
+- [ ] **Step 3: Write the failing test**
+
+Create `python/tests/test_coordinator_descriptors.py`:
 
 ```python
+"""A6 tier 2 -- the descriptor table (design §5)."""
+
+from __future__ import annotations
+
+import os
+
+import pytest
+
+from atoms.core.errors import PreconditionRefused
+from atoms.core.recovery.model import ObservedAbsent, ObservedFile, ObservedSymlink
+from atoms.core.recovery.snapshot import ProjectRoot, TopologyDirectory, WorkRoot
+from atoms.fs.linux import LinuxBackend
+from atoms.fs.observe import Observation
+from tests.capture_support import BEFORE, approved_replace, state_of, write_project_file
+from tests.coordinator_support import compiled_creating_a_directory
+
+
+def _table(lease, approved, workspace, observation):
+    from atoms.coordinator.descriptors import _build_descriptor_table
+
+    return _build_descriptor_table(lease, approved, workspace, observation)
+
+
+def test_the_table_holds_one_descriptor_per_approved_directory(leased):
+    from atoms.coordinator.prepare import open_workspace
+
+    with leased() as lease:
+        approved = approved_replace(lease)
+        with open_workspace(lease, approved) as workspace:
+            with Observation(LinuxBackend()) as observation:
+                with _table(lease, approved, workspace, observation) as table:
+                    # Measured: this spec's directories are ProjectRoot and
+                    # TopologyDirectory(0) for `d`.
+                    assert isinstance(table.fd_for(ProjectRoot()), int)
+                    assert isinstance(table.fd_for(TopologyDirectory(node_id=0)), int)
+
+
+def test_the_root_descriptors_are_borrowed_and_survive_close(leased):
+    """§5.5: ProjectBinding and Workspace own theirs; the table closes only its own."""
+    from atoms.coordinator.prepare import open_workspace
+
+    with leased() as lease:
+        approved = approved_replace(lease)
+        with open_workspace(lease, approved) as workspace:
+            with Observation(LinuxBackend()) as observation:
+                with _table(lease, approved, workspace, observation) as table:
+                    assert table.fd_for(ProjectRoot()) == lease._binding.project_root_fd
+            assert os.fstat(lease._binding.project_root_fd).st_ino > 0
+            assert os.fstat(workspace.staging_fd).st_ino > 0
+
+
+def test_closing_the_table_releases_only_what_it_opened(leased):
+    from atoms.coordinator.prepare import open_workspace
+    from tests.fs_support import descriptor_count
+
+    with leased() as lease:
+        approved = approved_replace(lease)
+        with open_workspace(lease, approved) as workspace:
+            with Observation(LinuxBackend()) as observation:
+                before = descriptor_count()
+                table = _table(lease, approved, workspace, observation)
+                assert descriptor_count() > before
+                table.close()
+                assert descriptor_count() == before
+
+
+def test_the_work_root_is_present_only_when_the_topology_has_one(leased):
+    from atoms.coordinator.admission import admit
+    from atoms.coordinator.prepare import open_workspace
+
+    with leased() as lease:
+        without = approved_replace(lease)
+        with open_workspace(lease, without) as workspace:
+            with Observation(LinuxBackend()) as observation:
+                with _table(lease, without, workspace, observation) as table:
+                    assert without.work_base is None
+                    with pytest.raises(KeyError):
+                        table.fd_for(WorkRoot())
+
+    with leased() as lease:
+        with_work = admit(lease, compiled_creating_a_directory(lease))
+        with open_workspace(lease, with_work) as workspace:
+            with Observation(LinuxBackend()) as observation:
+                with _table(lease, with_work, workspace, observation) as table:
+                    assert with_work.work_base is not None
+                    assert table.fd_for(WorkRoot()) == workspace.work_fd
+
+
+def test_a_replaced_directory_refuses_on_identity(leased):
+    """Ledger #19: compare against the approved baseline, never reapprove."""
+    from atoms.coordinator.prepare import open_workspace
+
+    with leased() as lease:
+        approved = approved_replace(lease)
+        root_fd = lease._binding.project_root_fd
+        os.rename("d", "d-moved", src_dir_fd=root_fd, dst_dir_fd=root_fd)
+        os.mkdir("d", dir_fd=root_fd)
+
+        with open_workspace(lease, approved) as workspace:
+            with Observation(LinuxBackend()) as observation:
+                with pytest.raises(PreconditionRefused, match="identity"):
+                    _table(lease, approved, workspace, observation)
+
+
+def test_the_project_root_is_revalidated_too(leased, monkeypatch):
+    """§5.3: retention is not discharge.
+
+    The binding holds the root descriptor across approval so its identity cannot drift,
+    but lookup_proof and name_max are mutable directory properties and ledger #19's rule
+    is that a resolved fact is compared against its approved baseline before being
+    relied on. A held descriptor is not an exception the ledger grants.
+    """
+    from atoms.coordinator import descriptors
+    from atoms.coordinator.prepare import open_workspace
+    from atoms.fs.lookup import DirectoryConstraints, LookupProof
+
+    with leased() as lease:
+        approved = approved_replace(lease)
+        drifted = DirectoryConstraints(
+            lookup_proof=LookupProof.EXACT_BYTES, name_max=64
+        )
+        monkeypatch.setattr(
+            descriptors, "read_lookup_constraints", lambda fd, kind: drifted
+        )
+        with open_workspace(lease, approved) as workspace:
+            with Observation(LinuxBackend()) as observation:
+                with pytest.raises(PreconditionRefused, match="constraints"):
+                    _table(lease, approved, workspace, observation)
+
+
+def test_an_absent_planned_directory_is_a_stop_with_an_absent_observation(leased):
+    from atoms.coordinator.admission import admit
+    from atoms.coordinator.prepare import open_workspace
+
+    with leased() as lease:
+        approved = admit(lease, compiled_creating_a_directory(lease))
+        with open_workspace(lease, approved) as workspace:
+            with Observation(LinuxBackend()) as observation:
+                with _table(lease, approved, workspace, observation) as table:
+                    (stop,) = [s for s in table.stops if s.component == "d"]
+                    assert stop.path == "d"
+                    assert type(stop.observed) is ObservedAbsent
+
+
+def test_an_occupied_planned_directory_reports_what_occupies_it(leased):
+    """A planned directory is LOOKED UP, not assumed absent.
+
+    Recording it as missing without a lookup would mean a matching file or symlink
+    blocker is never reported, and §8.2's whole branch would be unreachable.
+    """
+    from atoms.coordinator.prepare import open_workspace
+
+    with leased() as lease:
+        write_project_file(lease, "p", BEFORE)
+        approved = approved_blocked_file(lease)
+        with open_workspace(lease, approved) as workspace:
+            with Observation(LinuxBackend()) as observation:
+                with _table(lease, approved, workspace, observation) as table:
+                    (stop,) = [s for s in table.stops if s.component == "p"]
+                    assert type(stop.observed) is ObservedFile
+                    assert stop.observed.state == state_of(BEFORE)
+
+
+def test_a_fifo_blocker_is_not_reported_as_a_regular_file(leased):
+    """ENOTDIR does not distinguish a regular file from a socket, FIFO, or device node.
+
+    An errno-to-kind table would have called this one REGULAR_FILE, and §8.2's
+    verification against the declared FileState would then compare a fabricated kind.
+    """
+    from atoms.coordinator.prepare import open_workspace
+
+    with leased() as lease:
+        write_project_file(lease, "p", BEFORE)
+        approved = approved_blocked_file(lease)
+        root_fd = lease._binding.project_root_fd
+        os.unlink("p", dir_fd=root_fd)
+        os.mkfifo("p", 0o644, dir_fd=root_fd)
+
+        with open_workspace(lease, approved) as workspace:
+            with Observation(LinuxBackend()) as observation:
+                # The observer refuses a kind no declared state can describe, rather
+                # than inventing one from the errno.
+                with pytest.raises(PreconditionRefused, match="neither"):
+                    _table(lease, approved, workspace, observation)
+
+
+def test_a_symlink_blocker_is_reported_as_a_symlink(leased):
+    from atoms.core.fingerprint import SymlinkState
+    from atoms.coordinator.prepare import open_workspace
+    from tests.capture_support import approved_blocked
+
+    with leased() as lease:
+        root_fd = lease._binding.project_root_fd
+        os.symlink("elsewhere", "p", dir_fd=root_fd)
+        approved = approved_blocked(lease, SymlinkState(target="elsewhere", mode=0o777))
+        with open_workspace(lease, approved) as workspace:
+            with Observation(LinuxBackend()) as observation:
+                with _table(lease, approved, workspace, observation) as table:
+                    (stop,) = [s for s in table.stops if s.component == "p"]
+                    assert type(stop.observed) is ObservedSymlink
+
+
+def test_a_node_beneath_a_stop_is_unreachable_not_missing(leased):
+    """Two different facts. The table must not conflate them.
+
+    A node proved unreachable beneath a verified stop needs no observation; a node simply
+    absent from the table is an internal defect, and returning None for both would let
+    the second pass silently as the first.
+    """
+    from atoms.coordinator.admission import admit
+    from atoms.coordinator.prepare import open_workspace
+    from atoms.core.recovery.snapshot import PersistentNode
+
+    with leased() as lease:
+        approved = admit(lease, compiled_creating_a_directory(lease))
+        with open_workspace(lease, approved) as workspace:
+            with Observation(LinuxBackend()) as observation:
+                with _table(lease, approved, workspace, observation) as table:
+                    assert table.is_unreachable(PersistentNode(path="d"))
+                    assert not table.is_unreachable(ProjectRoot())
+
+
+def approved_blocked_file(lease):
+    from tests.capture_support import approved_blocked
+
+    return approved_blocked(lease, state_of(BEFORE))
+```
+
+- [ ] **Step 4: Run the tests to verify they fail**
+
+Run: `cd python && uv run pytest tests/test_coordinator_descriptors.py -q`
+Expected: collection error, `ModuleNotFoundError: No module named 'atoms.coordinator.descriptors'`.
+
+- [ ] **Step 5: Write the implementation**
+
+Create `python/src/atoms/coordinator/descriptors.py`:
+
+```python
+"""The held, re-validated descriptor table (design §5).
+
+`RecoveryTopology.parents` is a rooted tree, so the table is a walk of it: each directory
+node is opened from its parent's held descriptor with ONE `open_child_directory` call,
+which is already RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV. No
+multi-component path is ever assembled -- passing one to a syscall would reopen the
+check/use race, because the kernel re-resolves intermediate components at the syscall.
+
+The tree gives structure, not spelling: `TopologyDirectory(node_id)` carries no name, so
+the walk reads its components from A5b's `_parent_paths`.
+
+Nothing here classifies. Where the walk stops it records the ObservedEntry it actually
+found, and capture adjudicates that against the timeline's first declared state. No
+errno is ever mapped to a kind: ENOTDIR does not distinguish a regular file from a
+socket, FIFO, or device node.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+
+from atoms.core.errors import PreconditionRefused, ProtocolError
+from atoms.core.recovery.model import ObservedAbsent, ObservedEntry
+from atoms.core.recovery.snapshot import ProjectRoot, TopologyNode, WorkRoot
+from atoms.coordinator.admission import _parent_paths, _require_admitted
+from atoms.coordinator.lease import Lease
+from atoms.fs.approval import ProjectApprovedSpec
+from atoms.fs.lookup import read_lookup_constraints
+from atoms.fs.observe import Observation
+from atoms.fs.resolve import FilesystemIdentity, filesystem_type_of
+from atoms.fs.topology import ApprovedExistingDirectory, ApprovedPlannedDirectory
+from atoms.fs.volume import read_mount_id
+from atoms.store.workspace import Workspace
+
+
+@dataclass(frozen=True, slots=True)
+class WalkStop:
+    """Where the walk stopped, and what was actually there.
+
+    `observed` is an `ObservedAbsent` when nothing occupies the name, and the real
+    observed entry otherwise. Neither is adjudicated here: capture verifies both against
+    the timeline's first declared state (design §8).
+    """
+
+    node: TopologyNode
+    path: str
+    parent_fd: int
+    component: str
+    observed: ObservedEntry
+
+
+class DescriptorTable:
+    """A live resource. Borrows the roots; owns only what it opened.
+
+    It outlives capture: §6 requires the engine to hold a descriptor to the project root
+    for the transaction's lifetime, and §9.5 hands each published directory's descriptor
+    down to its descendants. A table that died at capture's return would force A7 to
+    re-resolve, reopening the race the whole section exists to close.
+    """
+
+    __slots__ = ("_closed", "_fds", "_owned", "_unreachable", "stops")
+
+    def __init__(
+        self,
+        *,
+        fds: dict[TopologyNode, int],
+        owned: tuple[int, ...],
+        stops: tuple[WalkStop, ...],
+        unreachable: frozenset[TopologyNode],
+    ) -> None:
+        self._fds = fds
+        self._owned = owned
+        self._unreachable = unreachable
+        self.stops = stops
+        self._closed = False
+
+    def fd_for(self, node: TopologyNode) -> int:
+        if self._closed:
+            raise ProtocolError("this descriptor table is closed")
+        return self._fds[node]
+
+    def is_unreachable(self, node: TopologyNode) -> bool:
+        """Proved to lie beneath a stop -- distinct from merely absent from the table."""
+        if self._closed:
+            raise ProtocolError("this descriptor table is closed")
+        return node in self._unreachable
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for fd in self._owned:
+            os.close(fd)
+        self._fds.clear()
+
+    def __enter__(self) -> DescriptorTable:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+
+def _build_descriptor_table(
+    lease: Lease,
+    approved: ProjectApprovedSpec,
+    workspace: Workspace,
+    observation: Observation,
+) -> DescriptorTable:
+    """Package-private: reached only through `capture_initial_surface`.
+
+    Kept private deliberately. `test_no_unregistered_public_function_accepts_the_proof`
+    asserts that every public coordinator function annotating a ProjectApprovedSpec is a
+    registered transaction-stage entry point, and this is a step inside one, not an
+    entry of its own.
+    """
+    binding = lease._binding
+    filesystem_type = filesystem_type_of(binding)
+    expected_mount = binding.evidence.mount_id
+    paths = _parent_paths(approved)
+    planned = {
+        entry.node
+        for entry in approved.directories
+        if type(entry) is ApprovedPlannedDirectory
+    }
+    existing = {
+        entry.node: entry
+        for entry in approved.directories
+        if type(entry) is ApprovedExistingDirectory
+    }
+
+    fds: dict[TopologyNode, int] = {}
+    owned: list[int] = []
+    stops: list[WalkStop] = []
+    stopped_nodes: set[TopologyNode] = set()
+
+    def validate(fd: int, node: TopologyNode) -> None:
+        """Ledger #19: identity, constraints, and mount, against the approved baseline.
+
+        DirectoryConstraints carries lookup_proof and name_max only, so mount membership
+        is a separate read -- a constraints comparison alone would pass a directory
+        replaced by a bind mount.
+        """
+        constraints = read_lookup_constraints(fd, filesystem_type)
+        mount = read_mount_id(fd)
+        if mount != expected_mount:
+            raise PreconditionRefused(
+                f"{node!r} is on mount {mount}, not the bound volume's {expected_mount}"
+            )
+        baseline = existing.get(node)
+        if baseline is not None:
+            info = os.fstat(fd)
+            actual = FilesystemIdentity(device=info.st_dev, inode=info.st_ino)
+            if actual != baseline.identity:
+                raise PreconditionRefused(
+                    f"{node!r} has identity {actual}, not the approved "
+                    f"{baseline.identity}; approval is not reapproved here"
+                )
+            if constraints != baseline.constraints:
+                raise PreconditionRefused(
+                    f"{node!r} has constraints {constraints}, not the approved "
+                    f"{baseline.constraints}"
+                )
+            return
+        # WorkRoot has no approved identity: A4b retained facts about metadata_root/work
+        # as ApprovedWorkBase, not as an ApprovedExistingDirectory.
+        if node == WorkRoot() and approved.work_base is not None:
+            if constraints != approved.work_base.constraints:
+                raise PreconditionRefused(
+                    f"the work root has constraints {constraints}, not the approved "
+                    f"{approved.work_base.constraints}"
+                )
+
+    try:
+        # Root 1: the project root, borrowed. Retention is not discharge -- lookup_proof
+        # and name_max are mutable directory properties, so it is re-validated too.
+        validate(binding.project_root_fd, ProjectRoot())
+        fds[ProjectRoot()] = binding.project_root_fd
+
+        # Root 2: the work root, borrowed, and present only when the topology has one.
+        # The logical WorkRoot -> ProjectRoot edge is NOT physically traversed: the work
+        # root lives under metadata_root, not beneath the project root.
+        if approved.work_base is not None:
+            validate(workspace.work_fd, WorkRoot())
+            fds[WorkRoot()] = workspace.work_fd
+
+        for node in _walk_order(approved, paths):
+            parent = _parent_of(approved, node)
+            parent_fd = fds.get(parent)
+            if parent_fd is None:
+                stopped_nodes.add(node)
+                continue
+            component = _component(paths, parent, node)
+            if node in planned:
+                # Looked up, not assumed. An occupied planned name must reach §8.2.
+                observed = observation.observe(
+                    parent_fd, component, modeled=_modeled_children(paths, node)
+                )
+                stops.append(
+                    WalkStop(
+                        node=node,
+                        path=paths[node],
+                        parent_fd=parent_fd,
+                        component=component,
+                        observed=observed,
+                    )
+                )
+                if type(observed) is not ObservedAbsent:
+                    continue
+                stopped_nodes.add(node)
+                continue
+            fd = _open_existing(binding, parent_fd, component)
+            if fd is None:
+                observed = observation.observe(
+                    parent_fd, component, modeled=_modeled_children(paths, node)
+                )
+                stops.append(
+                    WalkStop(
+                        node=node,
+                        path=paths[node],
+                        parent_fd=parent_fd,
+                        component=component,
+                        observed=observed,
+                    )
+                )
+                stopped_nodes.add(node)
+                continue
+            owned.append(fd)
+            validate(fd, node)
+            fds[node] = fd
+    except BaseException:
+        for fd in owned:
+            os.close(fd)
+        raise
+
+    unreachable = _closure(approved, stopped_nodes)
+    return DescriptorTable(
+        fds=fds, owned=tuple(owned), stops=tuple(stops), unreachable=unreachable
+    )
+
+
+def _open_existing(binding, parent_fd: int, component: str) -> int | None:
+    """Open a directory that approval said exists, or report that it no longer does.
+
+    `None` means "something else is there now" -- the caller observes what, coherently.
+    The errno is not consulted for a kind.
+    """
+    try:
+        return binding.backend.open_child_directory(parent_fd, component)
+    except OSError:
+        return None
+
+
+def _modeled_children(paths: dict[TopologyNode, str], node: TopologyNode) -> frozenset[str]:
+    """Every declared name directly beneath `node`, for occupancy evidence."""
+    prefix = paths[node]
+    base = f"{prefix}/" if prefix else ""
+    return frozenset(
+        path[len(base) :]
+        for path in paths.values()
+        if path.startswith(base) and path != prefix and "/" not in path[len(base) :]
+    )
+
+
+def _walk_order(
+    approved: ProjectApprovedSpec, paths: dict[TopologyNode, str]
+) -> tuple[TopologyNode, ...]:
+    """Directory nodes, shallowest first, so every parent is open before its child."""
+    directories = [
+        entry.node
+        for entry in approved.directories
+        if entry.node not in (ProjectRoot(), WorkRoot())
+    ]
+    return tuple(sorted(directories, key=lambda node: paths[node].count("/")))
+
+
+def _parent_of(approved: ProjectApprovedSpec, node: TopologyNode) -> TopologyNode:
+    for edge in approved.topology.parents:
+        if edge.node == node:
+            return edge.parent
+    raise ProtocolError(f"{node!r} has no parent edge in the approved topology")
+
+
+def _closure(
+    approved: ProjectApprovedSpec, stopped: set[TopologyNode]
+) -> frozenset[TopologyNode]:
+    """Every node at or beneath a stop. The topology is a tree, so this terminates."""
+    unreachable = set(stopped)
+    changed = True
+    while changed:
+        changed = False
+        for edge in approved.topology.parents:
+            if edge.parent in unreachable and edge.node not in unreachable:
+                unreachable.add(edge.node)
+                changed = True
+    return frozenset(unreachable)
+
+
+def _component(
+    paths: dict[TopologyNode, str], parent: TopologyNode, node: TopologyNode
+) -> str:
+    child_path, parent_path = paths[node], paths[parent]
+    remainder = child_path[len(parent_path) :].lstrip("/")
+    if not remainder or "/" in remainder:
+        raise ProtocolError(
+            f"{child_path!r} is not one component below {parent_path!r}; the walk "
+            "would have to assemble a multi-component path"
+        )
+    return remainder
+```
+
+- [ ] **Step 6: Run the tests to verify they pass**
+
+Run: `cd python && uv run pytest tests/test_coordinator_descriptors.py -q`
+Expected: PASS, 11 tests.
+
+- [ ] **Step 7: Run the full gate set**
+
+Run: `cd python && uv run ruff format && uv run ruff check && uv run pyright && uv run pytest -q`
+Expected: all green.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add python/src/atoms/fs/resolve.py python/src/atoms/coordinator/descriptors.py \
+        python/tests/capture_support.py python/tests/test_coordinator_descriptors.py
+git commit -m "feat(coordinator): hold a re-validated descriptor table across the walk"
+```
+
+---
+
+## Task 4: Capture — absence inference, staging, flush, and the manifest
+
+**Files:**
+- Create: `python/src/atoms/coordinator/capture.py`
+- Create: `python/tests/test_coordinator_capture.py`
+- Modify: `python/tests/test_fs_architecture.py` (register the entry point)
+
+**Interfaces:**
+- Produces:
+  - `class PayloadSource(Protocol):` — `open(self, digest: str) -> IO[bytes]`, raising `KeyError` for
+    an unknown digest
+  - `require_one_length_per_digest(pairs) -> dict[str, int]`
+  - `class Captured:` — `manifest: tuple[StagedBlob, ...]`, `descriptors: DescriptorTable`, `close()`,
+    `__enter__`, `__exit__`
+  - `capture_initial_surface(lease, approved, workspace, payloads) -> Captured`
+
+Tasks 4-and-5 of the previous revision are merged: the payload contract had no independently green
+commit, because its tests exercised an entry point that did not exist yet.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `python/tests/test_coordinator_capture.py`:
+
+```python
+"""A6 tier 3 -- capture: absence, staging, flush, and refusals (design §7, §8, §9)."""
+
+from __future__ import annotations
+
+import itertools
+import os
+
+import pytest
+
+from atoms.core.errors import PreconditionRefused, ProtocolError
+from atoms.core.fingerprint import SymlinkState
+from atoms.store.blobs import digest_to_leaf
+from tests.capture_support import (
+    AFTER,
+    BEFORE,
+    DictPayloads,
+    approved_blocked,
+    approved_delete_symlink,
+    approved_replace,
+    digest_of,
+    state_of,
+    write_project_file,
+)
+from tests.coordinator_support import compiled_creating_a_directory
+
+
+def payloads_for_replace() -> DictPayloads:
+    return DictPayloads({digest_of(AFTER): AFTER})
+
+
+# --- the digest-length precheck (design §7.2) ---------------------------------------
+
+
 def test_one_digest_at_two_lengths_refuses_before_anything_is_written():
-    """Design §7.2. Measured: `compile_spec` accepts the contradiction.
+    """Measured: `compile_spec` accepts the contradiction.
 
     The staging name is `digest_to_leaf(digest)` -- one name per digest -- so two lengths
-    would collide and whichever wrote second would publish a blob one effect's FileState
+    collide and whichever wrote second would publish a blob one effect's FileState
     disagrees with. `_preflight` catches it too, but only after both files exist.
     """
-    from atoms.core.errors import ProtocolError
     from atoms.coordinator.capture import require_one_length_per_digest
 
     with pytest.raises(ProtocolError, match="two byte_len"):
-        require_one_length_per_digest((("sha256:" + "a" * 64, 3), ("sha256:" + "a" * 64, 99)))
+        require_one_length_per_digest(
+            (("sha256:" + "a" * 64, 3), ("sha256:" + "a" * 64, 99))
+        )
 
 
 def test_one_length_per_digest_passes_through():
@@ -1776,34 +1751,125 @@ def test_one_length_per_digest_passes_through():
     }
 
 
-def test_a_preimage_is_staged_and_verified_from_one_read(leased):
+# --- absence inference (design §8) ---------------------------------------------------
+
+
+def test_a_missing_ancestor_justifies_its_descendants_absence(leased):
+    from atoms.coordinator.admission import admit
     from atoms.coordinator.capture import capture_initial_surface
     from atoms.coordinator.prepare import open_workspace
-    from atoms.store.blobs import digest_to_leaf
-    from tests.capture_support import AFTER, BEFORE, DictPayloads, digest_of
+
+    with leased() as lease:
+        approved = admit(lease, compiled_creating_a_directory(lease))
+        with open_workspace(lease, approved) as workspace:
+            with capture_initial_surface(
+                lease, approved, workspace, payloads_for_replace()
+            ) as captured:
+                assert captured.manifest
+
+
+def test_a_regular_file_blocker_matching_its_declared_state_justifies_absence(leased):
+    from atoms.coordinator.capture import capture_initial_surface
+    from atoms.coordinator.prepare import open_workspace
+
+    with leased() as lease:
+        write_project_file(lease, "p", BEFORE)
+        approved = approved_blocked(lease, state_of(BEFORE))
+        with open_workspace(lease, approved) as workspace:
+            with capture_initial_surface(
+                lease, approved, workspace, payloads_for_replace()
+            ):
+                pass
+
+
+def test_a_drifted_regular_file_blocker_refuses(leased):
+    from atoms.coordinator.capture import capture_initial_surface
+    from atoms.coordinator.prepare import open_workspace
+
+    with leased() as lease:
+        write_project_file(lease, "p", BEFORE)
+        approved = approved_blocked(lease, state_of(BEFORE))
+        write_project_file(lease, "p", b"drifted")
+        with open_workspace(lease, approved) as workspace:
+            with pytest.raises(PreconditionRefused, match="declared"):
+                with capture_initial_surface(
+                    lease, approved, workspace, payloads_for_replace()
+                ):
+                    pass
+
+
+def test_a_drifted_symlink_blocker_refuses(leased):
+    """A drifted symlink is a symlink but not THIS symlink."""
+    from atoms.coordinator.capture import capture_initial_surface
+    from atoms.coordinator.prepare import open_workspace
+
+    with leased() as lease:
+        root_fd = lease._binding.project_root_fd
+        os.symlink("elsewhere", "p", dir_fd=root_fd)
+        approved = approved_blocked(lease, SymlinkState(target="elsewhere", mode=0o777))
+        os.unlink("p", dir_fd=root_fd)
+        os.symlink("drifted", "p", dir_fd=root_fd)
+
+        with open_workspace(lease, approved) as workspace:
+            with pytest.raises(PreconditionRefused, match="declared"):
+                with capture_initial_surface(
+                    lease, approved, workspace, payloads_for_replace()
+                ):
+                    pass
+
+
+def test_a_top_level_declared_absent_path_is_accepted(leased):
+    """ABSENT is `AbsentState()`, not None.
+
+    An observed-to-declared comparison that reached for a missing `.state` attribute
+    would compare None against AbsentState and refuse every correct absent path.
+    """
+    from atoms.coordinator.admission import admit
+    from atoms.coordinator.capture import capture_initial_surface
+    from atoms.coordinator.prepare import open_workspace
+    from tests.coordinator_support import compiled_for
+
+    with leased() as lease:
+        approved = admit(lease, compiled_for(lease))  # CreateFileNoClobber d/f.txt
+        with open_workspace(lease, approved) as workspace:
+            with capture_initial_surface(
+                lease, approved, workspace, payloads_for_replace()
+            ) as captured:
+                # Nothing to retain: the only declared initial state is ABSENT.
+                assert {e.digest for e in captured.manifest} == {digest_of(AFTER)}
+
+
+# --- staging (design §7) --------------------------------------------------------------
+
+
+def test_a_preimage_is_staged_under_its_digest_leaf(leased):
+    from atoms.coordinator.capture import capture_initial_surface
+    from atoms.coordinator.prepare import open_workspace
 
     with leased() as lease:
         approved = approved_replace(lease)
-        payloads = DictPayloads({digest_of(AFTER): AFTER})
         with open_workspace(lease, approved) as workspace:
-            with capture_initial_surface(lease, approved, workspace, payloads) as captured:
+            with capture_initial_surface(
+                lease, approved, workspace, payloads_for_replace()
+            ) as captured:
                 names = {entry.name for entry in captured.manifest}
                 assert digest_to_leaf(digest_of(BEFORE)) in names
+                assert digest_to_leaf(digest_of(AFTER)) in names
                 assert set(os.listdir(workspace.staging_fd)) == names
 
 
 def test_a_drifted_preimage_refuses(leased):
     from atoms.coordinator.capture import capture_initial_surface
     from atoms.coordinator.prepare import open_workspace
-    from tests.capture_support import AFTER, DictPayloads, digest_of, write_project_file
 
     with leased() as lease:
         approved = approved_replace(lease)
         write_project_file(lease, "d/f.txt", b"drifted")
-        payloads = DictPayloads({digest_of(AFTER): AFTER})
         with open_workspace(lease, approved) as workspace:
             with pytest.raises(PreconditionRefused):
-                with capture_initial_surface(lease, approved, workspace, payloads):
+                with capture_initial_surface(
+                    lease, approved, workspace, payloads_for_replace()
+                ):
                     pass
 
 
@@ -1813,149 +1879,31 @@ def test_a_symlink_preimage_is_verified_and_not_staged(leased):
     `referenced_digests` filters on FileState and never names one, and §10's rollback
     material for a symlink is the atomically transferred tombstone, which only A7 creates.
     """
-    from atoms.core.fingerprint import SymlinkState
     from atoms.coordinator.capture import capture_initial_surface
     from atoms.coordinator.prepare import open_workspace
-    from tests.capture_support import DictPayloads, delete_symlink_approved
 
     with leased() as lease:
-        approved = delete_symlink_approved(lease)
+        approved = approved_delete_symlink(lease)
         with open_workspace(lease, approved) as workspace:
             with capture_initial_surface(
                 lease, approved, workspace, DictPayloads({})
             ) as captured:
                 assert captured.manifest == ()
                 assert os.listdir(workspace.staging_fd) == []
-```
-
-Add the supporting builder to `python/tests/capture_support.py`:
-
-```python
-def delete_symlink_spec(target: str = "elsewhere") -> TransactionSpec:
-    from atoms.core.fingerprint import SymlinkState
-
-    pre = SymlinkState(target=target, mode=0o777)
-    return build_spec(
-        consumer_tag="test",
-        intent_digest="sha256:" + "c" * 64,
-        initial_surface={"link": pre},
-        final_surface={"link": ABSENT},
-        effects=[DeletePath(effect_id="e1", path="link", pre=pre)],
-    )
 
 
-def delete_symlink_approved(lease: Lease, target: str = "elsewhere"):
-    from atoms.coordinator.admission import admit
-
-    root_fd = lease._binding.project_root_fd
-    try:
-        os.unlink("link", dir_fd=root_fd)
-    except FileNotFoundError:
-        pass
-    os.symlink(target, "link", dir_fd=root_fd)
-    return admit(lease, compile_spec(delete_symlink_spec(target)))
-```
-
-- [ ] **Step 2: Run the tests to verify they fail**
-
-Run: `cd python && uv run pytest tests/test_coordinator_capture.py -q`
-Expected: FAIL, `ImportError: cannot import name 'require_one_length_per_digest'`.
-
-- [ ] **Step 3: Write the implementation**
-
-Add to `python/src/atoms/coordinator/capture.py`:
-
-```python
-from typing import IO, Protocol
-
-from atoms.core.errors import ProtocolError
-from atoms.store.blobs import StagedBlob, digest_to_leaf
-from atoms.store.records import referenced_digests
-
-
-class PayloadSource(Protocol):
-    """The consumer's planned-postimage bytes (design §7.1).
-
-    Authority §4.1 forbids the engine from reaching back into consumer plan formats and
-    §4.2 reserves staging-path derivation to the engine, so the bytes arrive
-    content-addressed: two effects writing identical content are supplied once, and the
-    consumer never learns a staging path.
-
-    `open` returns a FRESH binary stream, owned by capture, which closes it whether the
-    stream is consumed, refused, or abandoned by an earlier failure.
-    """
-
-    def open(self, digest: str) -> IO[bytes]: ...
-
-
-def require_one_length_per_digest(
-    pairs: tuple[tuple[str, int], ...],
-) -> dict[str, int]:
-    """One byte_len per digest, checked BEFORE anything is written (design §7.2).
-
-    `compile_spec` validates each byte_len's range and the empty-hash correspondence but
-    never cross-checks that one content_hash carries one byte_len -- measured. The
-    staging name is one name per digest, so two lengths collide on it. `_preflight`
-    refuses this too, but only after capture has already written both files.
-
-    This is engine misuse surfacing at the first layer that can see it, not external
-    drift: the contradiction is in the frozen spec and no filesystem state is involved.
-    """
-    lengths: dict[str, int] = {}
-    for digest, byte_len in pairs:
-        previous = lengths.setdefault(digest, byte_len)
-        if previous != byte_len:
-            raise ProtocolError(
-                f"digest {digest} is declared at two byte_len values, {previous} and "
-                f"{byte_len}; both would stage under one name"
-            )
-    return lengths
-```
-
-- [ ] **Step 4: Run the two precheck tests**
-
-Run: `cd python && uv run pytest tests/test_coordinator_capture.py -q -k length`
-Expected: PASS, 2 tests. The staging tests still fail — Task 7 adds `capture_initial_surface`.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add python/src/atoms/coordinator/capture.py python/tests/capture_support.py \
-        python/tests/test_coordinator_capture.py
-git commit -m "feat(capture): add the payload contract and the digest-length precheck"
-```
-
----
-
-## Task 7: `capture_initial_surface`, flush ordering, and the manifest
-
-**Files:**
-- Modify: `python/src/atoms/coordinator/capture.py`
-- Modify: `python/src/atoms/coordinator/admission.py`
-- Modify: `python/tests/test_coordinator_capture.py`
-
-**Interfaces:**
-- Produces:
-  - `class Captured:` live resource with `manifest: tuple[StagedBlob, ...]`, `descriptors: DescriptorTable`, `close()`, `__enter__`, `__exit__`
-  - `capture_initial_surface(lease: Lease, approved: ProjectApprovedSpec, workspace: Workspace, payloads: PayloadSource) -> Captured`
-
-- [ ] **Step 1: Write the failing test**
-
-Add to `python/tests/test_coordinator_capture.py`:
-
-```python
 def test_capture_composes_with_preparation(leased):
     """The whole seam: open_workspace -> capture -> prepare_transaction."""
     from atoms.core.recovery import TransactionState
     from atoms.coordinator.capture import capture_initial_surface
     from atoms.coordinator.prepare import open_workspace, prepare_transaction
-    from tests.capture_support import AFTER, DictPayloads, digest_of
 
     with leased() as lease:
         approved = approved_replace(lease)
-        payloads = DictPayloads({digest_of(AFTER): AFTER})
         with open_workspace(lease, approved) as workspace:
-            with capture_initial_surface(lease, approved, workspace, payloads) as captured:
+            with capture_initial_surface(
+                lease, approved, workspace, payloads_for_replace()
+            ) as captured:
                 prepare_transaction(lease, approved, workspace, captured.manifest)
 
         record = lease._store.read_active()
@@ -1965,91 +1913,177 @@ def test_capture_composes_with_preparation(leased):
 
 
 def test_the_descriptor_table_outlives_capture(leased):
-    """§5.5: the table is what A7 executes against; capture returning a bare tuple would
-    force A7 to re-resolve and reopen the race §6 closes."""
-    from atoms.core.recovery.model import ProjectRoot
+    """§5.5: the table is what A7 executes against."""
+    from atoms.core.recovery.snapshot import ProjectRoot
     from atoms.coordinator.capture import capture_initial_surface
     from atoms.coordinator.prepare import open_workspace, prepare_transaction
-    from tests.capture_support import AFTER, DictPayloads, digest_of
 
     with leased() as lease:
         approved = approved_replace(lease)
-        payloads = DictPayloads({digest_of(AFTER): AFTER})
         with open_workspace(lease, approved) as workspace:
-            with capture_initial_surface(lease, approved, workspace, payloads) as captured:
+            with capture_initial_surface(
+                lease, approved, workspace, payloads_for_replace()
+            ) as captured:
                 prepare_transaction(lease, approved, workspace, captured.manifest)
                 # Still live AFTER preparation -- this is the whole point.
                 assert isinstance(captured.descriptors.fd_for(ProjectRoot()), int)
 
 
-def test_every_staged_file_is_flushed_before_its_sink_closes(leased, monkeypatch):
-    """§7.3 ordering. `promote_staging` flushes DIRECTORIES only, so nothing else makes
-    the contents durable; a lost flush is invisible until a crash."""
+def test_a_stray_staging_entry_refuses_rather_than_surviving_success(leased):
+    """§7.4 and criterion 10: on success, staging holds EXACTLY the manifest.
+
+    `promote_staging` would refuse the stray later, but capture must not report success
+    with an unrelated leaf still present.
+    """
     from atoms.coordinator.capture import capture_initial_surface
     from atoms.coordinator.prepare import open_workspace
-    from atoms.fs.linux import LinuxBackend
-    from tests.capture_support import AFTER, DictPayloads, digest_of
-
-    events: list[tuple[str, int]] = []
-    real_flush = LinuxBackend.flush_file
-    real_close = os.close
-
-    def spy_flush(self, fd):
-        events.append(("flush", fd))
-        return real_flush(self, fd)
-
-    def spy_close(fd):
-        events.append(("close", fd))
-        return real_close(fd)
-
-    monkeypatch.setattr(LinuxBackend, "flush_file", spy_flush)
 
     with leased() as lease:
         approved = approved_replace(lease)
-        payloads = DictPayloads({digest_of(AFTER): AFTER})
         with open_workspace(lease, approved) as workspace:
-            monkeypatch.setattr(os, "close", spy_close)
-            with capture_initial_surface(lease, approved, workspace, payloads) as captured:
-                monkeypatch.undo()
-                count = len(captured.manifest)
+            fd = os.open(
+                "stray",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=workspace.staging_fd,
+            )
+            os.close(fd)
+            with pytest.raises(PreconditionRefused, match="stray"):
+                with capture_initial_surface(
+                    lease, approved, workspace, payloads_for_replace()
+                ):
+                    pass
 
-    flushed = {fd for kind, fd in events if kind == "flush"}
-    assert len(flushed) >= count
-    for fd in flushed:
-        order = [i for i, (_, seen) in enumerate(events) if seen == fd]
-        kinds = [events[i][0] for i in order]
-        assert kinds.index("flush") < kinds.index("close"), f"fd {fd} closed before flush"
+
+# --- durability (design §7.3) ---------------------------------------------------------
+
+
+def test_every_staged_file_is_flushed_before_its_sink_closes(leased, monkeypatch):
+    """§7.3 ordering. `promote_staging` flushes DIRECTORIES only, so nothing else makes
+    the contents durable, and a lost flush is invisible until a crash.
+
+    Events are keyed by GENERATION, not by file descriptor: numeric descriptors are
+    reused, so a closed sink and a later one that happened to get the same number would
+    be conflated and the ordering assertion would pass on a broken build.
+    """
+    from atoms.coordinator import capture as capture_module
+    from atoms.coordinator.capture import capture_initial_surface
+    from atoms.coordinator.prepare import open_workspace
+    from atoms.fs.linux import LinuxBackend
+
+    generations: dict[int, int] = {}
+    events: list[tuple[str, int]] = []
+    counter = itertools.count()
+    real_open_sink = capture_module._open_sink
+    real_flush = LinuxBackend.flush_file
+    real_close = os.close
+
+    def spy_open_sink(workspace, name):
+        fd = real_open_sink(workspace, name)
+        generations[fd] = next(counter)
+        events.append(("open", generations[fd]))
+        return fd
+
+    def spy_flush(self, fd):
+        if fd in generations:
+            events.append(("flush", generations[fd]))
+        return real_flush(self, fd)
+
+    def spy_close(fd):
+        generation = generations.pop(fd, None)
+        if generation is not None:
+            events.append(("close", generation))
+        return real_close(fd)
+
+    monkeypatch.setattr(capture_module, "_open_sink", spy_open_sink)
+    monkeypatch.setattr(LinuxBackend, "flush_file", spy_flush)
+    monkeypatch.setattr(os, "close", spy_close)
+
+    with leased() as lease:
+        approved = approved_replace(lease)
+        with open_workspace(lease, approved) as workspace:
+            with capture_initial_surface(
+                lease, approved, workspace, payloads_for_replace()
+            ) as captured:
+                count = len(captured.manifest)
+    monkeypatch.undo()
+
+    opened = [g for kind, g in events if kind == "open"]
+    assert len(opened) == count
+    for generation in opened:
+        sequence = [kind for kind, g in events if g == generation]
+        assert sequence == ["open", "flush", "close"], (generation, sequence)
+
+
+# --- payload contract (design §7.1, §9) -----------------------------------------------
 
 
 def test_a_payload_whose_bytes_disagree_refuses(leased):
     from atoms.coordinator.capture import capture_initial_surface
     from atoms.coordinator.prepare import open_workspace
-    from tests.capture_support import AFTER, DictPayloads, digest_of
 
     with leased() as lease:
         approved = approved_replace(lease)
-        # Right key, wrong bytes: external state diverging from frozen intent.
         payloads = DictPayloads({digest_of(AFTER): b"not-after"})
         with open_workspace(lease, approved) as workspace:
-            with pytest.raises(PreconditionRefused, match="digest"):
+            with pytest.raises(PreconditionRefused, match="hashes to"):
                 with capture_initial_surface(lease, approved, workspace, payloads):
                     pass
 
 
 def test_a_missing_payload_binding_is_a_protocol_error(leased):
     """§9: absent or malformed is a broken submission, not external state."""
-    from atoms.core.errors import ProtocolError
     from atoms.coordinator.capture import capture_initial_surface
     from atoms.coordinator.prepare import open_workspace
-    from tests.capture_support import DictPayloads
 
     with leased() as lease:
         approved = approved_replace(lease)
         with open_workspace(lease, approved) as workspace:
-            with pytest.raises(ProtocolError, match="payload"):
+            with pytest.raises(ProtocolError, match="no binding"):
                 with capture_initial_surface(
                     lease, approved, workspace, DictPayloads({})
                 ):
+                    pass
+
+
+def test_a_payload_stream_error_propagates_as_itself(leased):
+    """§9.1: only the missing-binding signal is translated.
+
+    An `except Exception` around `open()` would convert EIO, ENOSPC, and outright bugs in
+    the consumer's source into ProtocolError, which is exactly the overreach A5a's rule
+    forbids.
+    """
+    from atoms.coordinator.capture import capture_initial_surface
+    from atoms.coordinator.prepare import open_workspace
+
+    class Exploding:
+        def open(self, digest):
+            raise OSError(5, "EIO")
+
+    with leased() as lease:
+        approved = approved_replace(lease)
+        with open_workspace(lease, approved) as workspace:
+            with pytest.raises(OSError) as caught:
+                with capture_initial_surface(lease, approved, workspace, Exploding()):
+                    pass
+            assert caught.value.errno == 5
+
+
+def test_a_payload_stream_yielding_text_refuses(leased):
+    from atoms.coordinator.capture import capture_initial_surface
+    from atoms.coordinator.prepare import open_workspace
+
+    class TextSource:
+        def open(self, digest):
+            import io
+
+            return io.StringIO("not bytes")
+
+    with leased() as lease:
+        approved = approved_replace(lease)
+        with open_workspace(lease, approved) as workspace:
+            with pytest.raises(ProtocolError, match="bytes"):
+                with capture_initial_surface(lease, approved, workspace, TextSource()):
                     pass
 
 
@@ -2061,7 +2095,6 @@ def test_an_extra_payload_binding_is_not_an_error(leased):
     """
     from atoms.coordinator.capture import capture_initial_surface
     from atoms.coordinator.prepare import open_workspace
-    from tests.capture_support import AFTER, DictPayloads, digest_of
 
     with leased() as lease:
         approved = approved_replace(lease)
@@ -2072,16 +2105,14 @@ def test_an_extra_payload_binding_is_not_an_error(leased):
                 assert captured.manifest
 
 
-def test_a_refusal_leaves_reclaimable_scratch_not_a_halt(leased):
+def test_a_refusal_leaves_reclaimable_scratch_and_no_record(leased):
     """§7.4: cleanliness is scoped to success.
 
     Partial workspace scratch is mutation-free, no durable record exists, and A5b's
     reclamation removes it at the next lease entry.
     """
-    from atoms.core.errors import TransactionHalted
     from atoms.coordinator.capture import capture_initial_surface
     from atoms.coordinator.prepare import open_workspace
-    from tests.capture_support import AFTER, DictPayloads, digest_of
 
     with leased() as lease:
         approved = approved_replace(lease)
@@ -2095,14 +2126,65 @@ def test_a_refusal_leaves_reclaimable_scratch_not_a_halt(leased):
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cd python && uv run pytest tests/test_coordinator_capture.py -q -k capture_composes`
-Expected: FAIL, `ImportError: cannot import name 'capture_initial_surface'`.
+Run: `cd python && uv run pytest tests/test_coordinator_capture.py -q`
+Expected: collection error, `ModuleNotFoundError: No module named 'atoms.coordinator.capture'`.
 
 - [ ] **Step 3: Write the implementation**
 
-Add to `python/src/atoms/coordinator/capture.py`:
+Create `python/src/atoms/coordinator/capture.py`:
 
 ```python
+"""Authority §7.3 step 1 -- coherent capture (design §7, §8, §9).
+
+Everything here happens BEFORE the durable record exists, so no path halts. Errnos with a
+defined domain meaning translate (`translated_lookup`); every other OSError propagates
+with its own class and traceback.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+from typing import IO, Protocol
+
+from atoms.core.errors import PreconditionRefused, ProtocolError
+from atoms.core.fingerprint import ABSENT, DirectoryState, FileState, SymlinkState
+from atoms.core.recovery.model import (
+    ObservedAbsent,
+    ObservedDirectory,
+    ObservedEntry,
+    ObservedFile,
+    ObservedSymlink,
+)
+from atoms.coordinator.admission import _require_admitted
+from atoms.coordinator.descriptors import DescriptorTable, WalkStop, _build_descriptor_table
+from atoms.coordinator.lease import Lease
+from atoms.fs.approval import ProjectApprovedSpec
+from atoms.fs.observe import Observation
+from atoms.store.blobs import StagedBlob, digest_to_leaf
+from atoms.store.records import referenced_digests
+from atoms.store.workspace import Workspace
+
+_READ_CHUNK = 1 << 20
+
+
+class PayloadSource(Protocol):
+    """The consumer's planned-postimage bytes (design §7.1).
+
+    Authority §4.1 forbids the engine from reaching back into consumer plan formats and
+    §4.2 reserves staging-path derivation to the engine, so the bytes arrive
+    content-addressed: two effects writing identical content are supplied once, and the
+    consumer never learns a staging path.
+
+    `open` returns a FRESH binary stream, owned by capture, which closes it whether the
+    stream is consumed, refused, or abandoned by an earlier failure. It raises `KeyError`
+    -- and only `KeyError` -- when it has no binding for a digest. That is the one signal
+    capture translates; every other exception is the source's own and propagates.
+    """
+
+    def open(self, digest: str) -> IO[bytes]: ...
+
+
 class Captured:
     """A live resource: the manifest, and the descriptor table that outlives capture."""
 
@@ -2134,10 +2216,7 @@ def capture_initial_surface(
     workspace: Workspace,
     payloads: PayloadSource,
 ) -> Captured:
-    """Authority §7.3 step 1 (design §7).
-
-    Everything here happens BEFORE the durable record exists, so no path halts.
-    """
+    """Authority §7.3 step 1 (design §7)."""
     _require_admitted(lease, approved)
     if workspace.txid != approved.txid:
         raise ProtocolError(
@@ -2147,43 +2226,114 @@ def capture_initial_surface(
 
     lengths = require_one_length_per_digest(referenced_digests(approved.compiled.spec))
     backend = lease._binding.backend
-    table = build_descriptor_table(lease, approved, workspace)
     manifest: list[StagedBlob] = []
+    table: DescriptorTable | None = None
     try:
         with Observation(backend) as observation:
-            verify_absence_below(observation, table, approved)
-            retained = _observe_and_verify(observation, table, approved, workspace, backend)
-            manifest.extend(retained)
+            table = _build_descriptor_table(lease, approved, workspace, observation)
+            _verify_stops(table, approved)
+            manifest.extend(
+                _stage_preimages(observation, table, approved, workspace, backend)
+            )
         manifest.extend(
             _stage_payloads(
                 backend, workspace, payloads, lengths, {e.digest for e in manifest}
             )
         )
+        _require_staging_matches(workspace, manifest)
     except BaseException:
-        table.close()
+        if table is not None:
+            table.close()
         raise
     return Captured(manifest=tuple(manifest), descriptors=table)
-```
 
-And the two staging helpers:
 
-```python
-def _observe_and_verify(
+def require_one_length_per_digest(
+    pairs: tuple[tuple[str, int], ...],
+) -> dict[str, int]:
+    """One byte_len per digest, checked BEFORE anything is written (design §7.2).
+
+    `compile_spec` validates each byte_len's range and the empty-hash correspondence but
+    never cross-checks that one content_hash carries one byte_len -- measured. The staging
+    name is one name per digest, so two lengths collide on it. `_preflight` refuses this
+    too, but only after capture has already written both files.
+
+    Engine misuse surfacing at the first layer that can see it, not external drift: the
+    contradiction is in the frozen spec and no filesystem state is involved.
+    """
+    lengths: dict[str, int] = {}
+    for digest, byte_len in pairs:
+        previous = lengths.setdefault(digest, byte_len)
+        if previous != byte_len:
+            raise ProtocolError(
+                f"digest {digest} is declared at two byte_len values, {previous} and "
+                f"{byte_len}; both would stage under one name"
+            )
+    return lengths
+
+
+def _verify_stops(table: DescriptorTable, approved: ProjectApprovedSpec) -> None:
+    """Justify the absence of everything beneath each stop (design §8).
+
+    Two routes, two branches, both selected by the DECLARED state and never by an errno.
+    Conflating them would silently grant a symlink the file branch's coherence.
+    """
+    declared = _first_states(approved)
+    for stop in table.stops:
+        if type(stop.observed) is ObservedAbsent:
+            # §8.1: the planned directory's name is genuinely free.
+            continue
+        expected = declared.get(stop.path)
+        if type(expected) is FileState:
+            # §8.2, descriptor-coherent: type, mode, and hash all from one descriptor.
+            # Stronger than the negative lookup it replaces.
+            _require_declared(stop, ObservedFile, expected)
+        elif type(expected) is SymlinkState:
+            # §8.2, NOT descriptor-coherent: lstat + readlink, no descriptor, no
+            # identity. The absence inference holds because a symlink holds no entries;
+            # the identity contract is deferred to A7's destructive transfer.
+            _require_declared(stop, ObservedSymlink, expected)
+        else:
+            raise PreconditionRefused(
+                f"{stop.path!r} blocks traversal but no declared file or symlink state "
+                f"describes it; observed {stop.observed!r}"
+            )
+
+
+def _require_declared(stop: WalkStop, expected_type: type, expected) -> None:
+    if type(stop.observed) is not expected_type or stop.observed.state != expected:
+        raise PreconditionRefused(
+            f"{stop.path!r} blocks traversal but is not the declared {expected!r}; "
+            f"observed {stop.observed!r}"
+        )
+
+
+def _stage_preimages(
     observation: Observation,
     table: DescriptorTable,
     approved: ProjectApprovedSpec,
     workspace: Workspace,
     backend,
 ) -> list[StagedBlob]:
-    """Verify every declared path against its timeline's FIRST precondition, staging
-    each regular-file preimage through the same descriptor it was hashed from."""
+    """Verify every reachable declared path against its timeline's FIRST precondition.
+
+    Later occurrence-local preconditions describe intermediate states no initial capture
+    can observe, and checking them here would refuse correct transactions.
+    """
     declared = _first_states(approved)
     staged: list[StagedBlob] = []
     seen: set[str] = set()
     for path_entry in approved.paths:
-        parent_fd = _parent_fd_or_none(table, path_entry.parent_node)
-        if parent_fd is None:
-            continue  # Below a stop; §8 already justified its absence.
+        parent = path_entry.parent_node
+        if table.is_unreachable(parent):
+            continue  # §8 already justified the absence of everything below the stop.
+        try:
+            parent_fd = table.fd_for(parent)
+        except KeyError as caught:
+            raise ProtocolError(
+                f"{parent!r} is neither in the descriptor table nor proved unreachable; "
+                "the walk and the approved paths disagree"
+            ) from caught
         expected = declared[path_entry.path]
         if type(expected) is FileState and expected.content_hash not in seen:
             seen.add(expected.content_hash)
@@ -2203,7 +2353,11 @@ def _observe_and_verify(
                 )
             )
             continue
-        entry = observation.observe(parent_fd, path_entry.leaf)
+        entry = observation.observe(
+            parent_fd,
+            path_entry.leaf,
+            modeled=_modeled_under(approved, path_entry.path),
+        )
         _require_state(path_entry.path, entry, expected)
     return staged
 
@@ -2217,38 +2371,53 @@ def _stage_payloads(
 ) -> list[StagedBlob]:
     staged: list[StagedBlob] = []
     for digest in sorted(set(lengths) - already):
-        name = digest_to_leaf(digest)
         try:
             stream = payloads.open(digest)
-        except Exception as caught:
+        except KeyError as caught:
             raise ProtocolError(
-                f"the payload source supplied no usable binding for {digest}: {caught}"
+                f"the payload source has no binding for {digest}, which the frozen spec "
+                "declares as a planned postimage"
             ) from caught
-        sink = _open_sink(workspace, name)
+        # Two independent owners: a failure to open the sink must not leak the stream,
+        # and a stream that raises on close must not skip closing the sink.
         try:
-            observed, byte_len = _stream_into(stream, sink)
-            if observed != digest or byte_len != lengths[digest]:
-                raise PreconditionRefused(
-                    f"the payload for {digest} hashes to {observed} at {byte_len} "
-                    f"bytes, not {digest} at {lengths[digest]}"
-                )
-            backend.flush_file(sink)
+            sink = _open_sink(workspace, digest_to_leaf(digest))
+            try:
+                observed, byte_len = _stream_into(stream, sink)
+                if observed != digest or byte_len != lengths[digest]:
+                    raise PreconditionRefused(
+                        f"the payload for {digest} hashes to {observed} at {byte_len} "
+                        f"bytes, not {digest} at {lengths[digest]}"
+                    )
+                backend.flush_file(sink)
+            finally:
+                os.close(sink)
         finally:
             stream.close()
-            os.close(sink)
-        staged.append(StagedBlob(name=name, digest=digest, byte_len=lengths[digest]))
+        staged.append(
+            StagedBlob(
+                name=digest_to_leaf(digest), digest=digest, byte_len=lengths[digest]
+            )
+        )
     return staged
-```
 
-Plus the three small helpers `_open_sink`, `_stream_into`, `_require_state`, and
-`_parent_fd_or_none`:
 
-```python
+def _require_staging_matches(
+    workspace: Workspace, manifest: list[StagedBlob]
+) -> None:
+    """On success, staging holds EXACTLY the manifest (design §7.4, criterion 10)."""
+    present = set(os.listdir(workspace.staging_fd))
+    expected = {entry.name for entry in manifest}
+    if present != expected:
+        raise PreconditionRefused(
+            f"staging/{workspace.txid}/ holds stray entries "
+            f"{sorted(present - expected)} and is missing {sorted(expected - present)}"
+        )
+
+
 def _open_sink(workspace: Workspace, name: str) -> int:
     """The staging sink. O_EXCL, so external occupancy of the leaf surfaces as EEXIST."""
-    flags = (
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
-    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
     try:
         return os.open(name, flags, 0o600, dir_fd=workspace.staging_fd)
     except FileExistsError as caught:
@@ -2260,49 +2429,90 @@ def _open_sink(workspace: Workspace, name: str) -> int:
 
 
 def _stream_into(stream: IO[bytes], sink_fd: int) -> tuple[str, int]:
-    import hashlib
-
     digest = hashlib.sha256()
     length = 0
     while True:
-        chunk = stream.read(1 << 20)
+        chunk = stream.read(_READ_CHUNK)
         if not chunk:
             break
+        if type(chunk) is not bytes:
+            raise ProtocolError(
+                f"a payload stream yielded {type(chunk).__name__}, not bytes"
+            )
         digest.update(chunk)
         length += len(chunk)
-        offset = 0
         view = memoryview(chunk)
-        while offset < len(chunk):
-            offset += os.write(sink_fd, view[offset:])
+        while view:
+            view = view[os.write(sink_fd, view) :]
     return "sha256:" + digest.hexdigest(), length
 
 
-def _require_state(path: str, entry, expected) -> None:
-    observed = getattr(entry, "state", None)
-    if observed != expected:
+def _require_state(path: str, entry: ObservedEntry, expected) -> None:
+    """Compare an observation with a declared state.
+
+    Explicit per kind. `ABSENT` is `AbsentState()`, not None, so reaching for a missing
+    `.state` attribute would compare None against AbsentState and refuse every correct
+    declared-absent path.
+    """
+    matches = (
+        (type(entry) is ObservedAbsent and expected is ABSENT)
+        or (type(entry) is ObservedFile and type(expected) is FileState)
+        or (type(entry) is ObservedSymlink and type(expected) is SymlinkState)
+        or (type(entry) is ObservedDirectory and type(expected) is DirectoryState)
+    )
+    if not matches:
         raise PreconditionRefused(
-            f"{path!r} is {observed!r}, not the declared initial {expected!r}"
+            f"{path!r} is {entry!r}, which is not the declared initial {expected!r}"
+        )
+    if type(entry) is not ObservedAbsent and entry.state != expected:
+        raise PreconditionRefused(
+            f"{path!r} is {entry.state!r}, not the declared initial {expected!r}"
         )
 
 
-def _parent_fd_or_none(table: DescriptorTable, node) -> int | None:
-    try:
-        return table.fd_for(node)
-    except KeyError:
-        return None
+def _modeled_under(approved: ProjectApprovedSpec, path: str) -> frozenset[str]:
+    base = f"{path}/"
+    return frozenset(
+        entry.path[len(base) :]
+        for entry in approved.paths
+        if entry.path.startswith(base) and "/" not in entry.path[len(base) :]
+    )
+
+
+def _first_states(approved: ProjectApprovedSpec) -> dict[str, object]:
+    """Each path's FIRST precondition -- the declared initial surface.
+
+    Measured: `PathTimeline` is `(path, occurrences)` and `TimelineOccurrence` carries
+    `pre`.
+    """
+    return {
+        timeline.path: timeline.occurrences[0].pre
+        for timeline in approved.compiled.timelines
+    }
 ```
 
-- [ ] **Step 4: Add the admission gate**
+- [ ] **Step 4: Register the entry point**
 
-In `python/src/atoms/coordinator/admission.py`, extend the entry-point gate-set docstring and any
-gate-set registry to name `capture_initial_surface` as A6's **one** new entry (ledger #9). The
-descriptor-table builder stays package-private and is reached only through it, so it is not a second
-gate site.
+In `python/tests/test_fs_architecture.py`, extend `_TRANSACTION_STAGE_ENTRY_POINTS`:
+
+```python
+_TRANSACTION_STAGE_ENTRY_POINTS = {
+    "atoms/coordinator/capture.py": ("capture_initial_surface",),
+    "atoms/coordinator/prepare.py": ("open_workspace", "prepare_transaction"),
+    "atoms/coordinator/transitions.py": ("persist_plan_prefix",),
+}
+```
+
+Measured: `test_no_unregistered_public_function_accepts_the_proof` asserts `found == registered` over
+every public `coordinator/*.py` function annotating a `ProjectApprovedSpec` parameter, and
+`test_every_transaction_stage_entry_point_opens_with_the_proof_gate` requires `_require_admitted(...)`
+as the first statement after the docstring. `capture_initial_surface` satisfies both;
+`_build_descriptor_table` is private and therefore neither found nor registered.
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `cd python && uv run pytest tests/test_coordinator_capture.py -q`
-Expected: PASS, 14 tests.
+Run: `cd python && uv run pytest tests/test_coordinator_capture.py tests/test_fs_architecture.py -q`
+Expected: PASS, 20 capture tests plus the architecture tier.
 
 - [ ] **Step 6: Run the full gate set**
 
@@ -2312,25 +2522,22 @@ Expected: all green.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add python/src/atoms/coordinator/capture.py python/src/atoms/coordinator/admission.py \
-        python/tests/test_coordinator_capture.py
+git add python/src/atoms/coordinator/capture.py python/tests/test_coordinator_capture.py \
+        python/tests/test_fs_architecture.py
 git commit -m "feat(capture): stage the initial surface behind one flushed manifest"
 ```
 
 ---
 
-## Task 8: Conformance against A3's two routes
+## Task 5: Conformance against A3's two routes
 
 **Files:**
 - Create: `python/tests/test_coordinator_capture_conformance.py`
 
-**Interfaces:**
-- Consumes: everything above; adds no production code.
-
-The **`Observation` mechanism's** outputs feed two different A3 entry points, and one route cannot
-exercise both. `Captured` exposes no observations — it carries the manifest and the descriptor table —
-so both routes drive the observer directly. Scratch relations come from the real observer over actual
-files and descriptors; building a `ScratchObservation` by hand and feeding it to A3 tests A3, not A6.
+Adds no production code. The **`Observation` mechanism's** outputs feed two different A3 entry points
+and one route cannot exercise both; `Captured` exposes no observations, so both routes drive the
+observer directly. Scratch relations come from the real observer over actual files and descriptors —
+building a `ScratchObservation` by hand and feeding it to A3 tests A3, not A6.
 
 - [ ] **Step 1: Write the test**
 
@@ -2351,155 +2558,336 @@ from atoms.core.recovery import (
     ScratchObservation,
     ScratchRole,
     TransactionState,
+    authorize_recovery_step,
     build_recovery_snapshot,
+    classify_recovery,
 )
-from atoms.core.recovery.plan import JointObservation
+from atoms.core.recovery.model import FileBuildRelation
+from atoms.core.recovery.plan import ActionPlan, JointObservation
+from atoms.fs.linux import LinuxBackend
 from atoms.fs.observe import Observation
-from tests.capture_support import BEFORE, approved_replace, write_project_file
+from tests.capture_support import approved_replace
+
+
+def _observed(lease, approved, workspace):
+    from atoms.coordinator.descriptors import _build_descriptor_table
+
+    with Observation(LinuxBackend()) as observation:
+        table = _build_descriptor_table(lease, approved, workspace, observation)
+        try:
+            (path_entry,) = approved.paths
+            scratch = approved.scratch[0]
+            live = observation.observe(
+                table.fd_for(path_entry.parent_node), path_entry.leaf
+            )
+            slot = observation.observe(
+                table.fd_for(scratch.parent_node), scratch.leaf
+            )
+        finally:
+            table.close()
+    return path_entry, scratch, live, slot
 
 
 def test_a_complete_observation_is_accepted_by_build_recovery_snapshot(leased):
     """Proves the observer satisfies A3's coverage and shape validators without A7."""
-    from atoms.coordinator.descriptors import build_descriptor_table
     from atoms.coordinator.prepare import open_workspace
 
     with leased() as lease:
         approved = approved_replace(lease)
         with open_workspace(lease, approved) as workspace:
-            with build_descriptor_table(lease, approved, workspace) as table:
-                with Observation(lease._binding.backend) as observation:
-                    (path_entry,) = approved.paths
-                    live = observation.observe(
-                        table.fd_for(path_entry.parent_node), path_entry.leaf
-                    )
-                    scratch_entry = observation.observe(
-                        table.fd_for(approved.scratch[0].parent_node),
-                        approved.scratch[0].leaf,
-                    )
+            path_entry, scratch, live, slot = _observed(lease, approved, workspace)
 
-                snapshot = build_recovery_snapshot(
-                    compiled=approved.compiled,
-                    topology=approved.topology,
-                    transaction_state=TransactionState.PREPARED,
-                    commit_decision=CommitDecision.UNCOMMITTED,
-                    rollback_result=None,
-                    halt_diagnostic=None,
-                    active=True,
-                    journals=(EffectJournalState("e1", JournalState.PENDING),),
-                    persistent_observations=(
-                        PersistentObservation(path_entry.path, live),
-                    ),
-                    scratch_observations=(
-                        ScratchObservation("e1", ScratchRole.STAGING, scratch_entry, None),
-                    ),
-                )
+            snapshot = build_recovery_snapshot(
+                compiled=approved.compiled,
+                topology=approved.topology,
+                transaction_state=TransactionState.PREPARED,
+                commit_decision=CommitDecision.UNCOMMITTED,
+                rollback_result=None,
+                halt_diagnostic=None,
+                active=True,
+                journals=(EffectJournalState("e1", JournalState.PENDING),),
+                persistent_observations=(PersistentObservation(path_entry.path, live),),
+                scratch_observations=(
+                    ScratchObservation("e1", scratch.role, slot, None),
+                ),
+            )
 
     assert snapshot.persistent_observations[0].entry is live
 
 
-def test_a_scratch_only_observation_forms_a_joint_observation(leased):
-    """The committed-cleanup route: exactly the named retained scratch slot, with empty
-    persistent and occupancy coverage. `authorize_recovery_step` consumes this, not a
-    RecoverySnapshot, so one conformance route cannot test both."""
-    from atoms.coordinator.descriptors import build_descriptor_table
+def test_a_joint_observation_is_accepted_by_authorize_recovery_step(leased):
+    """The committed-cleanup route, driven to a VERDICT.
+
+    Constructing a JointObservation and asserting its fields would test the dataclass.
+    `authorize_recovery_step` is the function whose contract A6's output has to satisfy,
+    so the test calls it and asserts it did not halt on the shape.
+    """
     from atoms.coordinator.prepare import open_workspace
 
     with leased() as lease:
         approved = approved_replace(lease)
-        scratch = approved.scratch[0]
         with open_workspace(lease, approved) as workspace:
-            with build_descriptor_table(lease, approved, workspace) as table:
-                parent_fd = table.fd_for(scratch.parent_node)
-                fd = os.open(
-                    scratch.leaf,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                    0o600,
-                    dir_fd=parent_fd,
-                )
-                os.write(fd, b"partial")
-                os.close(fd)
-                try:
-                    with Observation(lease._binding.backend) as observation:
-                        entry = observation.observe(parent_fd, scratch.leaf)
-                        joint = JointObservation(
-                            persistent=(),
-                            scratch=(
-                                ScratchObservation(
-                                    scratch.effect_id, scratch.role, entry, None
-                                ),
-                            ),
-                            parent_occupancy=(),
-                        )
-                finally:
-                    os.unlink(scratch.leaf, dir_fd=parent_fd)
+            path_entry, scratch, live, slot = _observed(lease, approved, workspace)
 
-    assert joint.persistent == ()
-    assert joint.scratch[0].effect_id == scratch.effect_id
+            snapshot = build_recovery_snapshot(
+                compiled=approved.compiled,
+                topology=approved.topology,
+                transaction_state=TransactionState.PREPARED,
+                commit_decision=CommitDecision.UNCOMMITTED,
+                rollback_result=None,
+                halt_diagnostic=None,
+                active=True,
+                journals=(EffectJournalState("e1", JournalState.PENDING),),
+                persistent_observations=(PersistentObservation(path_entry.path, live),),
+                scratch_observations=(
+                    ScratchObservation("e1", scratch.role, slot, None),
+                ),
+            )
+            plan = classify_recovery(snapshot)
+            assert type(plan) is ActionPlan
+
+            joint = JointObservation(
+                persistent=(PersistentObservation(path_entry.path, live),),
+                scratch=(ScratchObservation("e1", scratch.role, slot, None),),
+                parent_occupancy=(),
+            )
+            outcome = authorize_recovery_step(plan, 0, joint)
+
+    # A6's obligation is that its observation is a well-formed input, not that a
+    # particular step authorizes. A HaltPlan citing a malformed observation would fail
+    # here; one citing genuine state is A7's business.
+    assert outcome is not None
 
 
 def test_the_prefix_relation_comes_from_real_files(leased):
-    """§11.3: over actual files and descriptors, not hand-built model values.
-
-    A `ScratchObservation` constructed by hand and fed to A3 tests A3.
-    """
-    from atoms.core.recovery.model import FileBuildRelation
-    from atoms.coordinator.descriptors import build_descriptor_table
+    """§11.3: over actual files and descriptors, not hand-built model values."""
     from atoms.coordinator.prepare import open_workspace
 
     with leased() as lease:
         approved = approved_replace(lease)
         with open_workspace(lease, approved) as workspace:
-            with build_descriptor_table(lease, approved, workspace) as table:
-                staging_fd = workspace.staging_fd
-                for name, payload in (("staged", b"pay"), ("planned", b"payload")):
-                    fd = os.open(
-                        name,
-                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                        0o600,
-                        dir_fd=staging_fd,
-                    )
-                    os.write(fd, payload)
-                    os.close(fd)
-                staged_fd = os.open("staged", os.O_RDONLY, dir_fd=staging_fd)
-                planned_fd = os.open("planned", os.O_RDONLY, dir_fd=staging_fd)
-                try:
-                    with Observation(lease._binding.backend) as observation:
-                        relation = observation.build_relation(staged_fd, planned_fd)
-                finally:
-                    os.close(staged_fd)
-                    os.close(planned_fd)
-                    os.unlink("staged", dir_fd=staging_fd)
-                    os.unlink("planned", dir_fd=staging_fd)
+            staging_fd = workspace.staging_fd
+            for name, payload in (("staged", b"pay"), ("planned", b"payload")):
+                fd = os.open(
+                    name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=staging_fd
+                )
+                os.write(fd, payload)
+                os.close(fd)
+            staged_fd = os.open("staged", os.O_RDONLY, dir_fd=staging_fd)
+            planned_fd = os.open("planned", os.O_RDONLY, dir_fd=staging_fd)
+            try:
+                with Observation(LinuxBackend()) as observation:
+                    relation = observation.build_relation(staged_fd, planned_fd)
+            finally:
+                os.close(staged_fd)
+                os.close(planned_fd)
+                os.unlink("staged", dir_fd=staging_fd)
+                os.unlink("planned", dir_fd=staging_fd)
 
-    assert relation is FileBuildRelation.PREFIX
+    assert relation is FileBuildRelation.STRICT_PREFIX
 ```
 
 - [ ] **Step 2: Run the tests**
 
 Run: `cd python && uv run pytest tests/test_coordinator_capture_conformance.py -q`
-Expected: PASS, 3 tests.
+Expected: PASS, 3 tests. **If `classify_recovery` returns a `HaltPlan` for this snapshot, stop and
+report it** — the fixture is a clean PREPARED/PENDING transaction and should classify as a rollback.
 
 - [ ] **Step 3: Commit**
 
 ```bash
 git add python/tests/test_coordinator_capture_conformance.py
-git commit -m "test(capture): conform the observer to A3's snapshot and joint routes"
+git commit -m "test(capture): conform the observer to A3's snapshot and authorization routes"
 ```
 
 ---
 
-## Task 9: Architecture guards, the adversarial tier, and the documents
+## Task 6: The adversarial tier and the mutation surface
+
+**Files:**
+- Modify: `python/tests/coordinator_support.py` (receives `project_state`)
+- Modify: `python/tests/test_coordinator_lease.py` (imports the moved helper)
+- Create: `python/tests/test_coordinator_capture_adversarial.py`
+
+Scoped to A6. Symlink validation after a destructive transfer, and effect-staging swaps between a
+pre-publication check and the publishing rename, are **A7 obligations** — the objects do not exist
+until an effect creates them.
+
+- [ ] **Step 1: Move the mutation-surface helper**
+
+Cut `_project_state` from `python/tests/test_coordinator_lease.py:186` into
+`python/tests/coordinator_support.py` as a public `project_state`, keeping its docstring verbatim. In
+`test_coordinator_lease.py`, import it and replace the local calls.
+
+Measured: it already records the root itself as `"."`, uses `lstat` throughout so a symlink is
+compared as a symlink rather than followed, and keys on `(S_IFMT, S_IMODE, st_dev, st_ino, st_size,
+payload)` — which is why A6 reuses it rather than writing a weaker `os.walk` over files only.
+
+Run: `cd python && uv run pytest tests/test_coordinator_lease.py -q`
+Expected: PASS, unchanged.
+
+- [ ] **Step 2: Write the adversarial tests**
+
+Create `python/tests/test_coordinator_capture_adversarial.py`:
+
+```python
+"""A6 tier 5 -- adversarial, scoped to A6 (design §11.6)."""
+
+from __future__ import annotations
+
+import os
+
+import pytest
+
+from atoms.core.errors import PreconditionRefused
+from tests.capture_support import (
+    AFTER,
+    DictPayloads,
+    approved_replace,
+    digest_of,
+)
+from tests.coordinator_support import project_state
+
+
+def payloads() -> DictPayloads:
+    return DictPayloads({digest_of(AFTER): AFTER})
+
+
+def test_no_project_path_is_mutated_by_capture(leased, ext4_project_root):
+    """Authority §13.5. A6 writes only into staging/<txid>/.
+
+    `project_state` records the root itself, every descendant, `lstat` rather than
+    `stat`, and st_dev/st_ino -- so a path replaced by an inode of identical kind, mode,
+    and content is still visible, and a chmod on the root is not invisible.
+    """
+    from atoms.coordinator.capture import capture_initial_surface
+    from atoms.coordinator.prepare import open_workspace
+
+    with leased() as lease:
+        approved = approved_replace(lease)
+        before = project_state(str(ext4_project_root))
+        with open_workspace(lease, approved) as workspace:
+            with capture_initial_surface(lease, approved, workspace, payloads()):
+                pass
+        assert project_state(str(ext4_project_root)) == before
+
+
+def test_no_project_path_is_mutated_by_a_refused_capture(leased, ext4_project_root):
+    from atoms.coordinator.capture import capture_initial_surface
+    from atoms.coordinator.prepare import open_workspace
+
+    with leased() as lease:
+        approved = approved_replace(lease)
+        before = project_state(str(ext4_project_root))
+        bad = DictPayloads({digest_of(AFTER): b"wrong"})
+        with open_workspace(lease, approved) as workspace:
+            with pytest.raises(PreconditionRefused):
+                with capture_initial_surface(lease, approved, workspace, bad):
+                    pass
+        assert project_state(str(ext4_project_root)) == before
+
+
+def test_a_leaf_swapped_between_the_walk_and_the_observation_refuses(leased, monkeypatch):
+    """Between two A6 steps, not before capture begins.
+
+    The table opens and validates `d`; the observation then looks `f.txt` up beneath the
+    held descriptor. Swapping the leaf in the window between them is the race A6 itself
+    can close -- a swap after observation is A7's destructive-transfer validation, and
+    asserting it here would prove nothing about the code that will own it.
+    """
+    from atoms.coordinator import capture as capture_module
+    from atoms.coordinator.capture import capture_initial_surface
+    from atoms.coordinator.prepare import open_workspace
+
+    with leased() as lease:
+        approved = approved_replace(lease)
+        root_fd = lease._binding.project_root_fd
+        real_verify = capture_module._verify_stops
+
+        def swap_then_verify(table, spec):
+            os.unlink("d/f.txt", dir_fd=root_fd)
+            os.symlink("/etc/passwd", "d/f.txt", dir_fd=root_fd)
+            return real_verify(table, spec)
+
+        monkeypatch.setattr(capture_module, "_verify_stops", swap_then_verify)
+        with open_workspace(lease, approved) as workspace:
+            with pytest.raises(PreconditionRefused):
+                with capture_initial_surface(lease, approved, workspace, payloads()):
+                    pass
+
+
+def test_a_mount_crossing_mid_walk_refuses(leased, monkeypatch):
+    """DirectoryConstraints carries lookup_proof and name_max only.
+
+    A constraints comparison alone would pass a directory replaced by a bind mount, so
+    mount membership is read separately and compared with the bound volume's.
+    """
+    from atoms.coordinator import descriptors
+    from atoms.coordinator.capture import capture_initial_surface
+    from atoms.coordinator.prepare import open_workspace
+
+    with leased() as lease:
+        approved = approved_replace(lease)
+        real_read = descriptors.read_mount_id
+        root_fd = lease._binding.project_root_fd
+
+        def foreign_mount(fd):
+            # The project root itself keeps its real mount; the child `d` reports a
+            # different one, which is the shape a bind mount over `d` would produce.
+            return real_read(fd) if fd == root_fd else real_read(fd) + 1_000_000
+
+        monkeypatch.setattr(descriptors, "read_mount_id", foreign_mount)
+        with open_workspace(lease, approved) as workspace:
+            with pytest.raises(PreconditionRefused, match="mount"):
+                with capture_initial_surface(lease, approved, workspace, payloads()):
+                    pass
+
+
+def test_project_root_constraint_drift_after_approval_refuses(leased, monkeypatch):
+    """§5.3: retention is not discharge."""
+    from atoms.coordinator import descriptors
+    from atoms.coordinator.capture import capture_initial_surface
+    from atoms.coordinator.prepare import open_workspace
+    from atoms.fs.lookup import DirectoryConstraints, LookupProof
+
+    with leased() as lease:
+        approved = approved_replace(lease)
+        drifted = DirectoryConstraints(lookup_proof=LookupProof.EXACT_BYTES, name_max=64)
+        monkeypatch.setattr(
+            descriptors, "read_lookup_constraints", lambda fd, kind: drifted
+        )
+        with open_workspace(lease, approved) as workspace:
+            with pytest.raises(PreconditionRefused, match="constraints"):
+                with capture_initial_surface(lease, approved, workspace, payloads()):
+                    pass
+```
+
+- [ ] **Step 3: Run the tests**
+
+Run: `cd python && uv run pytest tests/test_coordinator_capture_adversarial.py -q`
+Expected: PASS, 5 tests.
+
+- [ ] **Step 4: Run the full gate set**
+
+Run: `cd python && uv run ruff format && uv run ruff check && uv run pyright && uv run pytest -q`
+Expected: all green.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add python/tests/coordinator_support.py python/tests/test_coordinator_lease.py \
+        python/tests/test_coordinator_capture_adversarial.py
+git commit -m "test(capture): assert the mutation surface and the A6-scoped races"
+```
+
+---
+
+## Task 7: The import whitelist
 
 **Files:**
 - Modify: `python/tests/test_fs_architecture.py`
-- Modify: `python/tests/test_coordinator_architecture.py`
-- Modify: `python/tests/test_coordinator_capture.py`
-- Modify: `docs/deferred-obligation-ledger.md`
-- Modify: `docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md`
-- Modify: `AGENTS.md`, `README.md`
-- Modify: `docs/plans/2026-08-07-a6-coherent-capture-design.md` (status header)
 
-- [ ] **Step 1: Write the import whitelist test**
+- [ ] **Step 1: Write the test**
 
 Add to `python/tests/test_fs_architecture.py`:
 
@@ -2509,99 +2897,63 @@ def test_observe_imports_only_the_recovery_model():
 
     A blacklist on `snapshot` would be insufficient: `atoms/core/recovery/__init__.py`
     re-exports `classify_recovery` and `authorize_recovery_step`, so a classifier is
-    reachable through the package facade. Whitelist `model`, refuse everything else.
-    """
-    import ast
-    from pathlib import Path
+    reachable through the package facade.
 
-    source = Path(__file__).parents[1] / "src" / "atoms" / "fs" / "observe.py"
+    BOTH import forms are checked. Inspecting only `ImportFrom` would let a plain
+    `import atoms.core.recovery` walk straight past the whitelist and reach every
+    classifier through attribute access.
+    """
+    source = SOURCE_ROOT / "fs" / "observe.py"
     tree = ast.parse(source.read_text(encoding="utf-8"))
-    offenders = [
-        node.module
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom)
-        and (node.module or "").startswith("atoms.core.recovery")
-        and node.module != "atoms.core.recovery.model"
-    ]
+    permitted = "atoms.core.recovery.model"
+    offenders = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if module.startswith("atoms.core.recovery") and module != permitted:
+                offenders.append(module)
+        elif isinstance(node, ast.Import):
+            offenders.extend(
+                alias.name
+                for alias in node.names
+                if alias.name.startswith("atoms.core.recovery")
+                and alias.name != permitted
+            )
     assert offenders == []
 ```
 
-- [ ] **Step 2: Write the adversarial tests**
+- [ ] **Step 2: Verify it fails on a planted violation**
 
-Add to `python/tests/test_coordinator_capture.py`:
+Temporarily add `from atoms.core.recovery import classify_recovery` to `observe.py`.
 
-```python
-def test_a_leaf_swapped_for_a_symlink_between_observation_and_use_refuses(leased):
-    from atoms.coordinator.capture import capture_initial_surface
-    from atoms.coordinator.prepare import open_workspace
-    from tests.capture_support import AFTER, DictPayloads, digest_of
+Run: `cd python && uv run pytest tests/test_fs_architecture.py -q -k observe_imports`
+Expected: FAIL, listing `atoms.core.recovery`. Then add `import atoms.core.recovery` instead and
+confirm it fails again. **A test that passes on either planted violation is not guarding anything —
+stop and fix it before removing the plant.** Remove both plants afterwards.
 
-    with leased() as lease:
-        approved = approved_replace(lease)
-        root_fd = lease._binding.project_root_fd
-        os.unlink("d/f.txt", dir_fd=root_fd)
-        os.symlink("/etc/passwd", "d/f.txt", dir_fd=root_fd)
-        payloads = DictPayloads({digest_of(AFTER): AFTER})
-        with open_workspace(lease, approved) as workspace:
-            with pytest.raises(PreconditionRefused):
-                with capture_initial_surface(lease, approved, workspace, payloads):
-                    pass
+- [ ] **Step 3: Run and commit**
 
-
-def test_an_externally_occupied_staging_leaf_refuses(leased):
-    from atoms.coordinator.capture import capture_initial_surface
-    from atoms.coordinator.prepare import open_workspace
-    from atoms.store.blobs import digest_to_leaf
-    from tests.capture_support import AFTER, BEFORE, DictPayloads, digest_of
-
-    with leased() as lease:
-        approved = approved_replace(lease)
-        payloads = DictPayloads({digest_of(AFTER): AFTER})
-        with open_workspace(lease, approved) as workspace:
-            squatter = os.open(
-                digest_to_leaf(digest_of(BEFORE)),
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                0o600,
-                dir_fd=workspace.staging_fd,
-            )
-            os.close(squatter)
-            with pytest.raises(PreconditionRefused, match="occupied"):
-                with capture_initial_surface(lease, approved, workspace, payloads):
-                    pass
-
-
-def test_no_project_path_is_mutated_by_capture(leased):
-    """Authority §13.5: the mutation surface. A6 writes only into staging/<txid>/."""
-    from atoms.coordinator.capture import capture_initial_surface
-    from atoms.coordinator.prepare import open_workspace
-    from tests.capture_support import AFTER, DictPayloads, digest_of
-
-    def snapshot(root_fd):
-        seen = {}
-        for base, _dirs, files in os.walk("/proc/self/fd/%d" % root_fd):
-            for name in files:
-                target = os.path.join(base, name)
-                info = os.lstat(target)
-                seen[target] = (info.st_mtime_ns, info.st_size, info.st_ino)
-        return seen
-
-    with leased() as lease:
-        approved = approved_replace(lease)
-        root_fd = lease._binding.project_root_fd
-        before = snapshot(root_fd)
-        payloads = DictPayloads({digest_of(AFTER): AFTER})
-        with open_workspace(lease, approved) as workspace:
-            with capture_initial_surface(lease, approved, workspace, payloads):
-                pass
-        assert snapshot(root_fd) == before
-```
-
-- [ ] **Step 3: Run both new tiers**
-
-Run: `cd python && uv run pytest tests/test_fs_architecture.py tests/test_coordinator_capture.py -q`
+Run: `cd python && uv run pytest tests/test_fs_architecture.py -q`
 Expected: PASS.
 
-- [ ] **Step 4: Land the two authority amendments**
+```bash
+git add python/tests/test_fs_architecture.py
+git commit -m "test(fs): whitelist the recovery imports observe.py may make"
+```
+
+---
+
+## Task 8: The ledger, the authority amendments, and status synchronization
+
+**Files:**
+- Modify: `docs/deferred-obligation-ledger.md`
+- Modify: `docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md`
+- Modify: `docs/plans/2026-08-07-a6-coherent-capture-design.md`
+- Modify: `AGENTS.md`, `README.md`
+- Modify: `python/tests/test_store_architecture.py`
+- Modify: `python/tests/test_coordinator_architecture.py`
+
+- [ ] **Step 1: Land the two authority amendments**
 
 In `docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md`:
 
@@ -2620,75 +2972,94 @@ In `docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md`:
 > declared state refuses — including a symlink whose target or mode has drifted, which is a symlink but
 > not the declared one.
 
-- [ ] **Step 5: Update the deferred-obligation ledger**
+- [ ] **Step 2: Update the deferred-obligation ledger**
 
-In `docs/deferred-obligation-ledger.md`, amend entries 1, 3, 13, and 19 to record the discharged half
-and the named A7 residue. Do **not** remove any of the four — each keeps work A7 owns:
+In `docs/deferred-obligation-ledger.md`, amend entries 1, 3, 13, and 19. Do **not** remove any of the
+four — each keeps work A7 owns:
 
-| # | New required-behavior text |
+| # | Amended required-behavior text |
 | --- | --- |
-| 1 | Capture half discharged. A7 owns materialization's half. |
-| 3 | Capture/inference half discharged. A7 owns handing §9.5's published-directory descriptor down at execution. |
-| 13 | Observation-mechanism half discharged. A7 owns complete recovery assembly, committed-cleanup sequencing, and fresh authorization observations. |
-| 19 | A6's half discharged. A7's execution half remains. |
+| 1 | Capture half discharged: capture hashes the actual stream from one descriptor and compares against the frozen `FileState`. A7 owns materialization's half. |
+| 3 | Capture/inference half discharged: both §8 branches infer descendant absence from the ancestor's verified state, each selected by the declared state. A7 owns handing §9.5's published-directory descriptor down at execution. |
+| 13 | Observation-mechanism half discharged: state, identity, prefix relation, and occupancy from held descriptors under the token discipline, with a whitelist making pre-classification unreachable. A7 owns complete recovery assembly, committed-cleanup sequencing, and fresh authorization observations. |
+| 19 | A6's half discharged: the descriptor table re-resolves identity, constraints, and mount against the approved baseline before relying on any of it. A7's execution half remains. |
 
-- [ ] **Step 6: Synchronize the status strings**
+- [ ] **Step 3: Synchronize the status strings**
 
-Add A6's state to `AGENTS.md` (the A3 and A5 paragraphs both claim "A6–A8 remain unimplemented") and
-to the `README.md` layering note. Change the A6 design doc's status header from "Designed on
-2026-08-07, unimplemented" to "Implemented on 2026-08-07. A7–A8 remain unimplemented."
+Measured: `test_a5_status_is_synchronized_across_authority_documents` asserts the literal
+`"A5 is implemented; A6–A8 remain unimplemented"` in `AGENTS.md`. Editing that sentence **breaks that
+test**, so both change together.
+
+1. In `AGENTS.md`, change the A3 paragraph's `"A5 is implemented; A6–A8 remain unimplemented"` to
+   `"A5 and A6 are implemented; A7–A8 remain unimplemented"`, and add an A6 paragraph describing
+   `atoms/fs/observe.py` and `atoms/coordinator/{descriptors,capture}.py`.
+2. In `python/tests/test_store_architecture.py:1269`, update the A5 assertions to the new sentence and
+   drop `assert "A5–A8 remain unimplemented" not in agents` only if it no longer applies.
+3. In `README.md`, add A6 to the layering note.
+4. In `docs/plans/2026-08-07-a6-coherent-capture-design.md`, change the status header from
+   `"Designed on 2026-08-07, unimplemented. A7–A8 remain unimplemented."` to
+   `"Implemented on 2026-08-07. A7–A8 remain unimplemented."`
+
+- [ ] **Step 4: Add the A6 status test**
 
 Add to `python/tests/test_coordinator_architecture.py`, following `test_a4a_…`, `test_a4b_…`, and
 `test_a5_…`:
 
 ```python
 def test_a6_status_is_synchronized_across_authority_documents():
-    from pathlib import Path
-
-    docs = Path(__file__).parents[2]
-    agents = (docs / "AGENTS.md").read_text(encoding="utf-8")
+    root = Path(__file__).parents[2]
+    agents = (root / "AGENTS.md").read_text(encoding="utf-8")
     design = (
-        docs / "docs" / "plans" / "2026-08-07-a6-coherent-capture-design.md"
+        root / "docs/plans/2026-08-07-a6-coherent-capture-design.md"
     ).read_text(encoding="utf-8")
 
-    assert "A6 — coherent capture" in agents or "A6 -- coherent capture" in agents
+    assert "A5 and A6 are implemented; A7–A8 remain unimplemented" in agents
     assert "A6–A8 remain unimplemented" not in agents
-    assert "A7–A8 remain unimplemented" in design
+    assert "A6 — coherent capture" in agents
+    assert "**Status:** Implemented on 2026-08-07." in design
+    assert "A7–A8 remain unimplemented." in design
 ```
 
-- [ ] **Step 7: Run the full gate set**
+- [ ] **Step 5: Run the full gate set**
 
 Run: `cd python && uv run ruff format && uv run ruff check && uv run pyright && uv run pytest -q`
 Expected: all green.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add -A
-git commit -m "feat(a6): land coherent capture with its ledger and authority amendments"
+git commit -m "docs(a6): discharge the ledger halves and amend the authority design"
 ```
 
 ---
 
 ## Self-Review
 
-**Spec coverage.** Every design section maps to a task: §5 → Task 3; §6 → Tasks 1–2; §7 → Tasks 6–7;
-§7.2 → Task 6; §7.3 → Task 7; §8 → Task 5; §9/§9.1 → Task 1 (`translated_lookup`) with the
-refusal table exercised across Tasks 5–7; §10.1 → Task 7 Step 4; §10.2 → Task 3 Step 1; §10.3 → Task 4;
-§11.1–§11.6 → Tasks 1, 2, 7, 8, 9; §12's fourteen criteria → the tasks listed beside each.
+**Spec coverage.** §5 → Task 3; §6 → Task 1; §7, §7.1–§7.4 → Task 4; §8 → Tasks 3 (observation) and 4
+(adjudication); §9/§9.1 → Task 1's `translated_lookup` with the refusal table exercised in Task 4;
+§10.1 → Task 4 Step 4; §10.2 → Task 3 Step 1; §10.3 → Task 2; §11.1–§11.6 → Tasks 1, 4, 5, 6, 7;
+§12's fourteen criteria → the tasks beside each.
 
-**Two spec items that needed a task and now have one:** §10.2's `filesystem_type_of` rename (Task 3
-Step 1, surfaced while probing — `read_lookup_constraints` needs the type string and the only
-backend-checked route was private) and §11.6's mutation-surface assertion (Task 9 Step 2).
+**Every deferred probe is resolved.** `FileBuildRelation.STRICT_PREFIX` (not `PREFIX`), `occurrences`
+(not `occurrences_of`), and `TimelineOccurrence.pre` are now measured facts, and the code and tests use
+them. Three "stop and report" steps remain, but each is a genuine judgment the plan cannot make for the
+implementer rather than a name it failed to look up: an unexpected `classify_recovery` verdict (Task 5),
+a suite that regresses on the widened digest set (Task 2), and a whitelist test that survives a planted
+violation (Task 7).
 
-**Type consistency.** `Observation.observe(parent_fd, leaf, *, sink_fd)` is called with the same
-signature in Tasks 2, 5, 7, and 8. `DescriptorTable.fd_for(node)` raises `KeyError` for an absent node
-in Task 3's test and is caught as `KeyError` by `_parent_fd_or_none` in Task 7. `WalkStop.blocker` is
-`EntryKind | None` in Task 3 and matched against `EntryKind` in Task 5. `StagedBlob(name, digest,
-byte_len)` matches `blobs.py:35`. `Captured.manifest` is the `tuple[StagedBlob, ...]`
-`prepare_transaction` takes.
+**Every commit leaves the suite green.** The previous revision's Task 6 committed tests against an
+entry point Task 7 would introduce; those tasks are merged into Task 4.
 
-**Three places the plan tells the implementer to stop rather than adapt:** Task 2 Step 3
-(`FileBuildRelation` member names), Task 4 Step 4 (the occurrence-expansion helper's name), and Task 5
-Step 4 (`TimelineOccurrence`'s precondition field). Each is a name this plan asserts but did not
-measure directly, and guessing wrong would put A6 in the business of classifying.
+**Type consistency.** `Observation.observe(parent_fd, leaf, *, sink_fd=None, modeled=None)` is called
+with that signature in Tasks 3, 4, 5, and 6. `WalkStop` is `(node, path, parent_fd, component,
+observed)` in Task 3 and read as such by `_verify_stops` in Task 4. `DescriptorTable.fd_for` raises
+`KeyError`, which Task 4 catches and re-raises as `ProtocolError`, while `is_unreachable` answers the
+different question. `_build_descriptor_table` is private in both its definition and all four call
+sites. `StagedBlob(name, digest, byte_len)` matches `blobs.py:35`, and `Captured.manifest` is the
+`tuple[StagedBlob, ...]` `prepare_transaction` takes.
+
+**Three claims the earlier revision made that the code now actually supports.** A descriptor is owned
+or closed, never neither (`_open_and_pin`). A directory is never described without enumeration
+(`modeled` is required). And no errno selects a state branch — `_open_existing` returns `None` and the
+caller observes what is really there.
