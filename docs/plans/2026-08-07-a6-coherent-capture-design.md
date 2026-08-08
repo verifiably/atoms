@@ -151,6 +151,14 @@ contain the `"A6–A8 remain unimplemented"` sentence every other document uses 
 string leaves the authority document, the one that outranks all the others, still denying A6 exists.
 The status test asserts this header positively for that reason.
 
+**The status guard reads headers and status sections, never whole files.** The paragraph you are
+reading quotes both retired spellings verbatim, because a record of an amendment has to state what it
+replaced. A whole-file scan would therefore fail on this section — and the only ways to make it pass
+would be to delete the record or to stop guarding the document, both of which trade away the thing the
+guard protects. The check is scoped to each document's `**Status:**` field or `## Status` section: the
+claim about the present, which is the only part that can go stale. The same reasoning excludes the two
+architecture test files, which name these strings as the strings they forbid.
+
 **Status synchronization.** `AGENTS.md`'s A3 and A5 paragraphs (the latter justifies the A7 build-stage
 trap partly by "A6 supplies no observations", which stops being true while the trap itself stays) and
 the `README.md` `## Status` section — already three sub-plans stale, stopping at A3 — gain A6's state,

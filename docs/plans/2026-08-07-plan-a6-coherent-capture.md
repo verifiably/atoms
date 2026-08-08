@@ -3496,63 +3496,111 @@ test**, so both change together.
 Run:
 
 ```bash
-cd python && grep -nE "A6–A8 remain unimplemented|A1–A5b are" \
-  ../AGENTS.md ../README.md \
-  ../docs/deferred-obligation-ledger.md \
-  ../docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md \
-  ../docs/plans/2026-08-02-a5b-recovery-lease-design.md \
-  ../docs/plans/2026-08-07-a6-coherent-capture-design.md \
-  tests/test_store_architecture.py tests/test_coordinator_architecture.py
+grep -nE "A6–A8 remain unimplemented|A1–A5b are" \
+  AGENTS.md README.md \
+  docs/deferred-obligation-ledger.md \
+  docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md \
+  docs/plans/2026-08-02-a5b-recovery-lease-design.md
 ```
 
 Expected: no matches, exit status 1. The second alternative catches the authority header, whose
 wording is its own and which the first alternative would sail past.
 
-**The file list is explicit on purpose.** A `grep -rn` over `../docs` cannot pass: the historical
-`2026-08-02-plan-a5b-recovery-lease.md:4205` records what A5b's own status line said at the time, and
-*this* plan quotes the string eight times in the very steps that retire it. Both are records of past
-moments, not current claims, and rewriting either to appease a grep would falsify the record. The
-files above are the current status surface — the ones a reader consults to learn what exists.
+**The file list is explicit, and three kinds of file are deliberately outside it.** A whole-file scan
+is sound only where a file has no legitimate reason to *contain* the string. These do:
+
+- **Records of past moments.** `docs/plans/2026-08-02-plan-a5b-recovery-lease.md:4205` records what
+  A5b's status line said when it landed, and *this* plan quotes the strings throughout the steps that
+  retire them.
+- **The amendment record.** The A6 design's §3.3 prints the authority's old header verbatim —
+  `"A1–A5b are implemented … A6–A8 (coherent capture, …) remain"` — and names the
+  `"A6–A8 remain unimplemented"` sentence to explain why the authority needs its own assertion. That
+  before/after is what makes the amendment auditable.
+- **The guards themselves.** `test_coordinator_architecture.py` and `test_store_architecture.py` name
+  these strings as the strings they forbid. A guard cannot be its own subject: scanning it means the
+  check fails precisely because it was written.
+
+Editing any of them to satisfy a grep would falsify the record, or delete the check, to make the check
+green — the exact inversion the guard exists to prevent. Nothing is lost by excluding them: the A6
+design's *header* is its current claim and Step 4's test reads it directly, and a stale assertion in
+either test file turns the suite red the moment the document it asserts over changes.
 
 - [ ] **Step 4: Add the A6 status test**
 
-Add to `python/tests/test_coordinator_architecture.py`, following `test_a4a_…`, `test_a4b_…`, and
+Add `import re` to `python/tests/test_coordinator_architecture.py`'s imports (it currently imports
+`ast`, `resolve_name`, and `Path`), then add the following, following `test_a4a_…`, `test_a4b_…`, and
 `test_a5_…`:
 
 ```python
+def _flat(lines: list[str]) -> str:
+    return " ".join(" ".join(lines).split())
+
+
+def _status_section(text: str) -> str:
+    """The `## Status…` section: its heading through the next `## ` heading.
+
+    Whitespace is flattened because both AGENTS.md and README.md wrap their status
+    sentences across lines, and a reflow must not silently disable a guard.
+    """
+    lines = text.splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith("## Status"))
+    end = next(
+        (i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")),
+        len(lines),
+    )
+    return _flat(lines[start:end])
+
+
+def _status_field(text: str) -> str:
+    """A design's `**Status:**` header field, bounded by a blank line or the next field.
+
+    Scoped to the header on purpose. A design's status is a claim about the present; its
+    body may legitimately QUOTE a status string while recording an amendment, and A6's
+    §3.3 does exactly that -- it prints the authority's old header verbatim so the
+    before/after is auditable. A whole-file scan conflates the claim with the record of
+    the claim changing, and would force the record to be edited to keep the guard green:
+    the precise inversion this guard exists to prevent.
+    """
+    lines = text.splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith("**Status:**"))
+    field = [lines[start]]
+    for line in lines[start + 1 :]:
+        if not line.strip() or re.match(r"\*\*[A-Za-z][^*]*:\*\*", line):
+            break
+        field.append(line)
+    return _flat(field)
+
+
 def test_a6_status_is_synchronized_across_authority_documents():
     root = Path(__file__).parents[2]
-    agents = (root / "AGENTS.md").read_text(encoding="utf-8")
-    readme = (root / "README.md").read_text(encoding="utf-8")
-    design = (
-        root / "docs/plans/2026-08-07-a6-coherent-capture-design.md"
-    ).read_text(encoding="utf-8")
 
-    a5b = (
-        root / "docs/plans/2026-08-02-a5b-recovery-lease-design.md"
-    ).read_text(encoding="utf-8")
-    authority = (
-        root / "docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md"
-    ).read_text(encoding="utf-8")
+    def read(name: str) -> str:
+        return (root / name).read_text(encoding="utf-8")
+
+    agents = _status_section(read("AGENTS.md"))
+    readme = _status_section(read("README.md"))
+    a6 = _status_field(read("docs/plans/2026-08-07-a6-coherent-capture-design.md"))
+    a5b = _status_field(read("docs/plans/2026-08-02-a5b-recovery-lease-design.md"))
+    authority = _status_field(
+        read("docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md")
+    )
 
     assert "A5 and A6 are implemented; A7–A8 remain unimplemented" in agents
     assert "A6 — coherent capture" in agents
-    assert "**Status:** Implemented on 2026-08-07." in design
-    # No banked document may still claim A6 is unimplemented. A5b's design carries the
+    assert "**Status:** Implemented on 2026-08-07." in a6
+    # No current status claim may still say A6 is unimplemented. A5b's design carries the
     # same sentence and is the one easiest to leave behind.
-    for document in (agents, readme, design, a5b, authority):
-        assert "A6–A8 remain unimplemented" not in document
+    for region in (agents, readme, a6, a5b, authority):
+        assert "A6–A8 remain unimplemented" not in region
     assert "A7–A8 remain unimplemented" in a5b
 
     # The authority header spells its remainder differently -- "A6–A8 (coherent capture,
     # ...) remain" -- so the shared forbidden string cannot police it. Assert the header
-    # positively, and forbid the span it replaces. Whitespace is flattened because the
-    # header wraps across lines and a reflow must not break this.
-    flat = " ".join(authority.split())
-    assert "A1–A6 are implemented" in flat
-    assert "A7–A8 (effect/recovery execution, synthetic exerciser) remain." in flat
-    assert "A1–A5b are implemented" not in flat
-    assert "A6–A8 (coherent capture" not in flat
+    # positively, and forbid the span it replaces.
+    assert "A1–A6 are implemented" in authority
+    assert "A7–A8 (effect/recovery execution, synthetic exerciser) remain." in authority
+    assert "A1–A5b are implemented" not in authority
+    assert "A6–A8 (coherent capture" not in authority
 
     # The README's roadmap is the reader's map of what exists; it was three sub-plans
     # stale before A6 and must not be left that way.
@@ -3565,6 +3613,10 @@ def test_a6_status_is_synchronized_across_authority_documents():
     ):
         assert heading in readme
 ```
+
+**Both extractors must find their anchor.** `next(...)` without a default raises `StopIteration` if a
+document loses its `## Status` heading or `**Status:**` field, which fails the test rather than
+vacuously passing it — a renamed heading is exactly the drift this is guarding.
 
 - [ ] **Step 5: Run the full gate set**
 
@@ -3667,6 +3719,19 @@ header spells the remainder as "A6–A8 (coherent capture, effect/recovery execu
 exerciser) remain", not "A6–A8 remain unimplemented". Step 1 rewrites it alongside the §6 and §14
 amendments, the grep gained a second alternative for it, and the status test asserts the new header
 positively over whitespace-flattened text so a reflow cannot break the check.
+
+**Both status guards are scoped to status claims, not to whole files.** The earlier revision scanned
+entire documents and could not pass: the A6 design's §3.3 quotes both retired spellings verbatim
+(that record is what makes the amendment auditable), and the architecture test files name the
+forbidden strings as the strings they forbid. A whole-file scan makes a document fail *because* it
+records the change, and makes a guard fail *because* it was written — and the only ways to go green
+are to delete the record or drop the check. The test now reads each document's `**Status:**` field or
+`## Status` section, and the grep covers only files with no such quotation.
+
+Both were executed against a simulated post-Task-8 tree before this plan was banked: the grep exits 1,
+every assertion passes, and each of the five documents left stale in turn — A5b's header, the
+authority header, AGENTS, README, the A6 design's header — fails the test. `next(...)` carries no
+default, so a renamed heading raises rather than vacuously passing.
 
 Task 8's closing `grep` names its files explicitly and is **not** a `-r` sweep. Two documents legitimately
 still contain the string: the historical A5b implementation plan, which records what A5b's status line
