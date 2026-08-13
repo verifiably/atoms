@@ -11,6 +11,7 @@ from typing import TypeVar
 from atoms.core.errors import ProtocolError
 from atoms.core.scratch import CHAIN_LEAF, is_scratch_leaf
 from atoms.fs.backend import Backend
+from atoms.fs.lock import _guarded_spelling
 
 
 class TargetClass(Enum):
@@ -68,21 +69,23 @@ class AuditedBackend:
             raise ProtocolError("project_root must be a non-empty string")
         if type(metadata_root) is not str or not metadata_root:
             raise ProtocolError("metadata_root must be a non-empty string")
-        if project_root == metadata_root:
+        project_spelling = _guarded_spelling(project_root)
+        metadata_spelling = _guarded_spelling(metadata_root)
+        if project_spelling == metadata_spelling:
             raise ProtocolError("project_root and metadata_root must be distinct")
-        metadata_parent, metadata_leaf = os.path.split(metadata_root)
+        metadata_parent, metadata_leaf = os.path.split(metadata_spelling)
         if not metadata_parent or not metadata_leaf:
             raise ProtocolError("metadata_root must have a parent and a final component")
         roots = {
-            project_root: Provenance(RootKind.PROJECT, ""),
-            metadata_root: Provenance(RootKind.METADATA, ""),
+            project_spelling: Provenance(RootKind.PROJECT, ""),
+            metadata_spelling: Provenance(RootKind.METADATA, ""),
         }
-        if metadata_parent != project_root:
+        if metadata_parent != project_spelling:
             roots[metadata_parent] = Provenance(RootKind.METADATA_PARENT, "")
         self._inner = inner
         self._roots = roots
         self._metadata_leaf = metadata_leaf
-        self._metadata_parent_is_project = metadata_parent == project_root
+        self._metadata_parent_is_project = metadata_parent == project_spelling
         self._provenance: dict[int, Provenance] = {}
         self._declared_paths: frozenset[str] = frozenset()
         self._records: list[AuditRecord] = []
@@ -99,8 +102,17 @@ class AuditedBackend:
         self._provenance[fd] = provenance
 
     def rebind(self, fd: int, provenance: Provenance) -> None:
-        self.provenance_of(fd)
+        current = self.provenance_of(fd)
         self._require_provenance(provenance)
+        if not (
+            current.root is RootKind.METADATA
+            and (current.path == "work" or current.path.startswith("work/"))
+            and provenance.root is RootKind.PROJECT
+            and provenance.path in self._declared_paths
+        ):
+            raise ProtocolError(
+                "descriptor rebind is permitted only from metadata work to a declared project path"
+            )
         self._provenance[fd] = provenance
 
     def unregister(self, fd: int) -> None:
@@ -206,11 +218,14 @@ class AuditedBackend:
         )
 
     def open_root(self, path: str) -> int:
+        if type(path) is not str or not path:
+            raise ProtocolError("a root path must be a non-empty string")
+        spelling = _guarded_spelling(path)
         try:
-            provenance = self._roots[path]
-        except (KeyError, TypeError) as caught:
+            provenance = self._roots[spelling]
+        except KeyError as caught:
             raise ProtocolError(f"path {path!r} is not a configured root") from caught
-        fd = self._inner.open_root(path)
+        fd = self._inner.open_root(spelling)
         self.register(fd, provenance)
         return fd
 

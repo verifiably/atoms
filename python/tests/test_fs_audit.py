@@ -222,6 +222,43 @@ def test_open_root_registers_only_the_three_configured_roots(tmp_path):
             backend.close_fd(fd)
 
 
+def test_root_roles_share_guarded_relative_and_dotted_spellings(tmp_path, monkeypatch):
+    _roots(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    backend = AuditedBackend(
+        LinuxBackend(),
+        project_root="project/.",
+        metadata_root="./metadata",
+    )
+    fds = [
+        backend.open_root("./project"),
+        backend.open_root("metadata/./"),
+        backend.open_root("."),
+    ]
+    try:
+        assert [backend.provenance_of(fd) for fd in fds] == [
+            Provenance(RootKind.PROJECT, ""),
+            Provenance(RootKind.METADATA, ""),
+            Provenance(RootKind.METADATA_PARENT, ""),
+        ]
+    finally:
+        for fd in reversed(fds):
+            backend.close_fd(fd)
+
+
+def test_equivalent_project_and_metadata_root_aliases_refuse(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(ProtocolError, match="distinct"):
+        AuditedBackend(
+            LinuxBackend(),
+            project_root="project",
+            metadata_root="./project",
+        )
+
+
 def test_metadata_parent_can_create_and_reopen_only_the_metadata_root(tmp_path):
     project, metadata = _roots(tmp_path, create_metadata=False)
     backend = _facade(project, metadata)
@@ -303,17 +340,59 @@ def test_create_exclusive_registers_the_returned_descriptor(tmp_path):
         backend.close_fd(project_fd)
 
 
-def test_rebind_changes_subsequent_descendant_classification(tmp_path):
+def test_rebind_refuses_project_to_metadata_authority_laundering(tmp_path):
     project, metadata = _roots(tmp_path)
-    scratch = ".#~tx.e01.work"
-    (project / scratch).mkdir()
     backend = _facade(project, metadata)
-    backend.set_declared_paths(frozenset({"live/child"}))
     project_fd = backend.open_root(str(project))
-    scratch_fd = backend.open_child_directory(project_fd, scratch)
     try:
-        backend.rebind(scratch_fd, Provenance(RootKind.PROJECT, "live"))
-        backend.mkdir_child(scratch_fd, "child", 0o700)
+        before = backend.provenance_of(project_fd)
+        with pytest.raises(ProtocolError, match="rebind"):
+            backend.rebind(project_fd, Provenance(RootKind.METADATA, ""))
+        assert backend.provenance_of(project_fd) == before
+    finally:
+        backend.close_fd(project_fd)
+
+
+@pytest.mark.parametrize(
+    ("current", "target", "declared"),
+    [
+        (
+            Provenance(RootKind.METADATA, "staging/tx"),
+            Provenance(RootKind.PROJECT, "live"),
+            frozenset({"live"}),
+        ),
+        (
+            Provenance(RootKind.METADATA, "work/tx"),
+            Provenance(RootKind.PROJECT, "other"),
+            frozenset({"live"}),
+        ),
+    ],
+)
+def test_rebind_refuses_invalid_work_or_live_paths(
+    tmp_path, current, target, declared
+):
+    project, metadata = _roots(tmp_path)
+    backend = _facade(project, metadata)
+    backend.set_declared_paths(declared)
+    backend.register(100, current)
+
+    with pytest.raises(ProtocolError, match="rebind"):
+        backend.rebind(100, target)
+
+    assert backend.provenance_of(100) == current
+
+
+def test_rebind_allows_metadata_work_to_declared_project_path(tmp_path):
+    project, metadata = _roots(tmp_path)
+    (metadata / "work" / "tx").mkdir(parents=True)
+    backend = _facade(project, metadata)
+    backend.set_declared_paths(frozenset({"live", "live/child"}))
+    metadata_fd = backend.open_root(str(metadata))
+    work_fd = backend.open_child_directory(metadata_fd, "work")
+    tx_fd = backend.open_child_directory(work_fd, "tx")
+    try:
+        backend.rebind(tx_fd, Provenance(RootKind.PROJECT, "live"))
+        backend.mkdir_child(tx_fd, "child", 0o700)
         assert backend.records == (
             AuditRecord(
                 "mkdir_child",
@@ -321,8 +400,9 @@ def test_rebind_changes_subsequent_descendant_classification(tmp_path):
             ),
         )
     finally:
-        backend.close_fd(scratch_fd)
-        backend.close_fd(project_fd)
+        backend.close_fd(tx_fd)
+        backend.close_fd(work_fd)
+        backend.close_fd(metadata_fd)
 
 
 def test_close_unregisters_once_and_refuses_a_second_close(tmp_path):
