@@ -1,17 +1,20 @@
 """Reserved scratch grammar (design §5.1).
 
 The discriminating sigil is the exact leaf prefix ``.#~`` — three ASCII punctuation
-bytes, none of which has a case or NFC/NFD variant. A leaf is a scratch name iff it
-begins with the sigil; only the sigil participates in classification.
+bytes, none of which has a case or NFC/NFD variant. Engine-reserved leaves begin with
+the sigil; scratch leaves additionally follow the closed generated-name grammar.
 """
 
 from __future__ import annotations
 
 import unicodedata
 
-from atoms.core.identifiers import require_valid_identifier
+from atoms.core.errors import ProtocolError
+from atoms.core.identifiers import is_valid_identifier, require_valid_identifier
 
 SCRATCH_SIGIL = ".#~"
+CHAIN_LEAF = ".#~chain"
+SCRATCH_ROLES: frozenset[str] = frozenset({"staging", "tombstone", "anchor", "work"})
 
 
 def leaf_of(rel_path: str) -> str:
@@ -20,16 +23,27 @@ def leaf_of(rel_path: str) -> str:
 
 
 def is_scratch_leaf(leaf: str) -> bool:
-    """True iff ``leaf`` begins with the reserved sigil (plain prefix test)."""
+    """True iff ``leaf`` is a valid engine-generated scratch leaf."""
+    if not leaf.startswith(SCRATCH_SIGIL):
+        return False
+    parts = leaf[len(SCRATCH_SIGIL) :].split(".")
+    if len(parts) != 3:
+        return False
+    txid, effect_id, role = parts
+    return is_valid_identifier(txid) and is_valid_identifier(effect_id) and role in SCRATCH_ROLES
+
+
+def is_engine_reserved_leaf(leaf: str) -> bool:
+    """True iff ``leaf`` begins with the engine-reserved sigil."""
     return leaf.startswith(SCRATCH_SIGIL)
 
 
 def aliases_scratch_sigil(leaf: str) -> bool:
     """True iff any case- or NFC/NFD-normalized form of ``leaf`` begins with the sigil.
 
-    Because the sigil is letter-free, this must agree with :func:`is_scratch_leaf` on
-    every input; the agreement is the property that proves the letter-free choice sound
-    (design §13.3).
+    Because the sigil is letter-free, this agrees with :func:`is_engine_reserved_leaf`
+    on every input; the agreement is the property that proves the letter-free choice
+    sound (design §13.3).
     """
     forms = {
         leaf,
@@ -49,5 +63,6 @@ def scratch_leaf(txid: str, effect_id: str, role: str) -> str:
     """
     require_valid_identifier("txid", txid)
     require_valid_identifier("effect_id", effect_id)
-    require_valid_identifier("role", role)
+    if role not in SCRATCH_ROLES:
+        raise ProtocolError(f"unknown scratch role: {role!r}")
     return f"{SCRATCH_SIGIL}{txid}.{effect_id}.{role}"
