@@ -115,6 +115,55 @@ def test_stops_are_unavailable_after_the_table_closes(leased):
                 _ = table.stops
 
 
+def test_close_attempts_every_owned_descriptor_and_preserves_the_failure(
+    leased, monkeypatch
+):
+    from atoms.coordinator.prepare import open_workspace
+    from atoms.core.recovery.snapshot import TopologyDirectory
+    from atoms.fs.audit import AuditedBackend
+    from tests.capture_support import approved_deep_replace
+
+    with leased() as lease:
+        approved = approved_deep_replace(lease)
+        nodes = [
+            entry.node
+            for entry in approved.directories
+            if type(entry.node) is TopologyDirectory
+        ]
+        with open_workspace(lease, approved) as workspace, Observation(LinuxBackend()) as observation:
+            table = _table(lease, approved, workspace, observation)
+            owned = [table.fd_for(node) for node in nodes]
+            assert len(owned) == 3
+            backend = lease._binding.backend
+            assert isinstance(backend, AuditedBackend)
+            attempted = []
+            real_close = LinuxBackend.close_fd
+
+            def failing_close(self, fd):
+                attempted.append(fd)
+                real_close(self, fd)
+                if fd == owned[1]:
+                    raise OSError(errno.EIO, "injected descriptor close failure")
+
+            with monkeypatch.context() as patched:
+                patched.setattr(LinuxBackend, "close_fd", failing_close)
+                with pytest.raises(OSError) as caught:
+                    table.close()
+            try:
+                assert caught.value.errno == errno.EIO
+                assert attempted == owned
+                for fd in owned:
+                    with pytest.raises(ProtocolError, match="unregistered"):
+                        backend.provenance_of(fd)
+            finally:
+                for fd in owned:
+                    try:
+                        backend.provenance_of(fd)
+                    except ProtocolError:
+                        continue
+                    backend.close_fd(fd)
+
+
 def test_the_work_root_is_absent_when_the_topology_has_none(leased):
     """`coordinator_on` shares one `ext4_project_root` across calls in one test (only
     the metadata root varies), so this case gets its own test function rather than

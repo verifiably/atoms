@@ -35,6 +35,7 @@ from atoms.core.errors import PreconditionRefused, ProtocolError
 from atoms.core.recovery.model import ObservedEntry
 from atoms.core.recovery.snapshot import PersistentNode, ProjectRoot, TopologyNode, WorkRoot
 from atoms.fs.approval import ProjectApprovedSpec
+from atoms.fs.lock import close_all
 from atoms.fs.lookup import read_lookup_constraints
 from atoms.fs.observe import Observation, translated_lookup
 from atoms.fs.resolve import FilesystemIdentity, filesystem_type_of
@@ -107,9 +108,10 @@ class DescriptorTable:
         if self._closed:
             return
         self._closed = True
-        for fd in self._owned:
-            self._backend.close_fd(fd)
-        self._fds.clear()
+        try:
+            close_all(self._backend, self._owned)
+        finally:
+            self._fds.clear()
 
     def __enter__(self) -> Self:
         return self
