@@ -12,7 +12,13 @@ import os
 from typing import IO, Protocol, Self, cast
 
 from atoms.coordinator.admission import _require_admitted
-from atoms.coordinator.descriptors import DescriptorTable, WalkStop, _build_descriptor_table
+from atoms.coordinator.descriptors import (
+    DescriptorTable,
+    WalkStop,
+    _build_descriptor_table,
+    _directory_paths,
+    _modeled_children,
+)
 from atoms.coordinator.lease import Lease
 from atoms.core.errors import PreconditionRefused, ProtocolError
 from atoms.core.fingerprint import ABSENT, DirectoryState, FileState, SymlinkState
@@ -23,6 +29,7 @@ from atoms.core.recovery.model import (
     ObservedFile,
     ObservedSymlink,
 )
+from atoms.core.recovery.snapshot import PersistentNode
 from atoms.fs.approval import ProjectApprovedSpec
 from atoms.fs.observe import Observation
 from atoms.store.blobs import StagedBlob, digest_to_leaf
@@ -203,9 +210,11 @@ def _stage_preimages(
     can observe, and checking them here would refuse correct transactions.
     """
     declared = _first_states(approved)
+    paths = _directory_paths(approved)
     staged: list[StagedBlob] = []
     seen: set[str] = set()
     for path_entry in approved.paths:
+        modeled = _modeled_children(paths, PersistentNode(path_entry.path))
         parent = path_entry.parent_node
         if table.is_unreachable(parent):
             continue  # §8 already justified the absence of everything below the stop.
@@ -224,7 +233,7 @@ def _stage_preimages(
                     parent_fd,
                     path_entry.leaf,
                     sink_fd=sink,
-                    modeled=_modeled_under(approved, path_entry.path),
+                    modeled=modeled,
                 )
                 _require_state(path_entry.path, entry, expected)
                 backend.flush_file(sink)
@@ -241,7 +250,7 @@ def _stage_preimages(
         entry = observation.observe(
             parent_fd,
             path_entry.leaf,
-            modeled=_modeled_under(approved, path_entry.path),
+            modeled=modeled,
         )
         _require_state(path_entry.path, entry, expected)
     return staged
@@ -361,15 +370,6 @@ def _require_state(path: str, entry: ObservedEntry, expected) -> None:
         raise PreconditionRefused(
             f"{path!r} is {present.state!r}, not the declared initial {expected!r}"
         )
-
-
-def _modeled_under(approved: ProjectApprovedSpec, path: str) -> frozenset[str]:
-    base = f"{path}/"
-    return frozenset(
-        entry.path[len(base) :]
-        for entry in approved.paths
-        if entry.path.startswith(base) and "/" not in entry.path[len(base) :]
-    )
 
 
 def _first_states(approved: ProjectApprovedSpec) -> dict[str, object]:

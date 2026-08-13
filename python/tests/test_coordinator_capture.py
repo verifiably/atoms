@@ -59,6 +59,13 @@ def test_one_length_per_digest_passes_through():
 # --- absence inference (design §8) ---------------------------------------------------
 
 
+def test_capture_uses_the_descriptor_tables_modeled_children_derivation():
+    from atoms.coordinator import capture, descriptors
+
+    assert not hasattr(capture, "_modeled_under")
+    assert capture._modeled_children is descriptors._modeled_children
+
+
 def test_a_missing_ancestor_justifies_its_descendants_absence(leased):
     from atoms.coordinator.admission import admit
     from atoms.coordinator.capture import capture_initial_surface
