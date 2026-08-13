@@ -90,9 +90,9 @@ def test_a_failing_release_is_not_cached(monkeypatch, injected_resolver_on):
         real_close_all = module.close_all
         failures = []
 
-        def failing(fds):
+        def failing(backend, fds):
             failures.append(tuple(fds))
-            real_close_all(fds)
+            real_close_all(backend, fds)
             raise OSError(errno.EIO, "injected close failure")
 
         monkeypatch.setattr(module, "close_all", failing)

@@ -365,7 +365,7 @@ def test_a_certification_failure_still_reclaims_probe_debris(
     # exact shape that skips a success-only cleanup, and the debris it would strand
     # sits in engine-owned space under the lock — where the next lease entry would
     # find it and have to guess whose it was.
-    def refuse(database_path, cleanup=False):
+    def refuse(database_path, cleanup=False, **_kwargs):
         os.close(os.open(database_path, os.O_CREAT | os.O_WRONLY | os.O_CLOEXEC, 0o600))
         raise CapabilityUnavailable("injected certification failure")
 
@@ -391,11 +391,11 @@ def test_a_descriptor_release_failure_still_reclaims(
     # disk must not become conditional on the one that does not: `close_all(...)`
     # followed by `reclaim_probe_survivors(lock)` in a single finally would skip
     # reclamation on exactly this path.
-    def leaves_debris(database_path, cleanup=False):
+    def leaves_debris(database_path, cleanup=False, **_kwargs):
         os.close(os.open(database_path, os.O_CREAT | os.O_WRONLY | os.O_CLOEXEC, 0o600))
 
-    def failing_release(retained):
-        close_layout(retained)
+    def failing_release(backend, retained):
+        close_layout(backend, retained)
         raise OSError(errno.EIO, "injected release failure")
 
     monkeypatch.setattr("atoms.fs.binding.certify_sqlite_wal", leaves_debris)
@@ -425,12 +425,12 @@ def test_release_and_reclamation_failures_attempt_both_and_raise_first(
     events = []
     reclaim_calls = 0
 
-    def no_certification(database_path, cleanup=False):
+    def no_certification(database_path, cleanup=False, **_kwargs):
         pass
 
-    def failing_release(retained):
+    def failing_release(backend, retained):
         events.append("release")
-        close_layout(retained)
+        close_layout(backend, retained)
         raise OSError(errno.EIO, "injected release failure")
 
     def failing_final_reclamation(lock):
@@ -468,12 +468,12 @@ def test_a_lone_reclamation_failure_surfaces_after_layout_release(
     events = []
     reclaim_calls = 0
 
-    def no_certification(database_path, cleanup=False):
+    def no_certification(database_path, cleanup=False, **_kwargs):
         pass
 
-    def recording_release(retained):
+    def recording_release(backend, retained):
         events.append("release")
-        close_layout(retained)
+        close_layout(backend, retained)
 
     def failing_final_reclamation(lock):
         nonlocal reclaim_calls

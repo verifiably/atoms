@@ -43,10 +43,10 @@ def test_layout_descriptors_are_released_in_reverse_opening_order(
     # pinned here rather than left to the comment in close_layout.
     calls = []
 
-    def recording(fds):
+    def recording(backend, fds):
         order = list(fds)
         calls.append(order)
-        close_all(order)
+        close_all(backend, order)
 
     monkeypatch.setattr("atoms.fs.bootstrap.close_all", recording)
     with held_lock(metadata_root) as lock, metadata_layout(lock) as retained:
@@ -67,10 +67,10 @@ def test_failed_intermediate_release_unwinds_the_retained_layout(
     real_close_all = close_all
     injected = False
 
-    def fail_nonempty_intermediate(fds):
+    def fail_nonempty_intermediate(backend, fds):
         nonlocal injected
         order = list(fds)
-        real_close_all(order)
+        real_close_all(backend, order)
         if order and not injected:
             injected = True
             raise OSError(errno.EIO, "injected intermediate release failure")
@@ -96,9 +96,9 @@ def test_intermediate_release_failure_precedes_retained_layout_release_failure(
     nonempty_releases = []
     errors = (errno.EIO, errno.ENOSPC)
 
-    def fail_each_nonempty_release(fds):
+    def fail_each_nonempty_release(backend, fds):
         order = list(fds)
-        real_close_all(order)
+        real_close_all(backend, order)
         if order:
             code = errors[len(nonempty_releases)]
             nonempty_releases.append(order)

@@ -246,6 +246,39 @@ class RestrictedBackend:
         self._overrides = errno_overrides
         self._real = LinuxBackend()
 
+    def create_exclusive(self, parent_fd, name, mode):
+        return self._real.create_exclusive(parent_fd, name, mode)
+
+    def write(self, fd, data):
+        return self._real.write(fd, data)
+
+    def set_mode(self, fd, mode):
+        return self._real.set_mode(fd, mode)
+
+    def mkdir_child(self, parent_fd, name, mode):
+        return self._real.mkdir_child(parent_fd, name, mode)
+
+    def unlink_child(self, parent_fd, name):
+        return self._real.unlink_child(parent_fd, name)
+
+    def rmdir_child(self, parent_fd, name):
+        return self._real.rmdir_child(parent_fd, name)
+
+    def symlink_child(self, parent_fd, name, target):
+        return self._real.symlink_child(parent_fd, name, target)
+
+    def create_or_open(self, parent_fd, name, mode):
+        return self._real.create_or_open(parent_fd, name, mode)
+
+    def set_marker_xattr(self, fd, name, value):
+        return self._real.set_marker_xattr(fd, name, value)
+
+    def repair_entry_mode(self, parent_fd, name, mode):
+        return self._real.repair_entry_mode(parent_fd, name, mode)
+
+    def close_fd(self, fd):
+        return self._real.close_fd(fd)
+
     def _dispatch(self, capability, operation, *args, contract=None, name=None):
         # Method-level overrides preserve the named-refusal injection used by the
         # exact-errno guard tests. Contract-level overrides key directly from
@@ -389,7 +422,7 @@ def metadata_layout(lock):
     try:
         yield retained
     finally:
-        close_layout(retained)
+        close_layout(lock.backend, retained)
 
 
 @contextlib.contextmanager

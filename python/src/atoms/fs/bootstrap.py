@@ -22,7 +22,7 @@ def _open_or_create_child(backend, parent_fd: int, name: str) -> int:
     had created it.
     """
     try:
-        os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+        backend.mkdir_child(parent_fd, name, 0o700)
     except FileExistsError:
         pass
     fd = backend.open_child_directory(parent_fd, name)
@@ -33,12 +33,12 @@ def _open_or_create_child(backend, parent_fd: int, name: str) -> int:
         if not stat.S_ISDIR(os.fstat(fd).st_mode):
             raise ProtocolError(f"metadata layout component is not a directory: {name!r}")
     except BaseException:
-        os.close(fd)
+        backend.close_fd(fd)
         raise
     return fd
 
 
-def close_layout(retained: dict[str, int]) -> None:
+def close_layout(backend, retained: dict[str, int]) -> None:
     """Release retained layout descriptors in reverse opening order (design §7.2, §9.3).
 
     `retained` is insertion-ordered by METADATA_LAYOUT, so `values()` is *opening*
@@ -49,7 +49,7 @@ def close_layout(retained: dict[str, int]) -> None:
     This is the single place that knows the ordering. Production and the test helper
     both call it, so neither can release in an order the other does not.
     """
-    close_all(reversed(list(retained.values())))
+    close_all(backend, reversed(list(retained.values())))
 
 
 def ensure_metadata_layout(lock: HeldProjectLock) -> dict[str, int]:
@@ -74,19 +74,19 @@ def ensure_metadata_layout(lock: HeldProjectLock) -> dict[str, int]:
             # parent to child, so reversing the concatenation is reverse acquisition
             # order: deepest first, and the lock's metadata root — which we never
             # opened — untouched.
-            close_all(reversed([*retained.values(), *opened]))
+            close_all(backend, reversed([*retained.values(), *opened]))
             raise
         retained[relative] = opened[-1]
         # The intermediate ancestors of the retained leaf, deepest first.
         try:
-            close_all(reversed(opened[:-1]))
+            close_all(backend, reversed(opened[:-1]))
         except BaseException as first:
             # The leaf is already in `retained`, so ownership cannot be returned to a
             # caller when an intermediate release fails. Unwind the complete retained
             # set before propagating that FIRST release failure. A retained-layout
             # close failure remains its context but cannot replace it.
             try:
-                close_layout(retained)
+                close_layout(backend, retained)
             except OSError:
                 raise first
             raise
@@ -100,15 +100,15 @@ def _remove_tree(backend, parent_fd: int, name: str) -> None:
         return
     if not stat.S_ISDIR(entry.st_mode):
         # Never follow a symlink: unlink the link itself.
-        os.unlink(name, dir_fd=parent_fd)
+        backend.unlink_child(parent_fd, name)
         return
     child_fd = backend.open_child_directory(parent_fd, name)
     try:
         for inner in os.listdir(child_fd):
             _remove_tree(backend, child_fd, inner)
     finally:
-        os.close(child_fd)
-    os.rmdir(name, dir_fd=parent_fd)
+        backend.close_fd(child_fd)
+    backend.rmdir_child(parent_fd, name)
 
 
 def reclaim_probe_survivors(lock: HeldProjectLock) -> None:
@@ -120,6 +120,7 @@ def reclaim_probe_survivors(lock: HeldProjectLock) -> None:
     A4a should not destroy something it did not create, and because metadata_root
     is engine-owned space whose invariant is already broken if that occurs.
     """
+    backend = lock.backend
     root_fd = lock.metadata_root_fd
     try:
         entry = os.lstat(PROBE_DIRECTORY, dir_fd=root_fd)
@@ -129,12 +130,12 @@ def reclaim_probe_survivors(lock: HeldProjectLock) -> None:
         raise ProtocolError(
             f"metadata_root/{PROBE_DIRECTORY} is not a directory; refusing to unlink it"
         )
-    probe_fd = lock.backend.open_child_directory(root_fd, PROBE_DIRECTORY)
+    probe_fd = backend.open_child_directory(root_fd, PROBE_DIRECTORY)
     try:
         for inner in os.listdir(probe_fd):
-            _remove_tree(lock.backend, probe_fd, inner)
+            _remove_tree(backend, probe_fd, inner)
     finally:
-        os.close(probe_fd)
+        backend.close_fd(probe_fd)
 
 
 def verified_child_path(

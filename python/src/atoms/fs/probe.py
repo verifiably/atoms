@@ -56,7 +56,7 @@ def _supported(operation: str, probe) -> bool:
     return True
 
 
-def _refused_with(expected: int, open_attempt) -> bool:
+def _refused_with(backend: Backend, expected: int, open_attempt) -> bool:
     """True if `open_attempt` refused with exactly `expected`; False if it succeeded.
 
     A guard is proved by the exact errno it refuses with, never by "some OSError
@@ -74,42 +74,37 @@ def _refused_with(expected: int, open_attempt) -> bool:
         if caught.errno == expected:
             return True
         raise
-    os.close(opened)
+    backend.close_fd(opened)
     return False
 
 
-def _write(parent_fd: int, name: str, payload: bytes) -> None:
-    fd = os.open(
-        name,
-        os.O_CREAT | os.O_WRONLY | os.O_EXCL | os.O_CLOEXEC,
-        0o600,
-        dir_fd=parent_fd,
-    )
+def _write(backend: Backend, parent_fd: int, name: str, payload: bytes) -> None:
+    fd = backend.create_exclusive(parent_fd, name, 0o600)
     try:
-        os.write(fd, payload)
+        backend.write(fd, payload)
     finally:
-        os.close(fd)
+        backend.close_fd(fd)
 
 
-def _read(parent_fd: int, name: str) -> bytes:
-    fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC, dir_fd=parent_fd)
+def _read(backend: Backend, parent_fd: int, name: str) -> bytes:
+    fd = backend.create_or_open(parent_fd, name, 0o600)
     try:
         return os.read(fd, 64)
     finally:
-        os.close(fd)
+        backend.close_fd(fd)
 
 
-def _clear(parent_fd: int) -> None:
+def _clear(backend: Backend, parent_fd: int) -> None:
     for name in os.listdir(parent_fd):
         info = os.lstat(name, dir_fd=parent_fd)
         if stat.S_ISDIR(info.st_mode):
-            os.rmdir(name, dir_fd=parent_fd)
+            backend.rmdir_child(parent_fd, name)
         else:
-            os.unlink(name, dir_fd=parent_fd)
+            backend.unlink_child(parent_fd, name)
 
 
 @contextlib.contextmanager
-def _staged(probe_fd: int) -> Iterator[None]:
+def _staged(backend: Backend, probe_fd: int) -> Iterator[None]:
     """Empty `probe_fd` on the way out, whatever the body managed to create in it.
 
     Entered BEFORE anything is created, and that is the whole point: a probe that
@@ -120,7 +115,7 @@ def _staged(probe_fd: int) -> Iterator[None]:
     try:
         yield
     finally:
-        _clear(probe_fd)
+        _clear(backend, probe_fd)
 
 
 @contextlib.contextmanager
@@ -144,22 +139,22 @@ def _child_pair(backend: Backend, probe_fd: int) -> Iterator[tuple[int, int]]:
     batch passed to `close_all`.
     """
     with contextlib.ExitStack() as stack:
-        os.mkdir("src", mode=0o700, dir_fd=probe_fd)
-        os.mkdir("dst", mode=0o700, dir_fd=probe_fd)
+        backend.mkdir_child(probe_fd, "src", 0o700)
+        backend.mkdir_child(probe_fd, "dst", 0o700)
         src_fd = backend.open_child_directory(probe_fd, "src")
-        stack.callback(os.close, src_fd)
-        stack.callback(_clear, src_fd)
+        stack.callback(backend.close_fd, src_fd)
+        stack.callback(_clear, backend, src_fd)
         dst_fd = backend.open_child_directory(probe_fd, "dst")
-        stack.callback(os.close, dst_fd)
-        stack.callback(_clear, dst_fd)
+        stack.callback(backend.close_fd, dst_fd)
+        stack.callback(_clear, backend, dst_fd)
         yield src_fd, dst_fd
-    _clear(probe_fd)
+    _clear(backend, probe_fd)
 
 
 def _probe_traversal(backend: Backend, probe_fd: int) -> bool:
-    with _staged(probe_fd):
-        os.mkdir("real", mode=0o700, dir_fd=probe_fd)
-        os.symlink("real", "escape", dir_fd=probe_fd)
+    with _staged(backend, probe_fd):
+        backend.mkdir_child(probe_fd, "real", 0o700)
+        backend.symlink_child(probe_fd, "escape", "real")
         # One open, not two: the availability check and the descriptor it produces are
         # the same call. Opening again to "get a real one" would discard a descriptor.
         opened: list[int] = []
@@ -169,12 +164,13 @@ def _probe_traversal(backend: Backend, probe_fd: int) -> bool:
 
         if not _supported("traversal", attempt):
             return False
-        os.close(opened[0])
+        backend.close_fd(opened[0])
         # RESOLVE_NO_SYMLINKS reports a symlink component as ELOOP; RESOLVE_BENEATH
         # reports an escape as EXDEV. Both refusals must arrive with exactly that
         # code, or the guard is not what proved itself.
         for refused, expected in (("escape", errno.ELOOP), ("..", errno.EXDEV)):
             if not _refused_with(
+                backend,
                 expected,
                 lambda name=refused: backend.open_child_directory(probe_fd, name),
             ):
@@ -185,9 +181,7 @@ def _probe_traversal(backend: Backend, probe_fd: int) -> bool:
 def _probe_lock(backend: Backend, lock: HeldProjectLock) -> bool:
     # flock is per open file description, so a second open in this process
     # contends correctly against the already-held lock.
-    contender = os.open(
-        "lock", os.O_RDWR | os.O_CLOEXEC, dir_fd=lock.metadata_root_fd
-    )
+    contender = backend.create_or_open(lock.metadata_root_fd, "lock", 0o600)
     try:
         acquired = None
 
@@ -199,25 +193,27 @@ def _probe_lock(backend: Backend, lock: HeldProjectLock) -> bool:
             return False
         return acquired is False
     finally:
-        os.close(contender)
+        backend.close_fd(contender)
 
 
 def _probe_exchange(backend: Backend, probe_fd: int) -> bool:
-    with _staged(probe_fd):
-        _write(probe_fd, "left", b"L")
-        _write(probe_fd, "right", b"R")
+    with _staged(backend, probe_fd):
+        _write(backend, probe_fd, "left", b"L")
+        _write(backend, probe_fd, "right", b"R")
         if not _supported(
             "exchange", lambda: backend.exchange(probe_fd, "left", "right")
         ):
             return False
-        return _read(probe_fd, "left") == b"R" and _read(probe_fd, "right") == b"L"
+        return _read(backend, probe_fd, "left") == b"R" and _read(
+            backend, probe_fd, "right"
+        ) == b"L"
 
 
 def _probe_transfer(backend: Backend, probe_fd: int) -> bool:
     # The distinct-parent form is what blob promotion and staging publication use.
     with _child_pair(backend, probe_fd) as (src_fd, dst_fd):
-        _write(src_fd, "payload", b"P")
-        _write(dst_fd, "payload", b"occupied")
+        _write(backend, src_fd, "payload", b"P")
+        _write(backend, dst_fd, "payload", b"occupied")
         blocked = False
         try:
             backend.transfer_noclobber(src_fd, "payload", dst_fd, "payload")
@@ -229,7 +225,7 @@ def _probe_transfer(backend: Backend, probe_fd: int) -> bool:
             blocked = True
         if not blocked:
             return False
-        os.unlink("payload", dir_fd=dst_fd)
+        backend.unlink_child(dst_fd, "payload")
         if not _supported(
             "transfer_noclobber",
             lambda: backend.transfer_noclobber(
@@ -237,12 +233,12 @@ def _probe_transfer(backend: Backend, probe_fd: int) -> bool:
             ),
         ):
             return False
-        return _read(dst_fd, "payload") == b"P"
+        return _read(backend, dst_fd, "payload") == b"P"
 
 
 def _probe_link(backend: Backend, probe_fd: int) -> bool:
     with _child_pair(backend, probe_fd) as (src_fd, dst_fd):
-        _write(src_fd, "payload", b"P")
+        _write(backend, src_fd, "payload", b"P")
         if not _supported(
             "link_anchor",
             lambda: backend.link_anchor(src_fd, "payload", dst_fd, "anchor"),
@@ -256,9 +252,9 @@ def _probe_link(backend: Backend, probe_fd: int) -> bool:
 
 
 def _probe_flush(backend: Backend, probe_fd: int) -> bool:
-    with _staged(probe_fd):
-        _write(probe_fd, "payload", b"P")
-        fd = os.open("payload", os.O_RDONLY | os.O_CLOEXEC, dir_fd=probe_fd)
+    with _staged(backend, probe_fd):
+        _write(backend, probe_fd, "payload", b"P")
+        fd = backend.create_or_open(probe_fd, "payload", 0o600)
         try:
 
             def attempt():
@@ -268,13 +264,13 @@ def _probe_flush(backend: Backend, probe_fd: int) -> bool:
             return _supported("flush", attempt)
         finally:
             # Inside _staged, so the descriptor closes before probe/ is emptied.
-            os.close(fd)
+            backend.close_fd(fd)
 
 
 def _probe_nofollow_read(backend: Backend, probe_fd: int) -> bool:
-    with _staged(probe_fd):
-        _write(probe_fd, "payload", b"P")
-        os.symlink("payload", "alias", dir_fd=probe_fd)
+    with _staged(backend, probe_fd):
+        _write(backend, probe_fd, "payload", b"P")
+        backend.symlink_child(probe_fd, "alias", "payload")
         opened: list[int] = []
 
         def attempt():
@@ -288,17 +284,18 @@ def _probe_nofollow_read(backend: Backend, probe_fd: int) -> bool:
             if os.read(opened[0], 8) != b"P":
                 return False
         finally:
-            os.close(opened[0])
+            backend.close_fd(opened[0])
         # O_NOFOLLOW on a symlink leaf refuses with exactly ELOOP. Any other errno
         # is an unrelated failure and must not be read as a working guard.
         return _refused_with(
+            backend,
             errno.ELOOP,
             lambda: backend.open_regular_nofollow(probe_fd, "alias"),
         )
 
 
 def _probe_symlink_fingerprint(backend: Backend, probe_fd: int) -> bool:
-    with _staged(probe_fd):
+    with _staged(backend, probe_fd):
         # symlink(2) reports EPERM when this filesystem cannot create symlinks,
         # and EPERM is part of symlink_fingerprint's own unsupported set. That is
         # why creation belongs inside this capability's _supported call. This is
@@ -306,7 +303,7 @@ def _probe_symlink_fingerprint(backend: Backend, probe_fd: int) -> bool:
         # traversal and nofollow probes.
         if not _supported(
             "symlink_fingerprint",
-            lambda: os.symlink("../target", "alias", dir_fd=probe_fd),
+            lambda: backend.symlink_child(probe_fd, "alias", "../target"),
         ):
             return False
         captured: list[tuple] = []
@@ -434,12 +431,14 @@ def _parent_sqlite_operation(
         ) from caught
 
 
-def _cleanup_sqlite_files(database_path: str) -> None:
+def _cleanup_sqlite_files(
+    backend: Backend, parent_fd: int, database_name: str
+) -> None:
     """Attempt every requested SQLite pathname and raise the first cleanup failure."""
     first: OSError | None = None
     for suffix in ("", "-wal", "-shm"):
         try:
-            os.unlink(database_path + suffix)
+            backend.unlink_child(parent_fd, database_name + suffix)
         except FileNotFoundError:
             pass
         except OSError as caught:
@@ -527,7 +526,13 @@ def _certify_sqlite_wal(database_path: str) -> None:
         parent.close()
 
 
-def certify_sqlite_wal(database_path: str, cleanup: bool = False) -> None:
+def certify_sqlite_wal(
+    database_path: str,
+    cleanup: bool = False,
+    *,
+    backend: Backend | None = None,
+    parent_fd: int | None = None,
+) -> None:
     """Certify the volume can host the SQLite-WAL metadata store (design §8.3).
 
     Opening a database and selecting WAL mode is insufficient: WAL can operate
@@ -543,16 +548,22 @@ def certify_sqlite_wal(database_path: str, cleanup: bool = False) -> None:
     resolve only by one side timing out. Splitting at the release point makes the
     ordering explicit and the outcome deterministic.
     """
+    cleanup_target: tuple[Backend, int] | None = None
+    if cleanup:
+        if backend is None or parent_fd is None:
+            raise TypeError("cleanup requires backend and parent_fd")
+        cleanup_target = backend, parent_fd
+    database_name = os.path.basename(database_path)
     try:
         _certify_sqlite_wal(database_path)
     except BaseException as failure:
-        if cleanup:
+        if cleanup_target is not None:
             try:
-                _cleanup_sqlite_files(database_path)
+                _cleanup_sqlite_files(*cleanup_target, database_name)
             except OSError as cleanup_failure:
                 failure.add_note(
                     f"SQLite cleanup also failed and was suppressed: {cleanup_failure!r}"
                 )
         raise
-    if cleanup:
-        _cleanup_sqlite_files(database_path)
+    if cleanup_target is not None:
+        _cleanup_sqlite_files(*cleanup_target, database_name)

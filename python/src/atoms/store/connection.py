@@ -160,9 +160,10 @@ def publish_entry(binding: ProjectBinding, fd: int) -> None:
     macOS.
     """
     gate(binding)
-    os.fchmod(fd, DATABASE_MODE)
-    binding.backend.flush_file(fd)
-    binding.backend.flush_directory(binding.metadata_root_fd)
+    backend = binding.backend
+    backend.set_mode(fd, DATABASE_MODE)
+    backend.flush_file(fd)
+    backend.flush_directory(binding.metadata_root_fd)
 
 
 def install_authorizer(connection: sqlite3.Connection) -> None:
@@ -231,16 +232,14 @@ def create_store(binding: ProjectBinding) -> sqlite3.Connection:
     _preflight_entries(binding, require_absent=True)
 
     gate(binding)
-    fd = os.open(
-        DATABASE_NAME,
-        os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_RDWR,
-        DATABASE_MODE,
-        dir_fd=binding.metadata_root_fd,
+    backend = binding.backend
+    fd = backend.create_exclusive(
+        binding.metadata_root_fd, DATABASE_NAME, DATABASE_MODE
     )
     try:
         publish_entry(binding, fd)
     finally:
-        os.close(fd)
+        backend.close_fd(fd)
 
     connection = _connect(binding)
     try:
@@ -331,25 +330,18 @@ def repair_unpublished(binding: ProjectBinding) -> None:
     repair began rather than when it changed a mode -- §5.4's exact complaint about a
     single gate at the front of an operation, in miniature.
     """
-    path_fd = os.open(
-        DATABASE_NAME,
-        os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC,
-        dir_fd=binding.metadata_root_fd,
+    gate(binding)
+    backend = binding.backend
+    backend.repair_entry_mode(
+        binding.metadata_root_fd, DATABASE_NAME, DATABASE_MODE
     )
-    try:
-        gate(binding)
-        os.chmod(f"/proc/self/fd/{path_fd}", DATABASE_MODE)
-    finally:
-        os.close(path_fd)
-    fd = os.open(
-        DATABASE_NAME,
-        os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
-        dir_fd=binding.metadata_root_fd,
+    fd = backend.create_or_open(
+        binding.metadata_root_fd, DATABASE_NAME, DATABASE_MODE
     )
     try:
         publish_entry(binding, fd)
     finally:
-        os.close(fd)
+        backend.close_fd(fd)
 
 
 def _integrity_findings(connection: sqlite3.Connection) -> tuple[str, ...]:

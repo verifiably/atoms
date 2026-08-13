@@ -22,7 +22,7 @@ _WORKSPACE_TOKEN = object()
 class Workspace:
     """A live resource: two owned directory descriptors and their spent flags."""
 
-    __slots__ = ("_closed", "_staging_fd", "_store", "_txid", "_work_fd")
+    __slots__ = ("_backend", "_closed", "_staging_fd", "_store", "_txid", "_work_fd")
 
     def __init__(
         self,
@@ -38,7 +38,10 @@ class Workspace:
                 "Workspace values are created only by Store.create_workspace or "
                 "Store.reopen_workspace"
             )
+        if store is None:
+            raise TypeError("a Workspace requires its issuing Store")
         self._store = store
+        self._backend = store._binding._backend
         self._txid = txid
         self._staging_fd = staging_fd
         self._work_fd = work_fd
@@ -84,12 +87,12 @@ class Workspace:
 
     def _spend_staging(self) -> None:
         if self._staging_fd is not None:
-            os.close(self._staging_fd)
+            self._backend.close_fd(self._staging_fd)
             self._staging_fd = None
 
     def _spend_work(self) -> None:
         if self._work_fd is not None:
-            os.close(self._work_fd)
+            self._backend.close_fd(self._work_fd)
             self._work_fd = None
 
     def close(self) -> None:
@@ -98,7 +101,7 @@ class Workspace:
         self._closed = True
         for fd in (self._staging_fd, self._work_fd):
             if fd is not None:
-                os.close(fd)
+                self._backend.close_fd(fd)
         self._staging_fd = None
         self._work_fd = None
         store = self._store
@@ -118,27 +121,24 @@ def _issue(store: Store, workspace: Workspace) -> Workspace:
 
 
 def _parent_fd(store: Store, name: str) -> int:
-    return store._binding.backend.open_child_directory(
+    return store._binding._backend.open_child_directory(
         store._binding.metadata_root_fd, name
     )
 
 
 def _parent_fds(store: Store) -> tuple[int, int]:
+    backend = store._binding._backend
     staging_parent = _parent_fd(store, STAGING_PARENT)
     try:
         return staging_parent, _parent_fd(store, WORK_PARENT)
     except BaseException:
-        os.close(staging_parent)
+        backend.close_fd(staging_parent)
         raise
 
 
-def _open_child(parent_fd: int, parent: str, txid: str) -> int | None:
+def _open_child(store: Store, parent_fd: int, parent: str, txid: str) -> int | None:
     try:
-        return os.open(
-            txid,
-            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-            dir_fd=parent_fd,
-        )
+        return store._binding._backend.open_child_directory(parent_fd, txid)
     except FileNotFoundError:
         return None
     except OSError as caught:
@@ -182,12 +182,13 @@ def _stat_or_none(parent_fd: int, name: str) -> os.stat_result | None:
 
 
 def _open_both(store: Store, txid: str, staging_parent: int, work_parent: int) -> Workspace:
-    staging_fd = _open_child(staging_parent, STAGING_PARENT, txid)
+    backend = store._binding._backend
+    staging_fd = _open_child(store, staging_parent, STAGING_PARENT, txid)
     try:
-        work_fd = _open_child(work_parent, WORK_PARENT, txid)
+        work_fd = _open_child(store, work_parent, WORK_PARENT, txid)
     except BaseException:
         if staging_fd is not None:
-            os.close(staging_fd)
+            backend.close_fd(staging_fd)
         raise
     return Workspace(
         store=store,
@@ -200,6 +201,7 @@ def _open_both(store: Store, txid: str, staging_parent: int, work_parent: int) -
 
 def create_workspace(store: Store, txid: str) -> Workspace:
     store._require_live()
+    backend = store._binding._backend
     require_identifier("txid", txid)
     staging_parent, work_parent = _parent_fds(store)
     try:
@@ -212,19 +214,20 @@ def create_workspace(store: Store, txid: str) -> Workspace:
         from atoms.store.connection import gate
 
         gate(store._binding)
-        os.mkdir(txid, 0o700, dir_fd=staging_parent)
+        backend.mkdir_child(staging_parent, txid, 0o700)
         gate(store._binding)
-        os.mkdir(txid, 0o700, dir_fd=work_parent)
-        store._binding.backend.flush_directory(staging_parent)
-        store._binding.backend.flush_directory(work_parent)
+        backend.mkdir_child(work_parent, txid, 0o700)
+        backend.flush_directory(staging_parent)
+        backend.flush_directory(work_parent)
         return _issue(store, _open_both(store, txid, staging_parent, work_parent))
     finally:
-        os.close(staging_parent)
-        os.close(work_parent)
+        backend.close_fd(staging_parent)
+        backend.close_fd(work_parent)
 
 
 def reopen_workspace(store: Store, txid: str) -> Workspace:
     store._require_live()
+    backend = store._binding._backend
     require_identifier("txid", txid)
     staging_parent, work_parent = _parent_fds(store)
     try:
@@ -233,24 +236,26 @@ def reopen_workspace(store: Store, txid: str) -> Workspace:
             raise ProtocolError(f"no workspace on disk for txid {txid!r}")
         return _issue(store, workspace)
     finally:
-        os.close(staging_parent)
-        os.close(work_parent)
+        backend.close_fd(staging_parent)
+        backend.close_fd(work_parent)
 
 
 def list_workspaces(store: Store) -> tuple[str, ...]:
     store._require_live()
+    backend = store._binding._backend
     found: set[str] = set()
     for parent in (STAGING_PARENT, WORK_PARENT):
         parent_fd = _parent_fd(store, parent)
         try:
             found.update(_require_permitted_children(parent_fd, parent))
         finally:
-            os.close(parent_fd)
+            backend.close_fd(parent_fd)
     return tuple(sorted(found))
 
 
 def remove_workspace(store: Store, workspace: Workspace) -> None:
     store._require_live()
+    backend = store._binding._backend
     if type(workspace) is not Workspace:
         raise ProtocolError(f"expected exactly Workspace, got {type(workspace).__name__}")
     if workspace._closed:
@@ -286,18 +291,18 @@ def remove_workspace(store: Store, workspace: Workspace) -> None:
         if workspace._staging_fd is not None:
             for name in staging_names:
                 gate(store._binding)
-                os.unlink(name, dir_fd=workspace._staging_fd)
-            store._binding.backend.flush_directory(workspace._staging_fd)
+                backend.unlink_child(workspace._staging_fd, name)
+            backend.flush_directory(workspace._staging_fd)
             gate(store._binding)
-            os.rmdir(txid, dir_fd=staging_parent)
+            backend.rmdir_child(staging_parent, txid)
             workspace._spend_staging()
-            store._binding.backend.flush_directory(staging_parent)
+            backend.flush_directory(staging_parent)
         if workspace._work_fd is not None:
             gate(store._binding)
-            os.rmdir(txid, dir_fd=work_parent)
+            backend.rmdir_child(work_parent, txid)
             workspace._spend_work()
-            store._binding.backend.flush_directory(work_parent)
+            backend.flush_directory(work_parent)
     finally:
-        os.close(staging_parent)
-        os.close(work_parent)
+        backend.close_fd(staging_parent)
+        backend.close_fd(work_parent)
     workspace.close()

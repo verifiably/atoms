@@ -428,19 +428,33 @@ def test_a_certification_child_that_times_out_refuses(
         probe_database_path(lock) as database,
         pytest.raises(CapabilityUnavailable, match=phase),
     ):
-        certify_sqlite_wal(database, cleanup=True)
+        probe_fd = lock.backend.open_child_directory(lock.metadata_root_fd, "probe")
+        try:
+            certify_sqlite_wal(
+                database, cleanup=True, backend=lock.backend, parent_fd=probe_fd
+            )
+        finally:
+            lock.backend.close_fd(probe_fd)
     assert os.listdir(os.path.dirname(database)) == []
 
 
 def test_sqlite_certification_removes_its_files(held_lock, metadata_root):
     with held_lock(metadata_root) as lock, probe_database_path(lock) as database:
-        certify_sqlite_wal(database, cleanup=True)
+        probe_fd = lock.backend.open_child_directory(lock.metadata_root_fd, "probe")
+        try:
+            certify_sqlite_wal(
+                database, cleanup=True, backend=lock.backend, parent_fd=probe_fd
+            )
+        finally:
+            lock.backend.close_fd(probe_fd)
         # All three of the database, -wal, and -shm names must be gone, so the
         # assertion is on the directory rather than on the three names.
         assert os.listdir(os.path.dirname(database)) == []
 
 
-def test_sqlite_certification_refuses_when_wal_is_unavailable(tmp_path, monkeypatch):
+def test_sqlite_certification_refuses_when_wal_is_unavailable(
+    linux_backend, tmp_path, monkeypatch
+):
     class RefusingConnection:
         def execute(self, statement, *args):
             # Production calls .fetchone() on what execute returns, so the fake must
@@ -459,13 +473,22 @@ def test_sqlite_certification_refuses_when_wal_is_unavailable(tmp_path, monkeypa
     monkeypatch.setattr(
         "atoms.fs.probe.sqlite3.connect", lambda *a, **k: RefusingConnection()
     )
-    with pytest.raises(CapabilityUnavailable, match="WAL"):
-        certify_sqlite_wal(database, cleanup=True)
+    parent_fd = linux_backend.open_root(str(tmp_path))
+    try:
+        with pytest.raises(CapabilityUnavailable, match="WAL"):
+            certify_sqlite_wal(
+                database,
+                cleanup=True,
+                backend=linux_backend,
+                parent_fd=parent_fd,
+            )
+    finally:
+        linux_backend.close_fd(parent_fd)
     assert list(tmp_path.iterdir()) == []
 
 
 def test_certification_failure_survives_cleanup_failure_and_all_names_are_attempted(
-    tmp_path, monkeypatch
+    linux_backend, tmp_path, monkeypatch
 ):
     database = str(tmp_path / "x.db")
     failure = sqlite3.OperationalError("injected connect failure")
@@ -474,15 +497,25 @@ def test_certification_failure_survives_cleanup_failure_and_all_names_are_attemp
     def fail_connect(*args, **kwargs):
         raise failure
 
-    def fail_cleanup(path):
+    def fail_cleanup(_parent_fd, name):
+        path = str(tmp_path / name)
         attempted.append(path)
         raise OSError(errno.EIO, f"injected cleanup failure for {path}")
 
     monkeypatch.setattr("atoms.fs.probe.sqlite3.connect", fail_connect)
-    monkeypatch.setattr("atoms.fs.probe.os.unlink", fail_cleanup)
+    monkeypatch.setattr(linux_backend, "unlink_child", fail_cleanup)
 
-    with pytest.raises(CapabilityUnavailable, match="connection") as caught:
-        certify_sqlite_wal(database, cleanup=True)
+    parent_fd = linux_backend.open_root(str(tmp_path))
+    try:
+        with pytest.raises(CapabilityUnavailable, match="connection") as caught:
+            certify_sqlite_wal(
+                database,
+                cleanup=True,
+                backend=linux_backend,
+                parent_fd=parent_fd,
+            )
+    finally:
+        linux_backend.close_fd(parent_fd)
 
     assert caught.value.__cause__ is failure
     assert attempted == [database, f"{database}-wal", f"{database}-shm"]

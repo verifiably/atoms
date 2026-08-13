@@ -85,12 +85,13 @@ class ProjectBinding:
     must never close one.
     """
 
-    __slots__ = ("_active", "_evidence", "_lock", "_project_root_fd")
+    __slots__ = ("_active", "_backend", "_evidence", "_lock", "_project_root_fd")
 
     def __init__(self, *, _construction_token: object | None = None, **kwargs) -> None:
         if _construction_token is not _TOKEN:
             raise TypeError("ProjectBinding values are created only by bind_project_volume")
         self._lock = kwargs["lock"]
+        self._backend = kwargs["backend"]
         self._project_root_fd = kwargs["project_root_fd"]
         self._evidence = kwargs["evidence"]
         self._active = True
@@ -116,7 +117,7 @@ class ProjectBinding:
     @property
     def backend(self) -> Backend:
         self._require_active()
-        return self._lock.backend
+        return self._backend
 
     @property
     def project_root_fd(self) -> int:
@@ -154,7 +155,7 @@ class ProjectBinding:
             return
         self._active = False
         # Closes only what it opened; the lock owns the metadata-root descriptor.
-        os.close(self._project_root_fd)
+        self._backend.close_fd(self._project_root_fd)
 
 
 def bind_project_volume(
@@ -216,7 +217,12 @@ def bind_project_volume(
                 metadata_info.st_ino,
                 PROBE_DIRECTORY,
             )
-            certify_sqlite_wal(os.path.join(probe_dir, "certify.db"), cleanup=True)
+            certify_sqlite_wal(
+                os.path.join(probe_dir, "certify.db"),
+                cleanup=True,
+                backend=backend,
+                parent_fd=probe_fd,
+            )
         finally:
             # Design §9.1 step 8 runs in a finally, not on the success path. A SQLite
             # refusal, a subprocess timeout, or an unexpected errno are exactly the
@@ -233,7 +239,7 @@ def bind_project_volume(
             # descriptor rather than abandoning the rest after the first failure, and
             # releases them in reverse opening order per design §9.3.
             try:
-                close_layout(retained)
+                close_layout(backend, retained)
             except OSError as first:
                 try:
                     reclaim_probe_survivors(lock)
@@ -253,12 +259,13 @@ def bind_project_volume(
             _construction_token=_TOKEN,
         )
     except BaseException:
-        os.close(project_root_fd)
+        backend.close_fd(project_root_fd)
         raise
 
     return ProjectBinding(
         _construction_token=_TOKEN,
         lock=lock,
+        backend=backend,
         project_root_fd=project_root_fd,
         evidence=evidence,
     )

@@ -16,7 +16,7 @@ SYNC_IGNORE_ATTRIBUTE = "user.com.dropbox.ignored"
 _TOKEN = object()
 
 
-def close_all(fds: Iterable[int]) -> None:
+def close_all(backend: Backend, fds: Iterable[int]) -> None:
     """Close every descriptor, attempting each, then raise the first failure.
 
     A failed close does not un-open the descriptors after it, so a plain loop that
@@ -32,7 +32,7 @@ def close_all(fds: Iterable[int]) -> None:
     first: OSError | None = None
     for fd in fds:
         try:
-            os.close(fd)
+            backend.close_fd(fd)
         except OSError as caught:
             if first is None:
                 first = caught
@@ -104,22 +104,22 @@ def establish_root(backend: Backend, path: str, create: bool) -> tuple[int, str,
     # goes has races this layer has no need to take on.
     parent_fd = _guarded_open(backend, parent)
     try:
-        os.mkdir(leaf, mode=0o700, dir_fd=parent_fd)
+        backend.mkdir_child(parent_fd, leaf, 0o700)
         # Reopen through guarded traversal even though we just created it, so the
         # descriptor is guard-checked on the same terms as the existing-root case.
         fd = backend.open_child_directory(parent_fd, leaf)
     except BaseException:
-        os.close(parent_fd)
+        backend.close_fd(parent_fd)
         raise
     # `fd` is owned from here on, so BOTH remaining steps run under that ownership.
     # A `finally: os.close(parent_fd)` around the block above would leak `fd` if that
     # close failed. A later child-close failure is retained as context but cannot
     # replace that first parent-close failure.
     try:
-        os.close(parent_fd)
+        backend.close_fd(parent_fd)
     except BaseException as first:
         try:
-            os.close(fd)
+            backend.close_fd(fd)
         except OSError:
             raise first
         raise
@@ -129,7 +129,7 @@ def establish_root(backend: Backend, path: str, create: bool) -> tuple[int, str,
         if not stat.S_ISDIR(os.fstat(fd).st_mode):
             raise ProtocolError(f"created metadata root is not a directory: {spelled!r}")
     except BaseException:
-        os.close(fd)
+        backend.close_fd(fd)
         raise
     return fd, os.path.normpath(spelled), True
 
@@ -200,7 +200,7 @@ class HeldProjectLock:
         # for the process lifetime — while `held` already reads False, so nothing would
         # ever retry it. The lock descriptor goes first: closing it is what releases
         # flock, and that must not depend on the root closing cleanly.
-        close_all((self._lock_fd, self._root_fd))
+        close_all(self._backend, (self._lock_fd, self._root_fd))
 
 
 def acquire_project_lock(backend: Backend, metadata_root: str) -> HeldProjectLock:
@@ -211,17 +211,12 @@ def acquire_project_lock(backend: Backend, metadata_root: str) -> HeldProjectLoc
             # synced copy is neither required nor trusted. Any failure is swallowed
             # and weakens no single-host guarantee.
             try:
-                os.setxattr(root_fd, SYNC_IGNORE_ATTRIBUTE, b"1")
+                backend.set_marker_xattr(root_fd, SYNC_IGNORE_ATTRIBUTE, b"1")
             except OSError:
                 pass
-        lock_fd = os.open(
-            "lock",
-            os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
-            0o600,
-            dir_fd=root_fd,
-        )
+        lock_fd = backend.create_or_open(root_fd, "lock", 0o600)
     except BaseException:
-        os.close(root_fd)
+        backend.close_fd(root_fd)
         raise
     try:
         if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
@@ -239,7 +234,7 @@ def acquire_project_lock(backend: Backend, metadata_root: str) -> HeldProjectLoc
         # One pass, not two sequential closes: a failure closing `lock_fd` must not
         # abandon `root_fd`, and this unwind runs on the CapabilityUnavailable path
         # that an unlockable volume takes, where a leak would be permanent.
-        close_all((lock_fd, root_fd))
+        close_all(backend, (lock_fd, root_fd))
         raise
     return HeldProjectLock(
         _construction_token=_TOKEN,

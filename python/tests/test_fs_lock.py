@@ -295,10 +295,10 @@ def test_release_is_idempotent_without_a_second_close(
 ):
     releases = []
 
-    def recording_close_all(fds):
+    def recording_close_all(backend, fds):
         order = tuple(fds)
         releases.append(order)
-        close_all(order)
+        close_all(backend, order)
 
     lock = acquire_project_lock(linux_backend, str(metadata_root))
     monkeypatch.setattr("atoms.fs.lock.close_all", recording_close_all)
@@ -319,7 +319,9 @@ def test_exceptional_exit_still_releases(linux_backend, metadata_root):
     assert lock.held is False
 
 
-def test_close_all_attempts_every_descriptor_and_raises_the_first_failure(test_volume):
+def test_close_all_attempts_every_descriptor_and_raises_the_first_failure(
+    linux_backend, test_volume
+):
     # A failed close does not un-open the descriptors after it, so a loop that lets the
     # first failure escape leaks every later one for the process lifetime — and in the
     # lock's case `held` is already False by then, so nothing ever retries. This is the
@@ -334,7 +336,7 @@ def test_close_all_attempts_every_descriptor_and_raises_the_first_failure(test_v
     os.close(first)
 
     with pytest.raises(OSError) as caught:
-        close_all((first, second))
+        close_all(linux_backend, (first, second))
     assert caught.value.errno == errno.EBADF
     # fstat rather than a second close: it proves `second` was reached without risking
     # closing whatever might have taken that number.
@@ -343,7 +345,7 @@ def test_close_all_attempts_every_descriptor_and_raises_the_first_failure(test_v
     assert reached.value.errno == errno.EBADF
 
 
-def test_close_all_raises_the_first_of_several_failures(monkeypatch):
+def test_close_all_raises_the_first_of_several_failures(linux_backend, monkeypatch):
     # The test above has one real failure, so it proves "keep going" but not the stated
     # precedence. Two failures with distinct errnos make "the FIRST failure" observable:
     # a `first = caught` that kept overwriting would surface ENOSPC instead.
@@ -359,9 +361,9 @@ def test_close_all_raises_the_first_of_several_failures(monkeypatch):
         raise OSError(codes[fd], "injected")
 
     with monkeypatch.context() as patched:
-        patched.setattr("atoms.fs.lock.os.close", failing_close)
+        patched.setattr(linux_backend, "close_fd", failing_close)
         with pytest.raises(OSError) as caught:
-            close_all((4242, 4243))
+            close_all(linux_backend, (4242, 4243))
     assert caught.value.errno == errno.EIO, "the first failure is what propagates"
     assert attempted == [4242, 4243], "a failure must not stop the remaining closes"
 
@@ -403,10 +405,10 @@ def test_held_lock_refuses_duplicate_ownership(
     # its eventual exit must remain the descriptors' one release.
     releases = []
 
-    def recording_close_all(fds):
+    def recording_close_all(backend, fds):
         order = tuple(fds)
         releases.append(order)
-        close_all(order)
+        close_all(backend, order)
 
     with acquire_project_lock(linux_backend, str(metadata_root)) as lock:
         root_fd = lock.metadata_root_fd

@@ -79,22 +79,20 @@ def leaf_to_digest_or_refuse(leaf: str) -> str:
 
 
 def _blobs_fd(store: Store) -> int:
-    backend = store._binding.backend
+    backend = store._binding._backend
     blobs_fd = backend.open_child_directory(
         store._binding.metadata_root_fd, BLOBS_DIRECTORY
     )
     try:
         return backend.open_child_directory(blobs_fd, SHA256_DIRECTORY)
     finally:
-        os.close(blobs_fd)
+        backend.close_fd(blobs_fd)
 
 
-def open_entry_nofollow(parent_fd: int, name: str, what: str) -> int:
+def open_entry_nofollow(backend, parent_fd: int, name: str, what: str) -> int:
     """Open a leaf without following symlinks, translating that forbidden shape."""
     try:
-        return os.open(
-            name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd
-        )
+        return backend.open_regular_nofollow(parent_fd, name)
     except OSError as caught:
         if caught.errno == errno.ELOOP:
             raise MetadataStoreInvalid(f"{what} is a symlink") from caught
@@ -136,6 +134,7 @@ def open_blob(store: Store, digest: str) -> int:
         byte_len = row[0]
 
     store._require_live()
+    backend = store._binding._backend
     try:
         parent = _blobs_fd(store)
     except FileNotFoundError as caught:
@@ -144,18 +143,23 @@ def open_blob(store: Store, digest: str) -> int:
         ) from caught
     try:
         try:
-            fd = open_entry_nofollow(parent, digest_to_leaf(digest), f"the leaf for {digest}")
+            fd = open_entry_nofollow(
+                backend,
+                parent,
+                digest_to_leaf(digest),
+                f"the leaf for {digest}",
+            )
         except FileNotFoundError as caught:
             raise MetadataStoreInvalid(
                 f"{digest} has a blob row but no leaf under {BLOBS_PARENT}/"
             ) from caught
     finally:
-        os.close(parent)
+        backend.close_fd(parent)
     try:
         verify_leaf(fd, digest, byte_len)
         store._require_live()
     except BaseException:
-        os.close(fd)
+        backend.close_fd(fd)
         raise
     return fd
 
@@ -163,6 +167,7 @@ def open_blob(store: Store, digest: str) -> int:
 def list_unindexed_blobs(store: Store) -> tuple[str, ...]:
     """Return verified leaves with no blob row, from one deferred read snapshot."""
     store._require_live()
+    backend = store._binding._backend
     parent = _blobs_fd(store)
     try:
         orphans: list[str] = []
@@ -172,7 +177,9 @@ def list_unindexed_blobs(store: Store) -> tuple[str, ...]:
                 with translated("reading blob membership during reclamation"):
                     row = connection.execute(SELECT_BLOB, (digest,)).fetchone()
                 try:
-                    fd = open_entry_nofollow(parent, leaf, f"the leaf for {digest}")
+                    fd = open_entry_nofollow(
+                        backend, parent, leaf, f"the leaf for {digest}"
+                    )
                 except FileNotFoundError as caught:
                     raise MetadataStoreInvalid(
                         f"the leaf for {digest} disappeared during enumeration"
@@ -180,11 +187,11 @@ def list_unindexed_blobs(store: Store) -> tuple[str, ...]:
                 try:
                     verify_leaf(fd, digest, None if row is None else row[0])
                 finally:
-                    os.close(fd)
+                    backend.close_fd(fd)
                 if row is None:
                     orphans.append(digest)
     finally:
-        os.close(parent)
+        backend.close_fd(parent)
     store._require_live()
     return tuple(orphans)
 
@@ -202,6 +209,7 @@ def remove_unindexed_blob(store: Store, digest: str) -> None:
         )
     with translated("beginning reclamation"):
         store._connection.execute(_BEGIN_IMMEDIATE_SQL)
+    backend = store._binding._backend
     try:
         with translated("rechecking blob membership during reclamation"):
             row = store._connection.execute(SELECT_BLOB, (digest,)).fetchone()
@@ -214,7 +222,10 @@ def remove_unindexed_blob(store: Store, digest: str) -> None:
         try:
             try:
                 fd = open_entry_nofollow(
-                    parent, digest_to_leaf(digest), f"the leaf for {digest}"
+                    backend,
+                    parent,
+                    digest_to_leaf(digest),
+                    f"the leaf for {digest}",
                 )
             except FileNotFoundError as caught:
                 raise ProtocolError(
@@ -223,18 +234,17 @@ def remove_unindexed_blob(store: Store, digest: str) -> None:
             try:
                 verify_leaf(fd, digest, None)
             finally:
-                os.close(fd)
-            backend = store._binding.backend
+                backend.close_fd(fd)
             gate(store._binding)
             try:
-                os.unlink(digest_to_leaf(digest), dir_fd=parent)
+                backend.unlink_child(parent, digest_to_leaf(digest))
             except FileNotFoundError as caught:
                 raise ProtocolError(
                     f"no leaf for {digest}; the argument is stale, re-enumerate"
                 ) from caught
             backend.flush_directory(parent)
         finally:
-            os.close(parent)
+            backend.close_fd(parent)
         gate(store._binding)
         with translated("ending reclamation"):
             store._connection.execute(_COMMIT_SQL)
@@ -245,6 +255,7 @@ def remove_unindexed_blob(store: Store, digest: str) -> None:
 
 def _preflight(store: Store, workspace: Workspace, manifest: tuple[StagedBlob, ...]) -> None:
     """Validate the complete batch before the first irreversible transfer."""
+    backend = store._binding._backend
     if type(manifest) is not tuple:
         raise ProtocolError(f"the manifest must be exactly tuple, got {type(manifest).__name__}")
     lengths: dict[str, int] = {}
@@ -287,12 +298,15 @@ def _preflight(store: Store, workspace: Workspace, manifest: tuple[StagedBlob, .
 
     for entry in manifest:
         fd = open_entry_nofollow(
-            staging_fd, entry.name, f"staging/{workspace.txid}/{entry.name}"
+            backend,
+            staging_fd,
+            entry.name,
+            f"staging/{workspace.txid}/{entry.name}",
         )
         try:
             verify_leaf(fd, entry.digest, entry.byte_len)
         finally:
-            os.close(fd)
+            backend.close_fd(fd)
 
     parent = _blobs_fd(store)
     try:
@@ -308,7 +322,10 @@ def _preflight(store: Store, workspace: Workspace, manifest: tuple[StagedBlob, .
                 )
             try:
                 fd = open_entry_nofollow(
-                    parent, digest_to_leaf(digest), f"the leaf for {digest}"
+                    backend,
+                    parent,
+                    digest_to_leaf(digest),
+                    f"the leaf for {digest}",
                 )
             except FileNotFoundError as caught:
                 raise MetadataStoreInvalid(
@@ -318,9 +335,9 @@ def _preflight(store: Store, workspace: Workspace, manifest: tuple[StagedBlob, .
             try:
                 verify_leaf(fd, digest, row[0])
             finally:
-                os.close(fd)
+                backend.close_fd(fd)
     finally:
-        os.close(parent)
+        backend.close_fd(parent)
 
 
 def promote_staging(
@@ -336,7 +353,7 @@ def promote_staging(
     _preflight(store, workspace, manifest)
     gate(store._binding)
 
-    backend = store._binding.backend
+    backend = store._binding._backend
     staging_fd = workspace.staging_fd
     parent = _blobs_fd(store)
     spent = False
@@ -349,14 +366,17 @@ def promote_staging(
                 spent = True
             except FileExistsError:
                 existing = open_entry_nofollow(
-                    parent, leaf, f"the existing leaf for {entry.digest}"
+                    backend,
+                    parent,
+                    leaf,
+                    f"the existing leaf for {entry.digest}",
                 )
                 try:
                     verify_leaf(existing, entry.digest, entry.byte_len)
                 finally:
-                    os.close(existing)
+                    backend.close_fd(existing)
                 gate(store._binding)
-                os.unlink(entry.name, dir_fd=staging_fd)
+                backend.unlink_child(staging_fd, entry.name)
                 spent = True
         backend.flush_directory(parent)
         backend.flush_directory(staging_fd)
@@ -369,18 +389,18 @@ def promote_staging(
     finally:
         if spent:
             workspace._spend_staging()
-        os.close(parent)
+        backend.close_fd(parent)
 
     staging_parent = backend.open_child_directory(
         store._binding.metadata_root_fd, STAGING_PARENT
     )
     try:
         gate(store._binding)
-        os.rmdir(workspace.txid, dir_fd=staging_parent)
+        backend.rmdir_child(staging_parent, workspace.txid)
         workspace._spend_staging()
         backend.flush_directory(staging_parent)
     finally:
-        os.close(staging_parent)
+        backend.close_fd(staging_parent)
 
     for entry in manifest:
         with translated("indexing a promoted blob"):

@@ -122,7 +122,11 @@ class LinuxBackend:
         os.fsync(fd)
 
     def open_regular_nofollow(self, parent_fd: int, name: str) -> int:
-        return os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd)
+        return os.open(
+            name,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=parent_fd,
+        )
 
     def symlink_fingerprint(self, parent_fd: int, name: str) -> tuple[os.stat_result, str]:
         info = os.lstat(name, dir_fd=parent_fd)

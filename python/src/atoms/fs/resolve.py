@@ -20,6 +20,7 @@ from atoms.core.errors import (
     SpecValidationError,
 )
 from atoms.core.paths import require_rel_path
+from atoms.fs.audit import AuditedBackend, Provenance
 from atoms.fs.binding import ProjectBinding
 from atoms.fs.bootstrap import WORK_DIRECTORY
 from atoms.fs.lock import close_all
@@ -276,9 +277,9 @@ class PathResolver:
                 )
             facts = DirectoryFacts(_identity(os.fstat(fd)), constraints)
         except BaseException:
-            close_all((fd,))
+            close_all(backend, (fd,))
             raise
-        close_all((fd,))  # may raise; nothing is cached if it does
+        close_all(backend, (fd,))  # may raise; nothing is cached if it does
         self._work_base = facts
         return facts
 
@@ -331,7 +332,7 @@ class PathResolver:
                 previous, owned = owned, child
                 parent_fd = child
                 if previous is not None:
-                    close_all((previous,))
+                    close_all(backend, (previous,))
                 facts = self._facts_for(child, rel_path)
                 hops.append(ResolvedHop(component, facts))
 
@@ -345,7 +346,7 @@ class PathResolver:
             )
         finally:
             if owned is not None:
-                close_all((owned,))
+                close_all(backend, (owned,))
 
     def _require_name_fits(
         self, component: str, facts: DirectoryFacts, rel_path: str
@@ -432,6 +433,7 @@ class PathResolver:
         and fdinfo answers for the same descriptor that fstat did — lstat could not
         see a bind mount that shares st_dev with its source.
         """
+        backend = self._binding.backend
         try:
             fd = os.open(name, self._OBSERVE_FLAGS, dir_fd=parent_fd)
         except FileNotFoundError:
@@ -442,6 +444,10 @@ class PathResolver:
                     f"component {name!r} of {rel_path!r} exceeds the filesystem name limit"
                 ) from caught
             raise
+        if isinstance(backend, AuditedBackend):
+            parent = backend.provenance_of(parent_fd)
+            path = f"{parent.path}/{name}" if parent.path else name
+            backend.register(fd, Provenance(parent.root, path))
         try:
             info = os.fstat(fd)
             identity = _identity(info)
@@ -458,7 +464,7 @@ class PathResolver:
                     f"(device {identity.device}, inode {identity.inode})"
                 )
         finally:
-            close_all((fd,))
+            close_all(backend, (fd,))
         return PresentFrontier(identity, _entry_kind(info.st_mode))
 
 
@@ -498,10 +504,10 @@ def _open_project_relative(
             previous, owned = owned, child
             parent_fd = child
             if previous is not None:
-                close_all((previous,))
+                close_all(backend, (previous,))
     except BaseException:
         if owned is not None:
-            close_all((owned,))
+            close_all(backend, (owned,))
         raise
     return parent_fd, True
 
@@ -517,11 +523,12 @@ def observe_child(
     _require_leaf(leaf)
     filesystem_type = filesystem_type_of(binding)
     parent_fd, owned = _open_project_relative(binding, parent_path)
+    backend = binding.backend
     try:
         return _observe_open_child(parent_fd, filesystem_type, leaf)
     finally:
         if owned:
-            close_all((parent_fd,))
+            close_all(backend, (parent_fd,))
 
 
 def observe_work_child(binding: ProjectBinding, leaf: str) -> ChildObservation:
@@ -547,4 +554,4 @@ def observe_work_child(binding: ProjectBinding, leaf: str) -> ChildObservation:
     try:
         return _observe_open_child(fd, filesystem_type, leaf)
     finally:
-        close_all((fd,))
+        close_all(backend, (fd,))

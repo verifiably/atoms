@@ -220,7 +220,7 @@ def _stage_preimages(
         if type(expected) is FileState and expected.content_hash not in seen:
             seen.add(expected.content_hash)
             name = digest_to_leaf(expected.content_hash)
-            sink = _open_sink(workspace, name)
+            sink = _open_sink(backend, workspace, name)
             try:
                 # `modeled` is passed on this route too. A declared file that drifted
                 # into a directory would otherwise make `Observation` raise
@@ -235,7 +235,7 @@ def _stage_preimages(
                 _require_state(path_entry.path, entry, expected)
                 backend.flush_file(sink)
             finally:
-                os.close(sink)
+                backend.close_fd(sink)
             staged.append(
                 StagedBlob(
                     name=name,
@@ -272,9 +272,9 @@ def _stage_payloads(
         # Two independent owners: a failure to open the sink must not leak the stream,
         # and a stream that raises on close must not skip closing the sink.
         try:
-            sink = _open_sink(workspace, digest_to_leaf(digest))
+            sink = _open_sink(backend, workspace, digest_to_leaf(digest))
             try:
-                observed, byte_len = _stream_into(stream, sink)
+                observed, byte_len = _stream_into(backend, stream, sink)
                 if observed != digest or byte_len != lengths[digest]:
                     raise PreconditionRefused(
                         f"the payload for {digest} hashes to {observed} at {byte_len} "
@@ -282,7 +282,7 @@ def _stage_payloads(
                     )
                 backend.flush_file(sink)
             finally:
-                os.close(sink)
+                backend.close_fd(sink)
         finally:
             stream.close()
         staged.append(
@@ -306,11 +306,10 @@ def _require_staging_matches(
         )
 
 
-def _open_sink(workspace: Workspace, name: str) -> int:
+def _open_sink(backend, workspace: Workspace, name: str) -> int:
     """The staging sink. O_EXCL, so external occupancy of the leaf surfaces as EEXIST."""
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
     try:
-        return os.open(name, flags, 0o600, dir_fd=workspace.staging_fd)
+        return backend.create_exclusive(workspace.staging_fd, name, 0o600)
     except FileExistsError as caught:
         raise PreconditionRefused(
             f"staging/{workspace.txid}/{name} is already occupied; authority §11 names "
@@ -319,7 +318,7 @@ def _open_sink(workspace: Workspace, name: str) -> int:
         ) from caught
 
 
-def _stream_into(stream: IO[bytes], sink_fd: int) -> tuple[str, int]:
+def _stream_into(backend, stream: IO[bytes], sink_fd: int) -> tuple[str, int]:
     digest = hashlib.sha256()
     length = 0
     while True:
@@ -337,7 +336,7 @@ def _stream_into(stream: IO[bytes], sink_fd: int) -> tuple[str, int]:
         length += len(chunk)
         view = memoryview(chunk)
         while view:
-            view = view[os.write(sink_fd, view) :]
+            view = view[backend.write(sink_fd, bytes(view)) :]
     return "sha256:" + digest.hexdigest(), length
 
 

@@ -165,7 +165,7 @@ class Observation:
             return
         self._closed = True
         for fd in self._pins.values():
-            os.close(fd)
+            self._backend.close_fd(fd)
         self._pins.clear()
         self._tokens.clear()
 
@@ -195,7 +195,7 @@ class Observation:
             digest.update(chunk)
             length += len(chunk)
             if sink_fd is not None:
-                _write_all(sink_fd, chunk)
+                _write_all(self._backend, sink_fd, chunk)
         return ObservedFile(
             state=FileState(
                 content_hash="sha256:" + digest.hexdigest(),
@@ -244,7 +244,7 @@ class Observation:
                     f"{leaf!r} stopped being {description} between lookup and open"
                 )
         except BaseException:
-            os.close(fd)
+            self._backend.close_fd(fd)
             raise
         return self._pin(info, fd), info
 
@@ -253,7 +253,7 @@ class Observation:
         key = (info.st_dev, info.st_ino)
         existing = self._tokens.get(key)
         if existing is not None:
-            os.close(fd)
+            self._backend.close_fd(fd)
             return existing
         token = EntryIdentity()
         self._tokens[key] = token
@@ -285,7 +285,7 @@ def _read_exactly(fd: int, size: int) -> bytes:
     return b"".join(parts)
 
 
-def _write_all(fd: int, chunk: bytes) -> None:
+def _write_all(backend: Backend, fd: int, chunk: bytes) -> None:
     view = memoryview(chunk)
     while view:
-        view = view[os.write(fd, view) :]
+        view = view[backend.write(fd, bytes(view)) :]

@@ -236,6 +236,12 @@ class AuditedBackend:
 
     def open_child_directory(self, parent_fd: int, name: str) -> int:
         provenance = self.provenance_of(parent_fd)
+        if name == "..":
+            fd = self._inner.open_child_directory(parent_fd, name)
+            # The traversal probe must observe a broken backend that accepts `..`, but
+            # that descriptor must carry no mutation authority before the probe closes it.
+            self.register(fd, Provenance(RootKind.METADATA_PARENT, "untrusted-traversal"))
+            return fd
         path = _join(provenance, name)
         child_provenance = (
             Provenance(RootKind.METADATA, "")

@@ -6,6 +6,7 @@ import contextlib
 from collections.abc import Iterator
 
 from atoms.coordinator.lease import Lease, _reclaim_orphans, _resolve
+from atoms.fs.audit import AuditedBackend
 from atoms.fs.backend import Backend
 from atoms.fs.binding import bind_project_volume
 from atoms.fs.bootstrap import reclaim_probe_survivors
@@ -28,6 +29,9 @@ def _recovery_lease(
     That is the intended fail-closed behaviour, and it is why ledger #18 is proved by an
     architecture assertion over this call rather than by an end-to-end run.
     """
+    backend = AuditedBackend(
+        backend, project_root=project_root, metadata_root=metadata_root
+    )
     with acquire_project_lock(backend, metadata_root) as lock:
         # Ledger #17 requires reclamation at EVERY lease entry. bind_project_volume
         # reclaims at its own step 4, which it reaches only after checks that can

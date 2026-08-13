@@ -21,6 +21,69 @@ from tests.architecture_support import (
 
 SOURCE_ROOT = Path(__file__).parents[1] / "src" / "atoms"
 
+_MUTATING_OS = {
+    "rename",
+    "replace",
+    "unlink",
+    "mkdir",
+    "rmdir",
+    "symlink",
+    "link",
+    "chmod",
+    "fchmod",
+    "lchmod",
+    "setxattr",
+    "fsetxattr",
+    "write",
+    "close",
+    "open",
+}
+_FACADE_EXEMPT = ("fs/audit.py", "fs/linux.py", "fs/syscalls/")
+_OS_OPEN_ALLOWED = ("fs/resolve.py",)
+
+
+def _os_attribute_references(path):
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "os"
+        ):
+            yield node
+
+
+def test_no_direct_os_mutation_or_close_outside_the_facade():
+    """Design §5.2: the facade is the only mutation and close surface; SQLite's VFS never
+    spells os.* in our source, so it needs no carve-out here."""
+    offenders = []
+    for path in sorted(SOURCE_ROOT.rglob("*.py")):
+        rel = str(path.relative_to(SOURCE_ROOT))
+        if rel.startswith(_FACADE_EXEMPT):
+            continue
+        for node in _os_attribute_references(path):
+            if node.attr == "open" and rel in _OS_OPEN_ALLOWED:
+                continue
+            if node.attr in _MUTATING_OS:
+                offenders.append(f"{rel}:{node.lineno} os.{node.attr}")
+    assert offenders == []
+
+
+def test_the_raw_backend_is_constructed_only_by_the_platform_factory():
+    for path in sorted(SOURCE_ROOT.rglob("*.py")):
+        rel = str(path.relative_to(SOURCE_ROOT))
+        if rel in {"fs/platform.py", "fs/linux.py"}:
+            continue
+        assert "LinuxBackend(" not in path.read_text(encoding="utf-8"), rel
+
+
+def test_the_facade_is_constructed_only_at_the_composition_root():
+    for path in sorted(SOURCE_ROOT.rglob("*.py")):
+        rel = str(path.relative_to(SOURCE_ROOT))
+        if rel in {"coordinator/root.py", "fs/audit.py"}:
+            continue
+        assert "AuditedBackend(" not in path.read_text(encoding="utf-8"), rel
+
 _CORE_IMPORT_ALLOWLIST = {
     "__future__",
     "atoms",
@@ -588,7 +651,7 @@ def test_the_backend_protocol_and_revision_are_exact():
     from atoms.fs.backend import Backend
     from atoms.fs.platform import BACKEND_REVISION
 
-    assert BACKEND_REVISION == "linux-1"
+    assert BACKEND_REVISION == "linux-2"
     assert {
         name
         for name, member in inspect.getmembers(Backend, inspect.isfunction)

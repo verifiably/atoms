@@ -68,16 +68,18 @@ class DescriptorTable:
     re-resolve, reopening the race the whole section exists to close.
     """
 
-    __slots__ = ("_closed", "_fds", "_owned", "_unreachable", "stops")
+    __slots__ = ("_backend", "_closed", "_fds", "_owned", "_unreachable", "stops")
 
     def __init__(
         self,
         *,
+        backend,
         fds: dict[TopologyNode, int],
         owned: tuple[int, ...],
         stops: tuple[WalkStop, ...],
         unreachable: frozenset[TopologyNode],
     ) -> None:
+        self._backend = backend
         self._fds = fds
         self._owned = owned
         self._unreachable = unreachable
@@ -100,7 +102,7 @@ class DescriptorTable:
             return
         self._closed = True
         for fd in self._owned:
-            os.close(fd)
+            self._backend.close_fd(fd)
         self._fds.clear()
 
     def __enter__(self) -> Self:
@@ -124,6 +126,7 @@ def _build_descriptor_table(
     entry of its own.
     """
     binding = lease._binding
+    backend = binding.backend
     filesystem_type = filesystem_type_of(binding)
     expected_mount = binding.evidence.mount_id
     paths = _directory_paths(approved)
@@ -236,18 +239,22 @@ def _build_descriptor_table(
             # There is no declared state for a TopologyDirectory to be adjudicated
             # against, so §8's branches could never rule on it; it refuses here.
             with translated_lookup(f"opening {component!r} for {node!r}"):
-                fd = binding.backend.open_child_directory(parent_fd, component)
+                fd = backend.open_child_directory(parent_fd, component)
             owned.append(fd)
             validate(fd, node)
             fds[node] = fd
     except BaseException:
         for fd in owned:
-            os.close(fd)
+            backend.close_fd(fd)
         raise
 
     unreachable = _closure(approved, stopped_nodes)
     return DescriptorTable(
-        fds=fds, owned=tuple(owned), stops=tuple(stops), unreachable=unreachable
+        backend=backend,
+        fds=fds,
+        owned=tuple(owned),
+        stops=tuple(stops),
+        unreachable=unreachable,
     )
 
 

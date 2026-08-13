@@ -307,8 +307,8 @@ def test_every_staged_file_is_flushed_before_its_sink_closes(leased, monkeypatch
     real_flush = LinuxBackend.flush_file
     real_close = os.close
 
-    def spy_open_sink(workspace, name):
-        fd = real_open_sink(workspace, name)
+    def spy_open_sink(backend, workspace, name):
+        fd = real_open_sink(backend, workspace, name)
         generations[fd] = next(counter)
         events.append(("open", generations[fd]))
         return fd
