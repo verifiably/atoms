@@ -1,6 +1,6 @@
 # A7 — effect execution, recovery execution, and the tamper-evident chain
 
-**Status:** Design under review, drafted 2026-08-13; A7–A9 remain unimplemented.
+**Status:** Design accepted 2026-08-13 after three review rounds; A7–A9 remain unimplemented.
 
 **Authority:** [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md)
 §5.5, §7.3–§7.5, §8, §9, §10, §11, §13.2, §13.5, §14, §15 — and, consumed as the
