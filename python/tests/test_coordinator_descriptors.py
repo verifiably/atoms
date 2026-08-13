@@ -180,7 +180,7 @@ def test_the_work_root_is_absent_when_the_topology_has_none(leased):
             _table(lease, without, workspace, observation) as table,
         ):
             assert without.work_base is None
-            with pytest.raises(KeyError):
+            with pytest.raises(ProtocolError, match="no descriptor"):
                 table.fd_for(WorkRoot())
 
 

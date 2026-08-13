@@ -96,7 +96,10 @@ class DescriptorTable:
     def fd_for(self, node: TopologyNode) -> int:
         if self._closed:
             raise ProtocolError("this descriptor table is closed")
-        return self._fds[node]
+        try:
+            return self._fds[node]
+        except KeyError as caught:
+            raise ProtocolError(f"{node!r} has no descriptor in this table") from caught
 
     def is_unreachable(self, node: TopologyNode) -> bool:
         """Proved to lie beneath a stop -- distinct from merely absent from the table."""

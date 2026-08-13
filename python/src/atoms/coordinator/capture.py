@@ -209,13 +209,7 @@ def _stage_preimages(
         parent = path_entry.parent_node
         if table.is_unreachable(parent):
             continue  # §8 already justified the absence of everything below the stop.
-        try:
-            parent_fd = table.fd_for(parent)
-        except KeyError as caught:
-            raise ProtocolError(
-                f"{parent!r} is neither in the descriptor table nor proved unreachable; "
-                "the walk and the approved paths disagree"
-            ) from caught
+        parent_fd = table.fd_for(parent)
         expected = declared[path_entry.path]
         if type(expected) is FileState and expected.content_hash not in seen:
             seen.add(expected.content_hash)
