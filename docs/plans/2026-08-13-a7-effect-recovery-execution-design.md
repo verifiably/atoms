@@ -1,6 +1,6 @@
 # A7 — effect execution, recovery execution, and the tamper-evident chain
 
-**Status:** Design accepted 2026-08-13; A7–A9 remain unimplemented.
+**Status:** Design under review, drafted 2026-08-13; A7–A9 remain unimplemented.
 
 **Authority:** [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md)
 §5.5, §7.3–§7.5, §8, §9, §10, §11, §13.2, §13.5, §14, §15 — and, consumed as the
@@ -26,9 +26,11 @@ executor's write path, not an annex to it.
 
 The seam that worked four times repeats once more: A4b-1 observed and A4b-2
 judged; A5a stored and A5b decided; A6 observes and **A7 acts** — and the chain
-witnesses. A3 remains the sole recovery authority: A7 executes only
-factory-authorized steps and never classifies, reclassifies, or invents a second
-decision table (ledger #14).
+witnesses. A3 remains the sole authority over the filesystem plan once a
+snapshot is assembled: A7 executes only factory-authorized steps and never
+classifies, reclassifies, or invents a second decision table (ledger #14). The
+one pre-assembly exception is #19's approval-evidence assembly halt (§9.3),
+which is coordinator-owned and reaches no A3 surface.
 
 Three structural decisions shape everything below:
 
@@ -125,8 +127,9 @@ where its imports already point:
 
 - **`atoms/core/`** — `TransactionSpec` v2 (`fulfills`, the registered-path
   subset), canonical encoding, `compile_spec` validation of the new members;
-  one new closed `HaltReason`; the `.#~` prefix redefined from "scratch iff"
-  to **engine-reserved** (§10, §13).
+  the canonical `AssemblyHalt` value in its own module, outside A3's recovery
+  model (§9.3); the `.#~` prefix redefined from "scratch iff" to
+  **engine-reserved** (§10, §13).
 - **`atoms/fs/backend.py`** — the extended `Backend` protocol (§5).
 - **`atoms/fs/audit.py`** — the audited facade and provenance registry; the
   §13.5 interposer (§5).
@@ -216,7 +219,11 @@ today (step 1's resolve becomes real recovery in this stage); A7 adds 5–15.
 Steps 2–4 mutate nothing outside metadata space.
 
 1. Lease entry — bootstrap, probe-survivor reclamation, bind, open store,
-   orphan reclamation, **resolve** (§9; the trap becomes real recovery).
+   orphan reclamation, **resolve** (§9; the trap becomes real recovery) —
+   then the **exact-genesis preflight**: the chain must carry a valid
+   genesis (validated per §9.1 phase 1), refused *here*, before any capture,
+   workspace, or record write. Only `register_root` admits the empty-chain
+   case; `append_intent` performs the same preflight.
 2. `admit` → `ProjectApprovedSpec`.
 3. `capture_initial_surface` (A6) — the descriptor table outlives capture.
 4. `prepare_transaction` — §7.3's single COMMIT publishes `PREPARED` with
@@ -255,7 +262,10 @@ Steps 2–4 mutate nothing outside metadata space.
 A caught failure anywhere in 5–10 — including `KeyboardInterrupt`,
 cancellation, and `SystemExit` — enters the plan loop (§8) before the
 exception is re-raised or a refusal is returned; `PreconditionRefused`
-surfaces only after restoration is proved (authority §11).
+surfaces only after restoration is proved (authority §11). **Substrate-invalid
+failures are excluded from that catch**: `ChainStateInvalid` and
+`MetadataStoreInvalid` prohibit further mutation by definition, so they
+propagate with evidence preserved and no rollback is attempted.
 
 ## 7. The five effect modules
 
@@ -341,55 +351,93 @@ as `COMMITTED` → `settled(committed)` → binding → cleanup → detach.
 
 `_resolve` takes the binding and the store (the `Lease` construction moves
 after resolution completes; the A5b trap-invariant tests convert into
-recovery tests preserving record/`active`/lock/descriptor discipline). For a
-live record:
+recovery tests preserving record/`active`/lock/descriptor discipline).
+Resolution runs in pinned phases; **no phase mutates until every earlier
+phase passes**:
 
-1. Recompile the frozen spec — `compile_spec` is pure and deterministic.
-2. Re-resolve the project topology and compare **exactly** against the
-   persisted canonical recovery-approval evidence (§11): directory
-   identities, lookup constraints, mount membership, work-root facts. On
-   exact match, issue a fresh factory-controlled `ProjectApprovedSpec`; on
-   any mismatch, **halt durably** (§9.3) — never refuse, never silently
-   reapprove, never substitute the newly resolved topology (#19).
-3. Reconcile the chain (§9.2).
-4. Observe every persistent path and every effect's required scratch slot in
-   one fresh `Observation` universe; `build_recovery_snapshot`'s validators
-   enforce complete coverage (#13).
-5. Enter the plan loop (§8).
+1. **Chain validation, read-only.** Walk the complete chain: decode every
+   envelope, verify each entry's content name against its bytes, verify
+   linkage and linearity, and *derive* §9.2's reconciliation actions without
+   performing any. Malformed evidence raises `ChainStateInvalid` — nothing
+   is persisted, no store write, no chain write, mutation refused.
+2. **Short-circuits, after validation.** A `HALTED` record returns its
+   stored diagnostic; a record carrying an assembly halt (§9.3) returns it.
+   Both only after phase 1 passes — a stored diagnostic is never returned
+   over chain evidence the engine cannot interpret — and neither mutates;
+   there is no silent discharge.
+3. **Reconciliation writes** — exactly the actions phase 1 derived (§9.2).
+4. **Recompile** the frozen spec — `compile_spec` is pure and deterministic.
+5. **Approval re-resolution.** Re-resolve the project topology and compare
+   **exactly** against the persisted canonical recovery-approval evidence
+   (§11): directory identities, lookup constraints, mount membership,
+   work-root facts. On exact match, issue a fresh factory-controlled
+   `ProjectApprovedSpec`; on any mismatch, **persist the assembly halt**
+   (§9.3) — never refuse, never silently reapprove, never substitute the
+   newly resolved topology (#19).
+6. **Observation** of every persistent path and every effect's required
+   scratch slot in one fresh `Observation` universe;
+   `build_recovery_snapshot`'s validators enforce complete coverage (#13).
+7. **The plan loop** (§8).
 
-A `HALTED` record short-circuits: the stored diagnostic is returned and
-nothing mutates; there is no silent discharge.
+### 9.2 Chain reconciliation — exact cases
 
-### 9.2 Chain reconciliation, before classification
+Derived read-only in phase 1, performed in phase 3, before any
+classification. Registration, against the record's stored digest and the
+validated chain:
 
-Explicit cases, evaluated against the record's stored digests and the chain's
-tip walk:
+- **Digest present** → it must resolve to a `registered` entry with matching
+  txid; a dangling digest, a mismatch, or duplicate txid entries is
+  `ChainStateInvalid`.
+- **Digest missing, record `PREPARED`, every journal `PENDING`** — the only
+  legitimate crash window: a unique matching entry exists → backfill the
+  binding, never a second append; no entry → append and bind.
+- **Digest missing in any other state** — any journal beyond `PENDING` or
+  any transaction state beyond `PREPARED` → `ChainStateInvalid`, *even when
+  a matching entry exists in the chain*: §11's triggers make that state
+  unreachable through the engine, so it is substrate evidence of raw
+  alteration, not a crash window to repair.
 
-- Unique matching `registered` entry, record digest missing → **backfill the
-  binding**, never a second append.
-- No entry, record `PREPARED` with every journal `PENDING` → **append and
-  bind**, then classify (registration completes; nothing has applied).
-- Stored digest absent from the chain, digest mismatch, a duplicate txid
-  among entries, or any journal state beyond `PENDING` without a bound
-  registration → **halt**; mutation state past the registration barrier
-  without its witness is contradictory durable evidence.
-- Terminal state with a bound registration and no settlement → **append the
-  settlement and bind** (idempotent by txid), then proceed — this is the
-  crash-window backfill of §8's prefix stop.
+Settlement, symmetric:
 
-Only after reconciliation does A3 classify the filesystem state.
+- **Binding present** → it must resolve to a `settled` entry whose kind
+  matches the durable terminal decision, whose registration reference is the
+  record's bound registration, and whose txid matches; anything else is
+  `ChainStateInvalid`.
+- **Binding missing, terminal decision durable** → exactly one matching
+  settlement in the chain → backfill the binding; none → append and bind
+  (the crash-window backfill of §8's prefix stop). A duplicate settlement,
+  wrong kind, wrong registration reference, or digest mismatch is
+  `ChainStateInvalid`.
+- **Any settlement entry for a nonterminal record** → `ChainStateInvalid`.
 
-### 9.3 Halt persistence
+### 9.3 The assembly halt
 
-Two failure classes, deliberately separate (§12): malformed chain evidence
-refuses mutation as `ChainStateInvalid` and persists nothing (the store may
-not be written on evidence the engine cannot interpret); an
-approval-evidence mismatch persists a durable halt with a new closed
-`HaltReason` and a canonical expected/observed topology diagnostic — through
-a **narrow store path that does not require a `ProjectApprovedSpec`**, since
-the proof is exactly what could not be issued. That path writes only the
-halt fields A5b already persists atomically and is the one exception to the
-proof-accepting entry-point rule, recorded as such in the architecture test.
+Two failure classes, deliberately separate (§12). Malformed chain evidence
+refuses mutation as `ChainStateInvalid` and persists nothing — the store may
+not be written on evidence the engine cannot interpret. An approval-evidence
+mismatch is different: the substrates are coherent and the *world* moved, so
+the finding is persisted durably as an **`AssemblyHalt`** — a new canonical
+frozen value, deliberately **not** an A3 `HaltDiagnostic` and not a new
+`HaltReason`: the mismatch is pre-classification, no `RecoverySnapshot`
+exists or ever will for it, and A3's model, reducer, and diagnostic encoding
+are untouched.
+
+- **Shape:** `AssemblyHalt(txid, reason, expected, observed,
+  operator_action)` — `reason` a closed coordinator-owned enum with the
+  single member `APPROVAL_EVIDENCE_MISMATCH`; `expected`/`observed` the
+  canonical topology projections (directory identities, lookup constraints,
+  mount membership, work-root facts) under the same canonical encoding as
+  the persisted evidence, so the diff is byte-honest.
+- **Persistence:** a nullable, write-once schema v2 column on the
+  transaction record; `StoredRecord` gains the decoded field. Transaction
+  state, journals, and `active` are left exactly as found — the halt is
+  *about* the world, not the transaction's own history.
+- **Surfacing:** persisted through a **narrow store path that requires no
+  `ProjectApprovedSpec`** — the proof is exactly what could not be issued —
+  recorded as the registry's one exception in the architecture test; then
+  raised as `TransactionHalted` carrying the value. Every later lease entry
+  short-circuits at §9.1 phase 2 and returns it unchanged: no silent
+  discharge, same as an A3 halt.
 
 ## 10. The chain
 
@@ -420,8 +468,13 @@ entry to an engine-reserved staging name inside `.#~chain/` via
 → `flush_directory(.#~chain)`. A crash leaves either nothing, an attributable
 staging survivor (reclaimed or completed at the next append or
 reconciliation — content-named, so completion is idempotent), or the durable
-entry. Re-appending an existing entry is a no-op by construction: same bytes,
-same name, no-clobber refuses, and the refusal is success.
+entry. **A no-clobber refusal is not itself idempotent success**: on `EEXIST`
+the appender re-reads the existing destination and proves it — exact
+canonical bytes whose digest equals the name, decoding to the expected entry
+class, txid, and previous-entry linkage — before accepting; only then is an
+exact staging survivor removed and the chain directory flushed. A foreign or
+divergent digest-named file is `ChainStateInvalid`, never adopted because
+its name looked right.
 
 ### 10.3 Genesis and `register_root`
 
@@ -435,8 +488,10 @@ of the log design — `corpus`/`world`/`store`, `forked_from`, id semantics —
 live in the payload and are science's to validate; atoms guarantees exactly
 linearity, baseline capture, and durability. Genesis retry is restartable
 through §10.2's staging protocol. **A root with no genesis refuses
-`run_transaction`** once A7 lands: registration is not optional, which is
-what makes `noclobber_transfer` always-required (§5.1).
+`run_transaction` and `append_intent` at the preflight** — immediately after
+lease resolution, before any capture, workspace, or record write (§6 step 1)
+— once A7 lands: registration is not optional, which is what makes
+`noclobber_transfer` always-required (§5.1).
 
 ### 10.4 `registered`, `settled`, and the intent API
 
@@ -469,14 +524,26 @@ on an unknown version is unchanged):
 - `transaction_record.registration_digest` and
   `transaction_record.settlement_digest` — nullable, **unique, write-once**
   (an `UPDATE` from non-null fails by trigger).
-- Canonical recovery-approval evidence, persisted in the `PREPARED` COMMIT:
-  the resolved directory identities, lookup constraints, mount membership,
-  and work-root facts recovery must compare exactly (#19). Canonical
-  encoding, so the comparison is byte-honest.
-- Structural triggers: `state = APPLYING` requires `registration_digest`
-  non-null; clearing `active` requires `settlement_digest` non-null for a
-  terminal state; deleting a terminal `transaction_record` row requires
-  `settlement_digest` non-null.
+- Canonical recovery-approval evidence, **non-null at insert and
+  write-once**, persisted in the `PREPARED` COMMIT: the resolved directory
+  identities, lookup constraints, mount membership, and work-root facts
+  recovery must compare exactly (#19). Canonical encoding, so the comparison
+  is byte-honest.
+- The `assembly_halt` column (§9.3) — nullable, write-once.
+- Structural triggers, stated as exact predicates rather than one-way
+  implications — they are what make §10.5's and acceptance criterion 3's
+  claims structural:
+  - a journal transition `PENDING → STARTED` requires transaction
+    `state = APPLYING` **and** `registration_digest` non-null;
+  - `state = APPLYING` requires `registration_digest` non-null;
+  - writing `settlement_digest` requires `registration_digest` non-null
+    **and** `state ∈ {COMMITTED, ROLLED_BACK}`;
+  - clearing `active` is allowed only for
+    `state ∈ {COMMITTED, ROLLED_BACK}` with **both** digests non-null;
+  - deleting a `transaction_record` row is allowed only when it is detached
+    (`active` does not reference it) **and**
+    `state ∈ {COMMITTED, ROLLED_BACK}` with both digests non-null —
+    `HALTED` and nonterminal records are never collectible.
 
 `TransactionSpec` v2: `fulfills: digest | None` (default absent) and the
 registered-path subset, both under canonical encoding and `compile_spec`
@@ -488,10 +555,11 @@ validation, persisted through `spec_json`.
   sibling branch or orphan, an undecodable envelope, reconciliation's
   contradictory cases. Same response class as `MetadataStoreInvalid`: stop,
   preserve evidence, refuse mutation; the message distinguishes the finding.
-- **Approval-evidence mismatch** — not a chain error and not a refusal: a
-  durable transaction halt with a new closed `HaltReason`
-  (`APPROVAL_EVIDENCE_MISMATCH`) and a canonical expected/observed topology
-  diagnostic, persisted through §9.3's narrow path.
+- **Approval-evidence mismatch** — not a chain error and not a refusal: the
+  durable, coordinator-owned `AssemblyHalt` (§9.3) with its closed reason
+  and canonical expected/observed topology projections, persisted through
+  the narrow path and raised as `TransactionHalted`; no A3 `HaltReason` is
+  added.
 - Everything else maps onto authority §11 unchanged: `PreconditionRefused`
   only after the plan loop proves restoration; `TransactionHalted` preserves
   the record and evidence; `ProtocolError` for engine misuse — including
@@ -501,16 +569,21 @@ validation, persisted through `spec_json`.
 
 1. **A6 §13 gap 1** — `DescriptorTable.stops` guarded by `_closed` like
    `fd_for`/`is_unreachable`.
-2. **Gap 2** — `DescriptorTable.close` and `Observation.close` close all
-   descriptors before raising, and set `_closed` such that a partial failure
-   is retryable; unified with the facade's unregister-on-close discipline.
+2. **Gap 2** — `DescriptorTable.close` and `Observation.close` unregister
+   ownership before each close attempt, attempt **every** descriptor exactly
+   once — never retrying an fd whose `close` returned an error, since the fd
+   may already be released and reused — and raise the first failure after
+   all attempts; unified with the facade's unregister-before-close
+   discipline.
 3. **Gap 3** — `fd_for` raises `ProtocolError` directly; `capture.py`'s
    translation wrapper is deleted.
 4. **Gap 4** — `_verify_stops`' final `else` gains its test (an entry
    appearing between admission and the walk).
-5. **Gap 5** — one "modeled children" derivation: `capture._modeled_under`
-   becomes the single source, `descriptors._modeled_children` delegates to
-   it, and A7's occupancy consumers read only that.
+5. **Gap 5** — one "modeled children" derivation, living in
+   `descriptors.py`, which sits below capture in the import DAG (capture
+   already imports it — the reverse delegation would be circular):
+   `capture._modeled_under` is deleted, capture calls downward, and A7's
+   occupancy consumers read only the shared derivation.
 6. **Gap 6** — the streaming read/write loops and `build_relation` wrap
    `EBADF` in the same §9.1 translation the lookups use.
 7. `core/scratch.py` — the engine-reserved prefix split (§10.1).
@@ -545,9 +618,14 @@ A7 lands with its own suites; the ledger halves it discharges name them.
   and of the plan loop mid-rollback; fresh-process recovery converges or
   preserves an explained halt, and second-pass recovery is idempotent.
 - **Chain internals**: every append barrier cut — staging create, staging
-  fsync, transfer, directory fsync — plus genesis retry, duplicate-append
-  idempotence, tip discovery over crash debris, and every reconciliation
-  case of §9.2 including all four halt shapes.
+  fsync, transfer, directory fsync — plus genesis retry, `EEXIST`
+  proof-then-accept including the foreign-file refusal, tip discovery over
+  crash debris, the genesis preflight refusing `run_transaction` and
+  `append_intent` on an unregistered root before any metadata write, every
+  §9.2 reconciliation case including each `ChainStateInvalid` shape, and the
+  phase discipline — a `HALTED` record's chain is validated before its
+  diagnostic is returned, and no reconciliation write precedes full
+  validation.
 - **Executor–A3 conformance**: on clean commit, caught rollback, and every
   recovery fixture family, the executor's observed terminal states and
   durable projections equal A3's fixed points (`apply_recovery_plan`); the

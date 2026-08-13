@@ -193,7 +193,7 @@ def test_every_design_document_declares_a_status():
 
 
 def test_the_roadmap_boundary_is_stated_where_the_reader_looks_first():
-    """Silence about A7-A8 reads as completeness. Both entry documents must say it."""
+    """Silence about A7-A9 reads as completeness. Both entry documents must say it."""
     for name in ("AGENTS.md", "README.md"):
         region = status_regions()[name]
         assert unimplemented_claims(region) == set(UNIMPLEMENTED), name
@@ -223,7 +223,7 @@ def test_no_status_region_claims_the_repository_writes_nothing():
 def test_the_authority_header_names_the_implemented_prefix():
     """The authority outranks every other document, and spells its remainder its own way.
 
-    It says "A1-A6 are implemented ... A7-A8 (...) remain" rather than the sentence the
+    It says "A1-A6 are implemented ... A7-A9 (...) remain" rather than the sentence the
     sub-plans share, so the shared parse is backed up by a positive check here.
     """
     field = status_field(AUTHORITY.read_text(encoding="utf-8"))
