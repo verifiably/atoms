@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import hashlib
 import os
@@ -198,12 +199,28 @@ def test_a_failing_sink_leaks_no_descriptor(project):
     try:
         before = open_descriptors()
         observation = Observation(LinuxBackend())
-        with pytest.raises(OSError):
+        with pytest.raises(ProtocolError, match="already closed while streaming"):
             observation.observe(fd, "f.txt", sink_fd=readonly)
         observation.close()
         assert open_descriptors() == before
     finally:
         os.close(readonly)
+
+
+def test_a_closed_observation_stream_is_a_protocol_error(project):
+    root, fd = project
+    (root / "f.txt").write_bytes(b"payload")
+    os.link(root / "f.txt", root / "same.txt")
+    observation = Observation(LinuxBackend())
+    entry = observation.observe(fd, "f.txt")
+    assert type(entry) is ObservedFile
+    os.close(observation.pinned_descriptor(entry.identity))
+    try:
+        with pytest.raises(ProtocolError, match="already closed while streaming"):
+            observation.observe(fd, "same.txt")
+    finally:
+        with contextlib.suppress(OSError):
+            observation.close()
 
 
 def test_the_retained_descriptor_pins_the_inode(project):
@@ -333,6 +350,23 @@ def test_differing_bytes_are_diverged(project):
 def test_a_staging_object_longer_than_the_plan_is_diverged(project):
     root, _ = project
     assert _relation(root, b"payload+", b"payload") is FileBuildRelation.DIVERGED
+
+
+def test_a_closed_build_relation_descriptor_is_a_protocol_error(project):
+    root, _ = project
+    (root / "staged").write_bytes(b"payload")
+    (root / "planned").write_bytes(b"payload")
+    staged_fd = os.open(str(root / "staged"), os.O_RDONLY)
+    planned_fd = os.open(str(root / "planned"), os.O_RDONLY)
+    os.close(staged_fd)
+    try:
+        with (
+            Observation(LinuxBackend()) as observation,
+            pytest.raises(ProtocolError, match="already closed while comparing"),
+        ):
+            observation.build_relation(staged_fd, planned_fd)
+    finally:
+        os.close(planned_fd)
 
 
 def test_a_namespace_contradiction_refuses():

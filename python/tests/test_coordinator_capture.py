@@ -429,6 +429,22 @@ def test_a_payload_stream_error_propagates_as_itself(leased):
         assert caught.value.errno == 5
 
 
+def test_a_closed_payload_stream_is_a_protocol_error(tmp_path):
+    from atoms.coordinator.capture import _stream_into
+    from atoms.fs.linux import LinuxBackend
+
+    sink_fd = os.open(str(tmp_path / "sink"), os.O_WRONLY | os.O_CREAT, 0o600)
+    source_fd = os.open(str(tmp_path / "source"), os.O_RDONLY | os.O_CREAT, 0o600)
+    stream = os.fdopen(source_fd, "rb", closefd=False)
+    os.close(source_fd)
+    try:
+        with pytest.raises(ProtocolError, match="already closed while streaming"):
+            _stream_into(LinuxBackend(), stream, sink_fd)
+    finally:
+        stream.close()
+        os.close(sink_fd)
+
+
 def test_a_payload_stream_yielding_text_refuses(leased):
     from atoms.coordinator.capture import capture_initial_surface
     from atoms.coordinator.prepare import open_workspace

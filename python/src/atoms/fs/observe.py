@@ -141,25 +141,26 @@ class Observation:
         `atoms.store` out of `atoms/fs/`.
         """
         self._require_open()
-        os.lseek(staged_fd, 0, os.SEEK_SET)
-        os.lseek(planned_fd, 0, os.SEEK_SET)
-        while True:
-            staged = _read_exactly(staged_fd, _READ_CHUNK)
-            planned = _read_exactly(planned_fd, _READ_CHUNK)
-            if staged == planned:
-                if not staged:
-                    return FileBuildRelation.EXACT
-                continue
-            shortest = min(len(staged), len(planned))
-            if staged[:shortest] != planned[:shortest]:
-                return FileBuildRelation.DIVERGED
-            # One side ran out first. A short read cannot cause this: `_read_exactly`
-            # returns fewer bytes only at end of file.
-            return (
-                FileBuildRelation.STRICT_PREFIX
-                if len(staged) < len(planned)
-                else FileBuildRelation.DIVERGED
-            )
+        with translated_lookup("comparing staged and planned files"):
+            os.lseek(staged_fd, 0, os.SEEK_SET)
+            os.lseek(planned_fd, 0, os.SEEK_SET)
+            while True:
+                staged = _read_exactly(staged_fd, _READ_CHUNK)
+                planned = _read_exactly(planned_fd, _READ_CHUNK)
+                if staged == planned:
+                    if not staged:
+                        return FileBuildRelation.EXACT
+                    continue
+                shortest = min(len(staged), len(planned))
+                if staged[:shortest] != planned[:shortest]:
+                    return FileBuildRelation.DIVERGED
+                # One side ran out first. A short read cannot cause this:
+                # `_read_exactly` returns fewer bytes only at end of file.
+                return (
+                    FileBuildRelation.STRICT_PREFIX
+                    if len(staged) < len(planned)
+                    else FileBuildRelation.DIVERGED
+                )
 
     def close(self) -> None:
         if self._closed:
@@ -187,17 +188,18 @@ class Observation:
         # Stream from the PINNED descriptor: one descriptor per identity, and any
         # failure below leaves it owned by the pass rather than orphaned.
         pinned = self._pins[identity]
-        os.lseek(pinned, 0, os.SEEK_SET)
         digest = hashlib.sha256()
         length = 0
-        while True:
-            chunk = os.read(pinned, _READ_CHUNK)
-            if not chunk:
-                break
-            digest.update(chunk)
-            length += len(chunk)
-            if sink_fd is not None:
-                _write_all(self._backend, sink_fd, chunk)
+        with translated_lookup(f"streaming {leaf!r}"):
+            os.lseek(pinned, 0, os.SEEK_SET)
+            while True:
+                chunk = os.read(pinned, _READ_CHUNK)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                length += len(chunk)
+                if sink_fd is not None:
+                    _write_all(self._backend, sink_fd, chunk)
         return ObservedFile(
             state=FileState(
                 content_hash="sha256:" + digest.hexdigest(),

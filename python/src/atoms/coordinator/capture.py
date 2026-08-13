@@ -31,7 +31,7 @@ from atoms.core.recovery.model import (
 )
 from atoms.core.recovery.snapshot import PersistentNode
 from atoms.fs.approval import ProjectApprovedSpec
-from atoms.fs.observe import Observation
+from atoms.fs.observe import Observation, translated_lookup
 from atoms.store.blobs import StagedBlob, digest_to_leaf
 from atoms.store.records import referenced_digests
 from atoms.store.workspace import Workspace
@@ -324,22 +324,23 @@ def _open_sink(backend, workspace: Workspace, name: str) -> int:
 def _stream_into(backend, stream: IO[bytes], sink_fd: int) -> tuple[str, int]:
     digest = hashlib.sha256()
     length = 0
-    while True:
-        chunk = stream.read(_READ_CHUNK)
-        # Type BEFORE falsiness. A stream returning None or "" is malformed, not at end
-        # of file, and testing falsiness first would accept it as a clean EOF -- which
-        # for an empty declared file hashes to the empty digest and validates.
-        if type(chunk) is not bytes:
-            raise ProtocolError(
-                f"a payload stream yielded {type(chunk).__name__}, not bytes"
-            )
-        if not chunk:
-            break
-        digest.update(chunk)
-        length += len(chunk)
-        view = memoryview(chunk)
-        while view:
-            view = view[backend.write(sink_fd, bytes(view)) :]
+    with translated_lookup("streaming a payload"):
+        while True:
+            chunk = stream.read(_READ_CHUNK)
+            # Type BEFORE falsiness. A stream returning None or "" is malformed, not at
+            # end of file, and testing falsiness first would accept it as a clean EOF --
+            # which for an empty declared file hashes to the empty digest and validates.
+            if type(chunk) is not bytes:
+                raise ProtocolError(
+                    f"a payload stream yielded {type(chunk).__name__}, not bytes"
+                )
+            if not chunk:
+                break
+            digest.update(chunk)
+            length += len(chunk)
+            view = memoryview(chunk)
+            while view:
+                view = view[backend.write(sink_fd, bytes(view)) :]
     return "sha256:" + digest.hexdigest(), length
 
 
