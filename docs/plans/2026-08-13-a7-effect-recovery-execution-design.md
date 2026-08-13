@@ -155,8 +155,15 @@ All descriptor-relative — a held parent descriptor plus a single-component
 leaf — preserving `anchored_traversal` at mutation time:
 
 - `create_exclusive(parent_fd, name, mode) -> int` — `O_CREAT | O_EXCL |
-  O_NOFOLLOW | O_WRONLY | O_CLOEXEC`; returns the **retained creating
-  descriptor**, making §9.1/§9.2's identity discipline a return-type contract.
+  O_NOFOLLOW | O_RDWR | O_CLOEXEC`; returns the **retained creating
+  descriptor**, making §9.1/§9.2's identity discipline a return-type
+  contract. `O_RDWR`, not `O_WRONLY`: the effects verify the published
+  postcondition by re-reading through this same descriptor, and a
+  write-only descriptor cannot.
+- `write(fd, data) -> int` — the audited byte-write primitive. Capture
+  streaming, probe writes, blob materialization, and effect staging all
+  write bytes; without this primitive they would retain direct `os.write`
+  calls and the facade-only claim (§5.2) would be false.
 - `set_mode(fd, mode)` — `fchmod` through a retained descriptor, never a path.
 - `mkdir_child(parent_fd, name, mode)`.
 - `unlink_child(parent_fd, name)` / `rmdir_child(parent_fd, name)`.
@@ -208,7 +215,8 @@ monkey-patched `os`). Mechanism:
 
 Existing direct mutation sites migrate onto the facade in this stage:
 workspace creation and removal, blob promotion and reclamation, capture
-staging, the persistent lock, the ignore marker, and the probe. SQLite's VFS
+staging **including its byte streaming**, the persistent lock, the ignore
+marker, and the probe including its writes. SQLite's VFS
 I/O — database, WAL, SHM, journal — remains the sole exclusion, bounded by the
 pinned profile under the verified `metadata_root`.
 
@@ -357,9 +365,10 @@ phase passes**:
 
 1. **Chain validation, read-only.** Walk the complete chain: decode every
    envelope, verify each entry's content name against its bytes, verify
-   linkage and linearity, and *derive* §9.2's reconciliation actions without
-   performing any. Malformed evidence raises `ChainStateInvalid` — nothing
-   is persisted, no store write, no chain write, mutation refused.
+   linkage and linearity, classify every staging survivor into its
+   finish/remove action (§10.2), and *derive* §9.2's reconciliation actions
+   without performing any. Malformed evidence raises `ChainStateInvalid` —
+   nothing is persisted, no store write, no chain write, mutation refused.
 2. **Short-circuits, after validation.** A `HALTED` record returns its
    stored diagnostic; a record carrying an assembly halt (§9.3) returns it.
    Both only after phase 1 passes — a stored diagnostic is never returned
@@ -424,10 +433,19 @@ are untouched.
 
 - **Shape:** `AssemblyHalt(txid, reason, expected, observed,
   operator_action)` — `reason` a closed coordinator-owned enum with the
-  single member `APPROVAL_EVIDENCE_MISMATCH`; `expected`/`observed` the
-  canonical topology projections (directory identities, lookup constraints,
-  mount membership, work-root facts) under the same canonical encoding as
-  the persisted evidence, so the diff is byte-honest.
+  single member `APPROVAL_EVIDENCE_MISMATCH`; `operator_action` a closed
+  enum with the single member `RESTORE_APPROVED_TOPOLOGY` (the non-mutating
+  next step, per authority §11's diagnostic rule). `expected` is the
+  persisted evidence verbatim. `observed` is a tuple of frozen per-node
+  findings under a **closed vocabulary** — `NODE_MISSING`,
+  `WRONG_ENTRY_KIND`, `IDENTITY_CHANGED`, `CONSTRAINTS_CHANGED`,
+  `MOUNT_CHANGED`, `WORK_ROOT_CHANGED` — each carrying the node's path and
+  the observed facts for exactly its kind, ordered deterministically by
+  path, under the same canonical encoding as the evidence, so the diff is
+  byte-honest. **Only determinate observations become evidence**: a leaf
+  that resolves, or a determinate `ENOENT`, classifies; an indeterminate
+  errno — `EIO` and kin — propagates as the error it is and is never
+  encoded as drift.
 - **Persistence:** a nullable, write-once schema v2 column on the
   transaction record; `StoredRecord` gains the decoded field. Transaction
   state, journals, and `active` are left exactly as found — the halt is
@@ -462,13 +480,29 @@ with its history while transaction metadata deliberately does not.
 
 ### 10.2 Durable append
 
-Atomic publication through the facade, restartable at every cut: write the
-entry to an engine-reserved staging name inside `.#~chain/` via
+**Bootstrap.** The chain directory is created by `register_root` and only
+there: create-or-open `.#~chain/` under the held project-root descriptor,
+validate it (empty, or a valid chain), and `flush_directory(project root)`
+so the directory entry is durable **before** the genesis append begins. Every
+other command requires the directory to exist — its absence at preflight is
+an unregistered root, refused (§6 step 1); its absence with a live record is
+`ChainStateInvalid`.
+
+**Append.** Atomic publication through the facade, restartable at every cut:
+write the entry to an engine-reserved staging name inside `.#~chain/` via
 `create_exclusive` → `flush_file` → `transfer_noclobber` onto the digest name
 → `flush_directory(.#~chain)`. A crash leaves either nothing, an attributable
-staging survivor (reclaimed or completed at the next append or
-reconciliation — content-named, so completion is idempotent), or the durable
-entry. **A no-clobber refusal is not itself idempotent success**: on `EEXIST`
+staging survivor, or the durable entry. **Staging survivors are classified in
+§9.1 phase 1 under a closed rule**: a survivor byte-identical to an entry the
+current reconciliation pass itself derives is **finished** by that append
+(content-named, so completion is idempotent); every other survivor —
+byte-identical to an already-durable entry, partially written, or decodable
+but derived by no reconciliation action (an intent append that never became
+durable: the caller never received its digest, so nothing was promised) — is
+**removed**; staging never counts as chain state, so removal forfeits
+nothing durable. Foreign or divergent *digest-named* files remain
+`ChainStateInvalid` as below — the closed rule governs the staging name
+only. **A no-clobber refusal is not itself idempotent success**: on `EEXIST`
 the appender re-reads the existing destination and proves it — exact
 canonical bytes whose digest equals the name, decoding to the expected entry
 class, txid, and previous-entry linkage — before accepting; only then is an
@@ -487,7 +521,13 @@ canonical envelope beside the engine-computed baseline. The three union arms
 of the log design — `corpus`/`world`/`store`, `forked_from`, id semantics —
 live in the payload and are science's to validate; atoms guarantees exactly
 linearity, baseline capture, and durability. Genesis retry is restartable
-through §10.2's staging protocol. **A root with no genesis refuses
+through §10.2's staging protocol, and a `register_root` call that finds an
+existing genesis returns its digest **only after proving the call is a
+retry**: the supplied payload bytes must equal the genesis payload and the
+supplied projection must equal the genesis baseline's path set — the
+fingerprints are the engine's records of registration-time state and are
+never recomputed against the current world. Anything else is
+`PreconditionRefused`: the root is already registered as something else. **A root with no genesis refuses
 `run_transaction` and `append_intent` at the preflight** — immediately after
 lease resolution, before any capture, workspace, or record write (§6 step 1)
 — once A7 lands: registration is not optional, which is what makes
@@ -535,15 +575,23 @@ on an unknown version is unchanged):
   claims structural:
   - a journal transition `PENDING → STARTED` requires transaction
     `state = APPLYING` **and** `registration_digest` non-null;
-  - `state = APPLYING` requires `registration_digest` non-null;
+  - writing `registration_digest` is allowed only while `state = PREPARED`
+    with every journal `PENDING` — the trigger *is* §9.2's crash window, so
+    the unreachable-state claim there is structural, not narrative;
+  - **every** transition away from `PREPARED` — `APPLYING` and
+    `ROLLING_BACK` alike — requires `registration_digest` non-null;
   - writing `settlement_digest` requires `registration_digest` non-null
     **and** `state ∈ {COMMITTED, ROLLED_BACK}`;
   - clearing `active` is allowed only for
-    `state ∈ {COMMITTED, ROLLED_BACK}` with **both** digests non-null;
+    `state ∈ {COMMITTED, ROLLED_BACK}` with **both** digests non-null and
+    `assembly_halt IS NULL`;
   - deleting a `transaction_record` row is allowed only when it is detached
     (`active` does not reference it) **and**
-    `state ∈ {COMMITTED, ROLLED_BACK}` with both digests non-null —
-    `HALTED` and nonterminal records are never collectible.
+    `state ∈ {COMMITTED, ROLLED_BACK}` with both digests non-null and
+    `assembly_halt IS NULL` — `HALTED`, assembly-halted, and nonterminal
+    records are never collectible;
+  - once `assembly_halt` is non-null the record is frozen: no journal,
+    state, or digest transition, no detach, no deletion.
 
 `TransactionSpec` v2: `fulfills: digest | None` (default absent) and the
 registered-path subset, both under canonical encoding and `compile_spec`
@@ -618,14 +666,19 @@ A7 lands with its own suites; the ledger halves it discharges name them.
   and of the plan loop mid-rollback; fresh-process recovery converges or
   preserves an explained halt, and second-pass recovery is idempotent.
 - **Chain internals**: every append barrier cut — staging create, staging
-  fsync, transfer, directory fsync — plus genesis retry, `EEXIST`
-  proof-then-accept including the foreign-file refusal, tip discovery over
-  crash debris, the genesis preflight refusing `run_transaction` and
-  `append_intent` on an unregistered root before any metadata write, every
-  §9.2 reconciliation case including each `ChainStateInvalid` shape, and the
-  phase discipline — a `HALTED` record's chain is validated before its
-  diagnostic is returned, and no reconciliation write precedes full
-  validation.
+  fsync, transfer, directory fsync — **and every bootstrap barrier cut** —
+  directory create, project-root flush, cuts inside the genesis append —
+  plus the genesis-retry proof (byte-equal payload and path-set → digest
+  returned; either differing → `PreconditionRefused`), every staging-survivor
+  classification (finished, removed-as-duplicate, removed-as-partial,
+  removed-as-underived), `EEXIST` proof-then-accept including the
+  foreign-file refusal, tip discovery over crash debris, the genesis
+  preflight refusing `run_transaction` and `append_intent` on an
+  unregistered root before any metadata write, every §9.2 reconciliation
+  case including each `ChainStateInvalid` shape, the assembly-halt freeze
+  (every trigger predicate exercised from both sides), and the phase
+  discipline — a `HALTED` record's chain is validated before its diagnostic
+  is returned, and no reconciliation write precedes full validation.
 - **Executor–A3 conformance**: on clean commit, caught rollback, and every
   recovery fixture family, the executor's observed terminal states and
   durable projections equal A3's fixed points (`apply_recovery_plan`); the
