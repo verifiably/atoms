@@ -36,7 +36,13 @@ from atoms.core.fingerprint import (
 )
 from atoms.core.identifiers import require_valid_identifier
 from atoms.core.paths import portability_equivalence_key, require_rel_path
-from atoms.core.spec import SCHEMA_VERSION, Dependency, SurfaceEntry, TransactionSpec
+from atoms.core.spec import (
+    SCHEMA_VERSION,
+    Dependency,
+    SurfaceEntry,
+    TransactionSpec,
+    validate_v2_members,
+)
 from atoms.core.timeline import PathTimeline, build_timelines
 
 SHA256_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -410,6 +416,10 @@ def _phase8_surface_shape(spec: TransactionSpec) -> None:
             seen.add(entry.path)
 
 
+def _phase9_registration(spec: TransactionSpec) -> None:
+    validate_v2_members(spec)
+
+
 def _surface_map(spec: TransactionSpec, label: str) -> dict[str, PathState]:
     return {entry.path: entry.state for entry in getattr(spec, label)}
 
@@ -535,6 +545,8 @@ def _canonicalize(spec: TransactionSpec) -> TransactionSpec:
         final_surface=tuple(sorted(spec.final_surface, key=lambda entry: entry.path)),
         effects=spec.effects,
         dependencies=tuple(sorted(spec.dependencies)),
+        fulfills=spec.fulfills,
+        registered_paths=spec.registered_paths,
     )
 
 
@@ -548,6 +560,7 @@ def compile_spec(spec: TransactionSpec) -> CompiledSpec:
     _phase6_unique_effect_ids(spec)
     _phase7_dependencies(spec)
     _phase8_surface_shape(spec)
+    _phase9_registration(spec)
 
     timelines = build_timelines(spec.effects)
     initial = _surface_map(spec, "initial_surface")

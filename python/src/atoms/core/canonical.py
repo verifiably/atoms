@@ -22,7 +22,13 @@ from atoms.core.fingerprint import (
     PathState,
     SymlinkState,
 )
-from atoms.core.spec import SCHEMA_VERSION, Dependency, SurfaceEntry, TransactionSpec
+from atoms.core.spec import (
+    SCHEMA_VERSION,
+    Dependency,
+    SurfaceEntry,
+    TransactionSpec,
+    validate_v2_members,
+)
 
 
 @singledispatch
@@ -136,6 +142,8 @@ def canonical_obj(spec: TransactionSpec) -> dict[str, Any]:
         "final_surface": [_surface_obj(e) for e in final],
         "effects": [_effect_obj(e) for e in spec.effects],
         "dependencies": [_dependency_obj(d) for d in deps],
+        "fulfills": spec.fulfills,
+        "registered_paths": list(spec.registered_paths),
     }
 
 
@@ -345,6 +353,8 @@ def _decode_canonical_obj(obj: object) -> TransactionSpec:
             "final_surface",
             "effects",
             "dependencies",
+            "fulfills",
+            "registered_paths",
         ),
     )
     version = _as_int(spec["schema_version"], "schema_version")
@@ -393,7 +403,7 @@ def _decode_canonical_obj(obj: object) -> TransactionSpec:
         _decode_effect(raw, f"effects[{index}]")
         for index, raw in enumerate(_as_list(spec["effects"], "effects"))
     )
-    return TransactionSpec(
+    decoded = TransactionSpec(
         schema_version=version,
         consumer_tag=_as_str(spec["consumer_tag"], "consumer_tag"),
         intent_digest=_as_str(spec["intent_digest"], "intent_digest"),
@@ -401,7 +411,18 @@ def _decode_canonical_obj(obj: object) -> TransactionSpec:
         final_surface=surfaces["final_surface"],
         effects=effects,
         dependencies=tuple(dependencies),
+        fulfills=(
+            None
+            if spec["fulfills"] is None
+            else _as_str(spec["fulfills"], "fulfills")
+        ),
+        registered_paths=tuple(
+            _as_str(path, f"registered_paths[{index}]")
+            for index, path in enumerate(_as_list(spec["registered_paths"], "registered_paths"))
+        ),
     )
+    validate_v2_members(decoded)
+    return decoded
 
 
 def from_canonical_obj(obj: object) -> TransactionSpec:

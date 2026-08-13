@@ -41,6 +41,8 @@ def valid_spec(**overrides) -> TransactionSpec:
         "final_surface": spec.final_surface,
         "effects": spec.effects,
         "dependencies": spec.dependencies,
+        "fulfills": spec.fulfills,
+        "registered_paths": spec.registered_paths,
     }
     fields.update(overrides)
     return TransactionSpec(**fields)

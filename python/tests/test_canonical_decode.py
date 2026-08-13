@@ -43,13 +43,15 @@ class _ExplodingEqualityKey:
 
 def _minimal_obj(**overrides: object) -> dict[object, object]:
     obj: dict[object, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "consumer_tag": "c",
         "intent_digest": "sha256:" + "0" * 64,
         "initial_surface": [],
         "final_surface": [],
         "effects": [],
         "dependencies": [],
+        "fulfills": None,
+        "registered_paths": [],
     }
     obj.update(overrides)
     return obj
@@ -145,8 +147,9 @@ def test_extra_field_is_rejected():
 
 def test_duplicate_json_key_is_rejected():
     dup = (
-        '{"schema_version":1,"schema_version":1,"consumer_tag":"c","intent_digest":"x",'
-        '"initial_surface":[],"final_surface":[],"effects":[],"dependencies":[]}'
+        '{"schema_version":2,"schema_version":2,"consumer_tag":"c","intent_digest":"x",'
+        '"initial_surface":[],"final_surface":[],"effects":[],"dependencies":[],'
+        '"fulfills":null,"registered_paths":[]}'
     )
     with pytest.raises(SpecValidationError, match="duplicate"):
         from_canonical_json(dup)

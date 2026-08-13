@@ -45,7 +45,7 @@ def test_canonical_json_is_valid_and_stable():
     forward, reverse = _spec_two_orderings()
     assert canonical_json(forward) == canonical_json(reverse)
     parsed = json.loads(canonical_json(forward))
-    assert parsed["schema_version"] == 1
+    assert parsed["schema_version"] == 2
 
 
 def test_canonical_json_has_no_incidental_whitespace():

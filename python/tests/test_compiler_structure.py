@@ -114,6 +114,30 @@ def test_unknown_schema_version_is_rejected():
         compile_spec(valid_spec(schema_version=999))
 
 
+def test_v1_schema_version_is_rejected():
+    with pytest.raises(SpecValidationError, match="schema_version"):
+        compile_spec(valid_spec(schema_version=1))
+
+
+@pytest.mark.parametrize(
+    ("registered_paths", "message"),
+    [
+        (("b.txt", "a.txt"), "sorted"),
+        (("a.txt", "a.txt"), "duplicate"),
+        (("outside.txt",), "surface"),
+    ],
+)
+def test_invalid_registered_paths_are_rejected(registered_paths, message):
+    with pytest.raises(SpecValidationError, match=message):
+        compile_spec(valid_spec(registered_paths=registered_paths))
+
+
+@pytest.mark.parametrize("fulfills", ["xyz", "a" * 63, "A" * 64])
+def test_invalid_fulfills_is_rejected(fulfills):
+    with pytest.raises(SpecValidationError, match="fulfills"):
+        compile_spec(valid_spec(fulfills=fulfills))
+
+
 def test_bool_schema_version_is_rejected():
     # bool subclasses int; True == 1 must not pass as the schema version.
     with pytest.raises(SpecValidationError, match="schema_version"):
