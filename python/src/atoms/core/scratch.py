@@ -41,9 +41,9 @@ def is_engine_reserved_leaf(leaf: str) -> bool:
 def aliases_scratch_sigil(leaf: str) -> bool:
     """True iff any case- or NFC/NFD-normalized form of ``leaf`` begins with the sigil.
 
-    Because the sigil is letter-free, this agrees with :func:`is_engine_reserved_leaf`
-    on every input; the agreement is the property that proves the letter-free choice
-    sound (design §13.3).
+    Because the sigil is letter-free, this must agree with :func:`is_scratch_leaf` on
+    every input; the agreement is the property that proves the letter-free choice sound
+    (design §13.3).
     """
     forms = {
         leaf,
