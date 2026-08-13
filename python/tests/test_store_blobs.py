@@ -22,6 +22,7 @@ from atoms.store.connection import open_store
 from atoms.store.errors import MetadataStoreInvalid
 from atoms.store.records import SELECT_BLOB, SELECT_RECORD
 from tests.store_support import (
+    APPROVAL_EVIDENCE,
     RELEASES,
     CorruptsStatement,
     child_dir,
@@ -158,7 +159,11 @@ def test_audited_blob_handoff_detaches_provenance_before_fd_reuse(leased):
                     workspace,
                     (StagedBlob("capture", digest, len(content)),),
                 )
-                txn.insert_record("handoff", spec_referencing(content))
+                txn.insert_record(
+                    "handoff",
+                    spec_referencing(content),
+                    approval_evidence=APPROVAL_EVIDENCE,
+                )
 
         backend = lease._binding.backend
         assert isinstance(backend, AuditedBackend)
@@ -333,7 +338,11 @@ def test_promotion_publishes_indexes_and_removes_the_staging_directory(
         manifest = _manifest(("one", b"first"), ("two", b"second"))
         with opened_store.transaction() as txn:
             txn.promote_staging(workspace, manifest)
-            txn.insert_record("tx1", spec_referencing(b"first", b"second"))
+            txn.insert_record(
+                "tx1",
+                spec_referencing(b"first", b"second"),
+                approval_evidence=APPROVAL_EVIDENCE,
+            )
     with child_dir(store_binding.metadata_root_fd, "blobs/sha256") as blobs_fd:
         assert set(os.listdir(blobs_fd)) == {digest_to_leaf(entry.digest) for entry in manifest}
     with child_dir(store_binding.metadata_root_fd, "staging") as staging_fd:
@@ -349,7 +358,11 @@ def test_promotion_spends_the_staging_half(opened_store):
         stage(workspace, "one", b"first")
         with opened_store.transaction() as txn:
             txn.promote_staging(workspace, _manifest(("one", b"first")))
-            txn.insert_record("tx1", spec_referencing(b"first"))
+            txn.insert_record(
+                "tx1",
+                spec_referencing(b"first"),
+                approval_evidence=APPROVAL_EVIDENCE,
+            )
         with pytest.raises(ProtocolError):
             _ = workspace.staging_fd
         with pytest.raises(ProtocolError), opened_store.transaction() as txn:
@@ -360,7 +373,9 @@ def test_an_empty_manifest_still_spends_the_staging_half(opened_store, store_bin
     with opened_store.create_workspace("tx1") as workspace:
         with opened_store.transaction() as txn:
             txn.promote_staging(workspace, ())
-            txn.insert_record("tx1", one_effect_spec())
+            txn.insert_record(
+                "tx1", one_effect_spec(), approval_evidence=APPROVAL_EVIDENCE
+            )
         with pytest.raises(ProtocolError):
             _ = workspace.staging_fd
     with child_dir(store_binding.metadata_root_fd, "staging") as staging_fd:
@@ -372,8 +387,14 @@ def test_a_promoted_digest_must_be_referenced_by_its_workspaces_record(opened_st
         stage(workspace, "one", b"shared")
         with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
             txn.promote_staging(workspace, _manifest(("one", b"shared")))
-            txn.insert_record("tx1", one_effect_spec())
-            txn.insert_record("tx2", spec_referencing(b"shared"))
+            txn.insert_record(
+                "tx1", one_effect_spec(), approval_evidence=APPROVAL_EVIDENCE
+            )
+            txn.insert_record(
+                "tx2",
+                spec_referencing(b"shared"),
+                approval_evidence=APPROVAL_EVIDENCE,
+            )
     assert "tx1" in str(caught.value)
 
 
@@ -382,7 +403,11 @@ def test_a_create_from_absent_postimage_reference_justifies_promotion(opened_sto
         stage(workspace, "one", b"after")
         with opened_store.transaction() as txn:
             txn.promote_staging(workspace, _manifest(("one", b"after")))
-            txn.insert_record("tx1", spec_referencing(b"after"))
+            txn.insert_record(
+                "tx1",
+                spec_referencing(b"after"),
+                approval_evidence=APPROVAL_EVIDENCE,
+            )
 
 
 @pytest.mark.parametrize(
@@ -471,7 +496,11 @@ def test_duplicate_digests_with_the_same_length_are_promoted_once(opened_store):
             txn.promote_staging(
                 workspace, _manifest(("one", b"first"), ("two", b"first"))
             )
-            txn.insert_record("tx1", spec_referencing(b"first"))
+            txn.insert_record(
+                "tx1",
+                spec_referencing(b"first"),
+                approval_evidence=APPROVAL_EVIDENCE,
+            )
 
 
 def test_the_staging_set_must_equal_the_manifest(opened_store):
@@ -511,7 +540,11 @@ def test_a_matching_indexed_destination_unlinks_the_source(opened_store, promote
         stage(workspace, "again", content)
         with store.transaction() as txn:
             txn.promote_staging(workspace, (StagedBlob("again", digest, len(content)),))
-            txn.insert_record("tx2", spec_referencing(content))
+            txn.insert_record(
+                "tx2",
+                spec_referencing(content),
+                approval_evidence=APPROVAL_EVIDENCE,
+            )
 
 
 def test_a_matching_orphan_destination_unlinks_the_source(opened_store, store_binding):
@@ -526,7 +559,11 @@ def test_a_matching_orphan_destination_unlinks_the_source(opened_store, store_bi
         stage(workspace, "one", content)
         with opened_store.transaction() as txn:
             txn.promote_staging(workspace, (StagedBlob("one", digest, len(content)),))
-            txn.insert_record("tx1", spec_referencing(content))
+            txn.insert_record(
+                "tx1",
+                spec_referencing(content),
+                approval_evidence=APPROVAL_EVIDENCE,
+            )
 
 
 @pytest.mark.parametrize("kind", ["content", "symlink"])
@@ -751,7 +788,11 @@ def test_promotion_refuses_a_substituted_staging_parent_without_outside_rmdir(
 
     with pytest.raises(OSError) as caught, opened_store.transaction() as txn:
         txn.promote_staging(workspace, _manifest(("one", content)))
-        txn.insert_record("tx1", spec_referencing(content))
+        txn.insert_record(
+            "tx1",
+            spec_referencing(content),
+            approval_evidence=APPROVAL_EVIDENCE,
+        )
 
     assert caught.value.errno == errno.ELOOP
     assert (outside / "tx1").is_dir()
@@ -785,7 +826,11 @@ def test_successful_promotion_flushes_blob_staging_and_staging_parent_in_order(
     try:
         with opened_store.transaction() as txn:
             txn.promote_staging(workspace, _manifest(("one", b"first")))
-            txn.insert_record("tx1", spec_referencing(b"first"))
+            txn.insert_record(
+                "tx1",
+                spec_referencing(b"first"),
+                approval_evidence=APPROVAL_EVIDENCE,
+            )
     finally:
         opened_store._connection.set_trace_callback(None)
     assert events == [blobs_inode, staging_inode, parent_inode, "INSERT_BLOB"]
@@ -836,7 +881,11 @@ def test_corruption_from_promotions_precommit_reference_query_is_translated(
         )
         with pytest.raises(MetadataStoreInvalid) as caught, opened_store.transaction() as txn:
             txn.promote_staging(workspace, _manifest(("one", content)))
-            txn.insert_record("tx1", spec_referencing(content))
+            txn.insert_record(
+                "tx1",
+                spec_referencing(content),
+                approval_evidence=APPROVAL_EVIDENCE,
+            )
     assert isinstance(caught.value.__cause__, sqlite3.DatabaseError)
 
 
@@ -1105,7 +1154,9 @@ def test_reclamation_requires_an_exact_string_digest(opened_store, bad):
 
 def test_removal_is_refused_inside_a_write_transaction(opened_store):
     with opened_store.transaction() as txn:
-        txn.insert_record("tx1", one_effect_spec())
+        txn.insert_record(
+            "tx1", one_effect_spec(), approval_evidence=APPROVAL_EVIDENCE
+        )
         with pytest.raises(ProtocolError) as caught:
             opened_store.remove_unindexed_blob(f"sha256:{HEX}")
         assert "write transaction" in str(caught.value)
@@ -1153,7 +1204,11 @@ def test_a_reclaimer_does_not_race_another_stores_promotion(store_on):
                     workspace,
                     (StagedBlob(name="one", digest=digest, byte_len=len(content)),),
                 )
-                txn.insert_record("tx1", spec_referencing(content))
+                txn.insert_record(
+                    "tx1",
+                    spec_referencing(content),
+                    approval_evidence=APPROVAL_EVIDENCE,
+                )
                 started.set()
                 assert enumerated.wait(5)
                 assert attempted_remove.wait(5)

@@ -60,6 +60,8 @@ def _require_projection_matches(
     approved: ProjectApprovedSpec,
 ) -> None:
     """Compare every durable field with the plan prefix reduced to `start`."""
+    # Registration, settlement, approval evidence, and assembly halt are outside A3's
+    # transition projection. A7b decides whether this comparison must grow to include them.
     snapshot = plan.bound_snapshot
     if snapshot.compiled != approved.compiled:
         raise ProtocolError(

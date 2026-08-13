@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from atoms.core.errors import ProtocolError
@@ -22,19 +24,27 @@ from tests.coordinator_support import (
 )
 
 
-def test_a_metadata_only_plan_runs_to_the_end(leased):
+def test_a_metadata_only_plan_detaches_only_after_settlement_binding(leased):
     from atoms.coordinator.transitions import persist_plan_prefix
 
     with leased() as lease:
         approved, plan = prepared_metadata_only(lease)
         assert type(plan.steps[-1]) is DetachActive
 
-        assert persist_plan_prefix(lease, approved, plan, 0) == len(plan.steps)
+        with pytest.raises(sqlite3.IntegrityError, match="active delete requires"):
+            persist_plan_prefix(lease, approved, plan, 0)
 
         record = lease._store.read_record(approved.txid)
         assert record is not None
         assert record.state is TransactionState.ROLLED_BACK
         assert record.rollback_result is RollbackResult.RESTORED
+        assert lease._store.read_active() is not None
+
+        with lease._store.transaction() as txn:
+            txn.set_settlement_digest(approved.txid, "1" * 64)
+        assert persist_plan_prefix(
+            lease, approved, plan, len(plan.steps) - 1
+        ) == len(plan.steps)
         assert lease._store.read_active() is None
 
 
@@ -87,7 +97,8 @@ def test_a_preserve_external_plan_still_reaches_its_terminal_state(leased):
     with leased() as lease:
         approved, plan = prepared_with_preserve_external(lease)
 
-        assert persist_plan_prefix(lease, approved, plan, 0) == len(plan.steps)
+        with pytest.raises(sqlite3.IntegrityError, match="active delete requires"):
+            persist_plan_prefix(lease, approved, plan, 0)
 
         record = lease._store.read_record(approved.txid)
         assert record is not None
@@ -247,8 +258,11 @@ def test_no_active_record_refuses(leased):
 
     with leased() as lease:
         approved, plan = prepared_metadata_only(lease)
+        with pytest.raises(sqlite3.IntegrityError, match="active delete requires"):
+            persist_plan_prefix(lease, approved, plan, 0)
         with lease._store.transaction() as txn:
-            txn.set_active(None)
+            txn.set_settlement_digest(approved.txid, "2" * 64)
+        persist_plan_prefix(lease, approved, plan, len(plan.steps) - 1)
 
         with pytest.raises(ProtocolError) as caught:
             persist_plan_prefix(lease, approved, plan, 0)

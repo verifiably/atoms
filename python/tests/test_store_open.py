@@ -401,8 +401,8 @@ def test_a_check_violating_row_refuses_at_reopen(store_on):
             raw.execute("PRAGMA ignore_check_constraints = ON")
             raw.execute(
                 "INSERT INTO transaction_record "
-                "(txid, spec_json, state, committed) VALUES ('tx1', '{}', 'bogus', "
-                "'uncommitted')"
+                "(txid, spec_json, state, committed, approval_evidence) VALUES "
+                "('tx1', '{}', 'bogus', 'uncommitted', '{}')"
             )
         finally:
             raw.close()

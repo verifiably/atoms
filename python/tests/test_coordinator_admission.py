@@ -7,7 +7,7 @@ import pytest
 from atoms.core.errors import PreconditionRefused, ProtocolError
 from atoms.core.identifiers import is_valid_identifier
 from tests.coordinator_support import compiled_for
-from tests.store_support import one_effect_spec
+from tests.store_support import APPROVAL_EVIDENCE, one_effect_spec
 
 
 def test_new_txid_is_a_valid_identifier():
@@ -28,7 +28,9 @@ def test_a_candidate_a_durable_record_owns_is_discarded(leased, monkeypatch):
 
     with leased() as lease:
         with lease._store.transaction() as txn:
-            txn.insert_record("taken", one_effect_spec())
+            txn.insert_record(
+                "taken", one_effect_spec(), approval_evidence=APPROVAL_EVIDENCE
+            )
 
         issued = iter(["taken", "free"])
         monkeypatch.setattr(admission, "new_txid", lambda: next(issued))
@@ -44,7 +46,9 @@ def test_every_candidate_owned_by_a_record_exhausts_the_bound(leased, monkeypatc
     with leased() as lease:
         for txid in ("a", "b", "c"):
             with lease._store.transaction() as txn:
-                txn.insert_record(txid, one_effect_spec())
+                txn.insert_record(
+                    txid, one_effect_spec(), approval_evidence=APPROVAL_EVIDENCE
+                )
 
         issued = iter(["a", "b", "c"])
         monkeypatch.setattr(admission, "new_txid", lambda: next(issued))
@@ -155,7 +159,9 @@ def test_a_record_collision_clears_an_earlier_candidates_occupancy(leased, monke
         # "a" has no record, so its scratch is consulted; "b" and "c" collide first.
         for txid in ("b", "c"):
             with lease._store.transaction() as txn:
-                txn.insert_record(txid, one_effect_spec())
+                txn.insert_record(
+                    txid, one_effect_spec(), approval_evidence=APPROVAL_EVIDENCE
+                )
         occupied_leaf = occupy_the_scratch_leaf(
             lease, approve_for_project(compiled, ProjectContext(lease._binding, "a"))
         )

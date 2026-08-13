@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from tests.coordinator_support import AFTER, prepared, spec_digest
-from tests.store_support import one_effect_spec
+from tests.store_support import APPROVAL_EVIDENCE, one_effect_spec
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -48,7 +48,9 @@ def test_a_second_lease_reclaims_both_kinds_of_orphan_and_spares_the_referenced(
         project_root, metadata_root = _roots(lease)
         lease._store.create_workspace("kept").close()
         with lease._store.transaction() as txn:
-            txn.insert_record("kept", one_effect_spec())
+            txn.insert_record(
+                "kept", one_effect_spec(), approval_evidence=APPROVAL_EVIDENCE
+            )
 
         with lease._store.create_workspace("orphan") as workspace:
             stage(workspace, "b0", content)
@@ -57,7 +59,11 @@ def test_a_second_lease_reclaims_both_kinds_of_orphan_and_spares_the_referenced(
                     workspace,
                     (StagedBlob(name="b0", digest=digest, byte_len=len(content)),),
                 )
-                txn.insert_record("orphan", spec_referencing(content))
+                txn.insert_record(
+                    "orphan",
+                    spec_referencing(content),
+                    approval_evidence=APPROVAL_EVIDENCE,
+                )
                 raise RuntimeError("cut before COMMIT")
 
         assert lease._store.read_record("orphan") is None

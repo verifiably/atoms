@@ -28,6 +28,7 @@ from atoms.core.spec import build_spec
 
 DATABASE_ENTRIES = ("atoms.db", "atoms.db-wal", "atoms.db-shm", "atoms.db-journal")
 SHARED_DIGEST = "sha256:" + "a" * 64
+APPROVAL_EVIDENCE = '{"directories":[],"mount_id":1,"work_root":null}'
 
 
 @contextmanager
@@ -49,6 +50,10 @@ def file_state(content: bytes, mode: int = 0o644) -> FileState:
 
 def digest_of(content: bytes) -> str:
     return "sha256:" + hashlib.sha256(content).hexdigest()
+
+
+def registration_digest(txid: str) -> str:
+    return hashlib.sha256(f"registered:{txid}".encode()).hexdigest()
 
 
 def one_effect_spec(effect_id: str = "e1"):
@@ -390,7 +395,8 @@ def commit_record(store, txid: str, spec, *contents: bytes) -> None:
     assert set(supplied) == referenced
     if not referenced:
         with store.transaction() as txn:
-            txn.insert_record(txid, spec)
+            txn.insert_record(txid, spec, approval_evidence=APPROVAL_EVIDENCE)
+            txn.set_registration_digest(txid, registration_digest(txid))
         return
 
     with store.create_workspace(txid) as workspace:
@@ -401,4 +407,5 @@ def commit_record(store, txid: str, spec, *contents: bytes) -> None:
             manifest.append(StagedBlob(name=name, digest=digest, byte_len=byte_len))
         with store.transaction() as txn:
             txn.promote_staging(workspace, tuple(manifest))
-            txn.insert_record(txid, spec)
+            txn.insert_record(txid, spec, approval_evidence=APPROVAL_EVIDENCE)
+            txn.set_registration_digest(txid, registration_digest(txid))

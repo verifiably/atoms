@@ -14,7 +14,13 @@ from atoms.core.canonical import canonical_json
 from atoms.store.blobs import StagedBlob
 from atoms.store.connection import open_store
 from atoms.store.records import referenced_digests
-from tests.store_support import digest_of, replace_spec, spec_referencing, stage
+from tests.store_support import (
+    APPROVAL_EVIDENCE,
+    digest_of,
+    replace_spec,
+    spec_referencing,
+    stage,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -57,7 +63,9 @@ def test_a_committed_record_reads_all_blobs_in_a_fresh_process(
                     )
                 with store.transaction() as txn:
                     txn.promote_staging(workspace, tuple(manifest))
-                    txn.insert_record("tx1", spec)
+                    txn.insert_record(
+                        "tx1", spec, approval_evidence=APPROVAL_EVIDENCE
+                    )
                     txn.set_active("tx1")
             written = store.read_record("tx1")
         assert written is not None
@@ -104,7 +112,11 @@ def test_a_committed_record_never_names_a_missing_blob(store_on):
                         ),
                     ),
                 )
-                txn.insert_record("tx1", spec_referencing(content))
+                txn.insert_record(
+                    "tx1",
+                    spec_referencing(content),
+                    approval_evidence=APPROVAL_EVIDENCE,
+                )
         with open_store(binding) as reopened:
             record = reopened.read_record("tx1")
             assert record is not None

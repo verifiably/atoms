@@ -12,6 +12,7 @@ from atoms.core.errors import ProtocolError
 from atoms.store.connection import open_store
 from atoms.store.errors import MetadataStoreInvalid
 from tests.store_support import (
+    APPROVAL_EVIDENCE,
     RELEASES,
     STORE_SURFACE,
     close_binding,
@@ -141,7 +142,9 @@ def test_corruption_reported_by_commit_is_translated_and_rolled_back(
     proxy = CorruptsStatement(opened_store._connection, "COMMIT")
     monkeypatch.setattr(opened_store, "_connection", proxy)
     with pytest.raises(MetadataStoreInvalid) as caught, opened_store.transaction() as txn:
-        txn.insert_record("tx1", one_effect_spec())
+        txn.insert_record(
+            "tx1", one_effect_spec(), approval_evidence=APPROVAL_EVIDENCE
+        )
     assert isinstance(caught.value.__cause__, sqlite3.DatabaseError)
     assert not proxy.in_transaction
 
@@ -180,7 +183,9 @@ def test_lock_released_before_commit_rolls_back(store_on, release):
         path = raw_path(binding)
         store = open_store(binding)
         with pytest.raises(ProtocolError) as caught, store.transaction() as txn:
-            txn.insert_record("tx1", one_effect_spec())
+            txn.insert_record(
+                "tx1", one_effect_spec(), approval_evidence=APPROVAL_EVIDENCE
+            )
             release(binding)
         assert ("closed" if release.__name__ == "close_binding" else "lock") in str(caught.value).lower()
         store.close()
@@ -199,7 +204,9 @@ def test_lock_released_during_a_load_returns_no_record(store_on, monkeypatch, re
     with store_on() as binding:
         store = open_store(binding)
         with store.transaction() as txn:
-            txn.insert_record("tx1", one_effect_spec())
+            txn.insert_record(
+                "tx1", one_effect_spec(), approval_evidence=APPROVAL_EVIDENCE
+            )
         real = records_module.coherence_findings
 
         def release_then_check(connection, txid):
@@ -217,7 +224,9 @@ def test_a_successful_read_ends_with_rollback(opened_store):
     from tests.store_support import one_effect_spec
 
     with opened_store.transaction() as txn:
-        txn.insert_record("tx1", one_effect_spec())
+        txn.insert_record(
+            "tx1", one_effect_spec(), approval_evidence=APPROVAL_EVIDENCE
+        )
     statements: list[str] = []
     opened_store._connection.set_trace_callback(statements.append)
     try:
@@ -309,7 +318,11 @@ def test_open_blob_is_refused_inside_this_stores_write_transaction(store_on):
                 workspace,
                 (StagedBlob(name="capture", digest=digest, byte_len=len(content)),),
             )
-            txn.insert_record("tx1", spec_referencing(content))
+            txn.insert_record(
+                "tx1",
+                spec_referencing(content),
+                approval_evidence=APPROVAL_EVIDENCE,
+            )
             with pytest.raises(ProtocolError) as caught:
                 store.open_blob(digest)
             assert "write transaction" in str(caught.value)
@@ -370,7 +383,11 @@ def test_the_gate_runs_before_promotions_staging_rmdir(store_on, monkeypatch, re
                         ),
                     ),
                 )
-                txn.insert_record("tx1", spec_referencing(content))
+                txn.insert_record(
+                    "tx1",
+                    spec_referencing(content),
+                    approval_evidence=APPROVAL_EVIDENCE,
+                )
             assert ("closed" if release is close_binding else "lock") in str(caught.value)
             workspace.close()
             store.close()
@@ -416,7 +433,11 @@ def test_the_gate_runs_between_the_eexist_hash_and_the_source_unlink(store_on, m
                 workspace,
                 (StagedBlob(name="capture", digest=digest, byte_len=len(content)),),
             )
-            txn.insert_record("tx1", spec_referencing(content))
+            txn.insert_record(
+                "tx1",
+                spec_referencing(content),
+                approval_evidence=APPROVAL_EVIDENCE,
+            )
         assert "closed" in str(caught.value)
         assert "capture" in os.listdir(workspace._staging_fd)
         workspace.close()

@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from enum import Enum
 from typing import TYPE_CHECKING, Self
 
+from atoms.core.assembly import AssemblyHalt, encode_assembly_halt
 from atoms.core.canonical import canonical_json, from_canonical_json
 from atoms.core.errors import CapabilityUnavailable, ProtocolError
 from atoms.core.recovery.model import (
@@ -24,23 +25,29 @@ from atoms.fs.binding import ProjectBinding
 from atoms.store.errors import MetadataStoreInvalid, translated
 from atoms.store.records import (
     DELETE_ACTIVE,
+    INSERT_ACTIVE,
     INSERT_EFFECT,
     INSERT_RECORD,
     SELECT_ACTIVE,
+    SELECT_APPROVAL_EVIDENCE,
     SELECT_RECORD,
+    UPDATE_ASSEMBLY_HALT,
     UPDATE_COMMITTED,
     UPDATE_HALT_DIAGNOSTIC,
     UPDATE_JOURNAL_STATE,
+    UPDATE_REGISTRATION_DIGEST,
     UPDATE_ROLLBACK_RESULT,
+    UPDATE_SETTLEMENT_DIGEST,
     UPDATE_STATE,
-    UPSERT_ACTIVE,
     StoredRecord,
     coherence_findings,
     encode_diagnostic,
     load_record,
     referenced_digests,
+    require_assembly_halt_binding,
     require_identifier,
     require_member,
+    require_text,
 )
 from atoms.store.schema import (
     APPLICATION_ID,
@@ -571,7 +578,9 @@ class _StoreTransaction:
                 entry.digest for entry in manifest
             )
 
-    def insert_record(self, txid: str, spec: TransactionSpec) -> None:
+    def insert_record(
+        self, txid: str, spec: TransactionSpec, *, approval_evidence: str
+    ) -> None:
         with self._mutating() as store:
             require_identifier("txid", txid)
             if type(spec) is not TransactionSpec:
@@ -586,6 +595,7 @@ class _StoreTransaction:
                         canonical_json(spec),
                         TransactionState.PREPARED.value,
                         CommitDecision.UNCOMMITTED.value,
+                        require_text("approval_evidence", approval_evidence),
                     ),
                 )
             for effect in spec.effects:
@@ -635,6 +645,40 @@ class _StoreTransaction:
                 )
             self._set_column(UPDATE_HALT_DIAGNOSTIC, txid, encode_diagnostic(diagnostic))
 
+    def set_registration_digest(self, txid: str, digest: str) -> None:
+        with self._mutating():
+            self._set_column(
+                UPDATE_REGISTRATION_DIGEST,
+                txid,
+                require_text("registration digest", digest),
+            )
+
+    def set_settlement_digest(self, txid: str, digest: str) -> None:
+        with self._mutating():
+            self._set_column(
+                UPDATE_SETTLEMENT_DIGEST,
+                txid,
+                require_text("settlement digest", digest),
+            )
+
+    def set_assembly_halt(self, txid: str, halt: AssemblyHalt) -> None:
+        with self._mutating() as store:
+            if type(halt) is not AssemblyHalt:
+                raise ProtocolError(
+                    f"halt must be exactly AssemblyHalt, got {type(halt).__name__}"
+                )
+            require_identifier("txid", txid)
+            with translated("reading an assembly halt's record binding"):
+                row = store._connection.execute(
+                    SELECT_APPROVAL_EVIDENCE, (txid,)
+                ).fetchone()
+            if row is None:
+                raise ProtocolError(
+                    f"no transaction_record row for txid {txid!r}"
+                )
+            require_assembly_halt_binding(txid, row[0], halt)
+            self._set_column(UPDATE_ASSEMBLY_HALT, txid, encode_assembly_halt(halt))
+
     def set_journal_state(self, txid: str, effect_id: str, state: JournalState) -> None:
         with self._mutating() as store:
             require_identifier("txid", txid)
@@ -658,7 +702,7 @@ class _StoreTransaction:
                 return
             require_identifier("txid", txid)
             with translated("setting the active transaction"):
-                store._connection.execute(UPSERT_ACTIVE, (txid,))
+                store._connection.execute(INSERT_ACTIVE, (txid,))
             self._touched.add(txid)
 
 

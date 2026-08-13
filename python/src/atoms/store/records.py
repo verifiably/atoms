@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from atoms.core.assembly import AssemblyHalt, decode_assembly_halt
 from atoms.core.canonical import canonical_json, from_canonical_json
 from atoms.core.compiler import compile_spec
 from atoms.core.effects import occurrences
@@ -304,8 +305,9 @@ def decode_diagnostic(text: str) -> HaltDiagnostic:
 
 INSERT_RECORD = (
     "INSERT INTO transaction_record "
-    "(txid, spec_json, state, committed, rollback_result, halt_diagnostic) "
-    "VALUES (?, ?, ?, ?, NULL, NULL)"
+    "(txid, spec_json, state, committed, rollback_result, halt_diagnostic, "
+    "registration_digest, settlement_digest, approval_evidence, assembly_halt) "
+    "VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, NULL)"
 )
 INSERT_EFFECT = (
     "INSERT INTO effect (txid, effect_id, variant, journal_state) VALUES (?, ?, ?, ?)"
@@ -314,13 +316,17 @@ UPDATE_STATE = "UPDATE transaction_record SET state = ? WHERE txid = ?"
 UPDATE_COMMITTED = "UPDATE transaction_record SET committed = ? WHERE txid = ?"
 UPDATE_ROLLBACK_RESULT = "UPDATE transaction_record SET rollback_result = ? WHERE txid = ?"
 UPDATE_HALT_DIAGNOSTIC = "UPDATE transaction_record SET halt_diagnostic = ? WHERE txid = ?"
+UPDATE_REGISTRATION_DIGEST = (
+    "UPDATE transaction_record SET registration_digest = ? WHERE txid = ?"
+)
+UPDATE_SETTLEMENT_DIGEST = (
+    "UPDATE transaction_record SET settlement_digest = ? WHERE txid = ?"
+)
+UPDATE_ASSEMBLY_HALT = "UPDATE transaction_record SET assembly_halt = ? WHERE txid = ?"
 UPDATE_JOURNAL_STATE = (
     "UPDATE effect SET journal_state = ? WHERE txid = ? AND effect_id = ?"
 )
-UPSERT_ACTIVE = (
-    "INSERT INTO active (singleton, txid) VALUES (0, ?) "
-    "ON CONFLICT(singleton) DO UPDATE SET txid = excluded.txid"
-)
+INSERT_ACTIVE = "INSERT INTO active (singleton, txid) VALUES (0, ?)"
 DELETE_ACTIVE = "DELETE FROM active"
 
 
@@ -346,6 +352,14 @@ def require_identifier(label: str, value: object) -> str:
     if not is_valid_identifier(value):
         raise ProtocolError(
             f"{label} {value!r} is not 1-64 characters of [A-Za-z0-9_-]"
+        )
+    return value
+
+
+def require_text(label: str, value: object) -> str:
+    if type(value) is not str:
+        raise ProtocolError(
+            f"{label} must be exactly str, got {type(value).__name__}"
         )
     return value
 
@@ -389,7 +403,14 @@ COHERENCE_RULES: tuple[str, ...] = (
     RULE_ROLLBACK_RESULT, RULE_HALT_DIAGNOSTIC, RULE_DIAGNOSTIC_DECISION,
     RULE_DIAGNOSTIC_JOURNALS, RULE_ACTIVE_RECORD,
 )
-SELECT_RECORD = "SELECT spec_json, state, committed, rollback_result, halt_diagnostic FROM transaction_record WHERE txid = ?"
+SELECT_RECORD = (
+    "SELECT spec_json, state, committed, rollback_result, halt_diagnostic, "
+    "registration_digest, settlement_digest, approval_evidence, assembly_halt "
+    "FROM transaction_record WHERE txid = ?"
+)
+SELECT_APPROVAL_EVIDENCE = (
+    "SELECT approval_evidence FROM transaction_record WHERE txid = ?"
+)
 SELECT_EFFECTS = "SELECT effect_id, variant, journal_state FROM effect WHERE txid = ?"
 SELECT_BLOB = "SELECT byte_len FROM blob WHERE digest = ?"
 SELECT_ACTIVE = "SELECT txid FROM active"
@@ -403,7 +424,25 @@ class StoredRecord:
     committed: CommitDecision
     rollback_result: RollbackResult | None
     halt_diagnostic: HaltDiagnostic | None
+    registration_digest: str | None
+    settlement_digest: str | None
+    approval_evidence: str
+    assembly_halt: AssemblyHalt | None
     journals: tuple[EffectJournalState, ...]
+
+
+def require_assembly_halt_binding(
+    txid: str, approval_evidence: str, halt: AssemblyHalt
+) -> None:
+    if halt.txid != txid:
+        raise ProtocolError(
+            f"assembly halt txid {halt.txid!r} does not match record txid {txid!r}"
+        )
+    if halt.expected != approval_evidence:
+        raise ProtocolError(
+            "assembly halt expected evidence does not match the record's "
+            "approval_evidence"
+        )
 
 
 def _finding(rule: str, detail: str) -> str:
@@ -462,7 +501,17 @@ def coherence_findings(connection: Any, txid: str) -> tuple[str, ...]:
         if active is not None and active_record is None:
             return (_finding(RULE_ACTIVE_RECORD, f"active names txid {active[0]!r}, which has no record"),)
         return ()
-    spec_json, state_value, committed_value, rollback_value, diagnostic_text = row
+    (
+        spec_json,
+        state_value,
+        committed_value,
+        rollback_value,
+        diagnostic_text,
+        _registration_digest,
+        _settlement_digest,
+        _approval_evidence,
+        _assembly_halt,
+    ) = row
     try:
         spec = from_canonical_json(spec_json)
     except (SpecValidationError, ValueError) as caught:
@@ -529,7 +578,17 @@ def load_record(connection: Any, txid: str) -> StoredRecord | None:
         row = connection.execute(SELECT_RECORD, (txid,)).fetchone()
     if row is None:
         return None
-    spec_json, state_value, committed_value, rollback_value, diagnostic_text = row
+    (
+        spec_json,
+        state_value,
+        committed_value,
+        rollback_value,
+        diagnostic_text,
+        registration_digest,
+        settlement_digest,
+        approval_evidence,
+        assembly_halt_text,
+    ) = row
     spec = from_canonical_json(spec_json)
     with translated("materializing effect rows"):
         effect_rows = tuple(connection.execute(SELECT_EFFECTS, (txid,)))
@@ -537,9 +596,32 @@ def load_record(connection: Any, txid: str) -> StoredRecord | None:
         effect_id: (variant, journal)
         for effect_id, variant, journal in effect_rows
     }
+    try:
+        assembly_halt = (
+            None
+            if assembly_halt_text is None
+            else decode_assembly_halt(assembly_halt_text)
+        )
+        if assembly_halt is not None:
+            require_assembly_halt_binding(txid, approval_evidence, assembly_halt)
+    except ProtocolError as caught:
+        raise MetadataStoreInvalid(
+            f"the record for txid {txid!r} has malformed assembly halt evidence: {caught}"
+        ) from caught
     return StoredRecord(
-        txid, spec, TransactionState(state_value), CommitDecision(committed_value),
-        None if rollback_value is None else RollbackResult(rollback_value),
-        None if diagnostic_text is None else decode_diagnostic(diagnostic_text),
-        journal_vector(spec, rows),
+        txid=txid,
+        spec=spec,
+        state=TransactionState(state_value),
+        committed=CommitDecision(committed_value),
+        rollback_result=(
+            None if rollback_value is None else RollbackResult(rollback_value)
+        ),
+        halt_diagnostic=(
+            None if diagnostic_text is None else decode_diagnostic(diagnostic_text)
+        ),
+        registration_digest=registration_digest,
+        settlement_digest=settlement_digest,
+        approval_evidence=approval_evidence,
+        assembly_halt=assembly_halt,
+        journals=journal_vector(spec, rows),
     )

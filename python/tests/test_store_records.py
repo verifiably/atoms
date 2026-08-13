@@ -48,6 +48,7 @@ from atoms.store.records import (
     referenced_digests,
 )
 from tests.store_support import (
+    APPROVAL_EVIDENCE,
     CorruptsStatement,
     commit_record,
     digest_of,
@@ -57,6 +58,7 @@ from tests.store_support import (
     non_compiling_spec,
     one_effect_spec,
     raw_connect,
+    registration_digest,
     replace_spec,
     two_length_spec,
 )
@@ -211,7 +213,7 @@ def test_a_duplicate_key_in_the_payload_refuses():
 def test_insert_record_stores_the_canonical_encoding(opened_store, store_binding):
     spec = one_effect_spec()
     with opened_store.transaction() as txn:
-        txn.insert_record("tx1", spec)
+        txn.insert_record("tx1", spec, approval_evidence=APPROVAL_EVIDENCE)
     raw = raw_connect(store_binding)
     try:
         stored = raw.execute(
@@ -225,7 +227,11 @@ def test_insert_record_stores_the_canonical_encoding(opened_store, store_binding
 
 def test_insert_record_derives_every_effect_row_from_the_spec(opened_store, store_binding):
     with opened_store.transaction() as txn:
-        txn.insert_record("tx1", one_effect_spec(effect_id="only"))
+        txn.insert_record(
+            "tx1",
+            one_effect_spec(effect_id="only"),
+            approval_evidence=APPROVAL_EVIDENCE,
+        )
     raw = raw_connect(store_binding)
     try:
         rows = raw.execute(
@@ -321,7 +327,9 @@ def test_one_digest_with_conflicting_lengths_across_surfaces_keeps_both_pairs():
 
 def test_spec_json_is_write_once_at_the_database(opened_store, store_binding):
     with opened_store.transaction() as txn:
-        txn.insert_record("tx1", one_effect_spec())
+        txn.insert_record(
+            "tx1", one_effect_spec(), approval_evidence=APPROVAL_EVIDENCE
+        )
     raw = raw_connect(store_binding)
     try:
         with pytest.raises(Exception) as caught:
@@ -339,9 +347,17 @@ def test_a_duplicate_txid_is_refused(opened_store):
     second insert leaves the record PK as the only constraint that can fire.
     """
     with opened_store.transaction() as txn:
-        txn.insert_record("tx1", one_effect_spec(effect_id="e1"))
+        txn.insert_record(
+            "tx1",
+            one_effect_spec(effect_id="e1"),
+            approval_evidence=APPROVAL_EVIDENCE,
+        )
     with pytest.raises(sqlite3.IntegrityError) as caught, opened_store.transaction() as txn:
-        txn.insert_record("tx1", one_effect_spec(effect_id="e2"))
+        txn.insert_record(
+            "tx1",
+            one_effect_spec(effect_id="e2"),
+            approval_evidence=APPROVAL_EVIDENCE,
+        )
     assert "transaction_record.txid" in str(caught.value)
 
 
@@ -360,7 +376,9 @@ def test_a_caught_write_failure_cannot_be_committed(opened_store, store_binding)
         # shape under test -- a caller that catches A5a's failure and carries on -- and
         # ruff's SIM117 refuses the nested `with` anyway.
         try:
-            txn.insert_record("tx1", duplicate_effect_spec())
+            txn.insert_record(
+                "tx1", duplicate_effect_spec(), approval_evidence=APPROVAL_EVIDENCE
+            )
         except sqlite3.IntegrityError:
             pass
         else:
@@ -378,13 +396,17 @@ def test_a_caught_write_failure_does_not_break_the_next_transaction(opened_store
     """The poisoned transaction rolls back cleanly, so the store is still usable."""
     with pytest.raises(ProtocolError), opened_store.transaction() as txn:
         try:
-            txn.insert_record("tx1", duplicate_effect_spec())
+            txn.insert_record(
+                "tx1", duplicate_effect_spec(), approval_evidence=APPROVAL_EVIDENCE
+            )
         except sqlite3.IntegrityError:
             pass
         else:
             raise AssertionError("the duplicate effect_id did not raise")
     with opened_store.transaction() as txn:
-        txn.insert_record("tx1", one_effect_spec())
+        txn.insert_record(
+            "tx1", one_effect_spec(), approval_evidence=APPROVAL_EVIDENCE
+        )
 
 
 @pytest.mark.parametrize("bad", [3, None, b"tx", "../escape", "", "x" * 65])
@@ -472,7 +494,9 @@ def test_a_wrong_typed_argument_checks_ownership_first_and_cannot_commit(
     assert "exactly" not in str(caught.value)
 
     with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
-        txn.insert_record("tx1", one_effect_spec())
+        txn.insert_record(
+            "tx1", one_effect_spec(), approval_evidence=APPROVAL_EVIDENCE
+        )
         try:
             getattr(txn, method)("tx1", bad)
         except ProtocolError:
@@ -487,7 +511,13 @@ def test_a_wrong_typed_argument_checks_ownership_first_and_cannot_commit(
 
 def test_setting_a_journal_state_updates_exactly_one_row(opened_store, store_binding):
     with opened_store.transaction() as txn:
-        txn.insert_record("tx1", one_effect_spec(effect_id="only"))
+        txn.insert_record(
+            "tx1",
+            one_effect_spec(effect_id="only"),
+            approval_evidence=APPROVAL_EVIDENCE,
+        )
+        txn.set_registration_digest("tx1", registration_digest("tx1"))
+        txn.set_transaction_state("tx1", TransactionState.APPLYING)
         txn.set_journal_state("tx1", "only", JournalState.STARTED)
     raw = raw_connect(store_binding)
     try:
@@ -500,27 +530,41 @@ def test_setting_a_journal_state_updates_exactly_one_row(opened_store, store_bin
 
 def test_setting_a_journal_state_for_an_unknown_effect_refuses(opened_store):
     with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
-        txn.insert_record("tx1", one_effect_spec(effect_id="only"))
+        txn.insert_record(
+            "tx1",
+            one_effect_spec(effect_id="only"),
+            approval_evidence=APPROVAL_EVIDENCE,
+        )
+        txn.set_registration_digest("tx1", registration_digest("tx1"))
+        txn.set_transaction_state("tx1", TransactionState.APPLYING)
         txn.set_journal_state("tx1", "ghost", JournalState.STARTED)
     assert "ghost" in str(caught.value)
 
 
-def test_set_active_enforces_the_single_active_row(opened_store, store_binding):
+def test_set_active_is_insert_only(opened_store, store_binding):
     commit_record(opened_store, "tx1", one_effect_spec())
     commit_record(opened_store, "tx2", replace_spec(), b"before", b"after")
     with opened_store.transaction() as txn:
         txn.set_active("tx1")
+    with pytest.raises(
+        sqlite3.IntegrityError, match="active.singleton"
+    ), opened_store.transaction() as txn:
         txn.set_active("tx2")
     raw = raw_connect(store_binding)
     try:
-        assert raw.execute("SELECT singleton, txid FROM active").fetchall() == [(0, "tx2")]
+        assert raw.execute("SELECT singleton, txid FROM active").fetchall() == [(0, "tx1")]
     finally:
         raw.close()
 
 
 def test_set_active_none_clears_the_row(opened_store, store_binding):
     with opened_store.transaction() as txn:
-        txn.insert_record("tx1", one_effect_spec())
+        txn.insert_record(
+            "tx1", one_effect_spec(), approval_evidence=APPROVAL_EVIDENCE
+        )
+        txn.set_registration_digest("tx1", registration_digest("tx1"))
+        txn.set_transaction_state("tx1", TransactionState.COMMITTED)
+        txn.set_settlement_digest("tx1", "1" * 64)
         txn.set_active("tx1")
         txn.set_active(None)
     raw = raw_connect(store_binding)
@@ -582,13 +626,26 @@ def _plant(raw, sql, parameters=()):
     raw.execute(sql, parameters)
 
 
+def _make_record_deletable(raw, txid: str) -> None:
+    raw.execute(
+        "UPDATE transaction_record SET state = 'committed' WHERE txid = ?", (txid,)
+    )
+    raw.execute(
+        "UPDATE transaction_record SET settlement_digest = ? WHERE txid = ?",
+        ("f" * 64, txid),
+    )
+
+
 def _plant_spec_json(raw, spec_json, effect_rows):
+    _make_record_deletable(raw, "tx1")
     raw.execute("DELETE FROM effect WHERE txid = 'tx1'")
     raw.execute("DELETE FROM transaction_record WHERE txid = 'tx1'")
     raw.execute(
-        "INSERT INTO transaction_record VALUES "
-        "('tx1', ?, 'prepared', 'uncommitted', NULL, NULL)",
-        (spec_json,),
+        "INSERT INTO transaction_record "
+        "(txid, spec_json, state, committed, rollback_result, halt_diagnostic, "
+        "registration_digest, settlement_digest, approval_evidence, assembly_halt) "
+        "VALUES ('tx1', ?, 'prepared', 'uncommitted', NULL, NULL, NULL, NULL, ?, NULL)",
+        (spec_json, APPROVAL_EVIDENCE),
     )
     for effect_id, variant in effect_rows:
         raw.execute(
@@ -673,6 +730,7 @@ def test_reading_a_ghost_active_reference_refuses(opened_store, store_binding):
     commit_record(opened_store, "tx1", _only_spec())
     raw = raw_connect(store_binding)
     try:
+        _make_record_deletable(raw, "tx1")
         raw.execute("DELETE FROM effect WHERE txid = 'tx1'")
         raw.execute("DELETE FROM transaction_record WHERE txid = 'tx1'")
         raw.execute("INSERT INTO active VALUES (0, 'ghost')")
@@ -685,7 +743,10 @@ def test_reading_a_ghost_active_reference_refuses(opened_store, store_binding):
 
 def test_a_cross_row_violation_is_protocol_error_before_commit(opened_store):
     with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
-        txn.insert_record("tx1", one_effect_spec())
+        txn.insert_record(
+            "tx1", one_effect_spec(), approval_evidence=APPROVAL_EVIDENCE
+        )
+        txn.set_registration_digest("tx1", registration_digest("tx1"))
         txn.set_transaction_state("tx1", TransactionState.ROLLED_BACK)
     assert RULE_ROLLBACK_RESULT in str(caught.value)
     assert opened_store.read_record("tx1") is None
@@ -709,9 +770,9 @@ def _plant_replace_blob_rows(raw, *, before_len: int | None) -> None:
 
 
 WRITE_SIDE_INCOHERENCE = (
-    (RULE_SPEC_COMPILES, _plant_blob_for_non_compiling_spec, lambda txn: txn.insert_record("tx3", non_compiling_spec())),
-    (RULE_BLOB_ROW_PRESENT, lambda raw: _plant_replace_blob_rows(raw, before_len=None), lambda txn: txn.insert_record("tx3", replace_spec())),
-    (RULE_BLOB_BYTE_LEN, lambda raw: _plant_replace_blob_rows(raw, before_len=999), lambda txn: txn.insert_record("tx3", replace_spec())),
+    (RULE_SPEC_COMPILES, _plant_blob_for_non_compiling_spec, lambda txn: txn.insert_record("tx3", non_compiling_spec(), approval_evidence=APPROVAL_EVIDENCE)),
+    (RULE_BLOB_ROW_PRESENT, lambda raw: _plant_replace_blob_rows(raw, before_len=None), lambda txn: txn.insert_record("tx3", replace_spec(), approval_evidence=APPROVAL_EVIDENCE)),
+    (RULE_BLOB_BYTE_LEN, lambda raw: _plant_replace_blob_rows(raw, before_len=999), lambda txn: txn.insert_record("tx3", replace_spec(), approval_evidence=APPROVAL_EVIDENCE)),
     (RULE_ROLLBACK_RESULT, None, lambda txn: txn.set_transaction_state("tx2", TransactionState.ROLLED_BACK)),
     (RULE_ROLLBACK_RESULT, None, lambda txn: txn.set_rollback_result("tx2", RollbackResult.RESTORED)),
     (RULE_HALT_DIAGNOSTIC, None, lambda txn: txn.set_transaction_state("tx2", TransactionState.HALTED)),
@@ -805,15 +866,20 @@ def test_a_read_takes_one_snapshot_across_a_concurrent_commit(store_on):
 
     with store_on() as binding, open_store(binding) as writer, open_store(binding) as reader:
         with writer.transaction() as txn:
-            txn.insert_record("tx1", one_effect_spec(effect_id="e1"))
+            txn.insert_record(
+                "tx1",
+                one_effect_spec(effect_id="e1"),
+                approval_evidence=APPROVAL_EVIDENCE,
+            )
+            txn.set_registration_digest("tx1", registration_digest("tx1"))
         fired = []
         def commit_between(statement):
             if "FROM effect" not in statement or fired:
                 return
             fired.append(statement)
             with writer.transaction() as txn:
-                txn.set_journal_state("tx1", "e1", JournalState.STARTED)
                 txn.set_transaction_state("tx1", TransactionState.APPLYING)
+                txn.set_journal_state("tx1", "e1", JournalState.STARTED)
         reader._connection.set_trace_callback(commit_between)
         try:
             during = reader.read_record("tx1")
@@ -828,7 +894,10 @@ def test_a_read_takes_one_snapshot_across_a_concurrent_commit(store_on):
 
 def test_a_coherent_rollback_sequence_commits(opened_store):
     with opened_store.transaction() as txn:
-        txn.insert_record("tx1", one_effect_spec())
+        txn.insert_record(
+            "tx1", one_effect_spec(), approval_evidence=APPROVAL_EVIDENCE
+        )
+        txn.set_registration_digest("tx1", registration_digest("tx1"))
     with opened_store.transaction() as txn:
         txn.set_transaction_state("tx1", TransactionState.ROLLED_BACK)
         txn.set_rollback_result("tx1", RollbackResult.RESTORED)
@@ -837,8 +906,13 @@ def test_a_coherent_rollback_sequence_commits(opened_store):
 
 def test_two_touched_records_roll_back_together(opened_store):
     with pytest.raises(ProtocolError), opened_store.transaction() as txn:
-        txn.insert_record("tx1", one_effect_spec())
-        txn.insert_record("tx2", one_effect_spec())
+        txn.insert_record(
+            "tx1", one_effect_spec(), approval_evidence=APPROVAL_EVIDENCE
+        )
+        txn.insert_record(
+            "tx2", one_effect_spec(), approval_evidence=APPROVAL_EVIDENCE
+        )
+        txn.set_registration_digest("tx2", registration_digest("tx2"))
         txn.set_transaction_state("tx2", TransactionState.ROLLED_BACK)
     assert opened_store.read_record("tx1") is None
     assert opened_store.read_record("tx2") is None
@@ -846,14 +920,18 @@ def test_two_touched_records_roll_back_together(opened_store):
 
 def test_a_read_inside_a_write_transaction_is_refused(opened_store):
     with opened_store.transaction() as txn:
-        txn.insert_record("tx1", one_effect_spec())
+        txn.insert_record(
+            "tx1", one_effect_spec(), approval_evidence=APPROVAL_EVIDENCE
+        )
         with pytest.raises(ProtocolError):
             opened_store.read_record("tx1")
 
 
 def test_a_failed_read_closes_its_transaction(opened_store, store_binding):
     with opened_store.transaction() as txn:
-        txn.insert_record("tx1", one_effect_spec())
+        txn.insert_record(
+            "tx1", one_effect_spec(), approval_evidence=APPROVAL_EVIDENCE
+        )
     raw = raw_connect(store_binding)
     try:
         raw.execute("DELETE FROM effect")
@@ -869,7 +947,9 @@ def test_corruption_from_the_record_materialization_query_is_translated(
     opened_store, monkeypatch
 ):
     with opened_store.transaction() as txn:
-        txn.insert_record("tx1", one_effect_spec())
+        txn.insert_record(
+            "tx1", one_effect_spec(), approval_evidence=APPROVAL_EVIDENCE
+        )
     monkeypatch.setattr(
         opened_store,
         "_connection",
@@ -889,5 +969,7 @@ def test_corruption_from_a_precommit_coherence_query_is_translated(
         CorruptsStatement(opened_store._connection, SELECT_ACTIVE),
     )
     with pytest.raises(MetadataStoreInvalid) as caught, opened_store.transaction() as txn:
-        txn.insert_record("tx1", one_effect_spec())
+        txn.insert_record(
+            "tx1", one_effect_spec(), approval_evidence=APPROVAL_EVIDENCE
+        )
     assert isinstance(caught.value.__cause__, sqlite3.DatabaseError)

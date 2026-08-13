@@ -27,7 +27,7 @@ from atoms.core.recovery.model import (
 )
 from atoms.core.recovery.plan import EffectVariant
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 APPLICATION_ID = int.from_bytes(b"atms", "big")
 
 _EnumT = TypeVar("_EnumT", bound=Enum)
@@ -45,12 +45,16 @@ def check_list(members: type[_EnumT]) -> str:
 
 SCHEMA_STATEMENTS: tuple[str, ...] = (
     f"""CREATE TABLE transaction_record (
-    txid            TEXT PRIMARY KEY,
-    spec_json       TEXT NOT NULL,
-    state           TEXT NOT NULL CHECK (state IN ({check_list(TransactionState)})),
-    committed       TEXT NOT NULL CHECK (committed IN ({check_list(CommitDecision)})),
-    rollback_result TEXT          CHECK (rollback_result IN ({check_list(RollbackResult)})),
-    halt_diagnostic TEXT
+    txid                TEXT PRIMARY KEY,
+    spec_json           TEXT NOT NULL,
+    state               TEXT NOT NULL CHECK (state IN ({check_list(TransactionState)})),
+    committed           TEXT NOT NULL CHECK (committed IN ({check_list(CommitDecision)})),
+    rollback_result     TEXT          CHECK (rollback_result IN ({check_list(RollbackResult)})),
+    halt_diagnostic     TEXT,
+    registration_digest TEXT UNIQUE,
+    settlement_digest   TEXT UNIQUE,
+    approval_evidence   TEXT NOT NULL,
+    assembly_halt       TEXT
 ) STRICT;""",
     f"""CREATE TABLE effect (
     txid          TEXT NOT NULL REFERENCES transaction_record(txid),
@@ -71,6 +75,124 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
 BEFORE UPDATE OF spec_json ON transaction_record
 BEGIN
     SELECT RAISE(ABORT, 'spec_json is write-once');
+END;""",
+    """CREATE TRIGGER trg_registration_write_once
+BEFORE UPDATE OF registration_digest ON transaction_record
+WHEN OLD.registration_digest IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'registration_digest is write-once');
+END;""",
+    """CREATE TRIGGER trg_settlement_write_once
+BEFORE UPDATE OF settlement_digest ON transaction_record
+WHEN OLD.settlement_digest IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'settlement_digest is write-once');
+END;""",
+    """CREATE TRIGGER trg_evidence_write_once
+BEFORE UPDATE OF approval_evidence ON transaction_record
+BEGIN
+    SELECT RAISE(ABORT, 'approval_evidence is write-once');
+END;""",
+    """CREATE TRIGGER trg_assembly_halt_write_once
+BEFORE UPDATE OF assembly_halt ON transaction_record
+WHEN OLD.assembly_halt IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'assembly_halt is write-once');
+END;""",
+    f"""CREATE TRIGGER trg_registration_window
+BEFORE UPDATE OF registration_digest ON transaction_record
+WHEN NEW.registration_digest IS NOT NULL AND (
+    OLD.state != '{TransactionState.PREPARED.value}'
+    OR EXISTS (
+        SELECT 1 FROM effect e
+        WHERE e.txid = OLD.txid
+            AND e.journal_state != '{JournalState.PENDING.value}'
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'registration window is closed');
+END;""",
+    f"""CREATE TRIGGER trg_departure_needs_registration
+BEFORE UPDATE OF state ON transaction_record
+WHEN OLD.state = '{TransactionState.PREPARED.value}'
+    AND NEW.state != '{TransactionState.PREPARED.value}'
+    AND OLD.registration_digest IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'departure requires registration');
+END;""",
+    f"""CREATE TRIGGER trg_journal_start_gate
+BEFORE UPDATE OF journal_state ON effect
+WHEN NEW.journal_state = '{JournalState.STARTED.value}'
+    AND OLD.journal_state = '{JournalState.PENDING.value}'
+    AND EXISTS (
+        SELECT 1 FROM transaction_record t
+        WHERE t.txid = NEW.txid
+            AND (t.state != '{TransactionState.APPLYING.value}'
+                OR t.registration_digest IS NULL)
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'journal start requires applying and registration');
+END;""",
+    f"""CREATE TRIGGER trg_settlement_gate
+BEFORE UPDATE OF settlement_digest ON transaction_record
+WHEN NEW.settlement_digest IS NOT NULL AND (
+    OLD.registration_digest IS NULL
+    OR OLD.state NOT IN (
+        '{TransactionState.COMMITTED.value}',
+        '{TransactionState.ROLLED_BACK.value}'
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'settlement requires a registered terminal record');
+END;""",
+    """CREATE TRIGGER trg_active_no_update
+BEFORE UPDATE ON active
+BEGIN
+    SELECT RAISE(ABORT, 'active is never updated');
+END;""",
+    f"""CREATE TRIGGER trg_active_delete_gate
+BEFORE DELETE ON active
+WHEN NOT EXISTS (
+    SELECT 1 FROM transaction_record t
+    WHERE t.txid = OLD.txid
+        AND t.state IN (
+            '{TransactionState.COMMITTED.value}',
+            '{TransactionState.ROLLED_BACK.value}'
+        )
+        AND t.registration_digest IS NOT NULL
+        AND t.settlement_digest IS NOT NULL
+        AND t.assembly_halt IS NULL
+)
+BEGIN
+    SELECT RAISE(ABORT, 'active delete requires a bound unhalted terminal record');
+END;""",
+    f"""CREATE TRIGGER trg_record_delete_gate
+BEFORE DELETE ON transaction_record
+WHEN OLD.state NOT IN (
+        '{TransactionState.COMMITTED.value}',
+        '{TransactionState.ROLLED_BACK.value}'
+    )
+    OR OLD.registration_digest IS NULL
+    OR OLD.settlement_digest IS NULL
+    OR OLD.assembly_halt IS NOT NULL
+    OR EXISTS (SELECT 1 FROM active WHERE active.txid = OLD.txid)
+BEGIN
+    SELECT RAISE(ABORT, 'record delete requires a detached bound unhalted terminal record');
+END;""",
+    """CREATE TRIGGER trg_assembly_halt_freezes_record
+BEFORE UPDATE ON transaction_record
+WHEN OLD.assembly_halt IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'assembly_halt freezes record');
+END;""",
+    """CREATE TRIGGER trg_assembly_halt_freezes_journal
+BEFORE UPDATE OF journal_state ON effect
+WHEN EXISTS (
+    SELECT 1 FROM transaction_record t
+    WHERE t.txid = NEW.txid AND t.assembly_halt IS NOT NULL
+)
+BEGIN
+    SELECT RAISE(ABORT, 'assembly_halt freezes journal');
 END;""",
 )
 
@@ -98,6 +220,8 @@ EXPECTED_CATALOG: frozenset[tuple[str, str, str, str | None]] = frozenset(
     [_catalog_row(statement) for statement in SCHEMA_STATEMENTS]
     + [
         ("index", "sqlite_autoindex_transaction_record_1", "transaction_record", None),
+        ("index", "sqlite_autoindex_transaction_record_2", "transaction_record", None),
+        ("index", "sqlite_autoindex_transaction_record_3", "transaction_record", None),
         ("index", "sqlite_autoindex_effect_1", "effect", None),
         ("index", "sqlite_autoindex_blob_1", "blob", None),
     ]

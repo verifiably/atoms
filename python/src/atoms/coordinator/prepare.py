@@ -5,7 +5,7 @@ from __future__ import annotations
 from atoms.coordinator.admission import _require_admitted, _require_work_slot_free
 from atoms.coordinator.lease import Lease
 from atoms.core.errors import ProtocolError
-from atoms.fs.approval import ProjectApprovedSpec
+from atoms.fs.approval import ProjectApprovedSpec, encode_approval_evidence
 from atoms.store.blobs import StagedBlob
 from atoms.store.workspace import Workspace
 
@@ -35,5 +35,9 @@ def prepare_transaction(
 
     with lease._store.transaction() as txn:
         txn.promote_staging(workspace, manifest)
-        txn.insert_record(approved.txid, approved.compiled.spec)
+        txn.insert_record(
+            approved.txid,
+            approved.compiled.spec,
+            approval_evidence=encode_approval_evidence(approved),
+        )
         txn.set_active(approved.txid)

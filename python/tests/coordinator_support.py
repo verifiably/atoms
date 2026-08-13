@@ -45,7 +45,7 @@ from atoms.core.spec import TransactionSpec, build_spec
 from atoms.fs.approval import ProjectApprovedSpec
 from atoms.store.blobs import StagedBlob
 from atoms.store.workspace import Workspace
-from tests.store_support import digest_of, file_state, stage
+from tests.store_support import digest_of, file_state, registration_digest, stage
 
 AFTER = b"after"
 POST = file_state(AFTER)
@@ -155,6 +155,8 @@ def prepared(lease: Lease) -> ProjectApprovedSpec:
         prepare_transaction(lease, approved, workspace, stage_manifest(workspace))
     finally:
         workspace.close()
+    with lease._store.transaction() as txn:
+        txn.set_registration_digest(approved.txid, registration_digest(approved.txid))
     return approved
 
 

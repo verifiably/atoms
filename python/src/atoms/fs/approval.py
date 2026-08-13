@@ -7,6 +7,7 @@ the correct count is zero rather than "no blanket handler".
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 from atoms.core.compiler import CompiledSpec
@@ -18,7 +19,13 @@ from atoms.core.errors import (
     SpecValidationError,
 )
 from atoms.core.identifiers import require_valid_identifier
-from atoms.core.recovery import RecoveryTopology
+from atoms.core.recovery import (
+    PersistentNode,
+    ProjectRoot,
+    RecoveryTopology,
+    TopologyDirectory,
+    WorkRoot,
+)
 from atoms.fs.binding import ProjectBinding
 from atoms.fs.judgment import (
     bind_scratch,
@@ -29,7 +36,9 @@ from atoms.fs.lookup import inherited_constraints
 from atoms.fs.resolve import PathResolver, ResolvedPrefix
 from atoms.fs.topology import (
     ApprovedDirectory,
+    ApprovedExistingDirectory,
     ApprovedPath,
+    ApprovedPlannedDirectory,
     ApprovedScratch,
     ApprovedWorkBase,
     build_topology,
@@ -100,6 +109,88 @@ def _require_exact(value: object, expected: type, label: str) -> None:
             f"{type(value).__name__}; a subclass would pass an isinstance gate and "
             "then break a later phase"
         )
+
+
+def _node_key(node: object) -> str:
+    if type(node) is ProjectRoot:
+        return "project_root"
+    if type(node) is WorkRoot:
+        return "work_root"
+    if type(node) is TopologyDirectory:
+        if type(node.node_id) is not int or node.node_id < 0:
+            raise ProtocolError("topology directory node_id is not a canonical decimal")
+        return f"topology_directory:{node.node_id}"
+    if type(node) is PersistentNode:
+        if type(node.path) is not str:
+            raise ProtocolError("persistent topology node path must be exactly str")
+        return f"persistent:{node.path}"
+    raise ProtocolError(
+        f"{type(node).__name__} is not a directory topology node with a stable key"
+    )
+
+
+def _constraint_evidence(constraints: object) -> dict[str, object]:
+    from atoms.fs.lookup import DirectoryConstraints, LookupProof
+
+    if type(constraints) is not DirectoryConstraints:
+        raise ProtocolError("approved directory constraints have the wrong exact type")
+    if type(constraints.lookup_proof) is not LookupProof:
+        raise ProtocolError("approved lookup proof has the wrong exact type")
+    if type(constraints.name_max) is not int:
+        raise ProtocolError("approved name_max has the wrong exact type")
+    return {
+        "lookup_proof": constraints.lookup_proof.value,
+        "name_max": constraints.name_max,
+    }
+
+
+def _identity_evidence(identity: object) -> dict[str, int]:
+    from atoms.fs.resolve import FilesystemIdentity
+
+    if type(identity) is not FilesystemIdentity:
+        raise ProtocolError("approved directory identity has the wrong exact type")
+    return {"st_dev": identity.device, "st_ino": identity.inode}
+
+
+def encode_approval_evidence(approved: ProjectApprovedSpec) -> str:
+    """Canonical A7 recovery evidence, with one stable key per directory node."""
+    _require_exact(approved, ProjectApprovedSpec, "approved")
+    directories: list[dict[str, object]] = []
+    for entry in approved.directories:
+        if type(entry) is ApprovedExistingDirectory:
+            identity: dict[str, int] | None = _identity_evidence(entry.identity)
+        elif type(entry) is ApprovedPlannedDirectory:
+            identity = None
+        else:
+            raise ProtocolError(
+                f"approved directory has unexpected type {type(entry).__name__}"
+            )
+        directories.append(
+            {
+                "node": _node_key(entry.node),
+                "identity": identity,
+                **_constraint_evidence(entry.constraints),
+            }
+        )
+    directories.sort(key=lambda item: str(item["node"]))
+
+    work_base = approved.work_base
+    work_root = None
+    if work_base is not None:
+        work_root = {
+            "identity": _identity_evidence(work_base.identity),
+            **_constraint_evidence(work_base.constraints),
+        }
+    return json.dumps(
+        {
+            "directories": directories,
+            "mount_id": approved.binding.evidence.mount_id,
+            "work_root": work_root,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
 
 
 def approve_for_project(

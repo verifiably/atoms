@@ -640,7 +640,7 @@ def store_binding(request):
 def promoted_blob(opened_store):
     """A store holding one promoted, indexed blob, with its digest and bytes."""
     from atoms.store.blobs import StagedBlob
-    from tests.store_support import digest_of, spec_referencing, stage
+    from tests.store_support import APPROVAL_EVIDENCE, digest_of, spec_referencing, stage
 
     content = b"the blob's bytes"
     digest = digest_of(content)
@@ -651,5 +651,9 @@ def promoted_blob(opened_store):
                 workspace,
                 (StagedBlob(name="capture", digest=digest, byte_len=len(content)),),
             )
-            txn.insert_record("fixture", spec_referencing(content))
+            txn.insert_record(
+                "fixture",
+                spec_referencing(content),
+                approval_evidence=APPROVAL_EVIDENCE,
+            )
     return opened_store, digest, content

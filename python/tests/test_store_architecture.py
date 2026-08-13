@@ -495,6 +495,17 @@ def _string_value(node: ast.expr, values: dict[str, object] | None = None) -> st
             and part.format_spec is None
         ):
             parts.append("'<statically-enumerated>'")
+        elif (
+            isinstance(part, ast.FormattedValue)
+            and isinstance(part.value, ast.Attribute)
+            and part.value.attr == "value"
+            and isinstance(part.value.value, ast.Attribute)
+            and isinstance(part.value.value.value, ast.Name)
+            and part.value.value.value.id in {"JournalState", "TransactionState"}
+            and part.conversion == -1
+            and part.format_spec is None
+        ):
+            parts.append("<enum-derived>")
         else:
             return None
     return "".join(parts)
@@ -1120,6 +1131,9 @@ def test_the_transaction_attribute_set_is_exactly_the_documented_surface():
         "set_journal_state",
         "set_rollback_result",
         "set_halt_diagnostic",
+        "set_registration_digest",
+        "set_settlement_digest",
+        "set_assembly_halt",
         "set_active",
     }
     assert "insert_blobs" not in public

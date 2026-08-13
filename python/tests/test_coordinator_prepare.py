@@ -19,6 +19,7 @@ from tests.coordinator_support import (
 
 def test_preparation_publishes_the_record_in_one_commit(leased):
     from atoms.coordinator.prepare import open_workspace, prepare_transaction
+    from atoms.fs.approval import encode_approval_evidence
 
     with leased() as lease:
         approved = admission_for(lease)
@@ -33,6 +34,7 @@ def test_preparation_publishes_the_record_in_one_commit(leased):
         assert record.txid == approved.txid
         assert record.state is TransactionState.PREPARED
         assert record.committed is CommitDecision.UNCOMMITTED
+        assert record.approval_evidence == encode_approval_evidence(approved)
 
 
 def test_nothing_is_durable_until_the_publication_commit(leased, monkeypatch):

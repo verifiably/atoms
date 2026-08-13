@@ -11,6 +11,7 @@ import pytest
 
 from atoms.core.errors import ProtocolError
 from tests.coordinator_support import project_state
+from tests.store_support import APPROVAL_EVIDENCE
 
 _CONTENDER = (
     "import fcntl, sys\n"
@@ -58,7 +59,9 @@ def test_reclamation_removes_orphans_and_spares_referenced_scratch(leased):
         lease._store.create_workspace("orphan1").close()
         lease._store.create_workspace("kept1").close()
         with lease._store.transaction() as txn:
-            txn.insert_record("kept1", one_effect_spec())
+            txn.insert_record(
+                "kept1", one_effect_spec(), approval_evidence=APPROVAL_EVIDENCE
+            )
 
         workspaces, blobs = _reclaim_orphans(lease._store)
 
@@ -90,7 +93,11 @@ def test_reclamation_removes_an_unindexed_blob(leased):
                     workspace,
                     (StagedBlob(name="b0", digest=digest, byte_len=len(content)),),
                 )
-                txn.insert_record("orphan2", spec_referencing(content))
+                txn.insert_record(
+                    "orphan2",
+                    spec_referencing(content),
+                    approval_evidence=APPROVAL_EVIDENCE,
+                )
                 raise RuntimeError("cut before COMMIT")
 
         assert lease._store.list_unindexed_blobs() == (digest,)
@@ -108,7 +115,9 @@ def test_a_live_record_traps_at_the_next_lease_entry(leased):
 
     with leased() as lease:
         with lease._store.transaction() as txn:
-            txn.insert_record("tx1", one_effect_spec())
+            txn.insert_record(
+                "tx1", one_effect_spec(), approval_evidence=APPROVAL_EVIDENCE
+            )
             txn.set_active("tx1")
 
         with pytest.raises(NotImplementedError) as caught:
@@ -123,7 +132,9 @@ def test_the_trap_leaves_the_logical_transaction_state_unchanged(leased):
 
     with leased() as lease:
         with lease._store.transaction() as txn:
-            txn.insert_record("tx1", one_effect_spec())
+            txn.insert_record(
+                "tx1", one_effect_spec(), approval_evidence=APPROVAL_EVIDENCE
+            )
             txn.set_active("tx1")
         before = lease._store.read_active()
 
@@ -212,7 +223,9 @@ def _trapping_lease(coordinator_on, leased):
         finally:
             os.close(fd)
         with lease._store.transaction() as txn:
-            txn.insert_record("tx1", one_effect_spec())
+            txn.insert_record(
+                "tx1", one_effect_spec(), approval_evidence=APPROVAL_EVIDENCE
+            )
             txn.set_active("tx1")
     return ingredients
 
@@ -313,7 +326,9 @@ def test_reclamation_survives_a_trapping_lease_entry(coordinator_on, leased):
     with leased(ingredients) as lease:
         lease._store.create_workspace("orphan3").close()
         with lease._store.transaction() as txn:
-            txn.insert_record("tx1", one_effect_spec())
+            txn.insert_record(
+                "tx1", one_effect_spec(), approval_evidence=APPROVAL_EVIDENCE
+            )
             txn.set_active("tx1")
         assert lease._store.list_workspaces() == ("orphan3",)
 
