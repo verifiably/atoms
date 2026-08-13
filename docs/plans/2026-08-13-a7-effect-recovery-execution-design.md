@@ -417,7 +417,13 @@ Settlement, symmetric:
   (the crash-window backfill of §8's prefix stop). A duplicate settlement,
   wrong kind, wrong registration reference, or digest mismatch is
   `ChainStateInvalid`.
-- **Any settlement entry for a nonterminal record** → `ChainStateInvalid`.
+- **A settlement on a record that is neither terminal nor a committed
+  halt** → `ChainStateInvalid`. The one legitimate settled-but-`HALTED`
+  history is a committed-cleanup failure (authority §8.1: a halt after
+  `COMMITTED` preserves the commit decision): a `HALTED` record whose bound
+  committed settlement is accepted **iff** the frozen halt diagnostic proves
+  `pre_halt_state = COMMITTED`. An uncommitted halt must have no settlement
+  — one there is `ChainStateInvalid`.
 
 ### 9.3 The assembly halt
 
@@ -440,9 +446,13 @@ are untouched.
   findings under a **closed vocabulary** — `NODE_MISSING`,
   `WRONG_ENTRY_KIND`, `IDENTITY_CHANGED`, `CONSTRAINTS_CHANGED`,
   `MOUNT_CHANGED`, `WORK_ROOT_CHANGED` — each carrying the node's path and
-  the observed facts for exactly its kind, ordered deterministically by
-  path, under the same canonical encoding as the evidence, so the diff is
-  byte-honest. **Only determinate observations become evidence**: a leaf
+  the observed facts for exactly its kind. Same-path handling is
+  deterministic: `NODE_MISSING` or `WRONG_ENTRY_KIND`, when it applies, is
+  the node's **sole** finding (the facts the other kinds would carry do not
+  exist for it); otherwise **every** applicable changed-kind finding is
+  emitted. Ordering is by `(path, finding-kind enum order)`, under the same
+  canonical encoding as the evidence, so the diff is byte-honest and
+  evidence-complete. **Only determinate observations become evidence**: a leaf
   that resolves, or a determinate `ENOENT`, classifies; an indeterminate
   errno — `EIO` and kin — propagates as the error it is and is never
   encoded as drift.
@@ -582,9 +592,12 @@ on an unknown version is unchanged):
     `ROLLING_BACK` alike — requires `registration_digest` non-null;
   - writing `settlement_digest` requires `registration_digest` non-null
     **and** `state ∈ {COMMITTED, ROLLED_BACK}`;
-  - clearing `active` is allowed only for
-    `state ∈ {COMMITTED, ROLLED_BACK}` with **both** digests non-null and
-    `assembly_halt IS NULL`;
+  - **every `UPDATE` of the `active` row is refused** — replacement is not
+    a path around the clear predicate: clearing is deleting the singleton
+    row, allowed only for `state ∈ {COMMITTED, ROLLED_BACK}` with **both**
+    digests non-null and `assembly_halt IS NULL`, and publishing a new
+    active is insert-only, possible only after the previous row was validly
+    deleted;
   - deleting a `transaction_record` row is allowed only when it is detached
     (`active` does not reference it) **and**
     `state ∈ {COMMITTED, ROLLED_BACK}` with both digests non-null and
