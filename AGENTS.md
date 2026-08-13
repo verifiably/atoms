@@ -8,7 +8,7 @@ A recoverable filesystem effect engine — the physical durability substrate bel
 ## Status: Plan A in progress
 
 The authority design under `docs/plans/` is approved. Its roadmap (§14) decomposes Plan A
-into eight sub-plans; each gets its own reviewed plan document before implementation, and
+into nine sub-plans; each gets its own reviewed plan document before implementation, and
 Plan B is written only after Plan A's interfaces settle.
 
 - **A1 — core model: implemented.** `python/src/atoms/core/` holds the transaction model,
@@ -20,7 +20,7 @@ Plan B is written only after Plan A's interfaces settle.
 - **A3 — executable recovery reference model: implemented.** The pure production authority exposes
   `build_recovery_snapshot`, `classify_recovery`, `authorize_recovery_step`,
   `reduce_recovery_plan_prefix`, and `apply_recovery_plan` with the closed recovery model, fresh-step
-  authorization, and abstract reducer. A5 and A6 are implemented; A7–A8 remain unimplemented, and no
+  authorization, and abstract reducer. A5 and A6 are implemented; A7–A9 remain unimplemented, and no
   project mutation code has landed.
 - **A4a — capability backend and project volume binding: implemented on 2026-07-30.**
   `python/src/atoms/fs/`

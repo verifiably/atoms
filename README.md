@@ -23,7 +23,8 @@ half-write.
 Early implementation. The engine was originally designed inside science through roughly a
 dozen rounds of adversarial contract review; that review capital is carried into the
 standalone authority design below. The design is approved and its roadmap (§14) decomposes
-Plan A into eight sub-plans, A1–A8.
+Plan A into nine sub-plans, A1–A9 (A9 — the macOS backend — added 2026-08-13 by the A7
+design's banking commit, so the macOS arm of Plan A item 6 has an owner).
 
 The pure core (`atoms.core`) is joined under `python/` by `atoms.fs` (capability backend,
 volume binding, project approval) and `atoms.store` (SQLite-in-WAL metadata store) beneath an
@@ -56,7 +57,7 @@ under `metadata_root`.
 - **A6 — coherent capture and the observation mechanism (implemented):**
   [`docs/plans/2026-08-07-a6-coherent-capture-design.md`](docs/plans/2026-08-07-a6-coherent-capture-design.md)
   — the descriptor table, the observation pass, and preimage capture into the workspace staging
-  directory. A7–A8 remain unimplemented: nothing yet executes an effect against a project path.
+  directory. A7–A9 remain unimplemented: nothing yet executes an effect against a project path.
 - Historical (superseded): the science-framed [`2026-07-20-*`](docs/plans/2026-07-20-recoverable-fs-effect-engine-design.md)
   design + roadmap, retained as the record of the review that hardened the effect/recovery contracts.
 

@@ -28,7 +28,7 @@ ROOT = Path(__file__).parents[2]
 PLANS = ROOT / "docs" / "plans"
 
 #: Every sub-plan of authority §14's Plan A roadmap, in delivery order.
-STAGES = ("A1", "A2", "A3", "A4a", "A4b", "A5a", "A5b", "A6", "A7", "A8")
+STAGES = ("A1", "A2", "A3", "A4a", "A4b", "A5a", "A5b", "A6", "A7", "A8", "A9")
 
 #: The one fact this file exists to hold. Landing a sub-plan moves this boundary.
 FIRST_UNIMPLEMENTED = "A7"
@@ -43,7 +43,7 @@ SUPERSEDED = "2026-07-20-"
 
 AUTHORITY = PLANS / "2026-07-23-recoverable-fs-effect-engine-design.md"
 
-_LABEL = r"A[1-8](?:[ab](?:-[12])?)?"
+_LABEL = r"A[1-9](?:[ab](?:-[12])?)?"
 # No ASCII hyphen: it is part of a label (`A4b-2`), never a connector between two.
 _CONNECTOR = r"\s*(?:[–—,]|and)\s*"
 _SPAN = re.compile(rf"{_LABEL}(?:{_CONNECTOR}{_LABEL})*")
@@ -55,7 +55,7 @@ _BULLET = re.compile(rf"\*\*({_LABEL}) —[^*]*?\bimplemented")
 # An ASCII-hyphen range ("A5-A8") would parse as two unrelated labels and silently
 # drop the stages between them. The corpus spells ranges with an en dash; assert it
 # rather than half-supporting the other spelling.
-_ASCII_RANGE = re.compile(r"A[1-8][ab]?-A[1-8]")
+_ASCII_RANGE = re.compile(r"A[1-9][ab]?-A[1-9]")
 
 
 def _stages_of(label: str) -> tuple[str, ...]:
@@ -144,7 +144,7 @@ def live_plan_documents() -> list[Path]:
 
 def _documented_stage(path: Path) -> str | None:
     """The stage a plan or design filename names, normalized onto `STAGES`."""
-    match = re.search(r"-(?:plan-)?(a[1-8][ab]?)[12]?-", path.name)
+    match = re.search(r"-(?:plan-)?(a[1-9][ab]?)[12]?-", path.name)
     if match is None:
         return None
     return match.group(1).replace("a", "A", 1)

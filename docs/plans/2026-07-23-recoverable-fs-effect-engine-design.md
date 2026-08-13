@@ -4,7 +4,7 @@
 **Status:** Approved — authority design for `atoms`. Plan A implementation underway; A1–A6 are
 implemented (pure model and compilation, recovery reference model, capability backend, path resolution
 and project approval, SQLite-WAL metadata store, recovery-resolve lease, coherent capture and the
-observation mechanism); A7–A8 (effect/recovery execution, synthetic exerciser) remain.
+observation mechanism); A7–A9 (effect/recovery execution, synthetic exerciser, macOS backend) remain.
 **Repository:** `atoms` (`~/d/atoms`) — Python-first physical durability substrate below `nodes`
 **Supersedes:** the science-framed [`2026-07-20-recoverable-fs-effect-engine-design.md`](2026-07-20-recoverable-fs-effect-engine-design.md), retained as the historical, review-hardened record.
 
@@ -1543,7 +1543,9 @@ preserve an explained halt.
 ### 13.5 Actual mutation surface
 
 An always-on in-process interposer records successful mutating operations only after the syscall
-succeeds. Every target must be:
+succeeds. *(Amended 2026-08-13, the A7 design: the interposer is realized as the audited backend
+facade — the single mutation surface production code can reach — never an `os`-level patch; the
+operation list below names the audited operation classes that facade covers.)* Every target must be:
 
 - a declared effect path;
 - an engine-derived staging path; or
@@ -1591,7 +1593,9 @@ probed **per project-root volume**, not per OS, because atomic exchange, no-clob
 hard-link identity are filesystem-specific on both platforms, and plain `fsync` is not power-loss
 durable on macOS. Delivery is **progressive**: Linux lands complete first; macOS fills in
 capability-by-capability, and any capability a mount cannot supply refuses only the effects that need it
-(§5.5) — not an all-or-nothing platform gate. Windows is out of scope: it has no `atomic_exchange`
+(§5.5) — not an all-or-nothing platform gate. The macOS arm is its own sub-plan, **A9**, following A8
+*(amended 2026-08-13, the A7 design's banking commit: "progressive" was a strategy with no owner while
+Plan A item 6 promised suites on both backends)*. Windows is out of scope: it has no `atomic_exchange`
 primitive with the same crash-recovery table and no explicit directory-entry durability barrier, so a
 Windows backend would need a divergent recovery classification; a Windows operation refuses at
 preparation with `CapabilityUnavailable`. A Windows backend may be added later without changing the
@@ -1624,7 +1628,8 @@ transaction model.
    Restartable materialization's staging-object classification ships with the effects that create the
    objects it classifies (item 5).
 5. Five effects and the recovery executor (§8–§9).
-6. Model, real-filesystem, subprocess-recovery, and persistence-cut suites, run on both backends (§13).
+6. Model, real-filesystem, subprocess-recovery, and persistence-cut suites, run on both backends (§13)
+   — Linux at A7–A8; the macOS backend and its suite runs land with A9 *(amended 2026-08-13)*.
 7. The synthetic exerciser and the end-to-end recovery matrix (§12.1, §13.4).
 
 ### Plan B — production adoption
@@ -1684,7 +1689,10 @@ remains attributable to the intent that authorized it.
 **Designed 2026-08-03** (science's `2026-08-03-tamper-evident-log-design.md`; its §9 enumerates the
 engine obligations, restated here so this document carries its own contract). The engine owns
 registration — a per-engine-root hash chain at a reserved in-corpus path — and the obligations land
-with A7–A8, not before (written as A6–A8; A6 landed 2026-08-08 carrying none of them):
+with A7–A8, not before (written as A6–A8; A6 landed 2026-08-08 carrying none of them), and are
+recorded as deferred-obligation ledger entries #24–#29 *(captured 2026-08-13, the A7 design's
+banking commit — the log design's §9 said they were entered at banking, and they had been
+restated here instead)*:
 
 1. **Pinned registration order, idempotent under recovery.** Durable `PREPARED` → durable
    `registered(txid, …)` chain entry → the transaction record durably stores the entry digest → first
