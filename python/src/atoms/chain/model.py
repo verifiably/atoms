@@ -67,6 +67,8 @@ _CONTENT_HASH = re.compile(r"^sha256:([0-9a-f]{64})$")
 _EMPTY_HASH = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 _MAX_INTEGER = 2**63 - 1
 _MAX_MODE = 0o7777
+_MAX_DECIMAL_DIGITS = len(str(_MAX_INTEGER))
+_MAX_MODE_DIGITS = len(oct(_MAX_MODE))
 
 
 def _fail(error: type[AtomsError], message: str) -> NoReturn:
@@ -113,20 +115,34 @@ def _path(value: object, error: type[AtomsError], label: str) -> str:
 
 def _mode(value: object, error: type[AtomsError], label: str) -> int:
     value = _string(value, error, label)
-    try:
-        parsed = int(value, 8)
-    except ValueError as caught:
-        raise error(f"{label} must be a canonical octal mode") from caught
     _require(
-        0 <= parsed <= _MAX_MODE and oct(parsed) == value,
+        len(value) <= _MAX_MODE_DIGITS,
         error,
         f"{label} must be a canonical octal mode in 0o0..0o7777",
     )
+    digits = value[2:] if value.startswith("0o") else ""
+    canonical = digits == "0" or (
+        bool(digits)
+        and digits[0] in "1234567"
+        and all(character in "01234567" for character in digits)
+    )
+    _require(
+        canonical,
+        error,
+        f"{label} must be a canonical octal mode in 0o0..0o7777",
+    )
+    parsed = int(value, 8)
+    _require(parsed <= _MAX_MODE, error, f"{label} exceeds 0o7777")
     return parsed
 
 
 def _decimal(value: object, error: type[AtomsError], label: str) -> int:
     value = _string(value, error, label)
+    _require(
+        len(value) <= _MAX_DECIMAL_DIGITS,
+        error,
+        f"{label} must be in 0..2**63 - 1",
+    )
     canonical = value == "0" or (
         value[:1] in "123456789" and value.isascii() and value.isdecimal()
     )
@@ -216,13 +232,28 @@ def state_from_json(data: PathStateJSON) -> PathState:
 def state_to_json(state: PathState) -> PathStateJSON:
     """Encode one engine path state to the chain's closed fact vocabulary."""
 
+    try:
+        return _state_to_json(state)
+    except AttributeError as caught:
+        raise ProtocolError("path state is missing a required field") from caught
+
+
+def _state_to_json(state: PathState) -> PathStateJSON:
     if type(state) is AbsentState:
         return (("kind", "absent"),)
     if type(state) is FileState:
         match = _CONTENT_HASH.fullmatch(state.content_hash) if type(state.content_hash) is str else None
         _require(match is not None, ProtocolError, "file content_hash must match sha256:<64 lowercase hex>")
-        _require(type(state.mode) is int, ProtocolError, "file mode must be an exact int")
-        _require(type(state.byte_len) is int, ProtocolError, "file byte_len must be an exact int")
+        _require(
+            type(state.mode) is int and 0 <= state.mode <= _MAX_MODE,
+            ProtocolError,
+            "file mode must be an exact int in 0..0o7777",
+        )
+        _require(
+            type(state.byte_len) is int and 0 <= state.byte_len <= _MAX_INTEGER,
+            ProtocolError,
+            "file byte_len must be an exact int in 0..2**63 - 1",
+        )
         result: PathStateJSON = (
             ("kind", "file"),
             ("content_hash", cast(re.Match[str], match).group(1)),
@@ -230,7 +261,11 @@ def state_to_json(state: PathState) -> PathStateJSON:
             ("byte_len", str(state.byte_len)),
         )
     elif type(state) is SymlinkState:
-        _require(type(state.mode) is int, ProtocolError, "symlink mode must be an exact int")
+        _require(
+            type(state.mode) is int and 0 <= state.mode <= _MAX_MODE,
+            ProtocolError,
+            "symlink mode must be an exact int in 0..0o7777",
+        )
         _target(state.target, ProtocolError, "symlink target")
         result = (
             ("kind", "symlink"),
@@ -238,7 +273,11 @@ def state_to_json(state: PathState) -> PathStateJSON:
             ("mode", oct(state.mode)),
         )
     elif type(state) is DirectoryState:
-        _require(type(state.mode) is int, ProtocolError, "directory mode must be an exact int")
+        _require(
+            type(state.mode) is int and 0 <= state.mode <= _MAX_MODE,
+            ProtocolError,
+            "directory mode must be an exact int in 0..0o7777",
+        )
         result = (("kind", "directory"), ("mode", oct(state.mode)))
     else:
         _fail(ProtocolError, f"unknown path state {type(state).__name__}")
@@ -404,7 +443,10 @@ def _canonical_bytes(obj: dict[str, object]) -> bytes:
 def encode_entry(previous: str | None, entry: Entry) -> bytes:
     """Validate and canonically encode an engine-created chain entry."""
 
-    return _canonical_bytes(_entry_obj(previous, entry, ProtocolError))
+    try:
+        return _canonical_bytes(_entry_obj(previous, entry, ProtocolError))
+    except AttributeError as caught:
+        raise ProtocolError("chain entry is missing a required field") from caught
 
 
 def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

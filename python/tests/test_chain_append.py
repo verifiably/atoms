@@ -406,6 +406,27 @@ def test_apply_returns_fresh_validation_and_append_refuses_the_stale_value(
     assert repeated == fresh
 
 
+def test_apply_finish_reports_an_external_successor_as_hostile_chain_drift(
+    chain_directory: ChainDirectory,
+) -> None:
+    from atoms.chain.append import apply_survivors
+
+    genesis_digest, _ = _put(
+        chain_directory.path, None, GenesisEntry(b"root", ())
+    )
+    envelope = encode_entry(genesis_digest, IntentEntry(b"planned"))
+    (chain_directory.path / STAGING_LEAF).write_bytes(envelope)
+    stale = validate_chain(
+        chain_directory.backend, chain_directory.chain_fd, (envelope,)
+    )
+    _put(chain_directory.path, genesis_digest, IntentEntry(b"external"))
+
+    with pytest.raises(ChainStateInvalid):
+        apply_survivors(chain_directory.backend, chain_directory.chain_fd, stale)
+
+    assert (chain_directory.path / STAGING_LEAF).read_bytes() == envelope
+
+
 def test_apply_refuses_a_new_survivor_after_a_survivor_free_validation(
     chain_directory: ChainDirectory,
 ) -> None:
@@ -496,6 +517,62 @@ def test_append_refuses_an_invalid_engine_created_validation_before_writing(
 
     assert chain_directory.backend.records == records_before
     assert list(chain_directory.path.iterdir()) == []
+
+
+class _TextSubclass(str):
+    pass
+
+
+def test_apply_refuses_a_validation_with_a_non_exact_tip_string(
+    chain_directory: ChainDirectory,
+) -> None:
+    from atoms.chain.append import apply_survivors
+
+    genesis = GenesisEntry(b"root", ())
+    digest, _ = _put(chain_directory.path, None, genesis)
+    forged = ValidatedChain(((digest, genesis),), _TextSubclass(digest), ())
+
+    with pytest.raises(ProtocolError):
+        apply_survivors(chain_directory.backend, chain_directory.chain_fd, forged)
+
+
+def test_apply_refuses_a_survivor_with_a_non_exact_name_string(
+    chain_directory: ChainDirectory,
+) -> None:
+    from atoms.chain.append import apply_survivors
+
+    forged = ValidatedChain(
+        (),
+        None,
+        (
+            SurvivorAction(
+                _TextSubclass(STAGING_LEAF),
+                SurvivorDisposition.REMOVE,
+                None,
+            ),
+        ),
+    )
+
+    with pytest.raises(ProtocolError):
+        apply_survivors(chain_directory.backend, chain_directory.chain_fd, forged)
+
+
+@pytest.mark.parametrize(
+    "forged",
+    [
+        object.__new__(ValidatedChain),
+        ValidatedChain((), None, (object.__new__(SurvivorAction),)),
+    ],
+    ids=("validation", "survivor"),
+)
+def test_apply_translates_missing_proof_slots_to_protocol_error(
+    chain_directory: ChainDirectory,
+    forged: ValidatedChain,
+) -> None:
+    from atoms.chain.append import apply_survivors
+
+    with pytest.raises(ProtocolError):
+        apply_survivors(chain_directory.backend, chain_directory.chain_fd, forged)
 
 
 @pytest.mark.parametrize("change", ["added-file", "rewritten-tip"])
@@ -672,6 +749,29 @@ def test_bootstrap_chain_refuses_a_non_project_root_before_mutation(
         assert list(ordinary.iterdir()) == []
     finally:
         chain_directory.backend.close_fd(ordinary_fd)
+
+
+@pytest.mark.parametrize("occupant", ["regular-file", "symlink"])
+def test_bootstrap_chain_reports_hostile_non_directory_occupancy(
+    tmp_path: Path,
+    occupant: str,
+) -> None:
+    from atoms.chain.append import bootstrap_chain
+
+    backend, project_fd, project = _bootstrap_backend(tmp_path)
+    chain = project / CHAIN_LEAF
+    if occupant == "regular-file":
+        chain.write_bytes(b"hostile")
+    else:
+        target = project / "target"
+        target.mkdir()
+        chain.symlink_to(target, target_is_directory=True)
+    try:
+        with pytest.raises(ChainStateInvalid):
+            bootstrap_chain(backend, project_fd)
+        assert chain.is_symlink() if occupant == "symlink" else chain.read_bytes() == b"hostile"
+    finally:
+        backend.close_fd(project_fd)
 
 
 def test_bootstrap_chain_converges_after_a_cut_between_mkdir_and_flush(

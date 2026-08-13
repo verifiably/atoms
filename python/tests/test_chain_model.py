@@ -231,6 +231,47 @@ def test_state_decoder_refuses_noncanonical_or_unknown_external_facts(malformed:
 
 
 @pytest.mark.parametrize(
+    "malformed",
+    [
+        (
+            ("kind", "file"),
+            ("content_hash", "1" * 64),
+            ("mode", "0o644"),
+            ("byte_len", "9" * 5_000),
+        ),
+        (("kind", "directory"), ("mode", "0o" + "7" * 5_000)),
+    ],
+    ids=("huge-byte-len", "huge-mode"),
+)
+def test_state_decoder_refuses_huge_numeric_evidence_without_leaking_conversion_errors(
+    malformed: PathStateJSON,
+) -> None:
+    with pytest.raises(ChainStateInvalid):
+        state_from_json(malformed)
+
+
+@pytest.mark.parametrize(
+    "defect",
+    ["file-mode", "file-byte-len", "symlink-mode", "directory-mode"],
+)
+def test_state_encoder_refuses_unbounded_engine_integers_as_protocol_errors(
+    defect: str,
+) -> None:
+    huge = 1 << 20_000
+    if defect == "file-mode":
+        state: PathState = FileState(CONTENT_A, huge, 7)
+    elif defect == "file-byte-len":
+        state = FileState(CONTENT_A, 0o644, huge)
+    elif defect == "symlink-mode":
+        state = SymlinkState("target", huge)
+    else:
+        state = DirectoryState(huge)
+
+    with pytest.raises(ProtocolError):
+        state_to_json(state)
+
+
+@pytest.mark.parametrize(
     ("previous", "entry"),
     [
         (HEX_A, GenesisEntry(b"payload", ())),
@@ -307,3 +348,24 @@ def test_encode_refuses_engine_created_protocol_defects(
 ) -> None:
     with pytest.raises(ProtocolError):
         encode_entry(previous, entry)
+
+
+def test_encode_translates_a_missing_entry_slot_to_protocol_error() -> None:
+    forged = object.__new__(GenesisEntry)
+
+    with pytest.raises(ProtocolError):
+        encode_entry(None, forged)
+
+
+@pytest.mark.parametrize(
+    "state_type",
+    [FileState, SymlinkState, DirectoryState],
+    ids=("file", "symlink", "directory"),
+)
+def test_state_encoder_translates_missing_engine_slots_to_protocol_error(
+    state_type: type[FileState | SymlinkState | DirectoryState],
+) -> None:
+    forged = object.__new__(state_type)
+
+    with pytest.raises(ProtocolError):
+        state_to_json(cast(PathState, forged))

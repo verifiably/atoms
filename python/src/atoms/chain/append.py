@@ -18,12 +18,25 @@ from atoms.core.errors import ProtocolError
 from atoms.core.scratch import CHAIN_LEAF
 from atoms.fs.audit import AuditedBackend, Provenance, RootKind
 
+_CHAIN_LOOKUP_CONTRADICTIONS = frozenset(
+    {errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.EXDEV}
+)
+
 
 def _validated(value: object) -> ValidatedChain:
+    try:
+        return _validated_fields(value)
+    except AttributeError as caught:
+        raise ProtocolError("validated chain is missing a required field") from caught
+
+
+def _validated_fields(value: object) -> ValidatedChain:
     if type(value) is not ValidatedChain:
         raise ProtocolError("validated chain must be an exact ValidatedChain")
     if type(value.entries) is not tuple or type(value.survivors) is not tuple:
         raise ProtocolError("validated chain collections must be exact tuples")
+    if value.tip is not None and type(value.tip) is not str:
+        raise ProtocolError("validated chain tip must be None or an exact str")
     previous: str | None = None
     for index, item in enumerate(value.entries):
         if type(item) is not tuple or len(item) != 2:
@@ -50,9 +63,16 @@ def _validated(value: object) -> ValidatedChain:
 
 
 def _action(value: object, tip: str | None) -> SurvivorAction:
+    try:
+        return _action_fields(value, tip)
+    except AttributeError as caught:
+        raise ProtocolError("survivor action is missing a required field") from caught
+
+
+def _action_fields(value: object, tip: str | None) -> SurvivorAction:
     if type(value) is not SurvivorAction:
         raise ProtocolError("survivor action must be an exact SurvivorAction")
-    if value.name != STAGING_LEAF:
+    if type(value.name) is not str or value.name != STAGING_LEAF:
         raise ProtocolError("a survivor action may name only the fixed staging leaf")
     if type(value.disposition) is not SurvivorDisposition:
         raise ProtocolError("survivor disposition has the wrong exact type")
@@ -142,8 +162,10 @@ def apply_survivors(
         raise ProtocolError("a FINISH survivor must link from the validated tip")
     digest = entry_digest(envelope)
     expected_entries = validated.entries + ((digest, entry),)
-    current = validate_chain(backend, chain_fd, (envelope,))
-    if _same_history(current, validated) and current.survivors == (action,):
+    current = validate_chain(backend, chain_fd)
+    if _same_history(current, validated):
+        if not current.survivors:
+            raise ChainStateInvalid("the staging survivor changed after validation")
         _finish(backend, chain_fd, envelope, digest)
     elif current.entries == expected_entries and current.tip == digest:
         if current.survivors:
@@ -243,7 +265,14 @@ def bootstrap_chain(
     except OSError as caught:
         if caught.errno != errno.EEXIST:
             raise
-    chain_fd = backend.open_child_directory(project_root_fd, CHAIN_LEAF)
+    try:
+        chain_fd = backend.open_child_directory(project_root_fd, CHAIN_LEAF)
+    except OSError as caught:
+        if caught.errno in _CHAIN_LOOKUP_CONTRADICTIONS:
+            raise ChainStateInvalid(
+                "the reserved chain leaf is not a stable directory"
+            ) from caught
+        raise
     try:
         backend.flush_directory(project_root_fd)
     except BaseException:
