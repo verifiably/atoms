@@ -724,3 +724,48 @@ def test_approval_evidence_refuses_an_unknown_node_type(approval_context):
         )
         with pytest.raises(ProtocolError, match="topology node"):
             encode_approval_evidence(approved)
+
+
+@pytest.mark.parametrize("bad", [True, "41"], ids=("bool", "string"))
+@pytest.mark.parametrize(
+    ("member", "attribute"),
+    [
+        ("st_dev", "device"),
+        ("st_ino", "inode"),
+        ("mount_id", "mount_id"),
+        ("name_max", "name_max"),
+        ("node_id", "node_id"),
+    ],
+)
+def test_approval_evidence_refuses_non_integer_numeric_facts(
+    approval_context, member, attribute, bad
+):
+    from atoms.core.recovery import TopologyDirectory
+    from atoms.fs.approval import approve_for_project, encode_approval_evidence
+    from atoms.fs.topology import ApprovedExistingDirectory
+
+    compiled = compiled_for(
+        CreateFileNoClobber("e1", "d/f.txt", file_state())
+    )
+    with approval_context() as (context, binding):
+        os.mkdir("d", dir_fd=binding.project_root_fd)
+        approved = approve_for_project(compiled, context)
+        directory = next(
+            entry
+            for entry in approved.directories
+            if type(entry.node) is TopologyDirectory
+        )
+        assert type(directory) is ApprovedExistingDirectory
+
+        if member in {"st_dev", "st_ino"}:
+            target = directory.identity
+        elif member == "mount_id":
+            target = approved.binding.evidence
+        elif member == "name_max":
+            target = directory.constraints
+        else:
+            target = directory.node
+        object.__setattr__(target, attribute, bad)
+
+        with pytest.raises(ProtocolError, match=member):
+            encode_approval_evidence(approved)

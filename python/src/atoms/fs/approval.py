@@ -111,15 +111,24 @@ def _require_exact(value: object, expected: type, label: str) -> None:
         )
 
 
+def _integer_evidence(value: object, label: str) -> int:
+    if type(value) is not int:
+        raise ProtocolError(
+            f"{label} must be exactly int, got {type(value).__name__}"
+        )
+    return value
+
+
 def _node_key(node: object) -> str:
     if type(node) is ProjectRoot:
         return "project_root"
     if type(node) is WorkRoot:
         return "work_root"
     if type(node) is TopologyDirectory:
-        if type(node.node_id) is not int or node.node_id < 0:
+        node_id = _integer_evidence(node.node_id, "node_id")
+        if node_id < 0:
             raise ProtocolError("topology directory node_id is not a canonical decimal")
-        return f"topology_directory:{node.node_id}"
+        return f"topology_directory:{node_id}"
     if type(node) is PersistentNode:
         if type(node.path) is not str:
             raise ProtocolError("persistent topology node path must be exactly str")
@@ -136,11 +145,9 @@ def _constraint_evidence(constraints: object) -> dict[str, object]:
         raise ProtocolError("approved directory constraints have the wrong exact type")
     if type(constraints.lookup_proof) is not LookupProof:
         raise ProtocolError("approved lookup proof has the wrong exact type")
-    if type(constraints.name_max) is not int:
-        raise ProtocolError("approved name_max has the wrong exact type")
     return {
         "lookup_proof": constraints.lookup_proof.value,
-        "name_max": constraints.name_max,
+        "name_max": _integer_evidence(constraints.name_max, "name_max"),
     }
 
 
@@ -149,7 +156,10 @@ def _identity_evidence(identity: object) -> dict[str, int]:
 
     if type(identity) is not FilesystemIdentity:
         raise ProtocolError("approved directory identity has the wrong exact type")
-    return {"st_dev": identity.device, "st_ino": identity.inode}
+    return {
+        "st_dev": _integer_evidence(identity.device, "st_dev"),
+        "st_ino": _integer_evidence(identity.inode, "st_ino"),
+    }
 
 
 def encode_approval_evidence(approved: ProjectApprovedSpec) -> str:
@@ -184,7 +194,9 @@ def encode_approval_evidence(approved: ProjectApprovedSpec) -> str:
     return json.dumps(
         {
             "directories": directories,
-            "mount_id": approved.binding.evidence.mount_id,
+            "mount_id": _integer_evidence(
+                approved.binding.evidence.mount_id, "mount_id"
+            ),
             "work_root": work_root,
         },
         ensure_ascii=False,
