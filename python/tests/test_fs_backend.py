@@ -269,3 +269,140 @@ def test_try_lock_exclusive_propagates_eacces(monkeypatch, linux_backend):
     with pytest.raises(OSError) as caught:
         linux_backend.try_lock_exclusive(42)
     assert caught.value is failure
+
+
+def test_create_exclusive_returns_a_read_write_descriptor(tmp_path, linux_backend):
+    root_fd = linux_backend.open_root(str(tmp_path))
+    try:
+        fd = linux_backend.create_exclusive(root_fd, "created", 0o600)
+        try:
+            assert os.write(fd, b"payload") == len(b"payload")
+            assert os.lseek(fd, 0, os.SEEK_SET) == 0
+            assert os.read(fd, len(b"payload")) == b"payload"
+        finally:
+            os.close(fd)
+    finally:
+        os.close(root_fd)
+
+
+def test_write_writes_bytes_to_a_descriptor(tmp_path, linux_backend):
+    path = tmp_path / "written"
+    path.touch()
+    root_fd = linux_backend.open_root(str(tmp_path))
+    try:
+        fd = os.open("written", os.O_RDWR | os.O_CLOEXEC, dir_fd=root_fd)
+        try:
+            assert linux_backend.write(fd, b"payload") == len(b"payload")
+        finally:
+            os.close(fd)
+    finally:
+        os.close(root_fd)
+    assert path.read_bytes() == b"payload"
+
+
+def test_set_mode_changes_the_open_entry_mode(tmp_path, linux_backend):
+    path = tmp_path / "mode"
+    path.touch()
+    root_fd = linux_backend.open_root(str(tmp_path))
+    try:
+        fd = os.open("mode", os.O_RDONLY | os.O_CLOEXEC, dir_fd=root_fd)
+        try:
+            linux_backend.set_mode(fd, 0o600)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(root_fd)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_mkdir_child_creates_a_directory(tmp_path, linux_backend):
+    root_fd = linux_backend.open_root(str(tmp_path))
+    try:
+        linux_backend.mkdir_child(root_fd, "child", 0o700)
+    finally:
+        os.close(root_fd)
+    assert (tmp_path / "child").is_dir()
+
+
+def test_unlink_child_removes_a_file(tmp_path, linux_backend):
+    path = tmp_path / "child"
+    path.touch()
+    root_fd = linux_backend.open_root(str(tmp_path))
+    try:
+        linux_backend.unlink_child(root_fd, "child")
+    finally:
+        os.close(root_fd)
+    assert not path.exists()
+
+
+def test_rmdir_child_removes_an_empty_directory(tmp_path, linux_backend):
+    path = tmp_path / "child"
+    path.mkdir()
+    root_fd = linux_backend.open_root(str(tmp_path))
+    try:
+        linux_backend.rmdir_child(root_fd, "child")
+    finally:
+        os.close(root_fd)
+    assert not path.exists()
+
+
+def test_symlink_child_creates_the_requested_target(tmp_path, linux_backend):
+    root_fd = linux_backend.open_root(str(tmp_path))
+    try:
+        linux_backend.symlink_child(root_fd, "link", "target")
+    finally:
+        os.close(root_fd)
+    assert os.readlink(tmp_path / "link") == "target"
+
+
+def test_create_or_open_preserves_existing_file_contents(tmp_path, linux_backend):
+    path = tmp_path / "lock"
+    path.write_bytes(b"existing")
+    root_fd = linux_backend.open_root(str(tmp_path))
+    try:
+        fd = linux_backend.create_or_open(root_fd, "lock", 0o600)
+        try:
+            assert os.read(fd, len(b"existing")) == b"existing"
+        finally:
+            os.close(fd)
+    finally:
+        os.close(root_fd)
+    assert path.read_bytes() == b"existing"
+
+
+def test_set_marker_xattr_sets_the_marker(tmp_path, linux_backend):
+    path = tmp_path / "marked"
+    path.touch()
+    root_fd = linux_backend.open_root(str(tmp_path))
+    try:
+        fd = os.open("marked", os.O_RDONLY | os.O_CLOEXEC, dir_fd=root_fd)
+        try:
+            linux_backend.set_marker_xattr(fd, "user.atoms-test", b"marker")
+        finally:
+            os.close(fd)
+    finally:
+        os.close(root_fd)
+    assert os.getxattr(path, "user.atoms-test") == b"marker"
+
+
+def test_repair_entry_mode_restores_a_mode_zero_entry(tmp_path, linux_backend):
+    path = tmp_path / "database"
+    path.touch(mode=0o000)
+    root_fd = linux_backend.open_root(str(tmp_path))
+    try:
+        with pytest.raises(PermissionError):
+            os.open("database", os.O_RDWR | os.O_CLOEXEC, dir_fd=root_fd)
+        linux_backend.repair_entry_mode(root_fd, "database", 0o600)
+        fd = os.open("database", os.O_RDWR | os.O_CLOEXEC, dir_fd=root_fd)
+        os.close(fd)
+    finally:
+        os.close(root_fd)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_close_fd_closes_the_descriptor(tmp_path, linux_backend):
+    root_fd = linux_backend.open_root(str(tmp_path))
+    linux_backend.close_fd(root_fd)
+    with pytest.raises(OSError) as caught:
+        os.fstat(root_fd)
+    assert caught.value.errno == errno.EBADF

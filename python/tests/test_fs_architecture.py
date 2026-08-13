@@ -594,17 +594,28 @@ def test_the_backend_protocol_and_revision_are_exact():
         for name, member in inspect.getmembers(Backend, inspect.isfunction)
         if not name.startswith("__")
     } == {
+        "close_fd",
+        "create_exclusive",
+        "create_or_open",
         "exchange",
         "flush_directory",
         "flush_file",
         "link_anchor",
         "lock_exclusive",
+        "mkdir_child",
         "open_child_directory",
         "open_regular_nofollow",
         "open_root",
+        "repair_entry_mode",
+        "rmdir_child",
+        "set_marker_xattr",
+        "set_mode",
+        "symlink_child",
         "symlink_fingerprint",
         "transfer_noclobber",
         "try_lock_exclusive",
+        "unlink_child",
+        "write",
     }
 
 

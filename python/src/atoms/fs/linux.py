@@ -19,6 +19,57 @@ def _c_string_path(value: str) -> bytes:
 
 
 class LinuxBackend:
+    def create_exclusive(self, parent_fd: int, name: str, mode: int) -> int:
+        return os.open(
+            name,
+            os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_RDWR | os.O_CLOEXEC,
+            mode,
+            dir_fd=parent_fd,
+        )
+
+    def write(self, fd: int, data: bytes) -> int:
+        return os.write(fd, data)
+
+    def set_mode(self, fd: int, mode: int) -> None:
+        os.fchmod(fd, mode)
+
+    def mkdir_child(self, parent_fd: int, name: str, mode: int) -> None:
+        os.mkdir(name, mode, dir_fd=parent_fd)
+
+    def unlink_child(self, parent_fd: int, name: str) -> None:
+        os.unlink(name, dir_fd=parent_fd)
+
+    def rmdir_child(self, parent_fd: int, name: str) -> None:
+        os.rmdir(name, dir_fd=parent_fd)
+
+    def symlink_child(self, parent_fd: int, name: str, target: str) -> None:
+        os.symlink(target, name, dir_fd=parent_fd)
+
+    def create_or_open(self, parent_fd: int, name: str, mode: int) -> int:
+        return os.open(
+            name,
+            os.O_CREAT | os.O_NOFOLLOW | os.O_RDWR | os.O_CLOEXEC,
+            mode,
+            dir_fd=parent_fd,
+        )
+
+    def set_marker_xattr(self, fd: int, name: str, value: bytes) -> None:
+        os.setxattr(fd, name, value)
+
+    def repair_entry_mode(self, parent_fd: int, name: str, mode: int) -> None:
+        path_fd = os.open(
+            name,
+            os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=parent_fd,
+        )
+        try:
+            os.chmod(f"/proc/self/fd/{path_fd}", mode)
+        finally:
+            os.close(path_fd)
+
+    def close_fd(self, fd: int) -> None:
+        os.close(fd)
+
     def open_root(self, path: str) -> int:
         # RESOLVE_NO_SYMLINKS over the complete path: O_NOFOLLOW would guard only
         # the final component and follow every ancestor symlink. RESOLVE_NO_XDEV is
