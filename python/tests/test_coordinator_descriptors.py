@@ -7,7 +7,7 @@ import os
 
 import pytest
 
-from atoms.core.errors import PreconditionRefused
+from atoms.core.errors import PreconditionRefused, ProtocolError
 from atoms.core.recovery.model import ObservedAbsent, ObservedFile, ObservedSymlink
 from atoms.core.recovery.snapshot import ProjectRoot, TopologyDirectory, WorkRoot
 from atoms.fs.linux import LinuxBackend
@@ -98,6 +98,21 @@ def test_closing_the_table_releases_only_what_it_opened(leased):
             assert descriptor_count() > before
             table.close()
             assert descriptor_count() == before
+
+
+def test_stops_are_unavailable_after_the_table_closes(leased):
+    from atoms.coordinator.prepare import open_workspace
+
+    with leased() as lease:
+        approved = approved_replace(lease)
+        with (
+            open_workspace(lease, approved) as workspace,
+            Observation(LinuxBackend()) as observation,
+        ):
+            table = _table(lease, approved, workspace, observation)
+            table.close()
+            with pytest.raises(ProtocolError, match="closed"):
+                _ = table.stops
 
 
 def test_the_work_root_is_absent_when_the_topology_has_none(leased):

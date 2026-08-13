@@ -68,7 +68,7 @@ class DescriptorTable:
     re-resolve, reopening the race the whole section exists to close.
     """
 
-    __slots__ = ("_backend", "_closed", "_fds", "_owned", "_unreachable", "stops")
+    __slots__ = ("_backend", "_closed", "_fds", "_owned", "_stops", "_unreachable")
 
     def __init__(
         self,
@@ -83,8 +83,14 @@ class DescriptorTable:
         self._fds = fds
         self._owned = owned
         self._unreachable = unreachable
-        self.stops = stops
+        self._stops = stops
         self._closed = False
+
+    @property
+    def stops(self) -> tuple[WalkStop, ...]:
+        if self._closed:
+            raise ProtocolError("this descriptor table is closed")
+        return self._stops
 
     def fd_for(self, node: TopologyNode) -> int:
         if self._closed:
