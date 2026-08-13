@@ -72,6 +72,27 @@ def test_a_missing_ancestor_justifies_its_descendants_absence(leased):
             assert captured.manifest
 
 
+def test_a_new_blocker_with_no_declared_state_refuses(leased):
+    from atoms.coordinator.admission import admit
+    from atoms.coordinator.capture import capture_initial_surface
+    from atoms.coordinator.prepare import open_workspace
+
+    with leased() as lease:
+        approved = admit(lease, compiled_creating_a_directory(lease))
+        write_project_file(lease, "d", b"appeared after admission")
+        with (
+            open_workspace(lease, approved) as workspace,
+            pytest.raises(
+                PreconditionRefused,
+                match="blocks traversal but no declared file or symlink state",
+            ),
+            capture_initial_surface(
+                lease, approved, workspace, payloads_for_replace()
+            ),
+        ):
+            pass
+
+
 def test_a_regular_file_blocker_matching_its_declared_state_justifies_absence(leased):
     from atoms.coordinator.capture import capture_initial_surface
     from atoms.coordinator.prepare import open_workspace
