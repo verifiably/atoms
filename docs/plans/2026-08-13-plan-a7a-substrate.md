@@ -46,6 +46,8 @@ Probed against the live tree on 2026-08-13 (worktree `.worktrees/a7-design`, `31
 | `test_docs_status.py`: `STAGES = (..., "A6", "A7", "A8", "A9")`, `FIRST_UNIMPLEMENTED = "A7"`; `_stages_of` expands base labels, so `"A7"` claims cover `A7a`/`A7b` once the tuple splits. | read 2026-08-13 |
 | `DirectoryConstraints` = `lookup_proof` + `name_max`; mount check = `read_mount_id(fd)` vs `binding.evidence.mount_id`; `ProjectApprovedSpec` = `compiled, binding, txid, topology, directories, paths, scratch, work_base`; the required ⊆ supplied adjudication site is A4b-2's (`fs/approval.py` — locate `variant_capabilities`/`ALWAYS_REQUIRED` consumption there before Task 9). | survey 2026-08-13 |
 | `Observation.observe(parent_fd, leaf, *, sink_fd=None, modeled=None)`; states `FileState(content_hash, mode, byte_len)`, `DirectoryState(mode)`, `SymlinkState(target, mode)`, `AbsentState()` in `core/fingerprint.py`. | survey 2026-08-13 |
+| The effect table is `CREATE TABLE effect (txid TEXT ... REFERENCES transaction_record(txid), ..., PRIMARY KEY (txid, effect_id))` — table `effect`, column `txid` (`store/schema.py:55-60`). The shared minimal-spec helper is `tests/support.py:21`'s `valid_spec(**overrides)`; `core/spec.py` exports its own `SCHEMA_VERSION`, and `core/canonical.py` also provides `canonical_bytes`/`from_canonical_bytes`. | probe 2026-08-13 |
+| Close/mutation sites the widened sweep additionally finds: `fs/binding.py:157,256` (`os.close`); `coordinator/descriptors.py:103,245` (`os.close`); `fs/bootstrap.py:36,103,110,111,137` (`os.close`/`os.unlink`/`os.rmdir`); `store/connection.py:163` (`os.fchmod` in `publish_entry`) and the `O_PATH` repair at `:324-336`; `fs/probe.py:150,153` (`stack.callback(os.close, ...)` — an os-attribute *reference*, not a call) plus its path-based `os.unlink`/`os.rmdir` cleanup (`:106,108,232`). | grep 2026-08-13 |
 
 ## Global Constraints
 
@@ -159,8 +161,8 @@ def test_a2_still_refuses_a_declared_chain_component():
         compile_spec(spec)
 ```
 
-Build the last test from whatever minimal-valid-spec constant `tests/test_compiler_structure.py`
-already uses (copy its construction — do not invent a helper module).
+Build the last test with `tests/support.py`'s `valid_spec(**overrides)` — the measured shared
+helper the compiler suites import.
 `is_scratch_leaf` validates the txid/effect parts with the same rules `require_valid_identifier`
 enforces — add a non-raising `is_valid_identifier(part: str) -> bool` beside it and implement
 `require_valid_identifier` over it so the two cannot drift.
@@ -220,11 +222,20 @@ def set_marker_xattr(self, fd: int, name: str, value: bytes) -> None: ...
 def repair_entry_mode(self, parent_fd: int, name: str, mode: int) -> None: ...
     # The store's mode-000 database repair seam: open with O_PATH|O_NOFOLLOW|O_CLOEXEC
     # (dir_fd=parent_fd), chmod through /proc/self/fd/<fd>, close. Copy the exact idiom from
-    # store/connection.py's existing repair path — this primitive exists so that idiom can live
-    # beneath the facade instead of beside it.
+    # store/connection.py:324-336 — this primitive exists so that idiom can live beneath the
+    # facade instead of beside it.
+def close_fd(self, fd: int) -> None: ...
+    # os.close. On the protocol — not only the facade — because Observation, DescriptorTable,
+    # ProjectBinding, and the store are typed against Backend and tests pass LinuxBackend
+    # directly; the facade's override unregisters (exactly once, even when close raises) and
+    # delegates.
 ```
 
-No new `Capability` member, no probe change, no `UNSUPPORTED_ERRNO` row.
+No new `Capability` member, no probe change, no `UNSUPPORTED_ERRNO` row. Both `repair_entry_mode`
+and `close_fd` are additions to the design's §5.1 primitive list — **amend the design in the same
+commit** (the design wins over this plan, so the plan must not silently outgrow it): add the two
+bullets to §5.1 with the note *"(amended 2026-08-13, the A7a plan review: the store's mode-repair
+idiom and the close lifecycle belong beneath the facade)"*.
 
 - [ ] **Step 1:** Failing tests, one behavior each over a `tmp_path` root fd — including the
   `O_RDWR` read-back proof for `create_exclusive` (write, `os.lseek(fd, 0, 0)`, `os.read`
@@ -256,6 +267,7 @@ class TargetClass(enum.Enum):
 class RootKind(enum.Enum):
     PROJECT = "project"
     METADATA = "metadata"
+    METADATA_PARENT = "metadata-parent"   # bootstrap-only: may mkdir exactly the metadata-root leaf
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class Provenance:
@@ -265,17 +277,24 @@ class Provenance:
 @dataclasses.dataclass(frozen=True, slots=True)
 class AuditRecord:
     operation: str
-    target_class: TargetClass
-    targets: tuple[str, ...]   # one entry normally; two for exchange / transfer_noclobber
+    targets: tuple[tuple[TargetClass, str], ...]   # (class, path) PER target — a transfer can be
+                                                   # scratch -> declared or scratch -> chain
 
 class AuditedBackend:          # implements the full (extended) Backend protocol
-    def __init__(self, inner: Backend) -> None: ...
+    def __init__(self, inner: Backend, *, project_root: str, metadata_root: str) -> None: ...
+        # The facade knows both root paths from construction — provenance needs no caller setup
+        # before acquire_project_lock. open_root(path) auto-registers by exact match: project_root
+        # -> Provenance(PROJECT, ""); metadata_root -> (METADATA, ""); metadata_root's parent ->
+        # (METADATA_PARENT, ""); any other path -> ProtocolError. METADATA_PARENT permits exactly
+        # one mutation — mkdir_child of the metadata-root leaf, classified METADATA — so bootstrap
+        # can create the root without blessing its parent broadly.
     records: tuple[AuditRecord, ...]
     def register(self, fd: int, provenance: Provenance) -> None: ...
     def rebind(self, fd: int, provenance: Provenance) -> None: ...
     def unregister(self, fd: int) -> None: ...
     def provenance_of(self, fd: int) -> Provenance: ...      # ProtocolError when unregistered
-    def close_fd(self, fd: int) -> None: ...                 # unregister (exactly once), then os.close;
+    def close_fd(self, fd: int) -> None: ...                 # override of the protocol method:
+                                                             # unregister (exactly once), then delegate;
                                                              # unregister happens even when close raises
     def set_declared_paths(self, paths: frozenset[str]) -> None: ...  # A7b's per-transaction scope;
     def clear_declared_paths(self) -> None: ...                       # empty outside a transaction
@@ -305,7 +324,11 @@ mutate nothing.
     `DECLARED_EFFECT`; after `clear_declared_paths()` it refuses again;
   - `.#~chain` first component under `PROJECT` → `CHAIN_BOOKKEEPING`; a scratch-grammar leaf →
     `ENGINE_SCRATCH`; any leaf under `METADATA` → `METADATA`;
-  - `exchange` records both targets, in argument order;
+  - `exchange` and `transfer_noclobber` record a `(class, path)` pair **per target**, in
+    argument order, each classified independently;
+  - `open_root` on the three configured paths registers the matching root kind; on any other
+    path → `ProtocolError`; under `METADATA_PARENT`, `mkdir_child(<metadata-root leaf>)`
+    classifies `METADATA` and any other mutation refuses;
   - records append only after syscall success (inner forced to raise → no record);
   - `create_exclusive` auto-registers (immediate `set_mode` through the returned fd succeeds);
   - `rebind` changes classification for subsequent descendants (the §9.5 rebind);
@@ -339,19 +362,21 @@ mutate nothing.
 _MUTATING_OS = {
     "rename", "replace", "unlink", "mkdir", "rmdir", "symlink", "link",
     "chmod", "fchmod", "lchmod", "setxattr", "fsetxattr", "write", "close",
+    "open",   # banned outright outside the allowlist below — flag analysis cannot see variables
 }
-_MUTATING_OPEN_FLAGS = {"O_CREAT", "O_TRUNC", "O_APPEND", "O_WRONLY", "O_RDWR"}
 _FACADE_EXEMPT = ("fs/audit.py", "fs/linux.py", "fs/syscalls/")
+# The exact read-only open allowlist: resolve.py's O_PATH observation is A4b-1's own lifecycle.
+_OS_OPEN_ALLOWED = ("fs/resolve.py",)
 
 
-def _os_calls(path):
+def _os_attribute_references(path):
+    # Attribute REFERENCES, not calls: stack.callback(os.close, fd) must be caught too.
     tree = ast.parse(path.read_text(encoding="utf-8"))
     for node in ast.walk(tree):
         if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "os"
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "os"
         ):
             yield node
 
@@ -364,14 +389,11 @@ def test_no_direct_os_mutation_or_close_outside_the_facade():
         rel = str(path.relative_to(SOURCE_ROOT))
         if rel.startswith(_FACADE_EXEMPT):
             continue
-        for node in _os_calls(path):
-            name = node.func.attr
-            if name in _MUTATING_OS:
-                offenders.append(f"{rel}:{node.lineno} os.{name}")
-            elif name == "open":
-                flags = {n.attr for n in ast.walk(node) if isinstance(n, ast.Attribute)}
-                if flags & _MUTATING_OPEN_FLAGS:
-                    offenders.append(f"{rel}:{node.lineno} os.open(mutating flags)")
+        for node in _os_attribute_references(path):
+            if node.attr == "open" and rel in _OS_OPEN_ALLOWED:
+                continue
+            if node.attr in _MUTATING_OS:
+                offenders.append(f"{rel}:{node.lineno} os.{node.attr}")
     assert offenders == []
 
 
@@ -383,36 +405,47 @@ def test_the_raw_backend_is_constructed_only_by_the_platform_factory():
         assert "LinuxBackend(" not in path.read_text(encoding="utf-8"), rel
 
 
-def test_the_platform_factory_returns_the_audited_facade():
-    source = (SOURCE_ROOT / "fs" / "platform.py").read_text(encoding="utf-8")
-    assert "return AuditedBackend(LinuxBackend())" in source
+def test_the_facade_is_constructed_only_at_the_composition_root():
+    for path in sorted(SOURCE_ROOT.rglob("*.py")):
+        rel = str(path.relative_to(SOURCE_ROOT))
+        if rel in {"coordinator/root.py", "fs/audit.py"}:
+            continue
+        assert "AuditedBackend(" not in path.read_text(encoding="utf-8"), rel
 ```
 
-Notes pinned by the measured facts: `os.open` with only read flags (`fs/resolve.py:436`'s
-`O_PATH` observation) is deliberately **not** swept — it mutates nothing and provenance for
-resolution descriptors is A4b-1's own lifecycle; `os.close` **is** swept, which forces every close
-site onto `close_fd` and closes review finding 4 mechanically.
+Notes: the platform factory returns the **raw** backend (it cannot know the root paths the
+facade's constructor requires); `coordinator/root.py` wraps it —
+`AuditedBackend(backend, project_root=..., metadata_root=...)` — as its first act, before
+`acquire_project_lock`, so bootstrap's metadata-parent mkdir already flows through the facade's
+`METADATA_PARENT` rule. `os.close` is swept as an attribute reference, which catches
+`stack.callback(os.close, ...)` and forces every close site onto `close_fd`.
 
 - [ ] **Step 4.2: Run** — the offender list must name exactly the measured-facts inventory
-  (lock, bootstrap, probe, observe, workspace, blobs, connection, capture, plus every `os.close`
-  site those modules own). More names than the inventory means stale facts: stop and report.
-- [ ] **Step 4.3: Wrap the factory** — `fs/platform.py` returns `AuditedBackend(LinuxBackend())`;
-  `coordinator/root.py` registers the four root descriptors it owns as they are opened
-  (`Provenance(RootKind.PROJECT, "")`, `Provenance(RootKind.METADATA, "")`, and the lock/probe
-  descriptors under `METADATA` aliases). Tests that need the raw backend construct
-  `LinuxBackend()` directly in test code — test files are outside `SOURCE_ROOT` and unaffected by
-  the guards.
+  (lock, bootstrap incl. its unlink/rmdir, probe incl. `stack.callback` closes and path-based
+  cleanup, observe, workspace, blobs, connection incl. `publish_entry`'s `fchmod` and both its
+  opens, capture, binding's and descriptors' closes). More names than the inventory means stale
+  facts: stop and report.
+- [ ] **Step 4.3: Wrap at the composition root** — `coordinator/root.py` wraps the supplied
+  backend in `AuditedBackend(backend, project_root=..., metadata_root=...)` before
+  `acquire_project_lock`; `open_root` auto-registration covers the roots (Task 3), and the
+  lock/probe descriptors register under `METADATA` aliases as they are opened. `fs/platform.py`
+  keeps returning the raw backend. Tests that need the raw backend construct `LinuxBackend()`
+  directly — test files are outside `SOURCE_ROOT` and unaffected.
 - [ ] **Step 4.4: Migrate, one commit per module, suites green after each:**
   - `fs/lock.py` — `mkdir_child`, `create_or_open`, `set_marker_xattr`, `close_fd`;
-  - `fs/bootstrap.py` — `mkdir_child` (keep the EEXIST-reopen-verify shape), `close_fd` on the
-    error path;
+  - `fs/bootstrap.py` — `mkdir_child` (keep the EEXIST-reopen-verify shape), `unlink_child`/
+    `rmdir_child` for its reclamation, `close_fd` on every path including the error path;
+  - `fs/binding.py` and `coordinator/descriptors.py` — closes through `close_fd` (this is why
+    Task 4 passes without waiting on Task 10: the *mechanism* migrates here; gap 2's
+    exactly-once/error-path semantics get their dedicated tests there);
   - `fs/probe.py` — every open/write/mkdir/symlink/close through the facade under `METADATA`
     provenance; probe semantics unchanged (its suite must not change);
   - `fs/observe.py` — sink streaming through `backend.write`; closes through `close_fd`;
   - `store/workspace.py`, `store/blobs.py` — mkdir/open/unlink/rmdir/close through the facade
     (`METADATA` provenance for `staging_fd`/`work_fd`/blob parents);
-  - `store/connection.py` — `create_store`'s exclusive create via `create_exclusive`, the mode
-    repair via `repair_entry_mode`, closes via `close_fd`;
+  - `store/connection.py` — `create_store`'s exclusive create via `create_exclusive`,
+    `publish_entry`'s `fchmod` via `set_mode`, the mode repair via `repair_entry_mode`, closes
+    via `close_fd`;
   - `coordinator/capture.py` — staging create via `create_exclusive`, streaming via
     `backend.write`, closes via `close_fd`.
 - [ ] **Step 4.5: Run the three guards and the full suite** — green; probe and capture suites
@@ -474,13 +507,18 @@ def decode_assembly_halt(payload: str) -> AssemblyHalt: ...   # exact round-trip
 
 `AssemblyHalt.__post_init__` enforces: findings non-empty; ordered exactly by
 `(path, kind enum order)`; a `NODE_MISSING` or `WRONG_ENTRY_KIND` finding is its path's sole
-finding. `AssemblyFinding.__post_init__` enforces: `observed` keys equal `_FACT_KEYS[kind]`
-exactly and in that order.
+finding. `AssemblyFinding.__post_init__` enforces `observed` keys equal `_FACT_KEYS[kind]`
+exactly and in that order, **and each value's closed domain**: `observed_kind ∈ {"file",
+"symlink", "other"}`; `work_base ∈ {"present", "absent"}`; `st_dev`, `st_ino`, `mount_id`,
+`name_max` canonical decimal strings (no sign, no leading zero except "0"); `lookup_proof`
+exactly the string `encode_approval_evidence` uses for that field — one encoding, asserted equal
+in a test, so the diff stays byte-honest.
 
 - [ ] **Step 1:** Failing tests — exact round-trip per kind; decode refuses unknown kind, missing
   member, wrong fact keys, extra fact keys, unsorted findings; construction refuses out-of-order
-  findings, a `NODE_MISSING` sharing its path, an empty findings tuple, and an
-  `IDENTITY_CHANGED` finding with a `mount_id` fact.
+  findings, a `NODE_MISSING` sharing its path, an empty findings tuple, an `IDENTITY_CHANGED`
+  finding with a `mount_id` fact, `observed_kind="socket"`, `st_ino="007"`, and
+  `work_base="maybe"`.
 - [ ] **Step 2:** Run — module missing. **Step 3:** Implement. **Step 4:** Suite green.
 - [ ] **Step 5:** `git commit -m "feat(core): AssemblyHalt with the closed per-kind fact vocabulary"`
 
@@ -495,7 +533,8 @@ exactly and in that order.
   `python/tests/test_compiler_structure.py` (validation refusals).
 
 **Interfaces:** `TransactionSpec` gains `fulfills: str | None = None` and
-`registered_paths: tuple[str, ...] = ()`; accepted `schema_version` becomes **2 and only 2** —
+`registered_paths: tuple[str, ...] = ()`; `core/spec.py`'s exported `SCHEMA_VERSION` constant
+moves 1 → 2 and the accepted `schema_version` becomes **2 and only 2** —
 `compile_spec` and `from_canonical_json` both refuse v1 (`SpecValidationError`; Plan A has no
 production data). `compile_spec` gains one validation phase: `registered_paths` sorted,
 duplicate-free, every entry a path of one of the two surfaces; `fulfills`, when present, a
@@ -503,7 +542,8 @@ duplicate-free, every entry a path of one of the two surfaces; `fulfills`, when 
 
 - [ ] **Step 1:** Failing tests — round-trip with both members set and with defaults; refusals:
   `schema_version=1`, unsorted/duplicated `registered_paths`, an entry in neither surface,
-  `fulfills="xyz"`, `fulfills` of 63 chars, uppercase hex.
+  `fulfills="xyz"`, `fulfills` of 63 chars, uppercase hex — through `canonical_json` and
+  `canonical_bytes` alike (both codecs exist; cover both).
 - [ ] **Step 2:** Run. **Step 3:** Implement.
 - [ ] **Step 4:** Full suite — move every spec construction to `schema_version=2` through the
   suites' central spec constants (`test_spec.py` and the compiler suites share them); let failures
@@ -555,17 +595,19 @@ trg_assembly_halt_write_once: BEFORE UPDATE OF assembly_halt ON transaction_reco
 trg_registration_window: BEFORE UPDATE OF registration_digest ON transaction_record
   WHEN NEW.registration_digest IS NOT NULL AND (
        OLD.state != '{prepared}'
-       OR EXISTS (SELECT 1 FROM <effect table> e
-                  WHERE e.<txid col> = OLD.txid AND e.journal_state != '{pending}')
+       OR EXISTS (SELECT 1 FROM effect e
+                  WHERE e.txid = OLD.txid AND e.journal_state != '{pending}')
   ) -> RAISE
 
 -- departures and starts
 trg_departure_needs_registration: BEFORE UPDATE OF state ON transaction_record
-  WHEN OLD.state = '{prepared}' AND NEW.state IN ('{applying}', '{rolling_back}')
+  WHEN OLD.state = '{prepared}' AND NEW.state != '{prepared}'
        AND OLD.registration_digest IS NULL -> RAISE
-trg_journal_start_gate: BEFORE UPDATE OF journal_state ON <effect table>
+  -- every departure: the store setter accepts any TransactionState, so APPLIED, COMMITTED,
+  -- ROLLED_BACK, and HALTED direct transitions are all gated, not only the two legal next states
+trg_journal_start_gate: BEFORE UPDATE OF journal_state ON effect
   WHEN NEW.journal_state = '{started}' AND OLD.journal_state = '{pending}' AND EXISTS (
-       SELECT 1 FROM transaction_record t WHERE t.txid = NEW.<txid col>
+       SELECT 1 FROM transaction_record t WHERE t.txid = NEW.txid
        AND (t.state != '{applying}' OR t.registration_digest IS NULL)
   ) -> RAISE
 
@@ -578,13 +620,14 @@ trg_settlement_gate: BEFORE UPDATE OF settlement_digest ON transaction_record
 
 -- active: never updated; delete-gated; insert-only publication
 trg_active_no_update: BEFORE UPDATE ON active -> RAISE (unconditional)
-trg_active_delete_gate: BEFORE DELETE ON active WHEN EXISTS (
-       SELECT 1 FROM transaction_record t WHERE t.txid = OLD.txid AND (
-            t.state NOT IN ('{committed}', '{rolled_back}')
-            OR t.registration_digest IS NULL OR t.settlement_digest IS NULL
-            OR t.assembly_halt IS NOT NULL
-       )
+trg_active_delete_gate: BEFORE DELETE ON active WHEN NOT EXISTS (
+       SELECT 1 FROM transaction_record t WHERE t.txid = OLD.txid
+            AND t.state IN ('{committed}', '{rolled_back}')
+            AND t.registration_digest IS NOT NULL AND t.settlement_digest IS NOT NULL
+            AND t.assembly_halt IS NULL
   ) -> RAISE
+  -- NOT EXISTS(valid row) encodes allowed-only exactly, and also refuses deleting an active row
+  -- whose txid resolves to no record at all
 
 -- terminal-record deletion
 trg_record_delete_gate: BEFORE DELETE ON transaction_record
@@ -596,12 +639,13 @@ trg_record_delete_gate: BEFORE DELETE ON transaction_record
 -- the assembly-halt freeze
 trg_assembly_halt_freezes_record: BEFORE UPDATE ON transaction_record
   WHEN OLD.assembly_halt IS NOT NULL -> RAISE
-trg_assembly_halt_freezes_journal: BEFORE UPDATE OF journal_state ON <effect table>
+trg_assembly_halt_freezes_journal: BEFORE UPDATE OF journal_state ON effect
   WHEN EXISTS (SELECT 1 FROM transaction_record t
-               WHERE t.txid = NEW.<txid col> AND t.assembly_halt IS NOT NULL) -> RAISE
+               WHERE t.txid = NEW.txid AND t.assembly_halt IS NOT NULL) -> RAISE
 ```
 
-`<effect table>`/`<txid col>` are copied from `store/schema.py`'s real DDL, not from this plan.
+Table and column names are the measured `effect`/`txid` (`store/schema.py:55-60`); the state
+literals stay derived.
 (`trg_assembly_halt_freezes_record` subsumes the halt column's own write-once for the
 value→value path; keep both triggers anyway — the write-once documents the column rule and
 covers it even if the freeze trigger is ever narrowed.)
@@ -610,9 +654,12 @@ covers it even if the freeze trigger is ever narrowed.)
   commits; the illegal one raises through the store's standard trigger-failure surface (copy the
   exception-asserting convention from the nearest existing constraint test in the store suites).
   Include: clearing a non-null registration digest (UPDATE to NULL) is refused; clearing a
-  non-null settlement digest is refused; `UPDATE active SET txid=...` is refused even when both
-  records are terminal-and-bound; insert-over-existing `active` fails on the primary key; delete
-  under a non-terminal record is refused.
+  non-null settlement digest is refused; **each** unregistered departure from `PREPARED` —
+  direct to `APPLYING`, `ROLLING_BACK`, `APPLIED`, `COMMITTED`, `ROLLED_BACK`, and `HALTED` —
+  is refused; `UPDATE active SET txid=...` is refused even when both records are
+  terminal-and-bound; insert-over-existing `active` fails on the primary key; delete under a
+  non-terminal record is refused; delete of an `active` row whose txid matches no record is
+  refused.
 - [ ] **Step 7.2:** Failing tests for the writer methods and `StoredRecord` round-trip
   (including `assembly_halt` through Task 5's codec), and an architecture-style assertion that
   `UPSERT_ACTIVE` no longer exists in `connection.py`.
@@ -670,9 +717,19 @@ class IntentEntry:
     payload: bytes
 Entry = GenesisEntry | RegisteredEntry | SettledEntry | IntentEntry
 
-def state_to_json(state) -> PathStateJSON: ...      # all four fingerprint classes; absence explicit
-def state_from_json(data: PathStateJSON): ...
+PathStateJSON = tuple[tuple[str, str], ...]
+    # sorted (key, value) string pairs, discriminated by the "kind" key:
+    #   ("kind","absent")
+    #   ("kind","file"), ("content_hash", <64-hex>), ("mode", <octal, e.g. "0o644">),
+    #                    ("byte_len", <decimal>)
+    #   ("kind","symlink"), ("target", <str>), ("mode", <octal>)
+    #   ("kind","directory"), ("mode", <octal>)
+def state_to_json(state) -> PathStateJSON: ...      # exactly the pairs above; nothing else
+def state_from_json(data: PathStateJSON): ...       # exact inverse; ChainStateInvalid on any defect
 def encode_entry(previous: str | None, entry: Entry) -> bytes: ...
+    # validates before encoding (ProtocolError — these are engine bugs, not disk evidence):
+    # txid/digest members are 64-lowercase-hex or the identifier grammar as each field requires;
+    # baseline/initial/final sorted by path, duplicate-free; previous None only for genesis
 def decode_entry(data: bytes) -> tuple[str | None, Entry]: ...   # ChainStateInvalid on any defect
 def entry_digest(data: bytes) -> str: ...
 
@@ -703,18 +760,24 @@ def validate_chain(backend: AuditedBackend, chain_fd: int,
 # append.py
 STAGING_LEAF = ".#~stage"
 def apply_survivors(backend: AuditedBackend, chain_fd: int,
-                    validated: ValidatedChain) -> None: ...
+                    validated: ValidatedChain) -> ValidatedChain: ...
     # FINISH: transfer_noclobber onto the envelope's digest name (EEXIST -> byte-proof, below),
     # flush_directory. REMOVE: unlink_child + flush_directory. Idempotent; must run before any
-    # append so the fixed STAGING_LEAF is free — this is how a crashed append converges instead
-    # of hitting EEXIST on its own debris (review finding 5).
+    # append so the fixed STAGING_LEAF is free. Returns a FRESH validate_chain pass over the
+    # post-application directory — ValidatedChain is immutable, so the stale value with nonempty
+    # survivors is never what downstream code holds; the returned chain has survivors == ().
 def append_entry(backend: AuditedBackend, chain_fd: int, validated: ValidatedChain,
                  entry: Entry) -> str: ...
-    # Requires survivors == () (apply_survivors ran): create_exclusive(STAGING_LEAF) -> write
-    # envelope -> flush_file -> close_fd -> transfer_noclobber onto the digest name ->
-    # flush_directory. EEXIST at the transfer: open the destination read-only, prove byte-equality
-    # with the envelope, then unlink the staging survivor and flush — idempotent completion;
-    # byte-inequality is ChainStateInvalid. Returns the digest.
+    # Requires validated.survivors == () (the value apply_survivors returned). Validates the
+    # entry's own grammar and that its `previous` equals validated.tip BEFORE any write. Then,
+    # immediately before mutating, re-proves the directory against `validated` — the staging
+    # leaf absent, the tip entry present with digest-matching bytes — because the lease excludes
+    # cooperating engines, not external writers; any deviation is ChainStateInvalid. Then:
+    # create_exclusive(STAGING_LEAF) -> write envelope -> flush_file -> close_fd ->
+    # transfer_noclobber onto the digest name -> flush_directory. EEXIST at the transfer: open
+    # the destination read-only, prove byte-equality with the envelope, then unlink the staging
+    # survivor and flush — idempotent completion; byte-inequality is ChainStateInvalid. Returns
+    # the digest.
 def bootstrap_chain(backend: AuditedBackend, project_root_fd: int) -> int: ...
     # mkdir_child(CHAIN_LEAF) or open existing; flush_directory(project_root_fd); returns the
     # chain fd, registered CHAIN_BOOKKEEPING via the facade's open path.
@@ -729,14 +792,20 @@ def bootstrap_chain(backend: AuditedBackend, project_root_fd: int) -> int: ...
   orphan-file each `ChainStateInvalid`; survivor classification: byte-identical-to-planned →
   FINISH with the envelope, already-durable duplicate → REMOVE, partial write → REMOVE,
   decodable-but-underived → REMOVE.
-- [ ] **Step 8.3:** Failing append tests — `apply_survivors` then `append_entry` converges after a
-  cut at **each** barrier (inject by wrapping the facade to raise after N calls, then rerun the
-  full validate → apply → append sequence): exactly one durable entry, staging gone; EEXIST
-  destination byte-proof accepts our bytes and unlinks staging; a foreign digest-named file →
-  `ChainStateInvalid`; `bootstrap_chain` idempotent, flushes the root, cut between mkdir and flush
-  converges on rerun.
-- [ ] **Step 8.4:** Implement `model.py` → green (8.1); implement `read.py` → green (8.2);
-  implement `append.py` + `errors.py` → green (8.3).
+- [ ] **Step 8.3:** Failing append tests — the `validate → apply (returns fresh) → append`
+  sequence converges after a cut at **each** barrier (inject by wrapping the facade to raise
+  after N calls, then rerun the full sequence): exactly one durable entry, staging gone;
+  `apply_survivors`' return has `survivors == ()` and `append_entry` refuses the stale
+  pre-application value (`ProtocolError`); `append_entry` refuses an entry whose `previous` is
+  not the validated tip before any write; an external change between validation and append — a
+  file added to the directory, tip bytes rewritten — is `ChainStateInvalid` from the
+  pre-mutation re-proof; EEXIST destination byte-proof accepts our bytes and unlinks staging; a
+  foreign digest-named file → `ChainStateInvalid`; `bootstrap_chain` idempotent, flushes the
+  root, cut between mkdir and flush converges on rerun.
+- [ ] **Step 8.4:** Implement `errors.py` + `model.py`; run `test_chain_model.py` → green (8.1).
+- [ ] **Step 8.4b:** Implement `read.py`; run the read half of `test_chain_append.py` → green
+  (8.2).
+- [ ] **Step 8.4c:** Implement `append.py`; run the append half → green (8.3).
 - [ ] **Step 8.5:** Extend `test_fs_architecture.py`: no module under `atoms/chain/` imports
   `atoms.coordinator` or `atoms.store`. Full suite green.
 - [ ] **Step 8.6:** `git commit -m "feat(chain): the tamper-evident chain mechanism"`
@@ -764,21 +833,29 @@ ALWAYS_REQUIRED = frozenset({ANCHORED_TRAVERSAL, DURABLE_PUBLISH, ADVISORY_PROJE
 def register_root(backend, project_root, metadata_root, storage,
                   genesis_payload: bytes, registered_surface: tuple[str, ...]) -> str: ...
 def append_intent(backend, project_root, metadata_root, storage, payload: bytes) -> str: ...
-def require_registered_root(lease: Lease) -> int: ...
-    # opens .#~chain/ under the project root; PreconditionRefused when absent with no live
-    # record; ChainStateInvalid when absent with a live record; validates and returns the chain fd.
+@contextlib.contextmanager
+def _registered_root(lease: Lease) -> Iterator[tuple[int, ValidatedChain]]: ...
+    # PRIVATE — it accepts Lease, so it can never be a public command (the guard forbids that
+    # combination). Opens .#~chain/ under the project root: PreconditionRefused when absent with
+    # no live record; ChainStateInvalid when absent with a live record. Validates, applies
+    # survivors, and yields (chain_fd, the fresh ValidatedChain); closes the fd via
+    # backend.close_fd on exit, error paths included. A7b's run_transaction preflight is this
+    # same context manager.
 ```
 
 Both commands, under the internally acquired lease, first prove `NOCLOBBER_TRANSFER` is supplied
 by the bound volume — reuse the exact adjudication the approval path uses over
-`binding.evidence`; refusal is `CapabilityUnavailable` **before** any chain write. `register_root`:
-`bootstrap_chain` → `validate_chain` → `apply_survivors` → if a genesis exists, prove the retry
-(payload bytes byte-equal **and** supplied surface equals the baseline's path set → return the
-digest; else `PreconditionRefused`); else capture the baseline (component-walk each path from
-`project_root_fd` via `open_child_directory`, observe the leaf with the `core.fingerprint`
-vocabulary; determinate `ENOENT` → `AbsentState`; any other errno propagates) and append the
-genesis. `append_intent`: `require_registered_root` → `apply_survivors` →
-`append_entry(IntentEntry(payload))`, durable before the digest returns.
+`binding.evidence`; refusal is `CapabilityUnavailable` **before** any chain write. `register_root` first
+validates `registered_surface` **before any traversal**: sorted, duplicate-free, and every entry
+passing the same relative-path grammar A2 enforces (reuse `core/paths`' component validation —
+the `aliases_scratch_sigil` refusal included); a violation is `PreconditionRefused`. Then:
+`bootstrap_chain` → `validate_chain` → `apply_survivors` (holding its returned fresh chain) → if
+a genesis exists, prove the retry (payload bytes byte-equal **and** supplied surface equals the
+baseline's path set → return the digest; else `PreconditionRefused`); else capture the baseline
+(component-walk each path from `project_root_fd` via `open_child_directory`, observe the leaf
+with the `core.fingerprint` vocabulary; determinate `ENOENT` → `AbsentState`; any other errno
+propagates) and append the genesis. `append_intent`: `with _registered_root(lease) as (chain_fd,
+validated):` → `append_entry(IntentEntry(payload))`, durable before the digest returns.
 
 - [ ] **Step 9.1:** Failing capability tests — `ALWAYS_REQUIRED` contains `NOCLOBBER_TRANSFER`;
   the existing adjudication suite's derivation cases update (an effectless spec now requires
@@ -793,9 +870,15 @@ genesis. `append_intent`: `require_registered_root` → `apply_survivors` →
   `test_coordinator_process.py`); two intents chain linearly; a cut between staging and transfer
   leaves debris the next command's validate → apply classifies and clears, and the dead caller
   never received a digest.
-- [ ] **Step 9.3:** Implement; register the chain fd provenance through the facade's open path.
-- [ ] **Step 9.4:** Architecture extension: every public function in `commands.py` enters
-  `_recovery_lease` and none annotates `ProjectApprovedSpec`. Full suite green.
+- [ ] **Step 9.3:** Implement the capability change and `_registered_root`; run the capability
+  and preflight tests → green.
+- [ ] **Step 9.3b:** Implement `register_root` (surface validation, retry proof, baseline
+  capture); run its tests → green.
+- [ ] **Step 9.3c:** Implement `append_intent`; run its tests → green.
+- [ ] **Step 9.4:** Architecture extension: the public functions of `commands.py` are exactly
+  `register_root` and `append_intent`; each enters `_recovery_lease`; none annotates
+  `ProjectApprovedSpec` or `Lease` (the private `_registered_root` is the only Lease-accepting
+  name, and it is underscore-private). Full suite green.
 - [ ] **Step 9.5:** `git commit -m "feat(coordinator): register_root and append_intent under the internal lease"`
 
 ---
@@ -893,7 +976,21 @@ Checked against the design and the plan-review findings, 2026-08-13:
    (`<effect table>` from `store/schema.py`; the minimal-spec constant from
    `test_compiler_structure.py`; the adjudication site via the `ALWAYS_REQUIRED` grep) — none is
    a design blank.
-4. **Type consistency.** `AuditedBackend.register/rebind/unregister/provenance_of/close_fd/
+4. **Second-round findings closed.** (1) facade construction carries both root paths and
+   `METADATA_PARENT` scopes bootstrap's one permitted parent mutation — Task 3; (2) per-target
+   `(class, path)` records — Task 3; (3) attribute-reference sweep, `os.open` allowlist, complete
+   inventory (binding/descriptors/bootstrap-reclamation/`publish_entry`-fchmod/probe-callback
+   closes), Task-4-passes-before-Task-10 ordering — Task 4; (4) `close_fd` on the protocol with
+   the facade override, design amended — Task 2; (5) every-departure trigger + `NOT EXISTS`
+   active gate with per-state tests — Task 7; (6) `apply_survivors` returns a fresh
+   `ValidatedChain`, `append_entry` proves grammar, tip linkage, and the pre-mutation directory
+   state — Task 8; (7) `_registered_root` private context manager yielding
+   `(chain_fd, ValidatedChain)`, surface grammar validated pre-traversal, public surface pinned
+   to exactly two commands — Task 9; (8) `PathStateJSON` defined, closed value domains,
+   entry-grammar validation before write, `effect`/`txid` pinned, `valid_spec` named, 8.4 and
+   9.3 split, and the design's §5.1 amended for the two primitive additions.
+
+5. **Type consistency.** `AuditedBackend.register/rebind/unregister/provenance_of/close_fd/
    set_declared_paths` (Task 3) are what Tasks 4, 8, 9, 10 call; `CHAIN_LEAF`/`SCRATCH_ROLES`/
    `is_scratch_leaf` (Task 1) are what Tasks 3, 8 consume; `encode_assembly_halt`/`decode_assembly_halt`
    (Task 5) are what Task 7 uses; `validate_chain`/`apply_survivors`/`append_entry`/

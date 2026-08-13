@@ -175,6 +175,14 @@ leaf — preserving `anchored_traversal` at mutation time:
   idempotent acquisition, today a raw `os.open` in `fs/lock.py`.
 - `set_marker_xattr(fd, name, value)` — the metadata-root ignore marker,
   today a raw `os.setxattr`.
+- `repair_entry_mode(parent_fd, name, mode)` — the store's mode-000 database
+  repair idiom (`O_PATH` open, chmod through `/proc/self/fd`), beneath the
+  facade instead of beside it *(amended 2026-08-13, the A7a plan review: the
+  facade-only claim is false while the repair spells its own syscalls)*.
+- `close_fd(fd)` — descriptor close as a protocol member, so every owner
+  typed against `Backend` closes through one seam and the facade's override
+  can unregister provenance before the fd number is reusable *(amended
+  2026-08-13, the A7a plan review, with the same rationale)*.
 
 **No capability-set member and no probe semantics change.** The probed eight
 remain exactly the filesystem-specific capabilities; the new primitives are
