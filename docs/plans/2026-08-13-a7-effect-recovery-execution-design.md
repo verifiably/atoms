@@ -173,16 +173,25 @@ leaf — preserving `anchored_traversal` at mutation time:
   what the probe already does inline.
 - `create_or_open(parent_fd, name, mode) -> int` — the persistent lock file's
   idempotent acquisition, today a raw `os.open` in `fs/lock.py`.
+- `open_existing(parent_fd, name, *, read_write=False, nofollow=False) -> int`
+  — the non-creating descriptor-relative open used where the probe and store
+  resume paths require their former exact access and nofollow flags. It never
+  carries `O_CREAT` and is not a new capability.
 - `set_marker_xattr(fd, name, value)` — the metadata-root ignore marker,
   today a raw `os.setxattr`.
-- `repair_entry_mode(parent_fd, name, mode)` — the store's mode-000 database
-  repair idiom (`O_PATH` open, chmod through `/proc/self/fd`), beneath the
+- `repair_entry_mode(parent_fd, name, mode, *, before_change)` — the store's
+  mode-000 database repair idiom (`O_PATH` open, invoke the required fresh
+  liveness gate, then chmod immediately through `/proc/self/fd`), beneath the
   facade instead of beside it *(amended 2026-08-13, the A7a plan review: the
-  facade-only claim is false while the repair spells its own syscalls)*.
+  facade-only claim is false while the repair spells its own syscalls; amended
+  after Task 4 review so the gate remains between the pin and mutation)*.
 - `close_fd(fd)` — descriptor close as a protocol member, so every owner
   typed against `Backend` closes through one seam and the facade's override
   can unregister provenance before the fd number is reusable *(amended
   2026-08-13, the A7a plan review, with the same rationale)*.
+- `detach_fd(fd)` — transfer a live descriptor to a caller that owns its raw
+  close, unregistering facade provenance without closing the descriptor. The
+  raw Linux backend has no registry work to perform.
 
 **No capability-set member and no probe semantics change.** The probed eight
 remain exactly the filesystem-specific capabilities; the new primitives are

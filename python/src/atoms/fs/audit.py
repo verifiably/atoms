@@ -135,6 +135,11 @@ class AuditedBackend:
         self.unregister(fd)
         self._inner.close_fd(fd)
 
+    def detach_fd(self, fd: int) -> None:
+        self.provenance_of(fd)
+        self._inner.detach_fd(fd)
+        self.unregister(fd)
+
     def set_declared_paths(self, paths: frozenset[str]) -> None:
         if type(paths) is not frozenset:
             raise ProtocolError("declared paths must be an exact frozenset")
@@ -206,6 +211,25 @@ class AuditedBackend:
         self._append("create_or_open", target)
         return fd
 
+    def open_existing(
+        self,
+        parent_fd: int,
+        name: str,
+        *,
+        read_write: bool = False,
+        nofollow: bool = False,
+    ) -> int:
+        provenance = self.provenance_of(parent_fd)
+        path = _join(provenance, name)
+        fd = self._inner.open_existing(
+            parent_fd,
+            name,
+            read_write=read_write,
+            nofollow=nofollow,
+        )
+        self.register(fd, Provenance(provenance.root, path))
+        return fd
+
     def set_marker_xattr(self, fd: int, name: str, value: bytes) -> None:
         target = self._classify_provenance(self.provenance_of(fd))
         self._audited(
@@ -214,12 +238,24 @@ class AuditedBackend:
             lambda: self._inner.set_marker_xattr(fd, name, value),
         )
 
-    def repair_entry_mode(self, parent_fd: int, name: str, mode: int) -> None:
+    def repair_entry_mode(
+        self,
+        parent_fd: int,
+        name: str,
+        mode: int,
+        *,
+        before_change: Callable[[], None],
+    ) -> None:
         target = self._classify_child(self.provenance_of(parent_fd), name)
         self._audited(
             "repair_entry_mode",
             (target,),
-            lambda: self._inner.repair_entry_mode(parent_fd, name, mode),
+            lambda: self._inner.repair_entry_mode(
+                parent_fd,
+                name,
+                mode,
+                before_change=before_change,
+            ),
         )
 
     def open_root(self, path: str) -> int:

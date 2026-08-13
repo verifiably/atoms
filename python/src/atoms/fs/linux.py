@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import fcntl
 import os
+from collections.abc import Callable
 
 from atoms.fs.syscalls import linux as sys_linux
 
@@ -53,22 +54,46 @@ class LinuxBackend:
             dir_fd=parent_fd,
         )
 
+    def open_existing(
+        self,
+        parent_fd: int,
+        name: str,
+        *,
+        read_write: bool = False,
+        nofollow: bool = False,
+    ) -> int:
+        flags = (os.O_RDWR if read_write else os.O_RDONLY) | os.O_CLOEXEC
+        if nofollow:
+            flags |= os.O_NOFOLLOW
+        return os.open(name, flags, dir_fd=parent_fd)
+
     def set_marker_xattr(self, fd: int, name: str, value: bytes) -> None:
         os.setxattr(fd, name, value)
 
-    def repair_entry_mode(self, parent_fd: int, name: str, mode: int) -> None:
+    def repair_entry_mode(
+        self,
+        parent_fd: int,
+        name: str,
+        mode: int,
+        *,
+        before_change: Callable[[], None],
+    ) -> None:
         path_fd = os.open(
             name,
             os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC,
             dir_fd=parent_fd,
         )
         try:
+            before_change()
             os.chmod(f"/proc/self/fd/{path_fd}", mode)
         finally:
             os.close(path_fd)
 
     def close_fd(self, fd: int) -> None:
         os.close(fd)
+
+    def detach_fd(self, fd: int) -> None:
+        pass
 
     def open_root(self, path: str) -> int:
         # RESOLVE_NO_SYMLINKS over the complete path: O_NOFOLLOW would guard only

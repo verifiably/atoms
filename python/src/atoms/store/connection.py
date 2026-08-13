@@ -330,13 +330,18 @@ def repair_unpublished(binding: ProjectBinding) -> None:
     repair began rather than when it changed a mode -- §5.4's exact complaint about a
     single gate at the front of an operation, in miniature.
     """
-    gate(binding)
     backend = binding.backend
     backend.repair_entry_mode(
-        binding.metadata_root_fd, DATABASE_NAME, DATABASE_MODE
+        binding.metadata_root_fd,
+        DATABASE_NAME,
+        DATABASE_MODE,
+        before_change=lambda: gate(binding),
     )
-    fd = backend.create_or_open(
-        binding.metadata_root_fd, DATABASE_NAME, DATABASE_MODE
+    fd = backend.open_existing(
+        binding.metadata_root_fd,
+        DATABASE_NAME,
+        read_write=True,
+        nofollow=True,
     )
     try:
         publish_entry(binding, fd)

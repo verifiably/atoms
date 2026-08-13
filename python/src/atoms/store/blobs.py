@@ -158,6 +158,7 @@ def open_blob(store: Store, digest: str) -> int:
     try:
         verify_leaf(fd, digest, byte_len)
         store._require_live()
+        backend.detach_fd(fd)
     except BaseException:
         backend.close_fd(fd)
         raise

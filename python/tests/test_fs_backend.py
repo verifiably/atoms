@@ -370,6 +370,18 @@ def test_create_or_open_preserves_existing_file_contents(tmp_path, linux_backend
     assert path.read_bytes() == b"existing"
 
 
+def test_open_existing_refuses_a_missing_entry_without_creating_it(
+    tmp_path, linux_backend
+):
+    root_fd = linux_backend.open_root(str(tmp_path))
+    try:
+        with pytest.raises(FileNotFoundError):
+            linux_backend.open_existing(root_fd, "missing")
+    finally:
+        os.close(root_fd)
+    assert not (tmp_path / "missing").exists()
+
+
 def test_set_marker_xattr_sets_the_marker(tmp_path, linux_backend):
     path = tmp_path / "marked"
     path.touch()
@@ -392,7 +404,12 @@ def test_repair_entry_mode_restores_a_mode_zero_entry(tmp_path, linux_backend):
     try:
         with pytest.raises(PermissionError):
             os.open("database", os.O_RDWR | os.O_CLOEXEC, dir_fd=root_fd)
-        linux_backend.repair_entry_mode(root_fd, "database", 0o600)
+        linux_backend.repair_entry_mode(
+            root_fd,
+            "database",
+            0o600,
+            before_change=lambda: None,
+        )
         fd = os.open("database", os.O_RDWR | os.O_CLOEXEC, dir_fd=root_fd)
         os.close(fd)
     finally:

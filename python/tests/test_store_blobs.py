@@ -144,6 +144,41 @@ def test_the_returned_descriptor_is_the_callers_to_close(promoted_blob):
     os.close(fd)
 
 
+def test_audited_blob_handoff_detaches_provenance_before_fd_reuse(leased):
+    from atoms.fs.audit import AuditedBackend
+
+    with leased() as lease:
+        store = lease._store
+        content = b"audited handoff"
+        digest = digest_of(content)
+        with store.create_workspace("handoff") as workspace:
+            stage(workspace, "capture", content)
+            with store.transaction() as txn:
+                txn.promote_staging(
+                    workspace,
+                    (StagedBlob("capture", digest, len(content)),),
+                )
+                txn.insert_record("handoff", spec_referencing(content))
+
+        backend = lease._binding.backend
+        assert isinstance(backend, AuditedBackend)
+        before = open_descriptor_count()
+        fd = store.open_blob(digest)
+        with pytest.raises(ProtocolError, match="unregistered"):
+            backend.provenance_of(fd)
+        os.close(fd)
+
+        reused = store.open_blob(digest)
+        try:
+            assert reused == fd
+            with pytest.raises(ProtocolError, match="unregistered"):
+                backend.provenance_of(reused)
+            assert os.read(reused, len(content)) == content
+        finally:
+            os.close(reused)
+        assert open_descriptor_count() == before
+
+
 def test_an_indexed_digest_whose_leaf_is_missing_refuses_without_a_descriptor_leak(
     promoted_blob, store_binding
 ):

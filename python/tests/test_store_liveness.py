@@ -506,7 +506,7 @@ def test_the_gate_runs_during_the_ddl_loop_before_its_commit(store_on, monkeypat
 
 @pytest.mark.parametrize("release", RELEASES, ids=("closed_binding", "released_lock"))
 def test_the_gate_runs_before_the_repair_chmod(store_on, monkeypatch, release):
-    from atoms.store import connection as connection_module
+    from atoms.fs import linux as linux_module
     from atoms.store.connection import reopen_store
 
     with store_on() as binding, metadata_root_snapshot(binding) as root_fd:
@@ -519,7 +519,7 @@ def test_the_gate_runs_before_the_repair_chmod(store_on, monkeypatch, release):
                 dir_fd=root_fd,
             )
             os.close(fd)
-            _release_after(monkeypatch, connection_module, "gate", binding, 1, release)
+            _release_after(monkeypatch, linux_module.os, "open", binding, 1, release)
             with pytest.raises(ProtocolError) as caught:
                 reopen_store(binding)
             assert ("closed" if release is close_binding else "lock") in str(caught.value)

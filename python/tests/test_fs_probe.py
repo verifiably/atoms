@@ -35,6 +35,37 @@ def test_probe_leaves_no_survivors(held_lock, metadata_root):
         assert os.listdir(probe_fd) == []
 
 
+def test_probe_read_does_not_recreate_a_missing_operand(held_lock, metadata_root):
+    with held_lock(metadata_root) as lock, probe_directory(lock) as probe_fd:
+        with pytest.raises(FileNotFoundError):
+            fs_probe._read(lock.backend, probe_fd, "missing")
+        assert os.listdir(probe_fd) == []
+
+
+def test_lock_probe_does_not_recreate_a_missing_lock(held_lock, metadata_root):
+    with held_lock(metadata_root) as lock:
+        lock.backend.unlink_child(lock.metadata_root_fd, "lock")
+        with pytest.raises(FileNotFoundError):
+            fs_probe._probe_lock(lock.backend, lock)
+        assert "lock" not in os.listdir(lock.metadata_root_fd)
+
+
+def test_flush_probe_does_not_recreate_a_disappeared_payload(
+    held_lock, metadata_root, monkeypatch
+):
+    real_write = fs_probe._write
+
+    def write_then_remove(backend, parent_fd, name, payload):
+        real_write(backend, parent_fd, name, payload)
+        backend.unlink_child(parent_fd, name)
+
+    monkeypatch.setattr(fs_probe, "_write", write_then_remove)
+    with held_lock(metadata_root) as lock, probe_directory(lock) as probe_fd:
+        with pytest.raises(FileNotFoundError):
+            fs_probe._probe_flush(lock.backend, probe_fd)
+        assert os.listdir(probe_fd) == []
+
+
 def test_missing_exchange_is_reported_not_raised(held_lock, metadata_root, fake_backend):
     backend = fake_backend(supplied=set(Capability) - {Capability.ATOMIC_EXCHANGE})
     with held_lock(metadata_root) as lock, probe_directory(lock) as probe_fd:

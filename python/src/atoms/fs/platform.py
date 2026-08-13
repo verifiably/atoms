@@ -9,7 +9,7 @@ import sys
 from atoms.core.errors import CapabilityUnavailable
 from atoms.fs.backend import Backend
 
-BACKEND_REVISION = "linux-2"
+BACKEND_REVISION = "linux-3"
 """Atoms backend contract revision (design §6.2).
 
 Bump this deliberately when the backend's syscall selection, flag set, or durability ordering

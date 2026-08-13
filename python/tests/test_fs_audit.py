@@ -79,8 +79,10 @@ def test_descriptor_identity_requires_an_exact_integer(tmp_path):
     "invoke",
     [
         lambda backend: backend.open_child_directory(2**30, "child"),
+        lambda backend: backend.open_existing(2**30, "file"),
         lambda backend: backend.open_regular_nofollow(2**30, "file"),
         lambda backend: backend.symlink_fingerprint(2**30, "link"),
+        lambda backend: backend.detach_fd(2**30),
         lambda backend: backend.flush_file(2**30),
         lambda backend: backend.flush_directory(2**30),
         lambda backend: backend.lock_exclusive(2**30),
@@ -459,3 +461,29 @@ def test_close_unregisters_even_when_the_inner_close_raises(tmp_path, monkeypatc
             backend.provenance_of(fd)
     finally:
         real_close(fd)
+
+
+def test_detach_unregisters_without_closing_the_descriptor(tmp_path):
+    project, metadata = _roots(tmp_path)
+    backend = _facade(project, metadata)
+    fd = backend.open_root(str(project))
+
+    backend.detach_fd(fd)
+    try:
+        os.fstat(fd)
+        with pytest.raises(ProtocolError, match="unregistered"):
+            backend.provenance_of(fd)
+    finally:
+        os.close(fd)
+
+
+def test_failed_inner_detach_keeps_descriptor_ownership(tmp_path):
+    project, metadata = _roots(tmp_path)
+    recording = RecordingBackend(fail=frozenset({"detach_fd"}))
+    backend = _facade(project, metadata, cast(Backend, recording))
+    fd = backend.open_root(str(project))
+
+    with pytest.raises(OSError, match="injected"):
+        backend.detach_fd(fd)
+    assert backend.provenance_of(fd) == Provenance(RootKind.PROJECT, "")
+    backend.close_fd(fd)

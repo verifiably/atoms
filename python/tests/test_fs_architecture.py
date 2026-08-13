@@ -651,7 +651,7 @@ def test_the_backend_protocol_and_revision_are_exact():
     from atoms.fs.backend import Backend
     from atoms.fs.platform import BACKEND_REVISION
 
-    assert BACKEND_REVISION == "linux-2"
+    assert BACKEND_REVISION == "linux-3"
     assert {
         name
         for name, member in inspect.getmembers(Backend, inspect.isfunction)
@@ -660,6 +660,7 @@ def test_the_backend_protocol_and_revision_are_exact():
         "close_fd",
         "create_exclusive",
         "create_or_open",
+        "detach_fd",
         "exchange",
         "flush_directory",
         "flush_file",
@@ -667,6 +668,7 @@ def test_the_backend_protocol_and_revision_are_exact():
         "lock_exclusive",
         "mkdir_child",
         "open_child_directory",
+        "open_existing",
         "open_regular_nofollow",
         "open_root",
         "repair_entry_mode",

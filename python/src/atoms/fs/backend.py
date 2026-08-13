@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import errno
 import os
+from collections.abc import Callable
 from typing import Protocol
 
 # Errno values that conclusively mean "this volume does not support the operation".
@@ -81,11 +82,29 @@ class Backend(Protocol):
 
     def create_or_open(self, parent_fd: int, name: str, mode: int) -> int: ...
 
+    def open_existing(
+        self,
+        parent_fd: int,
+        name: str,
+        *,
+        read_write: bool = False,
+        nofollow: bool = False,
+    ) -> int: ...
+
     def set_marker_xattr(self, fd: int, name: str, value: bytes) -> None: ...
 
-    def repair_entry_mode(self, parent_fd: int, name: str, mode: int) -> None: ...
+    def repair_entry_mode(
+        self,
+        parent_fd: int,
+        name: str,
+        mode: int,
+        *,
+        before_change: Callable[[], None],
+    ) -> None: ...
 
     def close_fd(self, fd: int) -> None: ...
+
+    def detach_fd(self, fd: int) -> None: ...
 
     # anchored_traversal
     def open_root(self, path: str) -> int:

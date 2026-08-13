@@ -87,7 +87,7 @@ def _write(backend: Backend, parent_fd: int, name: str, payload: bytes) -> None:
 
 
 def _read(backend: Backend, parent_fd: int, name: str) -> bytes:
-    fd = backend.create_or_open(parent_fd, name, 0o600)
+    fd = backend.open_existing(parent_fd, name)
     try:
         return os.read(fd, 64)
     finally:
@@ -181,7 +181,9 @@ def _probe_traversal(backend: Backend, probe_fd: int) -> bool:
 def _probe_lock(backend: Backend, lock: HeldProjectLock) -> bool:
     # flock is per open file description, so a second open in this process
     # contends correctly against the already-held lock.
-    contender = backend.create_or_open(lock.metadata_root_fd, "lock", 0o600)
+    contender = backend.open_existing(
+        lock.metadata_root_fd, "lock", read_write=True
+    )
     try:
         acquired = None
 
@@ -254,7 +256,7 @@ def _probe_link(backend: Backend, probe_fd: int) -> bool:
 def _probe_flush(backend: Backend, probe_fd: int) -> bool:
     with _staged(backend, probe_fd):
         _write(backend, probe_fd, "payload", b"P")
-        fd = backend.create_or_open(probe_fd, "payload", 0o600)
+        fd = backend.open_existing(probe_fd, "payload")
         try:
 
             def attempt():

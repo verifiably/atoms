@@ -270,14 +270,32 @@ class RestrictedBackend:
     def create_or_open(self, parent_fd, name, mode):
         return self._real.create_or_open(parent_fd, name, mode)
 
+    def open_existing(
+        self, parent_fd, name, *, read_write=False, nofollow=False
+    ):
+        return self._real.open_existing(
+            parent_fd,
+            name,
+            read_write=read_write,
+            nofollow=nofollow,
+        )
+
     def set_marker_xattr(self, fd, name, value):
         return self._real.set_marker_xattr(fd, name, value)
 
-    def repair_entry_mode(self, parent_fd, name, mode):
-        return self._real.repair_entry_mode(parent_fd, name, mode)
+    def repair_entry_mode(self, parent_fd, name, mode, *, before_change):
+        return self._real.repair_entry_mode(
+            parent_fd,
+            name,
+            mode,
+            before_change=before_change,
+        )
 
     def close_fd(self, fd):
         return self._real.close_fd(fd)
+
+    def detach_fd(self, fd):
+        return self._real.detach_fd(fd)
 
     def _dispatch(self, capability, operation, *args, contract=None, name=None):
         # Method-level overrides preserve the named-refusal injection used by the
