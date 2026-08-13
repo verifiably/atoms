@@ -179,6 +179,24 @@ def test_core_never_imports_the_filesystem_layer():
         assert not _imports_filesystem_layer(tree, package=_core_package(source_path)), source_path
 
 
+def test_chain_never_imports_the_coordinator_or_store() -> None:
+    chain_root = SOURCE_ROOT / "chain"
+    modules = sorted(chain_root.rglob("*.py"))
+    assert modules, "expected to find modules under atoms/chain"
+    for source_path in modules:
+        imports = _resolved_imports(
+            ast.parse(source_path.read_text(encoding="utf-8")),
+            package=_core_package(source_path),
+        )
+        forbidden = {
+            name
+            for name in imports
+            if name in {"atoms.coordinator", "atoms.store"}
+            or name.startswith(("atoms.coordinator.", "atoms.store."))
+        }
+        assert not forbidden, f"{source_path} imports {sorted(forbidden)}"
+
+
 def test_select_backend_refuses_a_non_linux_platform(monkeypatch):
     monkeypatch.setattr(fs_platform.sys, "platform", "darwin")
     with pytest.raises(CapabilityUnavailable, match="platform"):

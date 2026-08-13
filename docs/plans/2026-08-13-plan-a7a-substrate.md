@@ -769,7 +769,7 @@ def apply_survivors(backend: AuditedBackend, chain_fd: int,
 def append_entry(backend: AuditedBackend, chain_fd: int, validated: ValidatedChain,
                  entry: Entry) -> str: ...
     # Requires validated.survivors == () (the value apply_survivors returned). Validates the
-    # entry's own grammar and that its `previous` equals validated.tip BEFORE any write. Then,
+    # entry's own grammar and derives its `previous` from validated.tip BEFORE any write. Then,
     # immediately before mutating, re-proves the directory against `validated` — the staging
     # leaf absent, the tip entry present with digest-matching bytes — because the lease excludes
     # cooperating engines, not external writers; any deviation is ChainStateInvalid. Then:
@@ -796,8 +796,9 @@ def bootstrap_chain(backend: AuditedBackend, project_root_fd: int) -> int: ...
   sequence converges after a cut at **each** barrier (inject by wrapping the facade to raise
   after N calls, then rerun the full sequence): exactly one durable entry, staging gone;
   `apply_survivors`' return has `survivors == ()` and `append_entry` refuses the stale
-  pre-application value (`ProtocolError`); `append_entry` refuses an entry whose `previous` is
-  not the validated tip before any write; an external change between validation and append — a
+  pre-application value (`ProtocolError`); a non-genesis entry on an empty chain refuses before
+  any write, and an emitted non-genesis envelope decodes with `previous == validated.tip`; an
+  external change between validation and append — a
   file added to the directory, tip bytes rewritten — is `ChainStateInvalid` from the
   pre-mutation re-proof; EEXIST destination byte-proof accepts our bytes and unlinks staging; a
   foreign digest-named file → `ChainStateInvalid`; `bootstrap_chain` idempotent, flushes the
