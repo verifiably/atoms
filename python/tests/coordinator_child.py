@@ -20,16 +20,28 @@ STORAGE = StorageProfile(profile_id="atoms-test-profile")
 
 
 def _lease_phase(backend, project_root: str, metadata_root: str) -> dict:
+    from atoms.coordinator.commands import _registered_root
+    from atoms.core.errors import PreconditionRefused
+
     try:
         with root._recovery_lease(
             backend, project_root, metadata_root, STORAGE
         ) as lease:
             active = lease._store.read_active()
+            try:
+                with _registered_root(lease) as (_, validated):
+                    chain = {
+                        "tip": validated.tip,
+                        "digests": [digest for digest, _ in validated.entries],
+                    }
+            except PreconditionRefused:
+                chain = None
             return {
                 "trapped": None,
                 "workspaces": list(lease._store.list_workspaces()),
                 "unindexed_blobs": list(lease._store.list_unindexed_blobs()),
                 "active": None if active is None else active.txid,
+                "chain": chain,
             }
     except NotImplementedError as caught:
         return {"trapped": str(caught)}

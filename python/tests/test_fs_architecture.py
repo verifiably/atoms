@@ -1165,6 +1165,59 @@ def test_no_unregistered_public_function_accepts_the_proof():
     assert found == registered
 
 
+def test_chain_commands_keep_the_lease_and_approval_proofs_private():
+    tree = ast.parse(
+        (SOURCE_ROOT / "coordinator" / "commands.py").read_text(encoding="utf-8")
+    )
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+    }
+    public = {
+        name: function
+        for name, function in functions.items()
+        if not name.startswith("_")
+    }
+    assert set(public) == {"register_root", "append_intent"}
+
+    for name, function in public.items():
+        assert any(
+            isinstance(node, ast.With)
+            and any(
+                isinstance(item.context_expr, ast.Call)
+                and _called_name(item.context_expr) == "_recovery_lease"
+                for item in node.items
+            )
+            for node in ast.walk(function)
+        ), f"{name} does not enter _recovery_lease"
+        annotations = [
+            argument.annotation
+            for argument in function.args.args
+            if argument.annotation is not None
+        ]
+        if function.returns is not None:
+            annotations.append(function.returns)
+        names = {
+            node.id
+            for annotation in annotations
+            for node in ast.walk(annotation)
+            if isinstance(node, ast.Name)
+        }
+        assert names.isdisjoint({"Lease", "ProjectApprovedSpec"}), name
+
+    lease_acceptors = {
+        name
+        for name, function in functions.items()
+        if any(
+            isinstance(argument.annotation, ast.Name)
+            and argument.annotation.id == "Lease"
+            for argument in function.args.args
+        )
+    }
+    assert lease_acceptors == {"_registered_root"}
+
+
 def test_ledger_entry_nine_stays_open_against_the_stages_that_owe_it():
     """#9's enforcement is A5-A8's, and AGENTS.md must keep naming the two halves.
 

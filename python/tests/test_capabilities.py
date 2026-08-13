@@ -17,10 +17,19 @@ F = FileState(content_hash="sha256:" + "3" * 64, mode=0o644, byte_len=2)
 C = Capability
 
 
-def test_always_required_trio():
+def test_always_required_capabilities_include_chain_publication():
     assert ALWAYS_REQUIRED == frozenset(
-        {C.ANCHORED_TRAVERSAL, C.DURABLE_PUBLISH, C.ADVISORY_PROJECT_LOCK}
+        {
+            C.ANCHORED_TRAVERSAL,
+            C.DURABLE_PUBLISH,
+            C.ADVISORY_PROJECT_LOCK,
+            C.NOCLOBBER_TRANSFER,
+        }
     )
+
+
+def test_effectless_specs_still_require_chain_publication():
+    assert required_capabilities(()) == ALWAYS_REQUIRED
 
 
 def test_replace_file_needs_exchange_and_nofollow_read():
@@ -53,10 +62,10 @@ def test_create_variants_need_noclobber_transfer():
     assert variant_capabilities(cd) == frozenset({C.NOCLOBBER_TRANSFER})
 
 
-def test_replace_only_spec_excludes_identity_anchor_and_noclobber():
+def test_replace_only_spec_excludes_identity_anchor_but_requires_chain_publication():
     caps = required_capabilities([ReplaceFile(effect_id="e", path="a", pre=F, post=F)])
     assert C.IDENTITY_ANCHOR not in caps
-    assert C.NOCLOBBER_TRANSFER not in caps
+    assert C.NOCLOBBER_TRANSFER in caps
     assert ALWAYS_REQUIRED <= caps
     assert {C.ATOMIC_EXCHANGE, C.NOFOLLOW_COHERENT_READ} <= caps
 

@@ -33,6 +33,7 @@ ALWAYS_REQUIRED: frozenset[Capability] = frozenset(
         Capability.ANCHORED_TRAVERSAL,
         Capability.DURABLE_PUBLISH,
         Capability.ADVISORY_PROJECT_LOCK,
+        Capability.NOCLOBBER_TRANSFER,
     }
 )
 

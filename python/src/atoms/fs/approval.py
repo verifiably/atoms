@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
+from atoms.core.capabilities import Capability
 from atoms.core.compiler import CompiledSpec
 from atoms.core.effects import CreateDirectory
 from atoms.core.errors import (
@@ -26,7 +27,7 @@ from atoms.core.recovery import (
     TopologyDirectory,
     WorkRoot,
 )
-from atoms.fs.binding import ProjectBinding
+from atoms.fs.binding import ProjectBinding, VolumeEvidence
 from atoms.fs.judgment import (
     bind_scratch,
     require_ancestors_legal,
@@ -205,6 +206,17 @@ def encode_approval_evidence(approved: ProjectApprovedSpec) -> str:
     )
 
 
+def _require_capabilities(
+    required: frozenset[Capability], evidence: VolumeEvidence
+) -> None:
+    missing = required - evidence.supplied_capabilities
+    if missing:
+        raise CapabilityUnavailable(
+            "the bound volume does not supply required capabilities: "
+            + ", ".join(sorted(item.value for item in missing))
+        )
+
+
 def approve_for_project(
     compiled: CompiledSpec, context: ProjectContext
 ) -> ProjectApprovedSpec:
@@ -227,12 +239,7 @@ def approve_for_project(
         ) from caught
 
     evidence = binding.evidence
-    missing = compiled.spec.required_capabilities() - evidence.supplied_capabilities
-    if missing:
-        raise CapabilityUnavailable(
-            "the bound volume does not supply required capabilities: "
-            + ", ".join(sorted(item.value for item in missing))
-        )
+    _require_capabilities(compiled.spec.required_capabilities(), evidence)
 
     resolver = PathResolver(binding)
     filesystem_type = evidence.configuration.filesystem_type

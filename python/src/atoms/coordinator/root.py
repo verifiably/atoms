@@ -6,13 +6,21 @@ import contextlib
 from collections.abc import Iterator
 
 from atoms.coordinator.lease import Lease, _reclaim_orphans, _resolve
+from atoms.core.capabilities import Capability
+from atoms.fs.approval import _require_capabilities
 from atoms.fs.audit import AuditedBackend
 from atoms.fs.backend import Backend
-from atoms.fs.binding import bind_project_volume
+from atoms.fs.binding import VolumeEvidence, bind_project_volume
 from atoms.fs.bootstrap import reclaim_probe_survivors
 from atoms.fs.lock import acquire_project_lock
 from atoms.fs.volume import CERTIFIED_ALLOWLIST, StorageProfile
 from atoms.store.connection import open_store
+
+
+def _require_chain_publication(evidence: VolumeEvidence) -> None:
+    _require_capabilities(
+        frozenset({Capability.NOCLOBBER_TRANSFER}), evidence
+    )
 
 
 @contextlib.contextmanager
