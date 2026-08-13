@@ -259,6 +259,20 @@ def test_equivalent_project_and_metadata_root_aliases_refuse(tmp_path, monkeypat
         )
 
 
+@pytest.mark.parametrize("dotdot_root", ["project", "metadata"])
+def test_configured_roots_refuse_parent_components(tmp_path, dotdot_root):
+    project = str(tmp_path / "project")
+    metadata = str(tmp_path / "metadata")
+    alias = f"{project}/child/.."
+
+    with pytest.raises(ProtocolError, match="parent component"):
+        AuditedBackend(
+            LinuxBackend(),
+            project_root=alias if dotdot_root == "project" else project,
+            metadata_root=alias if dotdot_root == "metadata" else metadata,
+        )
+
+
 def test_metadata_parent_can_create_and_reopen_only_the_metadata_root(tmp_path):
     project, metadata = _roots(tmp_path, create_metadata=False)
     backend = _facade(project, metadata)
@@ -356,6 +370,11 @@ def test_rebind_refuses_project_to_metadata_authority_laundering(tmp_path):
 @pytest.mark.parametrize(
     ("current", "target", "declared"),
     [
+        (
+            Provenance(RootKind.METADATA, "work"),
+            Provenance(RootKind.PROJECT, "live"),
+            frozenset({"live"}),
+        ),
         (
             Provenance(RootKind.METADATA, "staging/tx"),
             Provenance(RootKind.PROJECT, "live"),

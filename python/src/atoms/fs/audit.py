@@ -71,6 +71,11 @@ class AuditedBackend:
             raise ProtocolError("metadata_root must be a non-empty string")
         project_spelling = _guarded_spelling(project_root)
         metadata_spelling = _guarded_spelling(metadata_root)
+        if any(
+            ".." in spelling.split(os.sep)
+            for spelling in (project_spelling, metadata_spelling)
+        ):
+            raise ProtocolError("configured roots must not contain a parent component")
         if project_spelling == metadata_spelling:
             raise ProtocolError("project_root and metadata_root must be distinct")
         metadata_parent, metadata_leaf = os.path.split(metadata_spelling)
@@ -106,7 +111,7 @@ class AuditedBackend:
         self._require_provenance(provenance)
         if not (
             current.root is RootKind.METADATA
-            and (current.path == "work" or current.path.startswith("work/"))
+            and current.path.startswith("work/")
             and provenance.root is RootKind.PROJECT
             and provenance.path in self._declared_paths
         ):
