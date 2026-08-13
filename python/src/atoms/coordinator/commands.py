@@ -16,7 +16,7 @@ from atoms.chain.read import ValidatedChain
 from atoms.chain.read import validate_chain as _validate_chain
 from atoms.coordinator.lease import Lease
 from atoms.coordinator.root import _recovery_lease, _require_chain_publication
-from atoms.core.errors import PreconditionRefused, SpecValidationError
+from atoms.core.errors import PreconditionRefused, ProtocolError, SpecValidationError
 from atoms.core.fingerprint import ABSENT, PathState
 from atoms.core.paths import require_rel_path
 from atoms.core.recovery.model import (
@@ -142,6 +142,8 @@ def register_root(
     genesis_payload: bytes,
     registered_surface: tuple[str, ...],
 ) -> str:
+    if type(genesis_payload) is not bytes:
+        raise ProtocolError("genesis_payload must be exact bytes")
     registered_surface = _validate_registered_surface(registered_surface)
     with _recovery_lease(backend, project_root, metadata_root, storage) as lease:
         chain_backend = _cast(AuditedBackend, lease._binding.backend)

@@ -25,6 +25,10 @@ from atoms.core.scratch import CHAIN_LEAF
 ROOT = Path(__file__).resolve().parents[1]
 
 
+class _BytesSubclass(bytes):
+    pass
+
+
 def _enable_commands(ingredients, monkeypatch) -> None:
     from atoms.coordinator import root
     from atoms.fs.lock import acquire_project_lock
@@ -189,6 +193,49 @@ def test_register_root_exact_retry_returns_the_genesis_without_recapturing(
 
     assert retried == first
     assert set(_durable_entries(project_root)) == {first}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [bytearray(b"opaque genesis"), _BytesSubclass(b"opaque genesis")],
+    ids=["bytearray", "bytes-subclass"],
+)
+def test_register_root_rejects_a_non_exact_payload_before_traversal(
+    coordinator_on, monkeypatch, payload
+):
+    ingredients = coordinator_on()
+    _enable_commands(ingredients, monkeypatch)
+    backend, project_root, _, _ = ingredients
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("root traversal ran before payload validation")
+
+    monkeypatch.setattr(type(backend), "open_root", forbidden)
+
+    with pytest.raises(ProtocolError, match="exact bytes"):
+        _register(ingredients, payload, ())
+
+    assert not (Path(project_root) / CHAIN_LEAF).exists()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [bytearray(b"opaque genesis"), _BytesSubclass(b"opaque genesis")],
+    ids=["bytearray", "bytes-subclass"],
+)
+def test_register_root_rejects_a_non_exact_retry_without_changing_the_chain(
+    coordinator_on, monkeypatch, payload
+):
+    ingredients = coordinator_on()
+    _enable_commands(ingredients, monkeypatch)
+    _, project_root, _, _ = ingredients
+    _register(ingredients, b"opaque genesis", ())
+    before = _durable_entries(project_root)
+
+    with pytest.raises(ProtocolError, match="exact bytes"):
+        _register(ingredients, payload, ())
+
+    assert _durable_entries(project_root) == before
 
 
 @pytest.mark.parametrize(

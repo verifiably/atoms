@@ -32,6 +32,7 @@ from atoms.core.recovery.model import (
     ObservedSymlink,
 )
 from atoms.fs.backend import Backend
+from atoms.fs.lock import close_all
 
 _READ_CHUNK = 1 << 20
 
@@ -164,10 +165,11 @@ class Observation:
         if self._closed:
             return
         self._closed = True
-        for fd in self._pins.values():
-            self._backend.close_fd(fd)
-        self._pins.clear()
-        self._tokens.clear()
+        try:
+            close_all(self._backend, self._pins.values())
+        finally:
+            self._pins.clear()
+            self._tokens.clear()
 
     def __enter__(self) -> Self:
         return self

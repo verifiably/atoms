@@ -244,6 +244,59 @@ def test_closing_the_pass_releases_every_pinned_descriptor(project):
         observation.pinned_descriptor(entry.identity)
 
 
+def test_close_attempts_every_pin_and_preserves_the_first_failure(
+    project, monkeypatch
+):
+    from atoms.fs.audit import AuditedBackend, Provenance, RootKind
+
+    root, root_fd = project
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (root / name).write_bytes(name.encode())
+    raw = LinuxBackend()
+    backend = AuditedBackend(
+        raw,
+        project_root=str(root),
+        metadata_root=str(root.parent / "unused-observation-metadata"),
+    )
+    backend.register(root_fd, Provenance(RootKind.PROJECT, ""))
+    observation = Observation(backend)
+    entries = tuple(
+        observation.observe(root_fd, name)
+        for name in ("a.txt", "b.txt", "c.txt")
+    )
+    pins = []
+    for entry in entries:
+        assert type(entry) is ObservedFile
+        pins.append(observation.pinned_descriptor(entry.identity))
+    attempted = []
+    real_close = raw.close_fd
+    failures = {pins[1]: errno.EIO, pins[2]: errno.ENOSPC}
+
+    def failing_close(fd):
+        attempted.append(fd)
+        real_close(fd)
+        if fd in failures:
+            raise OSError(failures[fd], "injected pin close failure")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(raw, "close_fd", failing_close)
+        with pytest.raises(OSError) as caught:
+            observation.close()
+    try:
+        assert caught.value.errno == errno.EIO
+        assert attempted == pins
+        for pin in pins:
+            with pytest.raises(ProtocolError, match="unregistered"):
+                backend.provenance_of(pin)
+    finally:
+        for pin in pins:
+            try:
+                backend.provenance_of(pin)
+            except ProtocolError:
+                continue
+            backend.close_fd(pin)
+
+
 def _relation(root, staged: bytes, planned: bytes) -> FileBuildRelation:
     (root / "staged").write_bytes(staged)
     (root / "planned").write_bytes(planned)
