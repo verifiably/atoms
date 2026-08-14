@@ -38,6 +38,7 @@ from atoms.core.recovery.model import (
     is_unrecognized_st_mode,
 )
 from atoms.core.spec import TransactionSpec
+from atoms.fs.approval import decode_approval_evidence
 from atoms.store.errors import MetadataStoreInvalid, translated
 from atoms.store.schema import variant_of
 
@@ -617,6 +618,12 @@ def load_record(connection: Any, txid: str) -> StoredRecord | None:
         effect_id: (variant, journal)
         for effect_id, variant, journal in effect_rows
     }
+    try:
+        decode_approval_evidence(approval_evidence)
+    except ProtocolError as caught:
+        raise MetadataStoreInvalid(
+            f"the record for txid {txid!r} has malformed approval evidence: {caught}"
+        ) from caught
     try:
         assembly_halt = (
             None

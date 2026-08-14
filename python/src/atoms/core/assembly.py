@@ -21,6 +21,8 @@ class AssemblyOperatorAction(enum.Enum):
 class AssemblyFindingKind(enum.Enum):
     NODE_MISSING = "node-missing"
     WRONG_ENTRY_KIND = "wrong-entry-kind"
+    MOUNT_BOUNDARY = "mount-boundary"
+    ACCESS_DENIED = "access-denied"
     IDENTITY_CHANGED = "identity-changed"
     CONSTRAINTS_CHANGED = "constraints-changed"
     MOUNT_CHANGED = "mount-changed"
@@ -30,6 +32,8 @@ class AssemblyFindingKind(enum.Enum):
 _FACT_KEYS: dict[AssemblyFindingKind, tuple[str, ...]] = {
     AssemblyFindingKind.NODE_MISSING: (),
     AssemblyFindingKind.WRONG_ENTRY_KIND: ("observed_kind",),
+    AssemblyFindingKind.MOUNT_BOUNDARY: (),
+    AssemblyFindingKind.ACCESS_DENIED: (),
     AssemblyFindingKind.IDENTITY_CHANGED: ("st_dev", "st_ino"),
     AssemblyFindingKind.CONSTRAINTS_CHANGED: ("lookup_proof", "name_max"),
     AssemblyFindingKind.MOUNT_CHANGED: ("mount_id",),
@@ -138,8 +142,12 @@ class AssemblyHalt:
             if left.path == right.path and left.kind in {
                 AssemblyFindingKind.NODE_MISSING,
                 AssemblyFindingKind.WRONG_ENTRY_KIND,
+                AssemblyFindingKind.MOUNT_BOUNDARY,
+                AssemblyFindingKind.ACCESS_DENIED,
             }:
-                raise ProtocolError("a missing or wrong-kind node must be its path's sole finding")
+                raise ProtocolError(
+                    "a fact-free or wrong-kind node must be its path's sole finding"
+                )
 
 
 def _finding_obj(finding: AssemblyFinding) -> dict[str, object]:

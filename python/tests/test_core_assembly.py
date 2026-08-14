@@ -23,6 +23,8 @@ def _finding(kind: AssemblyFindingKind, path: str) -> AssemblyFinding:
     facts = {
         AssemblyFindingKind.NODE_MISSING: (),
         AssemblyFindingKind.WRONG_ENTRY_KIND: (("observed_kind", "other"),),
+        AssemblyFindingKind.MOUNT_BOUNDARY: (),
+        AssemblyFindingKind.ACCESS_DENIED: (),
         AssemblyFindingKind.IDENTITY_CHANGED: (("st_dev", "1"), ("st_ino", "2")),
         AssemblyFindingKind.CONSTRAINTS_CHANGED: (
             ("lookup_proof", LookupProof.EXACT_BYTES.value),
@@ -53,10 +55,12 @@ def test_round_trips_every_closed_finding_kind_in_canonical_wire_shape() -> None
         '{"expected":"{\\"approved\\":true}","findings":['
         '{"kind":"node-missing","observed":[],"path":"node-0"},'
         '{"kind":"wrong-entry-kind","observed":[["observed_kind","other"]],"path":"node-1"},'
-        '{"kind":"identity-changed","observed":[["st_dev","1"],["st_ino","2"]],"path":"node-2"},'
-        '{"kind":"constraints-changed","observed":[["lookup_proof","exact_bytes"],["name_max","255"]],"path":"node-3"},'
-        '{"kind":"mount-changed","observed":[["mount_id","3"]],"path":"node-4"},'
-        '{"kind":"work-root-changed","observed":[["work_base","present"]],"path":"node-5"}'
+        '{"kind":"mount-boundary","observed":[],"path":"node-2"},'
+        '{"kind":"access-denied","observed":[],"path":"node-3"},'
+        '{"kind":"identity-changed","observed":[["st_dev","1"],["st_ino","2"]],"path":"node-4"},'
+        '{"kind":"constraints-changed","observed":[["lookup_proof","exact_bytes"],["name_max","255"]],"path":"node-5"},'
+        '{"kind":"mount-changed","observed":[["mount_id","3"]],"path":"node-6"},'
+        '{"kind":"work-root-changed","observed":[["work_base","present"]],"path":"node-7"}'
         '],"operator_action":"restore-approved-topology",'
         '"reason":"approval-evidence-mismatch","txid":"tx-1"}'
     )
@@ -129,6 +133,13 @@ def test_decode_refuses_duplicate_json_keys() -> None:
                 _finding(AssemblyFindingKind.MOUNT_CHANGED, "a"),
             ),
             "a wrong-kind node sharing its path",
+        ),
+        (
+            (
+                _finding(AssemblyFindingKind.ACCESS_DENIED, "a"),
+                _finding(AssemblyFindingKind.IDENTITY_CHANGED, "a"),
+            ),
+            "an access-denied node sharing its path",
         ),
         ((), "empty findings"),
     ],

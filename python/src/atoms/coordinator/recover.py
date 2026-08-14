@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import os
+import stat
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import cast
+from typing import Any, cast
 
 from atoms.chain.append import append_entry, apply_survivors
 from atoms.chain.errors import ChainStateInvalid
@@ -21,7 +23,13 @@ from atoms.chain.model import (
 )
 from atoms.chain.read import ValidatedChain, validate_chain
 from atoms.coordinator.admission import _require_admitted
-from atoms.coordinator.descriptors import DescriptorTable
+from atoms.coordinator.descriptors import (
+    DescriptorTable,
+    _build_descriptor_table,
+    _directory_paths,
+    _modeled_children,
+    _resume_descent,
+)
 from atoms.coordinator.effects.common import EffectMismatch
 from atoms.coordinator.effects.settle import (
     _observe_joint,
@@ -33,9 +41,34 @@ from atoms.coordinator.transitions import (
     persist_detach,
     persist_plan_prefix,
 )
-from atoms.core.errors import PreconditionRefused, ProtocolError
+from atoms.core.assembly import (
+    AssemblyFinding,
+    AssemblyFindingKind,
+    AssemblyHalt,
+    AssemblyHaltReason,
+    AssemblyOperatorAction,
+)
+from atoms.core.compiler import compile_spec
+from atoms.core.effects import CreateFileNoClobber, ReplaceFile
+from atoms.core.errors import (
+    PreconditionRefused,
+    ProjectApprovalRefused,
+    ProtocolError,
+    TransactionHalted,
+)
+from atoms.core.recovery import build_recovery_snapshot, classify_recovery
 from atoms.core.recovery.authorization import _mutation_denied, authorize_recovery_step
-from atoms.core.recovery.model import JournalState, TransactionState
+from atoms.core.recovery.model import (
+    OBSERVED_ABSENT,
+    FileBuildRelation,
+    JournalState,
+    ObservedDirectory,
+    ObservedEntry,
+    ObservedFile,
+    PersistentObservation,
+    ScratchObservation,
+    TransactionState,
+)
 from atoms.core.recovery.plan import (
     AuthorizedStep,
     DetachActive,
@@ -45,11 +78,27 @@ from atoms.core.recovery.plan import (
     RemoveScratch,
     TransformEffectTuple,
 )
+from atoms.core.recovery.snapshot import PersistentNode
 from atoms.core.scratch import CHAIN_LEAF
 from atoms.core.spec import TransactionSpec
-from atoms.fs.approval import ProjectApprovedSpec
-from atoms.fs.audit import AuditedBackend
+from atoms.fs.approval import (
+    ProjectApprovedSpec,
+    ProjectContext,
+    _approve_for_recovery,
+    decode_approval_evidence,
+)
+from atoms.fs.audit import AuditedBackend, Provenance, RootKind
+from atoms.fs.binding import ProjectBinding
+from atoms.fs.bootstrap import WORK_DIRECTORY
+from atoms.fs.lookup import read_lookup_constraints
+from atoms.fs.observe import Observation
+from atoms.fs.resolve import filesystem_type_of
+from atoms.fs.volume import read_mount_id
 from atoms.store import Store, StoredRecord
+from atoms.store.blobs import BLOBS_PARENT, digest_to_leaf
+from atoms.store.errors import MetadataStoreInvalid
+from atoms.store.records import require_assembly_halt_binding
+from atoms.store.workspace import reopen_work_slot, require_staging_discharged
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,6 +293,424 @@ def _perform_reconciliation(
     return fresh
 
 
+def _factless(path: str, kind: AssemblyFindingKind) -> AssemblyFinding:
+    return AssemblyFinding(path, kind, ())
+
+
+def _wrong_kind(parent_fd: int, component: str, path: str) -> AssemblyFinding:
+    info = os.stat(component, dir_fd=parent_fd, follow_symlinks=False)
+    if stat.S_ISREG(info.st_mode):
+        kind = "file"
+    elif stat.S_ISLNK(info.st_mode):
+        kind = "symlink"
+    else:
+        kind = "other"
+    return AssemblyFinding(
+        path, AssemblyFindingKind.WRONG_ENTRY_KIND, (("observed_kind", kind),)
+    )
+
+
+def _directory_changes(
+    binding: ProjectBinding,
+    fd: int,
+    path: str,
+    expected: dict[str, Any],
+) -> list[AssemblyFinding]:
+    findings: list[AssemblyFinding] = []
+    identity = expected["identity"]
+    if identity is not None:
+        info = os.fstat(fd)
+        if (info.st_dev, info.st_ino) != (identity["st_dev"], identity["st_ino"]):
+            findings.append(
+                AssemblyFinding(
+                    path,
+                    AssemblyFindingKind.IDENTITY_CHANGED,
+                    (("st_dev", str(info.st_dev)), ("st_ino", str(info.st_ino))),
+                )
+            )
+    constraints = read_lookup_constraints(fd, filesystem_type_of(binding))
+    if (
+        constraints.lookup_proof.value != expected["lookup_proof"]
+        or constraints.name_max != expected["name_max"]
+    ):
+        findings.append(
+            AssemblyFinding(
+                path,
+                AssemblyFindingKind.CONSTRAINTS_CHANGED,
+                (
+                    ("lookup_proof", constraints.lookup_proof.value),
+                    ("name_max", str(constraints.name_max)),
+                ),
+            )
+        )
+    return findings
+
+
+def _work_base_findings(
+    binding: ProjectBinding, expected: dict[str, Any] | None
+) -> tuple[list[AssemblyFinding], int | None]:
+    if expected is None:
+        return [], None
+    backend = cast(AuditedBackend, binding.backend)
+    path = ".#~work_base"
+    try:
+        fd = backend.open_child_directory(binding.metadata_root_fd, WORK_DIRECTORY)
+    except OSError as caught:
+        if caught.errno == errno.EXDEV:
+            return [_factless(path, AssemblyFindingKind.MOUNT_BOUNDARY)], None
+        if caught.errno in {errno.EACCES, errno.EPERM}:
+            return [_factless(path, AssemblyFindingKind.ACCESS_DENIED)], None
+        if caught.errno == errno.ENOENT:
+            return [
+                AssemblyFinding(
+                    path,
+                    AssemblyFindingKind.WORK_ROOT_CHANGED,
+                    (("work_base", "absent"),),
+                )
+            ], None
+        if caught.errno in {errno.ENOTDIR, errno.ELOOP}:
+            return [
+                AssemblyFinding(
+                    path,
+                    AssemblyFindingKind.WORK_ROOT_CHANGED,
+                    (("work_base", "present"),),
+                )
+            ], None
+        raise
+    info = os.fstat(fd)
+    constraints = read_lookup_constraints(fd, filesystem_type_of(binding))
+    identity = expected["identity"]
+    changed = (
+        (info.st_dev, info.st_ino) != (identity["st_dev"], identity["st_ino"])
+        or constraints.lookup_proof.value != expected["lookup_proof"]
+        or constraints.name_max != expected["name_max"]
+    )
+    findings = (
+        [
+            AssemblyFinding(
+                path,
+                AssemblyFindingKind.WORK_ROOT_CHANGED,
+                (("work_base", "present"),),
+            )
+        ]
+        if changed
+        else []
+    )
+    return findings, fd
+
+
+def _diff_approved_topology(
+    binding: ProjectBinding, expected: dict[str, Any], txid: str
+) -> tuple[AssemblyFinding, ...]:
+    """Compare the current rooted directory facts with the closed durable document."""
+
+    backend = cast(AuditedBackend, binding.backend)
+    findings: list[AssemblyFinding] = []
+    work_findings, work_base_fd = _work_base_findings(
+        binding, cast(dict[str, Any] | None, expected["work_root"])
+    )
+    findings.extend(work_findings)
+    owned: list[int] = []
+    project_fds: dict[str, int] = {"": binding.project_root_fd}
+    blocked: set[str] = set()
+    try:
+        directories = cast(list[dict[str, Any]], expected["directories"])
+        for item in sorted(
+            directories,
+            key=lambda row: (
+                -1 if row["path"] is None else cast(str, row["path"]).count("/"),
+                "" if row["path"] is None else cast(str, row["path"]),
+            ),
+        ):
+            path = item["path"]
+            if path is None:
+                pseudo = ".#~work_root"
+                if work_base_fd is None:
+                    continue
+                parent_fd, component = work_base_fd, txid
+                planned = False
+            else:
+                path = cast(str, path)
+                if path == "":
+                    fd = binding.project_root_fd
+                    findings.extend(_directory_changes(binding, fd, path, item))
+                    observed_mount = read_mount_id(fd)
+                    if observed_mount != expected["mount_id"]:
+                        findings.append(
+                            AssemblyFinding(
+                                path,
+                                AssemblyFindingKind.MOUNT_CHANGED,
+                                (("mount_id", str(observed_mount)),),
+                            )
+                        )
+                    continue
+                if any(path == prefix or path.startswith(f"{prefix}/") for prefix in blocked):
+                    continue
+                parent_path, _, component = path.rpartition("/")
+                parent_fd = project_fds[parent_path]
+                pseudo = path
+                planned = item["identity"] is None
+            try:
+                fd = backend.open_child_directory(parent_fd, component)
+            except OSError as caught:
+                if caught.errno == errno.EXDEV:
+                    findings.append(
+                        _factless(pseudo, AssemblyFindingKind.MOUNT_BOUNDARY)
+                    )
+                elif caught.errno in {errno.EACCES, errno.EPERM}:
+                    findings.append(
+                        _factless(pseudo, AssemblyFindingKind.ACCESS_DENIED)
+                    )
+                elif not planned and caught.errno == errno.ENOENT:
+                    findings.append(
+                        _factless(pseudo, AssemblyFindingKind.NODE_MISSING)
+                    )
+                elif not planned and caught.errno in {errno.ENOTDIR, errno.ELOOP}:
+                    findings.append(_wrong_kind(parent_fd, component, pseudo))
+                if path is not None:
+                    blocked.add(cast(str, path))
+                if caught.errno not in {
+                    errno.ENOENT,
+                    errno.ENOTDIR,
+                    errno.ELOOP,
+                    errno.EXDEV,
+                    errno.EACCES,
+                    errno.EPERM,
+                }:
+                    raise
+                continue
+            owned.append(fd)
+            if path is not None:
+                project_fds[cast(str, path)] = fd
+            findings.extend(_directory_changes(binding, fd, pseudo, item))
+    finally:
+        for fd in reversed(owned):
+            backend.close_fd(fd)
+        if work_base_fd is not None:
+            backend.close_fd(work_base_fd)
+    order = {kind: index for index, kind in enumerate(AssemblyFindingKind)}
+    return tuple(sorted(findings, key=lambda item: (item.path, order[item.kind])))
+
+
+def _persist_assembly_halt(store: Store, halt: AssemblyHalt) -> None:
+    with store.transaction() as txn:
+        txn.set_assembly_halt(halt.txid, halt)
+
+
+def _halt_for_findings(
+    store: Store, record: StoredRecord, findings: tuple[AssemblyFinding, ...]
+) -> None:
+    halt = AssemblyHalt(
+        txid=record.txid,
+        reason=AssemblyHaltReason.APPROVAL_EVIDENCE_MISMATCH,
+        expected=record.approval_evidence,
+        findings=findings,
+        operator_action=AssemblyOperatorAction.RESTORE_APPROVED_TOPOLOGY,
+    )
+    _persist_assembly_halt(store, halt)
+    raise TransactionHalted(halt)
+
+
+def _observe_snapshot(
+    lease: Lease,
+    approved: ProjectApprovedSpec,
+    table: DescriptorTable,
+    observation: Observation,
+    record: StoredRecord,
+):
+    paths = _directory_paths(approved)
+    stops = {stop.node: stop.observed for stop in table.stops}
+    persistent: list[PersistentObservation] = []
+    for row in approved.paths:
+        node = PersistentNode(row.path)
+        if node in stops:
+            entry = stops[node]
+        elif table.is_unreachable(row.parent_node):
+            entry = OBSERVED_ABSENT
+        else:
+            entry = observation.observe(
+                table.fd_for(row.parent_node),
+                row.leaf,
+                modeled=_modeled_children(paths, node),
+            )
+        persistent.append(PersistentObservation(row.path, entry))
+
+    live = {item.path: item.entry for item in persistent}
+    journals = {item.effect_id: item.state for item in record.journals}
+    effects = {effect.effect_id: effect for effect in approved.compiled.spec.effects}
+    scratch: list[ScratchObservation] = []
+    backend = cast(AuditedBackend, lease._binding.backend)
+    for row in approved.scratch:
+        if table.is_unreachable(row.parent_node):
+            entry: ObservedEntry = OBSERVED_ABSENT
+        else:
+            entry = observation.observe(
+                table.fd_for(row.parent_node), row.leaf, modeled=frozenset()
+            )
+        relation: FileBuildRelation | None = None
+        effect = effects[row.effect_id]
+        relation_required = (
+            journals[row.effect_id] is JournalState.STARTED
+            and type(entry) is ObservedFile
+            and (
+                type(effect) is CreateFileNoClobber
+                or type(effect) is ReplaceFile
+                and type(live[effect.path]) is ObservedFile
+                and cast(ObservedFile, live[effect.path]).state == effect.pre
+            )
+        )
+        if relation_required:
+            state = cast(CreateFileNoClobber | ReplaceFile, effect).post
+            blob_fd = lease._store.open_blob(state.content_hash)
+            backend.register(
+                blob_fd,
+                Provenance(
+                    RootKind.METADATA,
+                    f"{BLOBS_PARENT}/{digest_to_leaf(state.content_hash)}",
+                ),
+            )
+            try:
+                relation = observation.build_relation(
+                    observation.pinned_descriptor(cast(ObservedFile, entry).identity),
+                    blob_fd,
+                )
+            finally:
+                backend.close_fd(blob_fd)
+        scratch.append(ScratchObservation(row.effect_id, row.role, entry, relation))
+
+    return build_recovery_snapshot(
+        compiled=approved.compiled,
+        topology=approved.topology,
+        transaction_state=record.state,
+        commit_decision=record.committed,
+        rollback_result=record.rollback_result,
+        halt_diagnostic=record.halt_diagnostic,
+        active=True,
+        journals=record.journals,
+        persistent_observations=tuple(persistent),
+        scratch_observations=tuple(scratch),
+    )
+
+
+def resolve(binding: ProjectBinding, store: Store) -> None:
+    """Resolve one active transaction through the seven pinned recovery phases."""
+
+    backend = cast(AuditedBackend, binding.backend)
+    record = store.read_active()
+    try:
+        chain_fd = backend.open_child_directory(binding.project_root_fd, CHAIN_LEAF)
+    except OSError as caught:
+        if caught.errno == errno.ENOENT and record is None:
+            return
+        if caught.errno == errno.ENOENT:
+            raise ChainStateInvalid(
+                "a live transaction record exists without its project chain"
+            ) from caught
+        if caught.errno in {errno.ENOTDIR, errno.ELOOP, errno.EXDEV}:
+            raise ChainStateInvalid(
+                "the reserved chain leaf is not a stable directory"
+            ) from caught
+        raise
+    try:
+        validated = validate_chain(backend, chain_fd)
+        if record is not None and not validated.entries:
+            raise ChainStateInvalid(
+                "a live transaction record exists without a chain genesis"
+            )
+        actions = _derive_reconciliation(record, validated)
+        if record is not None and record.state is TransactionState.HALTED:
+            if record.halt_diagnostic is None:
+                raise ProtocolError("a HALTED record has no frozen diagnostic")
+            raise TransactionHalted(record.halt_diagnostic)
+        if record is not None and record.assembly_halt is not None:
+            require_assembly_halt_binding(
+                record.txid, record.approval_evidence, record.assembly_halt
+            )
+            raise TransactionHalted(record.assembly_halt)
+        _perform_reconciliation(
+            backend, store, chain_fd, validated, actions
+        )
+    finally:
+        backend.close_fd(chain_fd)
+
+    record = store.read_active()
+    if record is None:
+        return
+    compiled = compile_spec(record.spec)
+    expected = decode_approval_evidence(record.approval_evidence)
+    findings = _diff_approved_topology(binding, expected, record.txid)
+    if findings:
+        _halt_for_findings(store, record, findings)
+
+    def moved_world(caught: BaseException) -> None:
+        changed = _diff_approved_topology(binding, expected, record.txid)
+        if changed:
+            _halt_for_findings(store, record, changed)
+        raise ProtocolError(
+            "recovery approval disagrees with an unchanged topology diff"
+        ) from caught
+
+    try:
+        approved = _approve_for_recovery(
+            compiled,
+            ProjectContext(binding=binding, txid=record.txid),
+            evidence=expected,
+        )
+    except (ProjectApprovalRefused, PreconditionRefused) as caught:
+        moved_world(caught)
+        raise AssertionError("unreachable")
+
+    lease = Lease(_binding=binding, _store=store)
+    require_staging_discharged(store, record.txid)
+    try:
+        workspace = reopen_work_slot(store, record.txid)
+    except (MetadataStoreInvalid, OSError) as caught:
+        if isinstance(caught, OSError) and caught.errno not in {
+            errno.EACCES,
+            errno.EPERM,
+            errno.EXDEV,
+        }:
+            raise
+        changed = _diff_approved_topology(binding, expected, record.txid)
+        if any(
+            item.path in {".#~work_root", ".#~work_base"} for item in changed
+        ):
+            _halt_for_findings(store, record, changed)
+        raise
+
+    with workspace, Observation(backend) as observation:
+        try:
+            table = _build_descriptor_table(
+                lease, approved, workspace, observation
+            )
+        except (ProjectApprovalRefused, PreconditionRefused) as caught:
+            moved_world(caught)
+            raise AssertionError("unreachable")
+        with table:
+            try:
+                for stop in tuple(table.stops):
+                    if type(stop.observed) is ObservedDirectory:
+                        _resume_descent(
+                            table, backend, observation, approved, stop.node
+                        )
+            except PreconditionRefused as caught:
+                moved_world(caught)
+                raise AssertionError("unreachable")
+            snapshot = _observe_snapshot(
+                lease, approved, table, observation, record
+            )
+            plan = classify_recovery(snapshot)
+            backend.set_declared_paths(
+                frozenset(path.path for path in approved.paths)
+            )
+            try:
+                result = run_plan(lease, approved, table, plan)
+            finally:
+                backend.clear_declared_paths()
+    if type(result) is HaltPlan:
+        raise TransactionHalted(result.diagnostic)
+
+
 @contextlib.contextmanager
 def _registered_root(lease: Lease) -> Iterator[tuple[int, ValidatedChain]]:
     backend = cast(AuditedBackend, lease._binding.backend)
@@ -266,6 +733,8 @@ def _registered_root(lease: Lease) -> Iterator[tuple[int, ValidatedChain]]:
 
     try:
         validated = validate_chain(backend, chain_fd)
+        if validated.survivors:
+            raise ChainStateInvalid("chain staging appeared after lease resolution")
         if not validated.entries:
             if lease._store.read_active() is not None:
                 raise ChainStateInvalid(

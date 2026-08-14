@@ -939,6 +939,7 @@ def test_the_approved_proof_retains_only_the_authorized_schema():
                 "txid",
                 "topology",
                 "directories",
+                "directory_paths",
                 "paths",
                 "scratch",
                 "work_base",

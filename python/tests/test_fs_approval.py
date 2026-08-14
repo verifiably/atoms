@@ -225,6 +225,7 @@ def test_the_proof_refuses_ordinary_construction_and_replace(approval_context):
                 txid=proof.txid,
                 topology=proof.topology,
                 directories=proof.directories,
+                directory_paths=proof.directory_paths,
                 paths=proof.paths,
                 scratch=proof.scratch,
                 work_base=proof.work_base,

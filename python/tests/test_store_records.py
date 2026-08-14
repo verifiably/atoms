@@ -64,6 +64,39 @@ from tests.store_support import (
 )
 
 
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        APPROVAL_EVIDENCE + " ",
+        APPROVAL_EVIDENCE.replace(
+            '"mount_id":1', '"mount_id":1,"mount_id":1'
+        ),
+        APPROVAL_EVIDENCE.replace(',"path":""', ""),
+        APPROVAL_EVIDENCE.replace('"mount_id":1', '"mount_id":true'),
+    ],
+    ids=("noncanonical", "duplicate-key", "missing-path", "wrong-type"),
+)
+def test_hostile_approval_evidence_fails_as_invalid_metadata(
+    opened_store, store_binding, evidence
+) -> None:
+    with opened_store.transaction() as txn:
+        txn.insert_record(
+            "tx1", one_effect_spec(), approval_evidence=APPROVAL_EVIDENCE
+        )
+    raw = raw_connect(store_binding)
+    try:
+        raw.execute("DROP TRIGGER trg_evidence_write_once")
+        raw.execute(
+            "UPDATE transaction_record SET approval_evidence = ? WHERE txid = ?",
+            (evidence, "tx1"),
+        )
+    finally:
+        raw.close()
+
+    with pytest.raises(MetadataStoreInvalid, match="approval evidence"):
+        opened_store.read_record("tx1")
+
+
 @pytest.mark.parametrize("diagnostic", every_diagnostic_shape(), ids=lambda d: d.reason.value)
 def test_the_diagnostic_round_trips_exactly(diagnostic):
     assert decode_diagnostic(encode_diagnostic(diagnostic)) == diagnostic

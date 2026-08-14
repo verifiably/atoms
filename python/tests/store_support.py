@@ -28,7 +28,11 @@ from atoms.core.spec import build_spec
 
 DATABASE_ENTRIES = ("atoms.db", "atoms.db-wal", "atoms.db-shm", "atoms.db-journal")
 SHARED_DIGEST = "sha256:" + "a" * 64
-APPROVAL_EVIDENCE = '{"directories":[],"mount_id":1,"work_root":null}'
+APPROVAL_EVIDENCE = (
+    '{"directories":[{"identity":{"st_dev":1,"st_ino":1},'
+    '"lookup_proof":"exact_bytes","name_max":255,"node":"project_root",'
+    '"path":""}],"mount_id":1,"work_root":null}'
+)
 
 
 @contextmanager

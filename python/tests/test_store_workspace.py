@@ -23,6 +23,37 @@ def _child_bytes(parent_fd: int, name: str) -> bytes:
         os.close(fd)
 
 
+def test_prepared_reopen_seams_separate_staging_from_the_work_slot(
+    opened_store, store_binding
+) -> None:
+    from atoms.store.workspace import reopen_work_slot, require_staging_discharged
+
+    opened_store.create_workspace("tx1").close()
+    with pytest.raises(MetadataStoreInvalid, match="staging/tx1"):
+        require_staging_discharged(opened_store, "tx1")
+
+    with child_dir(store_binding.metadata_root_fd, "staging") as parent_fd:
+        os.rmdir("tx1", dir_fd=parent_fd)
+    require_staging_discharged(opened_store, "tx1")
+    with reopen_work_slot(opened_store, "tx1") as workspace:
+        os.fstat(workspace.work_fd)
+        with pytest.raises(ProtocolError, match="staging_fd is spent"):
+            _ = workspace.staging_fd
+
+
+def test_prepared_work_slot_absence_is_invalid_store_evidence(
+    opened_store, store_binding
+) -> None:
+    from atoms.store.workspace import reopen_work_slot
+
+    opened_store.create_workspace("tx1").close()
+    with child_dir(store_binding.metadata_root_fd, "work") as parent_fd:
+        os.rmdir("tx1", dir_fd=parent_fd)
+
+    with pytest.raises(MetadataStoreInvalid, match="work/tx1 is missing"):
+        reopen_work_slot(opened_store, "tx1")
+
+
 def test_creation_makes_both_directories(opened_store, store_binding):
     with opened_store.create_workspace("tx1") as workspace:
         assert workspace.txid == "tx1"

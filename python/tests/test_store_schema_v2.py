@@ -33,7 +33,11 @@ from atoms.store.schema import SCHEMA_VERSION
 from tests.fs_support import compiled_for, file_state
 from tests.store_support import one_effect_spec, raw_connect
 
-APPROVAL_EVIDENCE = '{"directories":[],"mount_id":1,"work_root":null}'
+APPROVAL_EVIDENCE = (
+    '{"directories":[{"identity":{"st_dev":1,"st_ino":1},'
+    '"lookup_proof":"exact_bytes","name_max":255,"node":"project_root",'
+    '"path":""}],"mount_id":1,"work_root":null}'
+)
 REGISTRATION = "a" * 64
 SETTLEMENT = "b" * 64
 
@@ -634,10 +638,10 @@ def test_approval_evidence_has_the_exact_canonical_wire_shape(approval_context):
         expected = (
             '{"directories":['
             f'{{"identity":{{"st_dev":{root.st_dev},"st_ino":{root.st_ino}}},'
-            '"lookup_proof":"exact_bytes","name_max":255,"node":"project_root"},'
+            '"lookup_proof":"exact_bytes","name_max":255,"node":"project_root","path":""},'
             f'{{"identity":{{"st_dev":{child.st_dev},"st_ino":{child.st_ino}}},'
             '"lookup_proof":"exact_bytes","name_max":255,'
-            '"node":"topology_directory:0"}],'
+            '"node":"topology_directory:0","path":"d"}],'
             f'"mount_id":{binding.evidence.mount_id},"work_root":null}}'
         )
         encoded = encode_approval_evidence(approved)
@@ -690,12 +694,16 @@ def test_approval_evidence_carries_the_physical_work_root_facts(approval_context
         "lookup_proof": "exact_bytes",
         "name_max": 255,
     }
-    assert next(
+    work_entry = next(
         item for item in evidence["directories"] if item["node"] == "work_root"
-    )["identity"] is None
-    assert next(
+    )
+    assert work_entry["identity"] is None
+    assert work_entry["path"] is None
+    planned_entry = next(
         item for item in evidence["directories"] if item["node"] == "persistent:d"
-    )["identity"] is None
+    )
+    assert planned_entry["identity"] is None
+    assert planned_entry["path"] == "d"
     nodes = [item["node"] for item in evidence["directories"]]
     assert nodes == ["persistent:d", "project_root", "work_root"]
 

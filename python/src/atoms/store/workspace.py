@@ -37,7 +37,7 @@ class Workspace:
         if _construction_token is not _WORKSPACE_TOKEN:
             raise TypeError(
                 "Workspace values are created only by Store.create_workspace or "
-                "Store.reopen_workspace"
+                "Store.reopen_workspace or reopen_work_slot"
             )
         if store is None:
             raise TypeError("a Workspace requires its issuing Store")
@@ -244,6 +244,45 @@ def reopen_workspace(store: Store, txid: str) -> Workspace:
         return _issue(store, workspace)
     finally:
         close_all(backend, (staging_parent, work_parent))
+
+
+def require_staging_discharged(store: Store, txid: str) -> None:
+    store._require_live()
+    require_identifier("txid", txid)
+    backend = store._binding._backend
+    parent_fd = _parent_fd(store, STAGING_PARENT)
+    try:
+        if _stat_or_none(parent_fd, txid) is not None:
+            raise MetadataStoreInvalid(
+                f"staging/{txid} exists after the durable PREPARED barrier"
+            )
+    finally:
+        backend.close_fd(parent_fd)
+
+
+def reopen_work_slot(store: Store, txid: str) -> Workspace:
+    store._require_live()
+    require_identifier("txid", txid)
+    backend = store._binding._backend
+    parent_fd = _parent_fd(store, WORK_PARENT)
+    try:
+        work_fd = _open_child(store, parent_fd, WORK_PARENT, txid)
+        if work_fd is None:
+            raise MetadataStoreInvalid(
+                f"work/{txid} is missing for a durable PREPARED record"
+            )
+        return _issue(
+            store,
+            Workspace(
+                store=store,
+                txid=txid,
+                staging_fd=None,
+                work_fd=work_fd,
+                _construction_token=_WORKSPACE_TOKEN,
+            ),
+        )
+    finally:
+        backend.close_fd(parent_fd)
 
 
 def list_workspaces(store: Store) -> tuple[str, ...]:

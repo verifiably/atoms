@@ -26,13 +26,14 @@ the narrow errno translation, and an undefined errno such as EIO propagates as i
 
 from __future__ import annotations
 
+import errno
 import os
 from dataclasses import dataclass
 from typing import Self
 
 from atoms.coordinator.lease import Lease
 from atoms.core.errors import PreconditionRefused, ProtocolError
-from atoms.core.recovery.model import ObservedEntry
+from atoms.core.recovery.model import ObservedDirectory, ObservedEntry
 from atoms.core.recovery.snapshot import PersistentNode, ProjectRoot, TopologyNode, WorkRoot
 from atoms.fs.approval import ProjectApprovedSpec
 from atoms.fs.lock import close_all
@@ -136,6 +137,35 @@ class DescriptorTable:
         self.close()
 
 
+def _validate_open_directory(
+    approved: ProjectApprovedSpec, fd: int, node: TopologyNode
+) -> None:
+    binding = approved.binding
+    constraints = read_lookup_constraints(fd, filesystem_type_of(binding))
+    mount = read_mount_id(fd)
+    expected_mount = binding.evidence.mount_id
+    if mount != expected_mount:
+        raise PreconditionRefused(
+            f"{node!r} is on mount {mount}, not the bound volume's {expected_mount}"
+        )
+    baseline = next((entry for entry in approved.directories if entry.node == node), None)
+    if baseline is None:
+        raise ProtocolError(
+            f"{node!r} bears a descriptor but has no approved directory record"
+        )
+    if constraints != baseline.constraints:
+        raise PreconditionRefused(
+            f"{node!r} has constraints {constraints}, not {baseline.constraints}"
+        )
+    if type(baseline) is ApprovedExistingDirectory:
+        info = os.fstat(fd)
+        actual = FilesystemIdentity(device=info.st_dev, inode=info.st_ino)
+        if actual != baseline.identity:
+            raise PreconditionRefused(
+                f"{node!r} has identity {actual}, not {baseline.identity}"
+            )
+
+
 def _build_descriptor_table(
     lease: Lease,
     approved: ProjectApprovedSpec,
@@ -151,8 +181,6 @@ def _build_descriptor_table(
     """
     binding = lease._binding
     backend = binding.backend
-    filesystem_type = filesystem_type_of(binding)
-    expected_mount = binding.evidence.mount_id
     paths = _directory_paths(approved)
     # One map, both kinds. Every descriptor-bearing node has an approved record in
     # `approved.directories`, including WorkRoot: A4b builds the topology with
@@ -172,53 +200,17 @@ def _build_descriptor_table(
     stops: list[WalkStop] = []
     stopped_nodes: set[TopologyNode] = set()
 
-    def validate(fd: int, node: TopologyNode) -> None:
-        """Ledger #19: identity, constraints, and mount, against the approved baseline.
-
-        DirectoryConstraints carries lookup_proof and name_max only, so mount membership
-        is a separate read -- a constraints comparison alone would pass a directory
-        replaced by a bind mount.
-        """
-        constraints = read_lookup_constraints(fd, filesystem_type)
-        mount = read_mount_id(fd)
-        if mount != expected_mount:
-            raise PreconditionRefused(
-                f"{node!r} is on mount {mount}, not the bound volume's {expected_mount}"
-            )
-        baseline = directories.get(node)
-        if baseline is None:
-            raise ProtocolError(
-                f"{node!r} bears a descriptor but has no record in the proof's approved "
-                "directories; the topology and the approval disagree"
-            )
-        if constraints != baseline.constraints:
-            raise PreconditionRefused(
-                f"{node!r} has constraints {constraints}, not the approved "
-                f"{baseline.constraints}"
-            )
-        # A planned directory has no approved identity -- it did not exist at approval,
-        # so there is nothing to compare an inode against. Constraints and mount are the
-        # whole of its baseline.
-        if type(baseline) is ApprovedExistingDirectory:
-            info = os.fstat(fd)
-            actual = FilesystemIdentity(device=info.st_dev, inode=info.st_ino)
-            if actual != baseline.identity:
-                raise PreconditionRefused(
-                    f"{node!r} has identity {actual}, not the approved "
-                    f"{baseline.identity}; approval is not reapproved here"
-                )
-
     try:
         # Root 1: the project root, borrowed. Retention is not discharge -- lookup_proof
         # and name_max are mutable directory properties, so it is re-validated too.
-        validate(binding.project_root_fd, ProjectRoot())
+        _validate_open_directory(approved, binding.project_root_fd, ProjectRoot())
         fds[ProjectRoot()] = binding.project_root_fd
 
         # Root 2: the work root, borrowed, and present only when the topology has one.
         # The logical WorkRoot -> ProjectRoot edge is NOT physically traversed: the work
         # root lives under metadata_root, not beneath the project root.
         if approved.work_base is not None:
-            validate(workspace.work_fd, WorkRoot())
+            _validate_open_directory(approved, workspace.work_fd, WorkRoot())
             fds[WorkRoot()] = workspace.work_fd
 
         for node in _walk_order(approved, paths):
@@ -262,10 +254,17 @@ def _build_descriptor_table(
             # An approved-EXISTING directory that no longer opens is drift, not a stop.
             # There is no declared state for a TopologyDirectory to be adjudicated
             # against, so §8's branches could never rule on it; it refuses here.
-            with translated_lookup(f"opening {component!r} for {node!r}"):
-                fd = backend.open_child_directory(parent_fd, component)
+            try:
+                with translated_lookup(f"opening {component!r} for {node!r}"):
+                    fd = backend.open_child_directory(parent_fd, component)
+            except OSError as caught:
+                if caught.errno == errno.EACCES:
+                    raise PreconditionRefused(
+                        f"access was denied opening {component!r} for {node!r}"
+                    ) from caught
+                raise
             owned.append(fd)
-            validate(fd, node)
+            _validate_open_directory(approved, fd, node)
             fds[node] = fd
     except BaseException:
         close_all(backend, owned)
@@ -278,6 +277,60 @@ def _build_descriptor_table(
         owned=tuple(owned),
         stops=tuple(stops),
         unreachable=unreachable,
+    )
+
+
+def _resume_descent(
+    table: DescriptorTable,
+    backend,
+    observation: Observation,
+    approved: ProjectApprovedSpec,
+    node: TopologyNode,
+) -> None:
+    """Resume a recovery walk through planned directories already created."""
+
+    paths = _directory_paths(approved)
+    planned = {
+        entry.node
+        for entry in approved.directories
+        if type(entry) is ApprovedPlannedDirectory
+    }
+    pending = [node]
+    while pending:
+        current = pending.pop(0)
+        stop = next((item for item in table._stops if item.node == current), None)
+        if stop is None or type(stop.observed) is not ObservedDirectory:
+            continue
+        try:
+            with translated_lookup(f"resuming descent through {stop.path!r}"):
+                fd = backend.open_child_directory(stop.parent_fd, stop.component)
+        except OSError as caught:
+            if caught.errno == errno.EACCES:
+                continue
+            raise
+        try:
+            _validate_open_directory(approved, fd, current)
+            table.adopt(current, fd)
+        except BaseException:
+            backend.close_fd(fd)
+            raise
+
+        for child in _walk_order(approved, paths):
+            if child not in planned or _parent_of(approved, child) != current:
+                continue
+            component = _component(paths, current, child)
+            observed = observation.observe(
+                table.fd_for(current),
+                component,
+                modeled=_modeled_children(paths, child),
+            )
+            table._stops = (
+                *table._stops,
+                WalkStop(child, paths[child], table.fd_for(current), component, observed),
+            )
+            pending.append(child)
+    table._unreachable = _closure(
+        approved, {stop.node for stop in table._stops}
     )
 
 

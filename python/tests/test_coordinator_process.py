@@ -10,8 +10,8 @@ from pathlib import Path
 
 import pytest
 
-from tests.coordinator_support import AFTER, prepared, spec_digest
 from tests.store_support import APPROVAL_EVIDENCE, one_effect_spec
+from tests.test_coordinator_resolve import _prepare_registered
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -78,18 +78,16 @@ def test_a_second_lease_reclaims_both_kinds_of_orphan_and_spares_the_referenced(
     assert seen["active"] is None
 
 
-def test_a_published_record_traps_a_fresh_lease_and_survives_intact(leased):
+def test_a_published_record_is_recovered_by_a_fresh_lease(leased):
     with leased() as lease:
         project_root, metadata_root = _roots(lease)
-        approved = prepared(lease)
+        _prepare_registered(lease)
 
     seen = _second_process(project_root, metadata_root)
 
-    assert seen["lease"]["trapped"] == "recovery execution is not implemented until A7"
-    assert seen["durable"]["active"] == approved.txid
-    assert seen["durable"]["state"] == "prepared"
-    assert seen["durable"]["spec"] == spec_digest(approved.compiled.spec)
-    assert list(seen["durable"]["blobs"].values()) == [len(AFTER)]
+    assert seen["lease"]["trapped"] is None
+    assert seen["lease"]["active"] is None
+    assert seen["durable"]["active"] is None
 
 
 def test_a_cut_inside_preparation_publishes_nothing_across_a_restart(
