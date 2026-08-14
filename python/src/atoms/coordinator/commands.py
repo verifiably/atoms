@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import errno
+from dataclasses import dataclass
 from typing import cast as _cast
 
 from atoms.chain.append import append_entry as _append_entry
 from atoms.chain.append import bootstrap_chain as _bootstrap_chain
-from atoms.chain.model import GenesisEntry, IntentEntry, state_to_json
+from atoms.chain.model import ChainOutcome, GenesisEntry, IntentEntry, state_to_json
 from atoms.chain.read import validate_chain as _validate_chain
+from atoms.coordinator.capture import PayloadSource
+from atoms.coordinator.execute import _run_under_lease
 from atoms.coordinator.recover import _registered_root
 from atoms.coordinator.root import _recovery_lease, _require_chain_publication
+from atoms.core.compiler import compile_spec
 from atoms.core.errors import PreconditionRefused, ProtocolError, SpecValidationError
 from atoms.core.fingerprint import ABSENT, PathState
 from atoms.core.paths import require_rel_path
@@ -20,13 +24,27 @@ from atoms.core.recovery.model import (
     ObservedFile,
     ObservedSymlink,
 )
+from atoms.core.spec import TransactionSpec
 from atoms.fs.audit import AuditedBackend
 from atoms.fs.backend import Backend
 from atoms.fs.lock import close_all
 from atoms.fs.observe import Observation
 from atoms.fs.volume import StorageProfile
 
-__all__ = ("append_intent", "register_root")
+__all__ = (
+    "TransactionOutcome",
+    "append_intent",
+    "register_root",
+    "run_transaction",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class TransactionOutcome:
+    txid: str
+    outcome: ChainOutcome
+    registration: str
+    settlement: str
 
 
 def _capture_baseline(
@@ -154,3 +172,28 @@ def append_intent(
             return _append_entry(
                 chain_backend, chain_fd, validated, IntentEntry(payload)
             )
+
+
+def run_transaction(
+    backend: Backend,
+    project_root: str,
+    metadata_root: str,
+    storage: StorageProfile,
+    spec: TransactionSpec,
+    payloads: PayloadSource,
+) -> TransactionOutcome:
+    compiled = compile_spec(spec)
+    with _recovery_lease(
+        backend, project_root, metadata_root, storage
+    ) as lease:
+        _require_chain_publication(lease._binding.evidence)
+        with _registered_root(lease) as (chain_fd, validated):
+            result = _run_under_lease(
+                lease, chain_fd, validated, compiled, payloads
+            )
+    return TransactionOutcome(
+        txid=result.txid,
+        outcome=ChainOutcome.COMMITTED,
+        registration=result.registration,
+        settlement=result.settlement,
+    )
