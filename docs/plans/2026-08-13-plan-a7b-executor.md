@@ -1228,7 +1228,20 @@ Phase mapping, exactly §9.1:
      `ResolvedTopology.directory_nodes`, the (path, node) pairs resolution
      already builds (measured `fs/topology.py:95`) — and each directory object
      in `encode_approval_evidence` gains a `"path"` member (project-relative,
-     `""` for the project root). **`WorkRoot` gets a closed special route**:
+     `""` for the project root). `directory_nodes` is a **multimap**: two
+     prefixes folding under their parent's policy share one node (its
+     contract, measured `fs/topology.py:116`; one entry per prefix,
+     measured `fs/topology.py:186-189`; the folding fixture,
+     `test_fs_topology.py:289`) — but no production lookup proof folds:
+     `UNREPRODUCIBLE_CASEFOLD`'s only source occurrence is its definition
+     (measured `fs/lookup.py:41`), and the fixture needs an injected
+     equivalence to reach the shape. The factory therefore **requires
+     exactly one route per non-`WorkRoot` approved directory** when
+     building `directory_paths`, raising `ProtocolError` on zero or on
+     more than one — under the exact-bytes production floor that world is
+     unreachable, so reaching it means the route mapping is broken and
+     the evidence would be ambiguous. The implementer selects nothing;
+     the rule is fail-early, not canonical choice. **`WorkRoot` gets a closed special route**:
      it never enters `directory_nodes` — it is appended to the directory
      set *after* the path-bearing mapping is built, as an
      `ApprovedPlannedDirectory` (measured `fs/topology.py:170-181`) — so
@@ -1262,8 +1275,16 @@ Phase mapping, exactly §9.1:
      `fs/approval.decode_approval_evidence(text) -> dict` validates the exact
      canonical shape — the closed key set, exact types, no duplicate keys,
      canonical integers, unique sorted node keys, well-formed paths — and
-     `load_record` calls it, translating any refusal to `MetadataStoreInvalid`;
-     phase 5 consumes the decoded value, never raw `json.loads`.
+     `load_record` calls it, translating any refusal to `MetadataStoreInvalid`.
+     **The handoff is exactly this**: `load_record` decodes once purely as
+     validation and **discards the document** —
+     `StoredRecord.approval_evidence` stays the canonical `str` (measured
+     `store/records.py:419`), which halt binding and the `AssemblyHalt`'s
+     `expected` member require verbatim — and `resolve`'s phase 5 calls
+     `decode_approval_evidence(record.approval_evidence)` itself for the
+     local document it hands `_diff_approved_topology`. No `StoredRecord`
+     field changes, no wrapper type; the one decoder is simply called at
+     both seams, and phase 5 never touches raw `json.loads`.
 
    The seam itself: `recover._diff_approved_topology(binding, expected: dict,
    txid: str) ->
@@ -1407,6 +1428,29 @@ Phase mapping, exactly §9.1:
    path and **every** effect's required scratch slot in one `Observation`
    universe, `build_recovery_snapshot` from the `StoredRecord` + observations
    (its validators enforce complete coverage — trust them, add none).
+   **The reopen is guarded by a narrow WorkRoot re-diff**, because the
+   moved-world rule above ends at the seams it names and
+   `reopen_workspace` has an error surface that rule never catches: full
+   absence raises `ProtocolError` (measured `store/workspace.py:240-243`),
+   a non-directory at a slot raises `MetadataStoreInvalid` (`_open_child`,
+   measured `store/workspace.py:147-158`), and `EACCES`/`EXDEV` propagate
+   as raw `OSError` (`_open_child` re-raises every errno but
+   `ENOTDIR`/`ELOOP`). If `work/<txid>` moves between phase 5's diff and
+   this reopen, each of those escapes as an engine-defect or substrate
+   claim for what is world drift. So **exactly the `reopen_workspace`
+   call** is wrapped: on `ProtocolError`, `MetadataStoreInvalid`, or an
+   `OSError` whose errno is `EACCES` or `EXDEV`, re-run
+   `_diff_approved_topology` **once** — findings present → persist the
+   `AssemblyHalt` and raise `TransactionHalted`; zero findings →
+   **re-raise the original error unchanged**. The handler proves drift or
+   gets out of the way: it never converts a class, so genuine substrate
+   corruption and engine defects keep their signal, and the never-caught
+   rule for substrate-invalid classes holds everywhere outside this one
+   proven-drift conversion. Step 7.1 pins the race: mutate the work slot
+   (remove it, replace it with a file, chmod `0o000`) after the first
+   diff and before the reopen — each ends in a persisted halt at
+   `".#~work_root"`, never a surfaced `ProtocolError`/
+   `MetadataStoreInvalid`/raw `OSError`.
    **Recovery descent rule:** `_build_descriptor_table` stops at every
    `ApprovedPlannedDirectory` whatever it observes, records a `WalkStop` only
    for the **first** planned ancestor, and merely marks the subtree unreachable
@@ -1927,7 +1971,8 @@ commit arm.
   (amendment), `docs/plans/2026-07-28-plan-a2-compilation-validation.md`
   (dated annotation pointing at it)
 - Modify: `docs/plans/2026-07-31-a4b2-project-approval-design.md`
-  (proof-schema amendment)
+  (proof-schema amendment), `docs/plans/2026-07-31-plan-a4b2-project-approval.md`
+  (dated annotation pointing at it)
 - Modify: `docs/deferred-obligation-ledger.md`, `README.md`, `AGENTS.md`
 
 - [ ] **Step 11.1:** Flip `FIRST_UNIMPLEMENTED` to `"A8"`. Run
@@ -1959,7 +2004,9 @@ commit arm.
     `consumer_tag`/`intent_digest`), and a finished staging survivor
     satisfies the append (Task 6); **§11** — the canonical
     recovery-approval evidence carries a `"path"` member per directory
-    node, routed from `directory_paths` on the proof (Task 7); **§7** —
+    node: project nodes routed from the project-path-only
+    `directory_paths` on the proof (exactly one route each), `WorkRoot`
+    through its closed `"path": null` route (Task 7); **§7** —
     the recovery-mutation surface is the A3-authorized six pairs, and the
     closing paragraph's staged re-creation/symlink-restore cases are
     unreachable through A3's classifier, so the executor does not
@@ -2639,3 +2686,33 @@ represent descendant observations.
 5. Task 11's A4b2 entry gains the historical-plan annotation (its line
    ~2602, same shape as A2's), and the self-review amendment inventory
    now names A4b2.
+
+## Nineteenth-round findings closed (2026-08-14)
+
+1. Phase 6's `reopen_workspace` is guarded by a narrow WorkRoot re-diff:
+   its error surface (absence → `ProtocolError`, `workspace.py:240-243`;
+   wrong kind → `MetadataStoreInvalid` from `_open_child`,
+   `workspace.py:147-158`; `EACCES`/`EXDEV` → raw `OSError`) escapes the
+   moved-world rule's exact `(ProjectApprovalRefused,
+   PreconditionRefused)` catch. Exactly the reopen call is wrapped: those
+   outcomes trigger one re-diff; WorkRoot findings → persisted halt at
+   `".#~work_root"`; zero findings → the original error re-raised
+   unchanged, so no class is ever converted without proven drift. The
+   race (remove / file-replace / chmod `0o000` between diff and reopen)
+   is pinned in step 7.1.
+2. The decoded-evidence handoff is specified minimally: `load_record`
+   decodes once as validation and discards the document —
+   `StoredRecord.approval_evidence` stays the canonical `str`
+   (`records.py:419`) that halt binding and the `AssemblyHalt`'s
+   `expected` need verbatim — and phase 5 decodes the string itself for
+   the diff's local document. No field change, no wrapper.
+3. `directory_paths` route selection is closed: `directory_nodes` is a
+   multimap (`topology.py:116,186-189`; folding fixture
+   `test_fs_topology.py:289`), but no production proof folds
+   (`UNREPRODUCIBLE_CASEFOLD` has no producer, `lookup.py:41`), so the
+   factory requires exactly one route per non-WorkRoot approved
+   directory and raises `ProtocolError` on zero or several — fail-early,
+   never an invented canonical choice.
+4. Task 11's Files list gains the historical A4b2 plan, and the A7 §11
+   amendment names the project-node/`WorkRoot` split instead of claiming
+   every route comes from `directory_paths`.
