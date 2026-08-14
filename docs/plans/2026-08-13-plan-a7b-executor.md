@@ -748,6 +748,8 @@ the status guard refuses "implemented" claims until the tree makes them true.
   `python/src/atoms/core/recovery/snapshot.py`,
   `python/src/atoms/core/recovery/diagnostics.py`,
   `python/src/atoms/core/recovery/reducer.py`,
+  `python/src/atoms/core/recovery/plan.py` (the `RecoveryPlan`
+  constructor token error names the factories truthfully),
   `python/src/atoms/core/recovery/__init__.py`,
   `python/src/atoms/fs/platform.py` (`BACKEND_REVISION` → `linux-4`),
   `python/src/atoms/store/records.py`, `python/src/atoms/fs/observe.py`,
@@ -776,6 +778,7 @@ the status guard refuses "implemented" claims until the tree makes them true.
 
 **Interfaces:**
 - Consumes: `classify_recovery`, `persist_plan_prefix`, `authorize_recovery_step`,
+  `authorization._mutation_denied` (this task adds it),
   Task 4's `settle.apply_transform`/`apply_remove_scratch`, `append_entry` +
   `SettledEntry`, `_StoreTransaction.set_settlement_digest`/`set_active`.
 - Produces, for Tasks 7–8:
@@ -1139,7 +1142,18 @@ becomes total, and the amendment documents the durable diagnostic shape.)
     reason and diagnostic — the mismatch details die with the caught
     exception, are promised nowhere, and never persist: ledger #14's
     measured premise is that A3 names no syscall, and the durable
-    evidence keeps it that way. The
+    evidence keeps it that way. The factory's refusals are directly
+    tested in `test_recovery_authorization.py`: a wrong exact type for
+    either argument, mismatched coverage, and an unequal projection each
+    raise `ProtocolError` **before** `_new_halt_plan` runs (no `HaltPlan`
+    is minted), and Task 10's architecture scan pins `recover.run_plan`
+    as its only production caller. `RecoveryPlan`'s constructor token
+    error — today "created only by `classify_recovery`" (measured
+    `plan.py:131,154,174`), already imprecise beside
+    `_precondition_changed_halt` — updates to name the recovery
+    factories truthfully without enumerating unstable internals:
+    "issued only by the recovery model's classification and
+    authorization factories". The
     halt is persisted via `_persist_halt` — a durable halt, ledger #14's
     outcome, with no
     retry. `HaltReason.MUTATION_DENIED` is a **value-only wire change**:
@@ -2187,6 +2201,11 @@ commit arm.
   - `_approve_for_recovery` has exactly one production caller —
     `recover.resolve`'s phase 5 — asserted by source scan (it issues a weaker
     proof from a plain `dict`; the scan is what keeps that power scoped).
+  - `_mutation_denied` has exactly one production caller —
+    `recover.run_plan`'s unchanged-reauthorization branch — asserted by
+    the same source-scan pattern: it mints an authoritative halt across
+    the core/coordinator boundary exactly as `_approve_for_recovery`
+    mints a proof, and deserves the same mechanical scope.
   - Effects modules import no `atoms.chain`, no `atoms.coordinator.execute`/
     `commit`/`recover`/`commands` (syscall execution only, design §4); `execute`/
     `commit`/`recover` never read `TransactionSpec.dependencies` (attribute scan —
@@ -2380,7 +2399,9 @@ signatures, refusal types, and expected run outcomes.
 that shape in Tasks 7 and 8; `_site_for(approved, table, effect)` in Tasks 4, 5
 and 8; `_registered_root` keeps its measured `(chain_fd, ValidatedChain)` yield
 across Tasks 5–8; `AuthorizedStep` flows `authorize_recovery_step` → `run_plan`
-→ `_execute_mutating` → `settle.*` with no raw-step bypass; `TransactionOutcome`
+→ `_execute_mutating` → `settle.*` with no raw-step bypass — except the
+unchanged-reauthorization branch, where the reissued proof flows to
+`authorization._mutation_denied` instead of settlement; `TransactionOutcome`
 fields match Task 8's construction and Task 10's `__all__` assertion;
 `_registration_entry(spec, txid)` has one definition (Task 6) and two consumers
 (Task 6's reconciliation appends, Task 8's forward append), both reading the
@@ -3240,3 +3261,21 @@ represent descendant observations.
    diagnostic, so the denied operation/slot/errno are private and
    ephemeral — the surfaced exception carries the generic reason and
    diagnostic only. The round-28 history claim is annotated.
+
+## Thirtieth-round findings closed (2026-08-14)
+
+1. Halt-minting authority is mechanically scoped: Task 10 gains the
+   `_mutation_denied` sole-production-caller scan (`recover.run_plan`
+   only — the `_approve_for_recovery` pattern, for the same reason), and
+   `test_recovery_authorization.py` directly tests the factory's
+   refusals — wrong exact types, mismatched coverage, unequal
+   projection — each `ProtocolError` before `_new_halt_plan` mints
+   anything.
+2. Inventory drift closed: Task 5's Consumes names
+   `authorization._mutation_denied`; the self-review `AuthorizedStep`
+   flow names the reauthorization-to-denial branch; and the
+   `RecoveryPlan` constructor token error (today "created only by
+   `classify_recovery`", `plan.py:131,154,174` — already imprecise
+   beside `_precondition_changed_halt`) updates to "issued only by the
+   recovery model's classification and authorization factories", with
+   `plan.py` added to Task 5's Files.
