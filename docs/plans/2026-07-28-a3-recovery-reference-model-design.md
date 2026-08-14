@@ -3,7 +3,8 @@
 **Date:** 2026-07-28
 **Status:** Implemented on 2026-07-29 according to
 [`2026-07-28-plan-a3-recovery-reference-model.md`](2026-07-28-plan-a3-recovery-reference-model.md).
-A7–A8 remain unimplemented, and no project path is mutated by any code in this repository.
+A7b–A8 remain unimplemented; A7a writes engine bookkeeping at the reserved `.#~chain/` leaf,
+while A7b has not yet executed an effect against a project path.
 **Depends on:** A1 core model and A2 compilation validation (implemented)
 **Authority:** [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md)
 §8.4 and §13.1

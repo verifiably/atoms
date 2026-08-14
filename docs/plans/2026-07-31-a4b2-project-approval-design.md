@@ -1,6 +1,6 @@
 # A4b-2 — rooted project approval
 
-**Status:** Implemented on 2026-07-31. A7–A8 remain unimplemented. A4b-2 reads project space
+**Status:** Implemented on 2026-07-31. A7b–A8 remain unimplemented. A4b-2 reads project space
 and never writes to it.
 
 **Authority:** [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md).

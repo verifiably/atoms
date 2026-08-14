@@ -57,8 +57,8 @@ Plan B is written only after Plan A's interfaces settle.
   (absence inference over both §6 branches, preimage streaming into workspace staging, flush, and the
   manifest `prepare_transaction` consumes). Its design is
   [`docs/plans/2026-08-07-a6-coherent-capture-design.md`](docs/plans/2026-08-07-a6-coherent-capture-design.md).
-  Ledger entries #1, #3, #13, and #19 are half-discharged; each keeps an A7b half open,
-  and the design's §13 lists six further gaps A7b inherits.
+  Ledger entries #1, #3, #13, and #19 are half-discharged; each keeps an A7b half open.
+  A7a closed the design's six further §13 gaps; A7b inherits only the remaining executor work.
 - **A7a — execution substrate: implemented on 2026-08-13.** Its design is
   [`docs/plans/2026-08-13-a7-effect-recovery-execution-design.md`](docs/plans/2026-08-13-a7-effect-recovery-execution-design.md):
   the audited facade, spec/schema v2, `AssemblyHalt`, the tamper-evident chain, and the root and intent commands.

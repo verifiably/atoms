@@ -63,8 +63,6 @@ def _stages_of(label: str) -> tuple[str, ...]:
     base = label.split("-")[0]
     if base in STAGES:
         return (base,)
-    if base == "A7":
-        return ("A7b",)
     covered = tuple(stage for stage in STAGES if stage.startswith(base))
     assert covered, f"unknown stage label {label!r}"
     return covered
@@ -219,10 +217,10 @@ def test_the_entry_documents_list_every_implemented_sub_plan():
 
 
 def test_no_status_region_claims_the_repository_writes_nothing():
-    """A4a, A5a, and A6 all write under `metadata_root`. Only project paths are untouched."""
+    """A7a's chain bookkeeping retires the old no-project-write claim."""
     for name, region in status_regions().items():
-        assert "no filesystem mutation code has landed" not in region, name
-        assert "mutates a filesystem path" not in region, name
+        assert "no project path is mutated by any code in this repository" not in region, name
+        assert "no code in this repository mutates a project path" not in region, name
 
 
 def test_the_authority_header_names_the_implemented_prefix():
@@ -240,12 +238,13 @@ def test_the_authority_header_names_the_implemented_prefix():
 def test_the_claim_parser_attaches_a_claim_to_the_span_that_owns_it():
     """The parse this file rests on, against the shapes the corpus actually uses."""
     assert unimplemented_claims("A5 and A6 are implemented; A7–A8 remain unimplemented.") == {
+        "A7a",
         "A7b",
         "A8",
     }
     assert unimplemented_claims(
         "A7–A8 (effect/recovery execution, synthetic exerciser) remain."
-    ) == {"A7b", "A8"}
+    ) == {"A7a", "A7b", "A8"}
     assert unimplemented_claims("A4b-2 and A5–A8 remain unimplemented.") == {
         "A4b",
         "A5a",
