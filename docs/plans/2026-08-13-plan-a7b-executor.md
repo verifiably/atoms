@@ -717,6 +717,11 @@ the status guard refuses "implemented" claims until the tree makes them true.
   change below)
 - Test: `python/tests/test_coordinator_recover.py`; update
   `python/tests/test_coordinator_transitions.py` for the new stop; update
+  `python/tests/fs_support.py` (`RestrictedBackend` gains
+  `open_directory_handle` through its existing `ANCHORED_TRAVERSAL`
+  dispatch, `contract="traversal"`, scoped by `name` — measured
+  `fs_support.py:218,324`; without it, an audited `EACCES` fallback over
+  the standard structural fixtures delegates to a missing member),
   `python/tests/test_fs_observe.py`, `python/tests/test_recovery_variants_files.py`,
   `python/tests/test_recovery_variants_paths.py`,
   `python/tests/test_recovery_classifier.py`,
@@ -813,7 +818,10 @@ end:
   unregistered parent refuses, `..` is never accepted); ownership
   transfers to the caller — the observation pins it or closes it on the
   way out. Backend and audit tests live in `test_fs_backend.py` /
-  `test_fs_audit.py`. Adding the member changes the backend's
+  `test_fs_audit.py`; the structural `RestrictedBackend` in
+  `tests/fs_support.py` gains the member through its
+  `ANCHORED_TRAVERSAL` dispatch so the fallback is reachable over the
+  standard capability fixtures. Adding the member changes the backend's
   syscall/flag contract, so **`BACKEND_REVISION` bumps to `linux-4` in
   this task** — the contract text demands a deliberate bump exactly here
   (measured `fs/platform.py:11-16`), and the exact protocol/revision
@@ -1168,7 +1176,10 @@ The derivation is design §9.2 verbatim; every branch below gets a test:
   preserving record/`active`/lock/descriptor discipline, per design §9.1),
   `python/tests/test_core_assembly.py` (the exhaustive wire test grows with
   the enum; the widened exclusivity's hostile case),
-  `python/tests/test_fs_approval.py` (encoder/decoder updates)
+  `python/tests/test_fs_approval.py` (encoder/decoder updates),
+  `python/tests/test_store_schema_v2.py` (the literal canonical-wire
+  assertion and the physical work-root evidence assertion, measured
+  `:625,676` — exact-string guards the new `"path"` members change)
 
 **Interfaces:**
 - Consumes: Tasks 5–6, `ProjectContext` with the existing txid and the new
@@ -1219,11 +1230,15 @@ Phase mapping, exactly §9.1:
      in `encode_approval_evidence` gains a `"path"` member (project-relative,
      `""` for the project root). **`WorkRoot` gets a closed special route**:
      it never enters `directory_nodes` — it is appended to the directory
-     set *after* the path-bearing mapping is built (measured
-     `fs/topology.py:170-172`) — yet the encoder iterates every approved
-     directory (measured `fs/approval.py:166`), so its evidence object
-     carries `"path": null` and `directory_paths` carries a matching
-     `WorkRoot` entry. The diff resolves it against
+     set *after* the path-bearing mapping is built, as an
+     `ApprovedPlannedDirectory` (measured `fs/topology.py:170-181`) — so
+     `directory_paths` is **project-path-only by construction** and never
+     carries a `WorkRoot` entry; the `tuple[tuple[str, TopologyNode], ...]`
+     type stays honest. The encoder, which iterates every approved
+     directory (measured `fs/approval.py:166`) and already keys `WorkRoot`
+     with the reserved `"work_root"` node key (measured
+     `fs/approval.py:126-127`), **special-cases that node to
+     `"path": null`**. The diff resolves it against
      `metadata_root/work/<txid>` — the transaction's own work slot, distinct
      from the physical `metadata_root/work` baseline — which is why
      `_diff_approved_topology` takes the **txid**. Without this route, the
@@ -1232,8 +1247,13 @@ Phase mapping, exactly §9.1:
      re-diff would find nothing, and the resolver would wrongly claim an
      engine defect via `ProtocolError`. Since `directory_paths` joins the
      proof, Task 7 also updates the **exact proof-schema guard** (measured
-     `test_fs_architecture.py:916`, criterion 21's closed field set). No
-     production data exists; A7a's encoder tests update. Design §11's
+     `test_fs_architecture.py:916`, criterion 21's closed field set) and
+     the **exact evidence-wire tests** the `"path"` member changes: the
+     literal canonical-JSON assertion and the physical work-root evidence
+     assertion (measured `test_store_schema_v2.py:625,676`) — A7a's
+     encoder tests in `test_fs_approval.py` update too, but they do not
+     replace those exact-wire guards. No
+     production data exists. Design §11's
      evidence clause and the **A4b2 proof schema** are amended (Task 11).
    - **The stored document is decoded closed, at load.** `load_record` today
      passes `approval_evidence` through as an unchecked string (measured
@@ -1249,13 +1269,40 @@ Phase mapping, exactly §9.1:
    txid: str) ->
    tuple[AssemblyFinding, ...]` walks the decoded evidence's directory entries
    by their `"path"`, shallowest-first, with descriptor-relative
-   `open_child_directory`/`lstat` lookups from the project root — except the
-   `"path": null` `WorkRoot` entry, which resolves against
-   `metadata_root/work/<txid>` under the same comparison and errno rules,
-   emitted at the closed work-root pseudo-path (pinned tests: missing,
-   wrong-kind, constraint drift, `EXDEV`, and `EACCES` at the work slot) —
-   comparing
-   **conditionally by entry class**:
+   `open_child_directory`/`lstat` lookups from the project root.
+
+   **The `"path": null` `WorkRoot` entry is carved out first**, before the
+   entry-class split below, because the generic planned-entry rule is wrong
+   for it: `work/<txid>` is created by `open_workspace` **before**
+   `prepare_transaction` inserts the durable `PREPARED` (measured
+   `coordinator/prepare.py:13-18,38-40`), and the diff only runs when a
+   record exists (phase 3) — so by the time any diff happens the slot has
+   already been made, and its absence or wrong kind is drift the engine
+   must halt on, never a not-yet-created state for A3 to classify. Left to
+   the generic branch, those states would emit nothing and phase 6's
+   `reopen_workspace`/`workspace.work_fd` validation (measured
+   `store/workspace.py:235`, `descriptors.py:149`) would escape as
+   `ProtocolError` or `MetadataStoreInvalid` — an engine-defect claim for
+   world drift. The carve-out resolves the entry against
+   `metadata_root/work/<txid>` under the same errno rules and emits its
+   **exact findings**: determinate `ENOENT` → `NODE_MISSING`, a
+   determinate non-directory kind → `WRONG_ENTRY_KIND` (each the sole
+   finding), constraint drift → `CONSTRAINTS_CHANGED`, determinate
+   `EXDEV` → `MOUNT_BOUNDARY`, determinate `EACCES` → `ACCESS_DENIED`
+   (identity is never compared — none was persisted). Findings are
+   emitted at the **literal pseudo-path `".#~work_root"`**: the leading
+   `SCRATCH_SIGIL` (`".#~"`, measured `core/scratch.py:15`) makes it
+   engine-reserved — `require_rel_path` refuses any project path whose
+   component aliases the sigil (measured `core/paths.py:40-43`), so no
+   compiled spec can collide with it. `AssemblyFinding.path` accepts any
+   exact string (measured `core/assembly.py:53-60`), so the reservation is
+   the collision proof, and it is tested: a project directory literally
+   named `work_root` diffs at path `"work_root"`, distinct from the
+   pseudo-path, and a spec declaring `".#~work_root"` refuses at compile.
+   Pinned tests: missing, wrong-kind, constraint drift, `EXDEV`, and
+   `EACCES` at the work slot, plus the collision pair.
+
+   Every other entry compares **conditionally by entry class**:
    - **Existing entries** (non-null `identity`): a determinate `ENOENT` →
      `NODE_MISSING`; a determinate non-directory kind → `WRONG_ENTRY_KIND`; a
      determinate `EXDEV` → **`MOUNT_BOUNDARY`**, a new fact-free finding kind
@@ -1287,7 +1334,9 @@ Phase mapping, exactly §9.1:
      membership, and work-root facts against the expected document and emit
      every applicable changed-kind finding. Design §9.3's vocabulary gains
      `MOUNT_BOUNDARY` and `ACCESS_DENIED` as a dated amendment (Task 11).
-   - **Planned entries** (`identity = null`, measured `fs/approval.py:170-176`):
+   - **Planned entries** (`identity = null`, measured `fs/approval.py:170-176`;
+     `WorkRoot` never reaches this branch — it is carved out above, because
+     its slot exists before `PREPARED` does):
      **absent or non-directory emits nothing** — those states are legitimately
      variable at recovery (not yet created, or a foreign blocker) and are
      **A3's** to classify through phase 6's stops and observations. But a
@@ -1944,6 +1993,9 @@ commit arm.
     gains `directory_paths` (criterion 21's closed field set widens by
     exactly that member), and the canonical evidence gains the per-node
     `"path"` member with `WorkRoot`'s closed `"path": null` route
+    (Task 7). The historical A4b2 plan — whose proof fields and exact
+    schema guard are presented as current (its line ~2602) — gets a dated
+    annotation pointing at the amendment, same shape as the A2 plan's
     (Task 7).
   - **A3 design** (`2026-07-28-a3-...-design.md`): the observed-entry
     union (its line ~246) gains the two arms and
@@ -2018,7 +2070,9 @@ decided in Task 5's "Decisions" block; the design amendments — spanning the
 A7 design (§9.1 twice, §9.3, §9.2, §11, §7, the primitive contract), the
 authority (restartable materialization and the compile-time directory-mode
 rule), the A2 design (the directory-mode narrowing, with the historical A2
-plan annotated), the A3 design (union arms, authorization guard, mkdir
+plan annotated), the A4b2 design (the proof schema and evidence `"path"`
+member, with the historical A4b2 plan annotated), the A3 design (union
+arms, authorization guard, mkdir
 table), and
 the A6 design (directory observation contract) — are decided in Tasks 3–8
 and land dated, grouped by document, in Task 11 step 11.2.
@@ -2528,7 +2582,12 @@ represent descendant observations.
    `ResolvedTopology.directory_nodes` (appended after the path-bearing
    mapping, `topology.py:170-172`) yet the encoder iterates every approved
    directory, so its evidence object carries the closed `"path": null`
-   route, `directory_paths` carries a matching entry,
+   route, `directory_paths` carries a matching entry *(superseded in the
+   eighteenth round: `directory_paths` stays project-path-only — its
+   `tuple[tuple[str, TopologyNode], ...]` type cannot carry null — and the
+   encoder special-cases the `work_root` node; the route also moved out of
+   the generic planned branch into an explicit carve-out with exact
+   findings at the reserved `".#~work_root"` pseudo-path)*,
    `_diff_approved_topology` takes the txid and resolves it against
    `metadata_root/work/<txid>` (missing, wrong-kind, constraint, `EXDEV`,
    and `EACCES` cases pinned) — without which the descriptor builder's
@@ -2549,3 +2608,34 @@ represent descendant observations.
    raises `ProtocolError` on an occupancy-`None` fact — opaque occupancy
    past the classifier boundary means the guard was bypassed, never a
    value to coerce (`reducer.py` and `test_recovery_reducer.py` added).
+
+## Eighteenth-round findings closed (2026-08-14)
+
+1. `WorkRoot` no longer falls through the generic planned branch: it is
+   carved out of `_diff_approved_topology` before the entry-class split,
+   because `open_workspace` creates `work/<txid>` **before**
+   `prepare_transaction` inserts `PREPARED` (`prepare.py:13-18,38-40`) —
+   so whenever the diff runs, absence or wrong kind at the slot is drift
+   to halt on, never A3-variable state. The carve-out's exact findings:
+   `NODE_MISSING` / `WRONG_ENTRY_KIND` (sole), `CONSTRAINTS_CHANGED`,
+   `MOUNT_BOUNDARY`, `ACCESS_DENIED`; identity never compared. Left
+   generic, phase 6's `reopen_workspace`/`work_fd` validation would
+   escape as `ProtocolError`/`MetadataStoreInvalid`.
+2. The route contract is typed honestly: `directory_paths` stays
+   project-path-only (`WorkRoot` never enters `directory_nodes`,
+   `topology.py:170-181`), the encoder special-cases the `work_root` node
+   key (`approval.py:126-127`) to `"path": null`, and the pseudo-path is
+   the literal `".#~work_root"` — sigil-reserved (`scratch.py:15`,
+   `paths.py:40-43`), so no compiled project path can collide; the
+   collision pair is tested.
+3. Task 5 adds `tests/fs_support.py`: `RestrictedBackend` gains
+   `open_directory_handle` through its `ANCHORED_TRAVERSAL` dispatch
+   (`fs_support.py:218,324`) so the audited `EACCES` fallback never
+   delegates to a missing member over the standard fixtures.
+4. Task 7 adds `test_store_schema_v2.py` — the literal canonical-wire and
+   physical work-root evidence assertions (`:625,676`) the `"path"`
+   members change; `test_fs_approval.py` does not replace those
+   exact-wire guards.
+5. Task 11's A4b2 entry gains the historical-plan annotation (its line
+   ~2602, same shape as A2's), and the self-review amendment inventory
+   now names A4b2.
