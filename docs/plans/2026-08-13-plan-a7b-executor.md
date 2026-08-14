@@ -64,6 +64,9 @@ Every fact below was read from the tree this plan builds on, not remembered.
 | `TransactionSpec` carries `consumer_tag: str` and `intent_digest: str` as required v1 members, compiler-validated (`require_valid_identifier`; `sha256:<64 lowercase hex>`), durable in `spec_json`; authority §13.4 names them "persisted in the durable record" for recovery attributability | `core/spec.py:31-40`, `core/compiler.py:202-214`, authority `:1690-1692` |
 | Evidence directory keys carry no path: `_node_key(TopologyDirectory)` is `topology_directory:<id>`; the (path, node) pairs live in `ResolvedTopology.directory_nodes` at approval time; `load_record` stores `approval_evidence` as an unchecked string | `fs/approval.py:123-139`, `fs/topology.py:95`, `store/records.py:573` |
 | Reverse-move durability is the forward move's mirror: fsync the restored-source parent before the old-destination parent | authority `:1150-1153` |
+| The proof-gate registry `_TRANSACTION_STAGE_ENTRY_POINTS` maps file → function names and requires each listed function's **first statement** to be a `_require_admitted` call | `tests/test_fs_architecture.py:1126-1143` |
+| A planned directory's evidence entry carries `identity = null`; only approved-existing directories carry identity facts | `fs/approval.py:170-176` |
+| Move × `RESTORE_PRE` is destination→source only with the anchor kept (a `RemoveScratch` follows via `_remove_after_transform`); the dual-name and anchor-only shapes are `REPAIR_INTERMEDIATE`; CreateDirectory removal targets the live directory only | `core/recovery/variants.py:962-1035,1235-1250` |
 
 ## Global constraints
 
@@ -347,11 +350,15 @@ the status guard refuses "implemented" claims until the tree makes them true.
   `core/recovery/plan.py:184-203`); `state_from_json` is NOT involved —
   expected/result states arrive as `JointObservation` values inside the step.
 - Produces, for Task 5's loop:
-  - `settle.apply_transform(backend, store, approved, table, authorized:
-    AuthorizedStep) -> None` — **typed against the proof, not the raw step**: the
-    only capability proving a fresh observation authorized this mutation is the
-    `AuthorizedStep`, so the mutating functions demand it (exact-type check, like
-    every other proof-accepting internal) and read `authorized.step` themselves.
+  - `settle.apply_transform(lease, approved, table, authorized: AuthorizedStep)
+    -> None` — a transaction-stage entry point: its **first statement** is
+    `_require_admitted(lease, approved)` (the proof-gate registry demands
+    exactly that shape — measured `test_fs_architecture.py:1126-1143`), it
+    derives the backend and store from the lease, and it is enumerated in
+    `_TRANSACTION_STAGE_ENTRY_POINTS` (Task 10). It is also **typed against the
+    authorization proof, not the raw step**: the only capability proving a
+    fresh observation authorized this mutation is the `AuthorizedStep`, so it
+    demands it (exact-type check) and reads `authorized.step` itself.
     Dispatches on `(step.variant, step.settlement)`, executes the recovery
     mutation, verifies the world now matches `step.result_after` for the step's
     covered slots (fresh observation through the same parent descriptors), then
@@ -361,11 +368,11 @@ the status guard refuses "implemented" claims until the tree makes them true.
     was removed from, so a reverse move flushes the restored-source parent
     before the old-destination parent. A post-mutation mismatch raises
     `EffectMismatch`.
-  - `settle.apply_remove_scratch(backend, approved, table, authorized:
-    AuthorizedStep) -> None` — same proof discipline; `unlink_child`
-    (file/symlink) or `rmdir_child` (directory) of exactly the named slot, per
-    the observed kind in `step.expected_before`, then `flush_directory` of the
-    slot's parent.
+  - `settle.apply_remove_scratch(lease, approved, table, authorized:
+    AuthorizedStep) -> None` — same gate, same proof discipline;
+    `unlink_child` (file/symlink) or `rmdir_child` (directory) of exactly the
+    named slot, per the observed kind in `step.expected_before`, then
+    `flush_directory` of the slot's parent.
 - **The dispatch table is the A3-authorized table, not design §7's full
   cross-product.** Measured: the classifier's variant factories emit exactly six
   `(variant, settlement)` pairs — `REPLACE_FILE × RESTORE_PRE`
@@ -400,10 +407,17 @@ the status guard refuses "implemented" claims until the tree makes them true.
     staging slot); the following `RemoveScratch` removes the staging. Directly
     unlinking the live path would skip `result_after` and is wrong.
   - **Delete × restore** transfers the validated tombstone back no-clobber.
-  - **Move × restore** transfers the destination back to the source, or
-    restores the source from the durable anchor when the destination is gone;
-    **move × repair** completes or removes the anchor per the delta.
-  - **Mkdir × remove** `rmdir_child`s the covered live or work slot.
+  - **Move × restore** is exactly the destination-back-to-source transfer —
+    `(source=ABSENT, destination=PRE) → (source=PRE, destination=ABSENT)` with
+    the anchor untouched (`variants.py:962-988`: the transform's scratch result
+    keeps the anchor; `_remove_after_transform` emits the `RemoveScratch` that
+    removes it). **Move × repair** covers the other two mid-move shapes
+    (`variants.py:990-1035`): the dual-name tuple removes the anchor-owned
+    destination, and the anchor-only tuple restores the source from the anchor
+    — neither transform removes the anchor; the following `RemoveScratch` does.
+  - **Mkdir × remove** `rmdir_child`s the **live** directory only
+    (`variants.py:1235-1250`); work-slot removal arrives as its own
+    `RemoveScratch`.
 
 - [ ] **Step 4.1: Failing tests.** Drive each of the six cells through a real
   prepared state: build the mid-flight filesystem shape by running the forward
@@ -440,13 +454,16 @@ the status guard refuses "implemented" claims until the tree makes them true.
   `SettledEntry`, `_StoreTransaction.set_settlement_digest`/`set_active`.
 - Produces, for Tasks 7–8:
   - `recover._registered_root(lease)` — **moved verbatim** from
-    `commands.py:39-73` (body byte-identical; only the module changes).
-    `commands.py` imports it from `recover` — `commands → recover` is the
-    dependency direction, so no cycle forms when Task 8 adds `run_transaction`.
+    `commands.py:39-73` (body byte-identical in this task; only the module
+    changes — Task 7 then strips its `_apply_survivors` call when reconciliation
+    starts running at lease entry). `commands.py` imports it from `recover` —
+    `commands → recover` is the dependency direction, so no cycle forms when
+    Task 8 adds `run_transaction`.
   - `recover.run_plan(lease, approved, table, plan: RecoveryPlan) -> RecoveryPlan`
-    — the §8 loop. Returns the plan it finished (an `ActionPlan` driven to
-    completion, or the `HaltPlan` it persisted — the caller decides whether that
-    raises).
+    — the §8 loop, opening with `_require_admitted(lease, approved)` and
+    enumerated in the transaction-stage entry-point registry (Task 10). Returns
+    the plan it finished (an `ActionPlan` driven to completion, or the
+    `HaltPlan` it persisted — the caller decides whether that raises).
   - `transitions.persist_detach(lease, approved, plan, cursor) -> int` — persists
     exactly one `DetachActive` step after asserting the active record carries
     **both** `registration_digest` and `settlement_digest`; any other step type at
@@ -521,21 +538,23 @@ the status guard refuses "implemented" claims until the tree makes them true.
   the reducer projects no record change for filesystem-mutating steps. The loop
   just continues at `cursor + 1`.
 
-  **A post-mutation verification failure never escapes the loop.**
-  `EffectMismatch` is effects-private; if `run_plan` let it propagate, resolver
-  recovery would leak the signal without persisting A3's prefix-bound halt. So
-  `_execute_mutating`'s caller catches it and re-enters the authorization seam
-  at the same cursor: take a fresh observation with the step's coverage and call
-  `authorize_recovery_step(plan, cursor, observed)` — a `HaltPlan` (the world no
-  longer matches `expected_before`) is persisted via `_persist_halt` and
-  returned, exactly as an up-front mismatch would be; an `AuthorizedStep` (the
-  world observably still at `expected_before` — the mutation never took) permits
-  **one** re-execution, and a second `EffectMismatch` with the world still at
-  `expected_before` is `ProtocolError` — a primitive that returns success while
-  the world does not move is an engine defect, not drift. Step 5.1 gains the
-  test: a settle-level verification failure injected beneath the facade ends in
-  a persisted `HaltPlan`, and `EffectMismatch` is never observable from
-  `run_plan`'s callers. `_reconcile_settlement`: under
+  **A post-mutation verification failure never escapes the loop, and is never
+  retried.** `EffectMismatch` is effects-private; if `run_plan` let it
+  propagate, resolver recovery would leak the signal without persisting A3's
+  prefix-bound halt. So `_execute_mutating`'s caller catches it and re-enters
+  the authorization seam **once**, at the same cursor, solely to obtain the
+  factory-issued halt: take a fresh observation with the step's coverage and
+  call `authorize_recovery_step(plan, cursor, observed)` — a `HaltPlan` (the
+  world no longer matches `expected_before`) is persisted via `_persist_halt`
+  and returned, exactly as an up-front mismatch would be. If it instead returns
+  another `AuthorizedStep`, raise `ProtocolError` immediately — **do not
+  execute again**: ledger #14 requires halting "instead of reclassifying,
+  retrying, or inventing a second decision table", and a primitive that
+  reported success while verification failed against an unmoved world is an
+  engine defect, not drift. Step 5.1 gains the test: a settle-level
+  verification failure injected beneath the facade ends in a persisted
+  `HaltPlan`, and `EffectMismatch` is never observable from `run_plan`'s
+  callers. `_reconcile_settlement`: under
   `_registered_root(lease)`, read the active record; if `settlement_digest` is
   set, verify it resolves in the validated chain and return; otherwise find a
   `SettledEntry` with this txid (exactly one → backfill its digest; more than one
@@ -565,10 +584,13 @@ the status guard refuses "implemented" claims until the tree makes them true.
     frozen value holding at most one registration action and one settlement action,
     each `BACKFILL(digest)` or `APPEND(entry)`, plus nothing when bindings resolve
     cleanly. Raises `ChainStateInvalid` for every contradictory case.
-  - `recover._perform_reconciliation(lease, chain_fd, validated, actions:
-    Reconciliation) -> ValidatedChain` — performs exactly the derived actions
-    (chain appends via `append_entry`, bindings via one store transaction each)
-    and returns the fresh proof.
+  - `recover._perform_reconciliation(backend: AuditedBackend, store: Store,
+    chain_fd, validated, actions: Reconciliation) -> ValidatedChain` — performs
+    exactly the derived actions (chain appends via `append_entry`, bindings via
+    one store transaction each) and returns the fresh proof. It takes its
+    actual dependencies — **not a `Lease`**: the resolver calls it in phase 3,
+    before any `Lease` exists (the `Lease` is constructed in phase 6), so a
+    lease parameter would force manufacturing one early.
 
 The derivation is design §9.2 verbatim; every branch below gets a test:
 
@@ -683,7 +705,16 @@ Phase mapping, exactly §9.1:
    null → raise `TransactionHalted` carrying it (verify with
    `require_assembly_halt_binding` first). No mutation, no silent discharge.
 3. `_perform_reconciliation` — which exclusively owns survivor application
-   (Task 6); `resolve` never calls `apply_survivors` itself.
+   (Task 6); `resolve` never calls `apply_survivors` itself. This task makes
+   that exclusivity tree-wide: `_registered_root` and `register_root` lose
+   their own `_apply_survivors` calls (measured `commands.py:60,156`) and
+   validate only — after lease-entry reconciliation a nonempty survivor set
+   means post-resolution external mutation, which `_registered_root` refuses as
+   `ChainStateInvalid`; their crash-retry tests move to lease-entry fixtures.
+   **Then, if no active record exists → return.** A registered root with no
+   transaction in flight is the normal state before `append_intent` or a new
+   transaction — survivor cleanup was the only work, and every later phase
+   reads `record`.
 4. `compiled = compile_spec(record.spec)` — pure.
 5. **Diff first, proof after.** The exception surface cannot carry the split —
    resolution converts absence into topology data during approval, and a missing
@@ -713,10 +744,19 @@ Phase mapping, exactly §9.1:
      phase 5 consumes the decoded value, never raw `json.loads`.
 
    The seam itself: `recover._diff_approved_topology(binding, expected: dict) ->
-   tuple[AssemblyFinding, ...]` walks each directory entry of the decoded
-   evidence by its `"path"`, shallowest-first, with descriptor-relative
-   `open_child_directory`/`lstat` lookups from the project root: a determinate
-   `ENOENT` → `NODE_MISSING`; a determinate non-directory kind →
+   tuple[AssemblyFinding, ...]` walks the decoded evidence's directory entries
+   by their `"path"`, shallowest-first, with descriptor-relative
+   `open_child_directory`/`lstat` lookups from the project root — **but only
+   the entries with a non-null `identity`** (the approved-existing
+   directories). A planned directory is encoded with `identity = null`
+   (measured `fs/approval.py:170-176`) and its state at recovery is
+   legitimately variable — absent, created by this transaction, or occupied by
+   a foreign blocker — all of which are **A3's** to classify through phase 6's
+   stops and observations, never assembly drift; encoding them as drift would
+   also make the promised planned-node-stays-a-stop case unreachable. A
+   planned node's inherited constraints are covered by validating its approved
+   ancestors and the descent's own checks. For the existing entries: a
+   determinate `ENOENT` → `NODE_MISSING`; a determinate non-directory kind →
    `WRONG_ENTRY_KIND` (each the node's **sole** finding); otherwise compare
    identity, constraints, mount membership, and work-root facts against the
    expected document and emit every applicable changed-kind finding. An
@@ -740,9 +780,10 @@ Phase mapping, exactly §9.1:
    (measured `descriptors.py:212-249`) — so a restarted mid-flight transaction
    could not otherwise observe descendants of a directory it already created,
    and `adopt` alone cannot resume the walk. Task 7 therefore adds the concrete
-   resume algorithm as `descriptors.resume_descent(table, backend, observation,
-   approved, node) -> None`, recovery-only, called for each planned-node
-   `WalkStop` whose observed entry is a directory:
+   resume algorithm as `descriptors._resume_descent(table, backend, observation,
+   approved, node) -> None` — private, since it is a one-use helper inside the
+   resolver's phase 6, not a transaction-stage entry point — called for each
+   planned-node `WalkStop` whose observed entry is a directory:
    1. Open the stop's directory (`open_child_directory` from the stop's
       `parent_fd`/`component`), validate it with the same constraint checks the
       builder applies, and `table.adopt(node, fd)` — ownership passes to the
@@ -776,7 +817,11 @@ registry's one recorded exception (Task 10 pins it).
 
 - [ ] **Step 7.1: Failing tests.** Resolution: a clean store with no active record
   resolves to a no-op (lease enters, no `NotImplementedError` anywhere — grep the
-  tree in the test); a mid-flight `PREPARED` record with untouched world rolls
+  tree in the test); a **registered idle root** — genesis present, no active
+  record — resolves to a return after survivor cleanup (append a genesis, crash
+  no transaction, re-enter: no error, chain intact, nothing persisted; this is
+  the state every `append_intent` call passes through); a mid-flight `PREPARED`
+  record with untouched world rolls
   back to `ROLLED_BACK` + settled + detached on fresh lease entry; a `HALTED`
   record short-circuits with its stored diagnostic (and phase order: the same
   record with a corrupted chain entry raises `ChainStateInvalid` instead);
@@ -793,7 +838,22 @@ registry's one recorded exception (Task 10 pins it).
   transaction killed after publication recovers with the created directory's
   descendants observed (a nested effect's slot appears in the snapshot); a
   planned node occupied by a foreign file at recovery stays a stop and the
-  classification rules on it.
+  classification rules on it — which also proves the diff skipped it (no
+  assembly halt was persisted for a planned node's occupant).
+
+  Two more test families this step owns:
+  - **Hostile stored evidence**, parametrized: duplicate JSON keys, noncanonical
+    bytes (unsorted keys, whitespace), duplicate paths or node keys, a node/path
+    inconsistency, wrong member types, and invalid enum/fact values — each read
+    back through `load_record` raises `MetadataStoreInvalid`, never an
+    incidental `KeyError`/`TypeError` (fabricate via direct `sqlite3` writes).
+  - **Resource lifetimes on raising branches.** The resolver owns a chain fd, a
+    workspace, a `DescriptorTable`, and `Observation`s across many raising
+    paths; each owned resource is context-managed (or closed in `finally`), and
+    a `descriptor_count` before/after assertion wraps a lease entry that exits
+    through each failure class — `ChainStateInvalid` in phase 1, the phase-2
+    short-circuits, an `AssemblyHalt` in phase 5, and a `HaltPlan` in phase 7 —
+    proving no descriptor leaks on any of them.
 - [ ] **Step 7.2: Implement** phases 1–7 as one `resolve` function calling private
   per-phase helpers in order, with an early return per short-circuit; wire
   `root.py`; delete `lease._resolve`; convert the A5b trap tests.
@@ -860,15 +920,22 @@ via `table.adopt(node, fd)` under transfer-or-close: the spine closes it if
 adoption raises) → `DONE` journal COMMIT (8) → `APPLIED` transition (9).
 `clear_declared_paths()` in the `finally`.
 
-`commit.commit_prepared(lease, approved, table, chain_fd, validated)`, steps
-10–14: one fresh `Observation` universe observing the **complete compiled final
-surface first, then the complete scratch vector** (10) — any disagreement raises
-`EffectMismatch` (a caught failure; the plan loop rolls back) → `COMMITTED` state
-+ commit decision in **one** store transaction (11) → `settled(committed)` append
-referencing the bound registration digest (12) → settlement binding COMMIT (13)
-→ committed cleanup and detach **through the plan loop** (14): assemble a fresh
-snapshot, `classify_recovery` (disposition `COMMITTED_CLEANUP`), `run_plan` — the
-detach stop finds the settlement already bound and detaches.
+`commit.commit_prepared(lease, approved, table, chain_fd)`, steps 10–14 — note
+**no `validated` parameter**: the proof taken at entry is stale the moment the
+registration append lands (`append_entry` refuses a proof whose history no
+longer matches, measured `chain/append.py:224-226`), so every later append works
+from a fresh proof taken under the still-held `chain_fd` immediately before it.
+The steps: one fresh `Observation` universe observing the **complete compiled
+final surface first, then the complete scratch vector** (10) — any disagreement
+raises `EffectMismatch` (a caught failure; the plan loop rolls back) →
+`COMMITTED` state + commit decision in **one** store transaction (11) → fresh
+`validate_chain(backend, chain_fd)` → `settled(committed)` append against that
+fresh proof, referencing the bound registration digest (12) → settlement
+binding COMMIT (13) → committed cleanup and detach **through the plan loop**
+(14): assemble a fresh snapshot, `classify_recovery` (disposition
+`COMMITTED_CLEANUP`), `run_plan` — the detach stop finds the settlement already
+bound and detaches. (The rollback arm's settlement goes through `run_plan`'s
+`_reconcile_settlement`, which already opens and validates its own chain view.)
 
 The catch (design §6, last paragraph), in `execute.py`:
 
@@ -907,7 +974,12 @@ only after restoration is proved). A `HaltPlan` from the loop raises
   and assert the final-surface proof already ran (call recording beneath the
   facade); commit decision and state land in one transaction (kill between them
   is impossible — assert via the store's single-COMMIT counter, measured
-  `_run_barrier`). Run: expect import failures.
+  `_run_barrier`). Lifetimes: the spine's owned resources — the `Workspace`,
+  `Captured`'s descriptor table, adopted `CreateDirectory` fds, the chain fd —
+  are context-managed or `finally`-closed, and a `descriptor_count`
+  before/after assertion wraps a run exiting through each class (clean commit,
+  caught rollback, substrate-invalid propagation): no descriptor leaks on any
+  of them. Run: expect import failures.
 - [ ] **Step 8.2: Implement** as specified. The APPLYING transition must be refused
   by the schema while the registration digest is null — do not pre-check it; let
   the trigger own the fact (a test drops the binding write and asserts the
@@ -1011,10 +1083,15 @@ commit arm.
     `recover._persist_assembly_halt`, and that function's parameters include no
     proof type — recorded as the registry's one exception with a comment naming
     design §9.3.
-  - `settle.apply_transform` and `settle.apply_remove_scratch` join the
-    proof-accepting internals registry (they demand `AuthorizedStep`), and a
-    source scan asserts no production call site constructs or forwards a raw
-    `TransformEffectTuple`/`RemoveScratch` into them.
+  - `_TRANSACTION_STAGE_ENTRY_POINTS` (measured
+    `test_fs_architecture.py:1126-1143`) gains every new proof consumer —
+    `settle.apply_transform`, `settle.apply_remove_scratch`, and
+    `recover.run_plan` — so the registry's `_require_admitted`-first rule
+    covers them; a source scan asserts no production call site constructs or
+    forwards a raw `TransformEffectTuple`/`RemoveScratch` into the `settle`
+    pair (they demand `AuthorizedStep`). One-use helpers below these entry
+    points (`_resume_descent`, `_diff_approved_topology`, `site_for`) stay
+    private and unregistered.
   - Effects modules import no `atoms.chain`, no `atoms.coordinator.execute`/
     `commit`/`recover`/`commands` (syscall execution only, design §4); `execute`/
     `commit`/`recover` never read `TransactionSpec.dependencies` (attribute scan —
@@ -1078,9 +1155,9 @@ reconciliation). §9.1 → Task 7 (seven phases, order pinned). §9.2 → Task 6
 case a test; two-pass validation so an interrupted append's survivor finishes).
 §9.3 → Task 7 (halt build/persist/surface; the determinacy split carried by the
 dedicated diff seam, not exceptions). §10.4's registered/settled payloads →
-Tasks 6/8. §11's triggers are A7a's; Task 8 deliberately leans on them (the
-APPLYING gate test); Task 6 adds the one v3 column with its own write-once
-trigger. §12 → `EffectMismatch` is internal;
+Tasks 6/8. §11's triggers and schema are A7a's, untouched; Task 8 deliberately
+leans on them (the APPLYING gate test); Task 7 amends only the evidence
+encoding (the `"path"` member). §12 → `EffectMismatch` is internal;
 `ChainStateInvalid`/`TransactionHalted`/`PreconditionRefused` surfaced exactly
 as specified. §13 item 8 → Task 7; items 1–7 and 9–13 landed in A7a (verified
 against the tree — the trap at `lease.py:59` was the one remainder). §14 →
@@ -1100,7 +1177,7 @@ fields match Task 8's construction and Task 10's `__all__` assertion;
 `_registration_entry(spec, txid)` has one definition (Task 6) and two consumers
 (Task 6's reconciliation appends, Task 8's forward append), both reading the
 tag and digest from the spec itself; `DescriptorTable.adopt` and
-`resume_descent` are defined once (Tasks 3 and 7) with named consumers.
+`_resume_descent` are defined once (Tasks 3 and 7) with named consumers.
 
 **Known open decisions surfaced to the executor-of-this-plan:** the two the tree
 left open (`transitions.py`'s stop set and the projection-comparison comment) are
@@ -1170,3 +1247,43 @@ step 11.2.
    returned; a still-at-`expected_before` world permits one re-execution, and a
    second failure there is `ProtocolError`. The private signal is never
    observable from `run_plan`'s callers.
+
+## Third-round findings closed (2026-08-14)
+
+1. `_perform_reconciliation` takes `(backend, store, chain_fd, validated,
+   actions)` — its actual dependencies — because the resolver calls it in
+   phase 3, before the internal `Lease` exists (phase 6).
+2. Phase 3 ends with an explicit return when no active record exists: a
+   registered idle root — the normal state before `append_intent` or a new
+   transaction — stops after survivor cleanup instead of falling through to
+   `record.spec` on `None`. Step 7.1 gains the registered-idle-root test.
+3. Survivor-application exclusivity is tree-wide: Task 7 strips
+   `_apply_survivors` from both `_registered_root` and `register_root`
+   (validate-only; post-resolution survivors are `ChainStateInvalid`), with
+   their crash-retry tests moved to lease-entry fixtures. Task 5's move stays
+   byte-identical so the intermediate tree remains green.
+4. `_diff_approved_topology` walks only evidence entries with non-null
+   `identity`: planned directories (identity = null) are legitimately absent,
+   transaction-created, or foreign-blocked — A3's classification territory via
+   phase 6, never assembly drift — which keeps the planned-node-stays-a-stop
+   case reachable.
+5. `commit_prepared` drops the stale `validated` parameter; the settlement
+   append works from a fresh `validate_chain` under the held `chain_fd`
+   immediately before appending, since `append_entry` refuses a proof whose
+   history moved at the registration append.
+6. The move and mkdir cells now match the factories exactly: restore is the
+   destination→source transfer alone, both dual-name and anchor-only shapes
+   are repair, no transform removes the anchor (the following `RemoveScratch`
+   does), and mkdir-remove targets the live directory only.
+7. The one-retry rule is gone: after a post-mutation `EffectMismatch`, the loop
+   reauthorizes once solely to obtain the factory `HaltPlan`; a returned
+   `AuthorizedStep` is `ProtocolError` immediately, per ledger #14's
+   no-retry/no-reclassify clause.
+8. `settle.apply_*` accept `Lease`, open with `_require_admitted`, and are
+   enumerated in `_TRANSACTION_STAGE_ENTRY_POINTS` along with `run_plan`;
+   `resume_descent` became the private `_resume_descent`.
+9. Lifetimes and hostile input are tested: descriptor-count assertions wrap
+   every raising exit class of both the resolver and the spine, and a
+   parametrized hostile-evidence family (duplicate keys, noncanonical bytes,
+   duplicate/inconsistent nodes, wrong types) must surface as
+   `MetadataStoreInvalid` from `load_record`.
