@@ -396,8 +396,12 @@ the status guard refuses "implemented" claims until the tree makes them true.
 - Create: `python/src/atoms/coordinator/effects/move.py`
 - Create: `python/src/atoms/coordinator/effects/create_directory.py`
 - Modify: `python/src/atoms/coordinator/descriptors.py` (`DescriptorTable.adopt`)
+- Modify: `python/src/atoms/core/recovery/variants.py` (the mkdir scaffold
+  shape in Step 3.2)
 - Test: `python/tests/test_effects_move.py`, `python/tests/test_effects_mkdir.py`,
-  additions to `python/tests/test_coordinator_descriptors.py`
+  additions to `python/tests/test_coordinator_descriptors.py` and
+  `python/tests/test_recovery_variants_paths.py` (scaffold-survivor
+  classification)
 
 **Interfaces:**
 - Consumes: `link_anchor`, `mkdir_child`, `open_child_directory`, facade `rebind`
@@ -434,7 +438,13 @@ the status guard refuses "implemented" claims until the tree makes them true.
   raises `EffectMismatch` without further mutation. Mkdir: forward success
   publishes an empty directory with the approved mode at the live path, identity
   verified through the retained descriptor, and the descriptor's facade
-  provenance now names the live path (assert via `provenance_of`); occupancy
+  provenance now names the live path (assert via `provenance_of`); the same
+  forward success under `umask(0o777)` with approved mode `0` (set and
+  restore the umask around the call) — the scaffold construction makes the
+  retain open and the final mode land regardless of masking; a
+  scaffold-mode work survivor (empty, mode subset of `0o700`) classifies to
+  `RemoveScratch` in the variants tests while a non-empty or
+  wider-than-`0o700` occupant stays a preserved blocker; occupancy
   (`EEXIST` on the cross-directory transfer) raises `PreconditionRefused` after
   removing only the attributable work-slot directory and flushing `work_fd`
   (the compensation-barrier rule); an injected `OSError(EIO)` from that same
@@ -459,13 +469,34 @@ the status guard refuses "implemented" claims until the tree makes them true.
   the anchor against `effect.source_pre` → `transfer_noclobber(source_fd,
   source_leaf, destination_fd, destination_leaf)` → require destination and anchor
   to name one inode still at the expected fingerprint → `flush_directory
-  (destination_fd)` **then** `flush_directory(source_fd)`. Mkdir:
-  `mkdir_child(work_fd, work_leaf, mode)` → `open_child_directory(work_fd,
-  work_leaf)` (retain) → `set_mode` → `flush_file(dir_fd)` →
+  (destination_fd)` **then** `flush_directory(source_fd)`. Mkdir — the
+  construction intermediate is **crash-safe against umask**. The kernel
+  masks `mkdir`'s requested mode with the process umask, approved modes go
+  down to `0` (measured `compiler.py:315`), and the retain open is
+  `O_RDONLY|O_DIRECTORY` (measured `fs/linux.py:12`) — so
+  `mkdir_child(..., mode)` under a hostile umask (a live probe with umask
+  `0o777` created mode `000`) yields a directory the very next open cannot
+  traverse, and a crash after the mkdir leaves a mode-masked work survivor
+  A3 could not attribute. The sequence: `mkdir_child(work_fd, work_leaf,
+  0o700)` (the **scaffold mode**; umask can only clear bits, so a survivor's
+  mode is always a subset of `0o700`) → `repair_entry_mode(work_fd,
+  work_leaf, 0o700, before_change=...)` with the hook validating the entry
+  is a directory (this undoes any umask stripping; after it the scaffold is
+  exactly `0o700`, traversable by its owner) → `open_child_directory(work_fd,
+  work_leaf)` (retain, through the seam) → `set_mode(dir_fd, mode)` (fchmod
+  is umask-immune — the approved mode lands here, `0` included) →
+  `flush_file(dir_fd)` →
   `transfer_noclobber(work_fd, work_leaf, parent_fd, live_leaf)` →
   `flush_directory(parent_fd)` → verify identity, mode, and emptiness through the
   retained descriptor → `flush_directory(work_fd)` → `backend.rebind(dir_fd,
   Provenance(RootKind.PROJECT, str(effect.path)))` → return `dir_fd`.
+  **A3 learns the scaffold shape** (`variants.py`, mkdir family): an empty
+  work-slot directory whose mode satisfies `mode & ~0o700 == 0` is
+  attributable construction debris, classified to the same `RemoveScratch`
+  as the approved-mode survivor — only the engine's scaffold produces an
+  owner-bits-only empty directory under the engine-derived work leaf. Task
+  11 records the amendment (the authority's restartable-materialization
+  intermediate and A3's normative model gain the scaffold shape).
 - [ ] **Step 3.3:** Task tests pass, then the full gate.
 - [ ] **Step 3.4:** `git commit -m "feat(effects): MoveNoClobber and CreateDirectory forward execution with provenance rebinding"`
 
@@ -604,8 +635,11 @@ the status guard refuses "implemented" claims until the tree makes them true.
 - Modify: `python/src/atoms/coordinator/commands.py` (`_registered_root` moves out)
 - Modify: `python/src/atoms/core/recovery/model.py`,
   `python/src/atoms/core/recovery/variants.py`,
+  `python/src/atoms/core/recovery/classifier.py`,
+  `python/src/atoms/core/recovery/authorization.py`,
   `python/src/atoms/core/recovery/snapshot.py`,
   `python/src/atoms/core/recovery/diagnostics.py`,
+  `python/src/atoms/core/recovery/__init__.py`,
   `python/src/atoms/store/records.py`, `python/src/atoms/fs/observe.py`,
   `python/src/atoms/coordinator/capture.py` (the total-observation substrate
   change below)
@@ -613,6 +647,8 @@ the status guard refuses "implemented" claims until the tree makes them true.
   `python/tests/test_coordinator_transitions.py` for the new stop; update
   `python/tests/test_fs_observe.py`, `python/tests/test_recovery_variants_files.py`,
   `python/tests/test_recovery_variants_paths.py`,
+  `python/tests/test_recovery_classifier.py`,
+  `python/tests/test_recovery_authorization.py`,
   `python/tests/test_recovery_snapshot.py`, `python/tests/test_store_records.py`,
   `python/tests/test_coordinator_capture.py` for the new observed arms
 
@@ -676,30 +712,64 @@ end:
   fingerprint whose leaf stopped being a symlink) after a successful
   `lstat`, or `_open_and_pin`'s kind predicate failing (the fd is closed
   first, as today). Observation states facts, it does not judge (ledger
-  #13's rule, already the module's charter). `fs/observe.py` is the **only
-  production constructor of both arms**, pinned by a source scan in the
-  architecture tests (the `_approve_for_recovery` sole-caller pattern).
+  #13's rule, already the module's charter). Exactly **two** production
+  constructors of the arms exist — `fs/observe.py`, the live-filesystem
+  producer, and the durable decoder in `store/records.py`, which must
+  reconstruct them when reading a persisted diagnostic back — and the
+  architecture source scan pins exactly those two (the
+  `_approve_for_recovery` sole-caller pattern, widened to a two-member
+  allowlist).
   Streaming and enumeration through pinned descriptors are untouched —
   their errors are substrate, not namespace.
-- `variants.py`: `_classify_entry` returns `EntryClass.EXTERNAL` for both
-  arms **before** `_entry_state` is consulted (`_entry_state` stays closed
-  over the kinds that carry a declared `PathState`, measured
-  `variants.py:149-159`). `EXTERNAL` is already every family's
-  no-restorable-survivor route, so classification lands on the existing
-  `HaltPlan` arms — no new decision table.
+- **One shared non-authorizable-arm guard — the arms never reach a
+  classification table.** Mapping them into `EntryClass` would be wrong:
+  `EXTERNAL` does not always halt (Replace `STARTED` with live `POST` and
+  external staging selects `_replace_exchange(refused=True)`, a **mutating**
+  transform — measured `variants.py:493-501`), and two fact-free
+  `ObservedContended()` values compare equal through the authorization
+  projection (measured `authorization.py:63-66`), so the arms could
+  authorize mutation of an unattributable state — violating the authority's
+  model invariant "recovery never mutates an unattributable state"
+  (measured `2026-07-23-...-design.md:1419`). Instead **one guard
+  function** in `classifier.py` scans a `JointObservation`'s persistent and
+  scratch entries for either arm and produces the factory halt. It runs in
+  exactly two places: at `classify_recovery`'s entry over the snapshot's
+  observations — before any variant table, before `_at_frontier`'s direct
+  `_entry_state` use (measured `variants.py:1390`), and before the
+  committed-recovery `_observed_state` (measured `classifier.py:446`) —
+  halting with `EFFECT_TUPLE_UNATTRIBUTABLE` and the offending joint
+  observation as evidence; and at `authorize_recovery_step`'s entry over
+  the fresh observation, **before** the equality projection, returning the
+  `PLAN_PRECONDITION_CHANGED` factory halt. Behind the guard,
+  `_entry_state`, `_classify_entry`, `_at_frontier`, and `_observed_state`
+  stay closed exactly as they are — an arm reaching one is an engine
+  defect, and the existing `ProtocolError`s say so. A census test walks
+  every fixture-family classification with each arm planted at each covered
+  slot and asserts no `ActionPlan` mutating step's
+  `expected_before`/`result_after` ever contains either arm; the
+  authorization tests plant each arm in the fresh observation and assert
+  the factory halt — never an `AuthorizedStep`.
 - **The halt must be reachable and durable**, so the closed layers between
   observation and the persisted diagnostic each gain the arms:
-  `snapshot._validate_observed_entry` accepts both (validating `st_mode` as
-  an exact `int`; measured refusal today at `snapshot.py:400-414`);
-  `diagnostics._entry_fields` projects them (measured refusal at
-  `diagnostics.py:38-49`) with `DiagnosticEntry.state` widened to
-  `PathState | ObservedUnrecognized | ObservedContended` (measured
-  `model.py:130`); and the durable codec (measured four-state `_state_obj`,
-  `records.py:61-73`) gains two tags — `{"kind": "unrecognized",
-  "st_mode": <canonical int>}` and `{"kind": "contended"}` — with the
-  decoder closed over them. Round-trip tests cover a diagnostic carrying
-  each arm; hostile tests cover an unknown state kind and a wrong-typed
-  `st_mode` (both `MetadataStoreInvalid`).
+  `snapshot._validate_observed_entry` accepts both (measured refusal today
+  at `snapshot.py:400-414`); `diagnostics._entry_fields` projects them
+  (measured refusal at `diagnostics.py:38-49`) with `DiagnosticEntry.state`
+  widened to `PathState | ObservedUnrecognized | ObservedContended`
+  (measured `model.py:130`); the **persisted-diagnostic validators** accept
+  the widened state (the diagnostic-entry state check admits only the four
+  declared states today, measured `snapshot.py:490-500`); and the durable
+  codec (measured four-state `_state_obj`, `records.py:61-73`) gains two
+  tags — `{"kind": "unrecognized", "st_mode": <canonical int>}` and
+  `{"kind": "contended"}` — with the decoder closed over them. `st_mode`
+  validation is **semantic, stated once and used by validator and decoder
+  both**: an exact canonical `int` whose format bits denote a kind the
+  union cannot otherwise represent — `stat.S_IFMT(st_mode)` in
+  {FIFO, socket, block device, character device} — because a
+  regular/directory/symlink format under the `"unrecognized"` tag is
+  hostile, as is any valueless integer. Round-trip tests cover a diagnostic
+  carrying each arm; hostile tests cover an unknown state kind, a
+  wrong-typed `st_mode`, a recognized-kind `st_mode` (a regular-file
+  format), and a garbage value (all `MetadataStoreInvalid`).
 - `capture.py`: capture translates either arm into `PreconditionRefused`
   naming the path (and `st_mode` where there is one) — capture runs before
   `PREPARED`, where refusal is §11's correct outcome, and §11 already names
@@ -718,8 +788,12 @@ race at the covered slot (a backend wrapper that removes or swaps the entry
 between the calls) — the observation reads `ObservedContended`, the halt is
 factory-issued, and no exception parsing or fabricated state is involved;
 the observe unit tests convert from asserting the refusals to asserting the
-returned arms; the variants tests pin `EXTERNAL` classification for both
-arms; the capture tests keep the refusal at capture for both. (Task 7 and
+returned arms; the guard is pinned across dispositions — an arm at a covered
+slot with its journal `PENDING` (the rollback arm), with the record
+`COMMITTED` (the committed-cleanup observation), and on an already-`HALTED`
+record (the phase-2 short-circuit returns the stored diagnostic unchanged,
+no re-observation) each halts or short-circuits, never classifies or
+authorizes; the capture tests keep the refusal at capture for both. (Task 7 and
 Task 8 pin the fresh-recovery and caught-rollback paths for the FIFO and
 both races; Task 11 records the design amendment — §9.1's observation phase
 becomes total, and the amendment documents the durable diagnostic shape.)
@@ -1476,6 +1550,12 @@ cut:
   append sequence, measured `chain/append.py:211-254`).
 - Both terminal arms: including between settlement append and binding, and between
   binding and detach; and mid-rollback (kill inside a `RESTORE_PRE` transform).
+- Mkdir scaffold cuts: a kill between `mkdir_child` and `repair_entry_mode`
+  (the survivor's mode is umask-masked, any subset of `0o700`) and between
+  the repair and the retain open (exactly `0o700`) — run under
+  `umask(0o777)` so the masked case is the worst one; recovery classifies
+  the scaffold survivor as attributable `RemoveScratch` debris and
+  converges.
 - Compensation barriers: for each in-process compensation (replace's
   exchange-back, create-file's `EEXIST` staging removal, delete's tombstone
   return, move's rename-back and anchor removal, mkdir's work-slot removal),
@@ -1597,7 +1677,7 @@ commit arm.
   (implemented, with the landing date), the authority design's status field
   ("A8–A9 … remain"), README and AGENTS status sections. Grep both docs trees for
   "A7b" and "A7–A9" to catch propagation beyond what the guard names (per the
-  design-doc drift rule). In the same commit, land the six design amendments
+  design-doc drift rule). In the same commit, land the seven design amendments
   this plan carries as candidates: **§9.1** — the phase-5 proof is issued by the
   factory-owned `_approve_for_recovery` path, which admits A3-variable planned
   states and skips forward-planning viability judgment (Task 7); **§9.3** — the
@@ -1617,7 +1697,12 @@ commit arm.
   one coherent look observes as `ObservedContended`, both classify to a
   `HaltPlan` — never a refusal — once a durable record exists, and the
   durable diagnostic encodes them as `{"kind": "unrecognized", "st_mode":
-  <canonical int>}` and `{"kind": "contended"}` (Task 5). Each amendment is one
+  <canonical int>}` and `{"kind": "contended"}` (Task 5); **authority
+  restartable-materialization / A3 normative model** — `CreateDirectory`'s
+  work-slot construction intermediate is the `0o700` scaffold (mkdir at
+  scaffold mode, entry-mode repair, then the approved mode via fchmod), and
+  an empty work-slot directory whose mode is a subset of `0o700` is
+  attributable construction debris (Task 3). Each amendment is one
   dated note in the design, same
   shape as the 2026-08-13 §5.1 amendments.
 - [ ] **Step 11.3:** Ledger: mark the A7 halves of #1, #3, #8, #12, #13, #14, #17,
@@ -1986,6 +2071,9 @@ step 11.2.
    was measured refusing the arm, so the promised FIFO halt could neither
    be built nor persisted. Round-trip and hostile decode tests are pinned,
    and the §9.1 amendment documents the durable diagnostic shape.
+   (Superseded in part by the twelfth round: `st_mode` validation is
+   semantic, the constructor scan allows the decoder, and three more
+   closed paths joined the threading.)
 2. Observation's transient twin is represented, not refused:
    `ObservedContended()` (fact-free, factory-controlled in `fs/observe.py`)
    is returned where a lookup→open or lookup→readlink race or a
@@ -1993,6 +2081,8 @@ step 11.2.
    `EXTERNAL` to the existing `HaltPlan` arms, capture keeps §11's refusal
    (which names this case verbatim), and injected-race tests are pinned
    across step authorization, fresh recovery, and caught rollback.
+   (The `EXTERNAL` mapping is superseded by the twelfth round: the arms
+   halt through one shared guard before any classification table.)
 3. `open_child_directory` joined `_DETERMINATE`
    (`ENOENT`/`ENOTDIR`/`ELOOP`/`EXDEV`) and the routing rule — mkdir's
    post-`mkdir_child` retain open races the same way — with its call-site
@@ -2002,3 +2092,35 @@ step 11.2.
    routed with injected-failure tests; a guard lookup failing determinately
    is itself the answer "no longer ours", chained under the in-flight
    mismatch, and the guard mutates nothing.
+
+## Twelfth-round findings closed (2026-08-14)
+
+1. The arms are non-authorizable by one shared guard, not an `EntryClass`
+   mapping: `EXTERNAL` can select a mutating transform
+   (`_replace_exchange(refused=True)`, `variants.py:493-501`) and two
+   fact-free `ObservedContended()` values pass the authorization equality
+   (`authorization.py:63-66`), so the guard scans every joint observation
+   at `classify_recovery`'s and `authorize_recovery_step`'s entries and
+   halts — with a census test proving no authorized mutating step ever
+   contains either arm.
+2. The guard placement covers the remaining closed paths (`_at_frontier`'s
+   direct `_entry_state`, committed recovery's `_observed_state`) and the
+   persisted-diagnostic validators accept the widened state; PENDING,
+   COMMITTED, and already-HALTED dispositions are pinned; `classifier.py`,
+   `authorization.py`, `core/recovery/__init__.py` and their tests joined
+   the Files list.
+3. `CreateDirectory` builds through a crash-safe `0o700` scaffold: mkdir at
+   scaffold mode (umask can only clear bits), `repair_entry_mode` back to
+   exactly `0o700`, retain open, then the approved mode via umask-immune
+   `set_mode` — verified against a live probe where umask `0o777` produced
+   an untraversable mode-`000` directory. A3 attributes the scaffold
+   survivor (empty, mode ⊆ `0o700`) as construction debris; umask-hostile
+   forward tests, scaffold kill cuts, and the authority/A3 amendment are
+   recorded (seven amendments now).
+4. The constructor source scan allows exactly two producers: the
+   live-filesystem observer and the durable decoder that reconstructs the
+   arms from a persisted diagnostic.
+5. `st_mode` validation is semantic and stated once: the format bits must
+   denote a kind the union cannot otherwise represent (FIFO, socket, block,
+   character); recognized-kind and garbage-value hostile payloads are
+   pinned.
