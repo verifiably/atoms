@@ -166,7 +166,10 @@ the status guard refuses "implemented" claims until the tree makes them true.
       `passthrough` member to be an `int`. Only then does it invoke `call`,
       catch `OSError`, re-raise it unchanged when its errno is in
       `passthrough` (the caller owns that branch), raise `EffectMismatch`
-      (naming the operation, the slot, and the errno) when it is in the
+      carrying the operation, the slot, and the errno as **structured
+      members** (`.operation: str`, `.slot: str`, `.errno: int` — not
+      message text; Task 5's recovery loop dispatches on `.errno`) when it
+      is in the
       resolved determinate set, and otherwise — `EIO` and kin — re-raise the
       `OSError` it is (design §9.3: never encoded as drift). The table:
       - `unlink_child`: `ENOENT`, `EISDIR`, `EBUSY`, `EACCES`, `EPERM`;
@@ -422,8 +425,8 @@ the status guard refuses "implemented" claims until the tree makes them true.
 - Modify: `python/src/atoms/coordinator/descriptors.py` (`DescriptorTable.adopt`)
 - Modify: `python/src/atoms/core/recovery/variants.py` (the mkdir scaffold
   shape in Step 3.2)
-- Modify: `python/src/atoms/core/compiler.py` (the directory-mode
-  compile-time rule in Step 3.2)
+- Modify: `python/src/atoms/core/compiler.py` (the directory-mode and
+  file-postimage compile-time rules in Step 3.2)
 - Modify: `python/src/atoms/coordinator/admission.py` (`_require_admitted`
   gains the binding-liveness access in Step 3.2)
 - Test: `python/tests/test_effects_move.py`, `python/tests/test_effects_mkdir.py`,
@@ -962,7 +965,7 @@ end:
   case asserts capture refuses each trigger.
 - **The halt must be reachable and durable**, so the closed layers between
   observation and the persisted diagnostic each gain the arms:
-  `snapshot._validate_observed_entry` accepts both (measured refusal today
+  `snapshot._validate_observed_entry` accepts them (measured refusal today
   at `snapshot.py:400-414`); `diagnostics._entry_fields` projects them
   (measured refusal at `diagnostics.py:38-49`) with `DiagnosticEntry.state`
   widened to `PathState | ObservedUnrecognized | ObservedContended |
@@ -1093,12 +1096,40 @@ becomes total, and the amendment documents the durable diagnostic shape.)
   factory-issued halt: take a fresh observation with the step's coverage and
   call `authorize_recovery_step(plan, cursor, observed)` — a `HaltPlan` (the
   world no longer matches `expected_before`) is persisted via `_persist_halt`
-  and returned, exactly as an up-front mismatch would be. If it instead returns
-  another `AuthorizedStep`, raise `ProtocolError` immediately — **do not
-  execute again**: ledger #14 requires halting "instead of reclassifying,
-  retrying, or inventing a second decision table", and a primitive that
-  reported success while verification failed against an unmoved world is an
-  engine defect, not drift. Step 5.1 gains the test: a settle-level
+  and returned, exactly as an up-front mismatch would be. If it instead
+  returns another `AuthorizedStep`, the world is unchanged in every fact
+  the model observes, and the mismatch's **structured errno decides**
+  what that means:
+  - `.errno` in `{EACCES, EPERM}` → **kernel-denied mutation of an
+    unchanged namespace**. This is not an engine defect: a parent
+    flipping `0755 → 0555`, a sticky bit, or an immutable attribute
+    denies the mutation while every modeled fact — lookups, occupancy,
+    constraints — stays equal (neither `ParentOccupancy` nor
+    `DirectoryConstraints` carries mutation authority or a parent mode),
+    so reauthorization can only re-issue the step. No observation is
+    fabricated to break the tie; instead a **factory-owned halt seam**
+    beside the guard's (same module, same factory discipline) builds the
+    `HaltPlan` with a new A3 `HaltReason.MUTATION_DENIED`, evidence the
+    fresh joint observation plus the denied operation, slot, and errno;
+    it is persisted via `_persist_halt` and surfaces as
+    `TransactionHalted` — a durable halt, ledger #14's outcome, with no
+    retry. `HaltReason.MUTATION_DENIED` threads like the arms: the
+    durable reason codec accepts it (round-trip and hostile
+    unknown-reason cases), the operator action stays
+    `INSPECT_PRESERVED_EVIDENCE` (the default arm of the existing
+    mapping), and the A3 design's halt vocabulary is amended (Task 11).
+  - any other `.errno` → raise `ProtocolError` immediately — **do not
+    execute again**: ledger #14 requires halting "instead of
+    reclassifying, retrying, or inventing a second decision table", and a
+    primitive that reported success while verification failed — or failed
+    `ENOENT` while the lookup still sees the entry — against an unmoved
+    world is an engine defect, not drift.
+  Step 5.1 pins both: a parent chmodded `0o555` after authorization (the
+  unlink/rename refuses `EACCES`, the fresh tuple compares equal, and the
+  result is a persisted `MUTATION_DENIED` halt — no retry, no
+  `ProtocolError`) and a representative unchanged-world `EPERM` (injected
+  through the structural backend — a real immutable flag needs
+  privileges the suite does not assume). Step 5.1 also keeps the test: a settle-level
   verification failure injected beneath the facade ends in a persisted
   `HaltPlan`, and `EffectMismatch` is never observable from `run_plan`'s
   callers. `_reconcile_settlement`: under
@@ -2254,7 +2285,10 @@ commit arm.
     `ObservedDirectory.has_unmodeled_child: bool | None`; the
     `authorize_recovery_step` contract (~361) gains the
     non-authorizable-arm guard ahead of the equality rule, with the
-    arms and occupancy-`None` as its four triggers; the mkdir
+    arms and occupancy-`None` as its four triggers; the halt vocabulary
+    gains `MUTATION_DENIED` — the factory halt for a kernel-denied
+    mutation of an unchanged namespace (permission-errno
+    `EffectMismatch` whose reauthorization re-issues the step); the mkdir
     classification table (~812) gains the scaffold-debris row demanding an
     **observed-empty** survivor — an opaque survivor halts before
     mutation (Tasks 3, 5).
@@ -2263,8 +2297,10 @@ commit arm.
     `open_child_directory`" claim is amended with the deliberately
     role-blind `EACCES → O_PATH`
     fallback (occupancy-`None`, on any directory observation),
-    and the FIFO/socket/device, contended, and inaccessible-file
-    (`EACCES` on the regular-file open) outcomes move from refusal or raw
+    and the FIFO/socket/device, contended, and inaccessible outcomes —
+    the last observation-level, from any observation step refusing
+    `EACCES` (child `lstat`, file open, `readlink`, or the failed
+    `O_PATH` fallback) — move from refusal or raw
     escape to the represented arms (Task 5).
 
   Each amendment is one dated note in its document, same shape as the
@@ -2321,14 +2357,16 @@ tag and digest from the spec itself; `DescriptorTable.adopt` and
 left open (`transitions.py`'s stop set and the projection-comparison comment) are
 decided in Task 5's "Decisions" block; the design amendments — spanning the
 A7 design (§9.1 twice, §9.3, §9.2, §11, §7, the primitive contract), the
-authority (restartable materialization and the compile-time directory-mode
-rule), the A2 design (the directory-mode narrowing, with the historical A2
+authority (restartable materialization and the compile-time
+directory-mode and file-postimage
+rules), the A2 design (the directory-mode and file-postimage narrowing,
+with the historical A2
 plan annotated), the A4b2 design (the proof schema and evidence `"path"`
 member, with the historical A4b2 plan annotated), the A5a design (the
 `Workspace` producer contract, with the historical A5a plan annotated),
 the A3 design (union
 arms, authorization guard, mkdir
-table), and
+table, the `MUTATION_DENIED` halt reason), and
 the A6 design (directory observation contract) — are decided in Tasks 3–8
 and land dated, grouped by document, in Task 11 step 11.2.
 
@@ -3103,3 +3141,24 @@ represent descendant observations.
    arms and the `{"kind": "inaccessible"}` tag; "either/both arms"
    phrasing generalized; the compile-rule parenthetical now reads
    "preimage file modes and symlink modes keep the full range."
+
+## Twenty-seventh-round findings closed (2026-08-14)
+
+1. Kernel-denied mutation of an unchanged namespace reaches a durable
+   halt instead of `ProtocolError`: `EffectMismatch` carries operation,
+   slot, and errno as structured members, and the recovery loop's
+   unchanged-reauthorization branch splits on the errno — `EACCES`/
+   `EPERM` (a parent flipped `0555`, sticky bit, immutable attribute:
+   states no `ParentOccupancy` or `DirectoryConstraints` fact observes)
+   routes through a factory-owned halt seam issuing the new A3
+   `HaltReason.MUTATION_DENIED` (persisted via `_persist_halt`, codec
+   round-trip and hostile cases, default operator action), while every
+   other errno keeps the engine-defect `ProtocolError`. No observation
+   is fabricated. Pinned: parent `0o755 → 0o555` after authorization →
+   persisted halt, no retry, no `ProtocolError`; representative
+   unchanged-world `EPERM` via the structural backend. Task 11's A3
+   amendment and the self-review inventory carry the new reason.
+2. Drift corrected: `_validate_observed_entry` "accepts them"; the A6
+   amendment states observation-level inaccessibility; Task 3's Files
+   entry and the self-review inventory name the file-postimage rule
+   beside the directory-mode rule.
