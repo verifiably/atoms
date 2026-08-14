@@ -402,10 +402,13 @@ the status guard refuses "implemented" claims until the tree makes them true.
 - Modify: `python/src/atoms/coordinator/descriptors.py` (`DescriptorTable.adopt`)
 - Modify: `python/src/atoms/core/recovery/variants.py` (the mkdir scaffold
   shape in Step 3.2)
+- Modify: `python/src/atoms/core/compiler.py` (the directory-mode
+  compile-time rule in Step 3.2)
 - Test: `python/tests/test_effects_move.py`, `python/tests/test_effects_mkdir.py`,
-  additions to `python/tests/test_coordinator_descriptors.py` and
+  additions to `python/tests/test_coordinator_descriptors.py`,
   `python/tests/test_recovery_variants_paths.py` (scaffold-survivor
-  classification)
+  classification), and `python/tests/test_compiler_structure.py` (the
+  mode refusal)
 
 **Interfaces:**
 - Consumes: `link_anchor`, `mkdir_child`, `open_child_directory`, facade `rebind`
@@ -413,9 +416,12 @@ the status guard refuses "implemented" claims until the tree makes them true.
   path.
 - Produces:
   - `move.apply(backend, store, site: MoveSite, effect) -> None`.
-  - `create_directory.apply(backend, store, site: MkdirSite, effect) -> int` —
+  - `create_directory.apply(backend, store, site: MkdirSite, effect, *,
+    gate: Callable[[], None]) -> int` —
     returns the **retained directory descriptor**, provenance already rebound to
-    the live declared path (ledger #3). Ownership is transfer-or-close: the
+    the live declared path (ledger #3). `gate` is the binding-liveness gate
+    `repair_entry_mode` requires; the spine passes
+    `lambda: _require_admitted(lease, approved)`. Ownership is transfer-or-close: the
     caller must either adopt the fd into the `DescriptorTable` or close it; the
     module itself closes the fd on **every** exception path before re-raising.
   - `DescriptorTable.adopt(node: TopologyNode, fd: int) -> None` — the adoption
@@ -443,13 +449,13 @@ the status guard refuses "implemented" claims until the tree makes them true.
   publishes an empty directory with the approved mode at the live path, identity
   verified through the retained descriptor, and the descriptor's facade
   provenance now names the live path (assert via `provenance_of`); the same
-  forward success under `umask(0o777)` with approved mode `0` (set and
+  forward success under `umask(0o777)` with approved mode `0o750` (set and
   restore the umask around the call) — the scaffold construction makes the
-  retain open land regardless of masking, and the effect completes at
-  scaffold with the restrictive mode deferred to the spine (asserted:
-  the returned descriptor's `fstat` mode is `0o700` and the module never
-  called `set_mode` with the restrictive mode — the restriction test
-  itself is Task 8's); a
+  retain open land and the approved mode arrive regardless of masking
+  (asserted: the returned descriptor's `fstat` mode equals the approved
+  mode); a spec holding a `CreateDirectory` with `mode & 0o700 != 0o700`
+  (`0o644`, `0`) refuses at `compile_spec` with `SpecValidationError` —
+  before any project context exists; a
   scaffold-mode work survivor (empty, mode subset of `0o700`) classifies to
   `RemoveScratch` in the variants tests while a non-empty or
   wider-than-`0o700` occupant stays a preserved blocker; an `ENOENT`
@@ -490,61 +496,54 @@ the status guard refuses "implemented" claims until the tree makes them true.
   A3 could not attribute. The sequence: `mkdir_child(work_fd, work_leaf,
   0o700)` (the **scaffold mode**; umask can only clear bits, so a survivor's
   mode is always a subset of `0o700`) → `repair_entry_mode(work_fd,
-  work_leaf, 0o700, before_change=...)` where the hook is exactly the
-  design's **required fresh liveness gate** (A7 design, `repair_entry_mode`
-  contract): it re-lstats the entry and proves it is still the just-created
-  directory before the chmod runs (this undoes any umask stripping; after
-  it the scaffold is exactly `0o700`, traversable by its owner) →
+  work_leaf, 0o700, before_change=gate)` where `gate` is the spine-supplied
+  **binding-liveness gate** — the same contract the store's mode repair
+  uses (measured `store/connection.py:341-346`: `before_change=lambda:
+  gate(binding)`), invoked by the backend between the `O_PATH` pin and the
+  chmod (measured `fs/linux.py:73-90`); for the effect the spine passes
+  `lambda: _require_admitted(lease, approved)`. Entry-kind validation is
+  **not** the hook's job — the following retain open's
+  `O_DIRECTORY`/nofollow discipline and the identity/emptiness
+  verification prove the entry. (The repair undoes any umask stripping;
+  after it the scaffold is exactly `0o700`, traversable by its owner.) →
   `open_child_directory(work_fd,
-  work_leaf)` (retain, through the seam) → **mode branch**: a
-  non-restrictive approved mode (`mode & 0o700 == 0o700`) lands now via
-  `set_mode(dir_fd, mode)` (fchmod is umask-immune); a **restrictive** mode
-  (any owner bit missing, `0` included) is **deferred** — the directory
-  stays at scaffold through publication, and the spine's restriction pass
-  applies it after every effect and the final-surface proof (Task 8, step
-  10b) → `flush_file(dir_fd)` →
+  work_leaf)` (retain, through the seam) → `set_mode(dir_fd, mode)`
+  (fchmod is umask-immune, and every approved directory mode is
+  traversable — the compile-time rule below) → `flush_file(dir_fd)` →
   `transfer_noclobber(work_fd, work_leaf, parent_fd, live_leaf)` →
   `flush_directory(parent_fd)` → verify identity, mode, and emptiness through the
   retained descriptor → `flush_directory(work_fd)` → `backend.rebind(dir_fd,
   Provenance(RootKind.PROJECT, str(effect.path)))` → return `dir_fd`.
 
-  **Why restriction defers — the restricted-directory mechanism.** A
-  restrictive mode locks the *owner* out too: directory observation reopens
-  `O_RDONLY` (measured `fs/observe.py:212-220`, `fs/linux.py:12`), and a
-  live probe confirmed a retained fd does not bypass permissions — after
+  **Restrictive directory modes are refused at compile time.** `compile_spec`
+  (A2) refuses a `CreateDirectory` whose `mode & 0o700 != 0o700` with
+  `SpecValidationError` naming the rule. The ground truth: a restrictive
+  mode locks the *owner* out too — directory observation reopens `O_RDONLY`
+  (measured `fs/observe.py:212-220`, `fs/linux.py:12`), and a live probe
+  confirmed a retained fd does not bypass permissions (after
   `fchmod(fd, 0)`, creating a child through the pre-opened fd fails
-  `EACCES`. So a mode-`000` directory applied at effect time would break
-  descendant effects, the fresh final-surface observation, and every
-  recovery observation. The model:
-  - **Execution**: all `CreateDirectory` effects publish and verify at
-    traversable modes; restrictive final modes land in one spine-owned
-    restriction pass (Task 8), inner-to-outer, through retained
-    descriptors, after the final-surface proof — every observation the
-    forward pass needs happens while the tree is traversable.
-  - **Observation** (Task 5's substrate): a directory whose readable open
-    refuses `EACCES` is observed through the backend's `O_PATH` directory
-    handle — identity pinned from its `fstat`, mode read, occupancy
-    **unobservable-by-policy**: `ObservedDirectory.has_unmodeled_child`
-    widens to `bool | None`, `None` produced only by this route.
-  - **The boundary rule** (A3 amendment): covered paths beneath a directory
-    whose *expected* final mode is restrictive are represented by the
-    boundary observation — the restricted parent's identity and mode are
-    the subtree's evidence. Forward, nothing engine-side mutates beneath it
-    after restriction; a foreign mutation beneath it is invisible to the
-    owner by the very mode the consumer chose. Classification requires the
-    boundary match; rollback of a restricted directory needs no
-    enumeration (`rmdir`'s atomic non-empty refusal is the emptiness
-    check, quarantine mode validated via the `O_PATH` handle).
+  `EACCES`) — so a restrictive published directory would break descendant
+  effects, the fresh final-surface proof, and every recovery observation.
+  A tree the engine cannot re-observe without mutating is unrecoverable by
+  design, and the engine refuses to build one; a consumer wanting a
+  restrictive final mode applies it outside the engine after settlement.
+  Task 11 records the authority amendment. (A deferred-restriction pass
+  was considered and vetoed in the thirteenth-round review: restricting
+  before `COMMITTED` makes rollback of a populated restricted tree
+  impossible, and completing restriction after `COMMITTED` has no A3
+  authority — the closed step union and authorization proof permit only
+  the existing recovery mutations.)
+
   **A3 learns the scaffold shape** (`variants.py`, mkdir family): an empty
   work-slot directory whose mode satisfies `mode & ~0o700 == 0` is
   attributable construction debris, classified to the same `RemoveScratch`
   as the approved-mode survivor — only the engine's scaffold produces an
-  owner-bits-only empty directory under the engine-derived work leaf — and
-  the published-POST shape widens to the final mode **or** scaffold
-  `0o700` when the final mode is restrictive (the restriction-pass crash
-  window). Task 11 records the amendments (authority
-  restartable-materialization, A3 mkdir table, A6 observation contract,
-  A7 §6 spine and primitive contract).
+  owner-bits-only empty directory under the engine-derived work leaf. The
+  umask-masked survivor can be untraversable (`000` under umask `0o777`),
+  so its observation goes through Task 5's narrow `O_PATH` route. Task 11
+  records the amendments (authority restartable-materialization and the
+  compile-time mode rule, A3 mkdir table, A6 observation contract, A7
+  primitive contract).
 - [ ] **Step 3.3:** Task tests pass, then the full gate.
 - [ ] **Step 3.4:** `git commit -m "feat(effects): MoveNoClobber and CreateDirectory forward execution with provenance rebinding"`
 
@@ -689,6 +688,8 @@ the status guard refuses "implemented" claims until the tree makes them true.
   `python/src/atoms/core/recovery/diagnostics.py`,
   `python/src/atoms/core/recovery/__init__.py`,
   `python/src/atoms/store/records.py`, `python/src/atoms/fs/observe.py`,
+  `python/src/atoms/fs/backend.py`, `python/src/atoms/fs/linux.py`,
+  `python/src/atoms/fs/audit.py` (`open_directory_handle`),
   `python/src/atoms/coordinator/capture.py` (the total-observation substrate
   change below)
 - Test: `python/tests/test_coordinator_recover.py`; update
@@ -698,7 +699,9 @@ the status guard refuses "implemented" claims until the tree makes them true.
   `python/tests/test_recovery_classifier.py`,
   `python/tests/test_recovery_authorization.py`,
   `python/tests/test_recovery_snapshot.py`, `python/tests/test_store_records.py`,
-  `python/tests/test_coordinator_capture.py` for the new observed arms
+  `python/tests/test_coordinator_capture.py` for the new observed arms;
+  `python/tests/test_fs_backend.py`, `python/tests/test_fs_audit.py` for
+  `open_directory_handle`
 
 **Interfaces:**
 - Consumes: `classify_recovery`, `persist_plan_prefix`, `authorize_recovery_step`,
@@ -769,23 +772,35 @@ end:
   allowlist).
   Streaming and enumeration through pinned descriptors are untouched —
   their errors are substrate, not namespace.
-- **Restricted directories observe through `O_PATH`** (the mechanism Task 3
-  defines): `_observe_directory`'s readable open refusing `EACCES` retries
-  with the backend's new `open_directory_handle(parent_fd, name)` —
-  `O_PATH|O_DIRECTORY|O_NOFOLLOW`, the same idiom `repair_entry_mode`
-  already uses beneath the facade (A7 design's primitive contract gains the
-  member; Task 11) — pinning identity from its `fstat` and reading the
-  mode, with `ObservedDirectory.has_unmodeled_child` widened to
-  `bool | None`: `None` means occupancy is unobservable-by-policy and is
-  produced **only** by this route. The widened field threads the same
-  layers as the arms (snapshot validators, diagnostics projection, the
-  durable codec encodes `null`, authorization equality compares it
-  exactly), and the non-authorizable-arm guard does **not** trip on it —
-  a boundary observation is attributable evidence, and A3's boundary rule
-  (Task 3) decides what it authorizes. A readable directory never carries
-  `None` (hostile-payload test), and `EACCES` from a *file* open stays
-  raw — the mechanism is scoped to directories, where the engine itself
-  defers restriction.
+- **The umask-masked work-slot survivor observes through `O_PATH`** — the
+  one directory the engine can leave behind at an untraversable mode is
+  the mkdir scaffold survivor (mode ⊆ `0o700`, e.g. `000` under umask
+  `0o777`); every *approved* directory mode is traversable because A2
+  refuses the rest (Task 3). `_observe_directory`'s readable open refusing
+  `EACCES` retries with the backend's new
+  `open_directory_handle(parent_fd, name) -> int`, fully specified:
+  `O_PATH|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC` resolved via `openat2` with
+  the same `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_XDEV`
+  discipline as `open_child_directory`; raw `OSError` errno behavior like
+  every backend member; the `AuditedBackend` override registers the
+  descriptor's provenance exactly as `open_child_directory` does (an
+  unregistered parent refuses, `..` is never accepted); ownership
+  transfers to the caller — the observation pins it or closes it on the
+  way out. Backend and audit tests live in `test_fs_backend.py` /
+  `test_fs_audit.py`. The result is an `ObservedDirectory` with identity
+  pinned from its `fstat`, the mode read, and
+  `has_unmodeled_child` widened to `bool | None`: `None` means occupancy
+  was unobservable and is produced **only** by this route. The widened
+  field threads the same layers as the arms (snapshot validators,
+  diagnostics projection, the durable codec encodes `null`, authorization
+  equality compares it exactly), but snapshot validation accepts `None`
+  **only on a scratch work-slot observation** — a persistent observation
+  carrying `None` is invalid (hostile-payload test). A3's scaffold-debris
+  classification does not require occupancy evidence for it: the
+  removal's `rmdir` atomic non-empty refusal is the emptiness authority,
+  and a refusal there halts (`DIRECTORY_NOT_EMPTY`). The
+  non-authorizable-arm guard does **not** trip on it, and `EACCES` from a
+  *file* open stays raw.
 - **One shared non-authorizable-arm guard — the arms never reach a
   classification table.** Mapping them into `EntryClass` would be wrong:
   `EXTERNAL` does not always halt (Replace `STARTED` with live `POST` and
@@ -1441,16 +1456,10 @@ immediately before it.
 - `commit.verify_committed_surface(lease, approved, table)` — step 10: one
   fresh `Observation` universe observing the **complete compiled final surface
   first, then the complete scratch vector**; any disagreement raises
-  `EffectMismatch` (a caught failure; the plan loop rolls back). A
-  restrictive-mode `CreateDirectory` is expected at scaffold `0o700` here —
-  its final mode is step 10b's. Runs inside the `try`, followed by the
-  **restriction pass** (step 10b, the `try`'s actual last statements): for
-  each restrictive-mode `CreateDirectory` **inner-to-outer**,
-  `set_mode(fd, mode)` through the retained descriptor →
-  `flush_file(fd)` — deferred to here so every descendant effect and the
-  final-surface proof ran while the tree was traversable (Task 3's
-  mechanism). A caught failure mid-restriction rolls back: quarantine-rmdir
-  needs no enumeration, and mode validation uses the `O_PATH` handle.
+  `EffectMismatch` (a caught failure; the plan loop rolls back). Runs as
+  the `try` block's last statement. (Every published directory is
+  traversable — A2's compile-time mode rule, Task 3 — so this fresh
+  observation never needs the `O_PATH` route.)
 - `commit.finalize_commit(lease, approved, table, chain_fd) -> _CommitResult`
   — steps 11–14, **outside** the catch. `_CommitResult` is a commit-internal
   frozen value `(txid, registration, settlement)`: the public
@@ -1464,12 +1473,7 @@ immediately before it.
   settlement binding COMMIT (13) → committed cleanup and detach **through the
   plan loop** (14): assemble a fresh snapshot, `classify_recovery`
   (disposition `COMMITTED_CLEANUP`), `run_plan` — the detach stop finds the
-  settlement already bound and detaches. Committed cleanup also **completes
-  restriction idempotently**: a restricted directory still observed at
-  scaffold (a crash between 10b stages, or a re-entered cleanup) gets its
-  final mode through the `O_PATH` handle before detach — `fchmod` to the
-  same value is idempotent, and the boundary rule makes the re-entered
-  final-surface observation well-defined. (The rollback arm's settlement goes
+  settlement already bound and detaches. (The rollback arm's settlement goes
   through `run_plan`'s `_reconcile_settlement`, which already opens and
   validates its own chain view.)
 
@@ -1562,13 +1566,6 @@ is proved). A `HaltPlan` from the loop raises `TransactionHalted` instead.
   `PreconditionRefused` chained to the converted mismatch — never a raw
   `OSError` (design §11: once mutation may have begun, the refusal comes only
   after restoration, `2026-07-23-...-design.md:1275-1283`). The
-  restricted-directory mechanism is pinned end to end:
-  `CreateDirectory(mode=0)` followed by a child file effect inside it
-  commits — the child executes while the tree is traversable, step 10b
-  restricts last, and the final world holds a mode-`0` directory containing
-  the child; the same transaction re-observed by a fresh lease entry
-  (post-commit, pre-detach kill) converges through the boundary
-  observation. The
   unrecognized-kind path is pinned here for caught rollback: a FIFO planted
   beneath the facade at a covered slot mid-flight drives `_roll_back`'s
   re-observation into a classified halt — `TransactionHalted` with the
@@ -1645,14 +1642,6 @@ cut:
   `umask(0o777)` so the masked case is the worst one; recovery classifies
   the scaffold survivor as attributable `RemoveScratch` debris and
   converges.
-- Restriction cuts, for a `CreateDirectory(mode=0)` transaction: a kill
-  between step 10b's `set_mode` and its `flush_file` (published mode-`0`
-  directory, pre-`COMMITTED` — recovery rolls back through the boundary
-  rule, removing the restricted directory without enumeration) and a kill
-  after `COMMITTED` with restriction incomplete (a mixed tree, some
-  directories restricted and some at scaffold — the re-entered committed
-  cleanup completes restriction idempotently and detaches; a third pass is
-  byte-identical).
 - Compensation barriers: for each in-process compensation (replace's
   exchange-back, create-file's `EEXIST` staging removal, delete's tombstone
   return, move's rename-back and anchor removal, mkdir's work-slot removal),
@@ -1762,8 +1751,13 @@ commit arm.
 
 **Files:**
 - Modify: `python/tests/test_docs_status.py` (`FIRST_UNIMPLEMENTED = "A8"`)
-- Modify: `docs/plans/2026-08-13-a7-effect-recovery-execution-design.md` (status)
-- Modify: `docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md` (status)
+- Modify: `docs/plans/2026-08-13-a7-effect-recovery-execution-design.md`
+  (status + amendments)
+- Modify: `docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md`
+  (status + amendments)
+- Modify: `docs/plans/2026-07-28-a3-recovery-reference-model-design.md`
+  (amendments)
+- Modify: `docs/plans/2026-08-07-a6-coherent-capture-design.md` (amendments)
 - Modify: `docs/deferred-obligation-ledger.md`, `README.md`, `AGENTS.md`
 
 - [ ] **Step 11.1:** Flip `FIRST_UNIMPLEMENTED` to `"A8"`. Run
@@ -1798,35 +1792,34 @@ commit arm.
     the recovery-mutation surface is the A3-authorized six pairs, and the
     closing paragraph's staged re-creation/symlink-restore cases are
     unreachable through A3's classifier, so the executor does not
-    implement them (Task 4); **§6 (spine)** — the spine gains step 10b,
-    the inner-to-outer restriction pass for restrictive-mode directories,
-    and committed cleanup completes restriction idempotently (Tasks 3, 8);
-    **primitive contract** — the backend gains
+    implement them (Task 4); **primitive contract** — the backend gains
     `open_directory_handle(parent_fd, name)` (`O_PATH|O_DIRECTORY|
-    O_NOFOLLOW`), the observation route for restricted directories
-    (Task 5).
-  - **Authority** (`2026-07-23-...-design.md`, restartable
-    materialization): `CreateDirectory`'s work-slot construction
+    O_NOFOLLOW|O_CLOEXEC`, `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|
+    RESOLVE_NO_XDEV`), the observation route for the umask-masked
+    work-slot survivor (Task 5).
+  - **Authority** (`2026-07-23-...-design.md`): restartable
+    materialization — `CreateDirectory`'s work-slot construction
     intermediate is the `0o700` scaffold (mkdir at scaffold mode,
-    entry-mode repair, then the approved mode — non-restrictive at effect
-    time, restrictive deferred to the restriction pass), and an empty
-    work-slot directory whose mode is a subset of `0o700` is attributable
-    construction debris (Task 3).
+    entry-mode repair, then the approved mode via umask-immune fchmod),
+    and an empty work-slot directory whose mode is a subset of `0o700` is
+    attributable construction debris; spec semantics — a `CreateDirectory`
+    mode must satisfy `mode & 0o700 == 0o700` (`SpecValidationError` at
+    compile): the engine refuses to build a tree it cannot re-observe
+    without mutating (Task 3).
   - **A3 design** (`2026-07-28-a3-...-design.md`): the observed-entry
     union (its line ~246) gains the two arms and
     `ObservedDirectory.has_unmodeled_child: bool | None`; the
     `authorize_recovery_step` contract (~361) gains the
     non-authorizable-arm guard ahead of the equality rule; the mkdir
-    classification table (~812) gains the scaffold-debris row, the
-    restricted-POST widening (final mode or scaffold when the final mode
-    is restrictive), and the boundary rule for covered paths beneath a
-    restricted-expected directory (Tasks 3, 5).
+    classification table (~812) gains the scaffold-debris row with the
+    occupancy-`None` acceptance for the work-slot observation — removal's
+    `rmdir` atomic refusal is the emptiness authority (Tasks 3, 5).
   - **A6 design** (`2026-08-07-a6-...-design.md`, per-kind observation,
     ~340): directory observation's "every directory uses
     `open_child_directory`" claim is amended with the `EACCES → O_PATH`
-    fallback producing occupancy-`None` boundary observations, and the
-    FIFO/socket/device and contended outcomes move from refusal to the
-    represented arms (Task 5).
+    fallback for the umask-masked work-slot survivor (occupancy-`None`),
+    and the FIFO/socket/device and contended outcomes move from refusal to
+    the represented arms (Task 5).
 
   Each amendment is one dated note in its document, same shape as the
   2026-08-13 §5.1 amendments.
@@ -1881,9 +1874,9 @@ tag and digest from the spec itself; `DescriptorTable.adopt` and
 **Known open decisions surfaced to the executor-of-this-plan:** the two the tree
 left open (`transitions.py`'s stop set and the projection-comparison comment) are
 decided in Task 5's "Decisions" block; the design amendments — spanning the
-A7 design (§9.1 twice, §9.3, §9.2, §11, §7, §6's restriction pass, the
-primitive contract), the authority's restartable materialization, the A3
-design (union arms, authorization guard, mkdir table and boundary rule), and
+A7 design (§9.1 twice, §9.3, §9.2, §11, §7, the primitive contract), the
+authority (restartable materialization and the compile-time directory-mode
+rule), the A3 design (union arms, authorization guard, mkdir table), and
 the A6 design (directory observation contract) — are decided in Tasks 3–8
 and land dated, grouped by document, in Task 11 step 11.2.
 
@@ -2242,9 +2235,10 @@ and land dated, grouped by document, in Task 11 step 11.2.
    an untraversable mode-`000` directory. A3 attributes the scaffold
    survivor (empty, mode ⊆ `0o700`) as construction debris; umask-hostile
    forward tests, scaffold kill cuts, and the authority/A3 amendment are
-   recorded (seven amendments now). (Superseded in part by the thirteenth
-   round: restrictive final modes defer to the spine's restriction pass —
-   applying them at effect time locks the owner out of its own tree.)
+   recorded (seven amendments now). (Superseded twice: the thirteenth
+   round deferred restrictive modes to a spine restriction pass; the
+   fourteenth vetoed that pass and refuses restrictive modes at compile
+   time instead.)
 4. The constructor source scan allows exactly two producers: the
    live-filesystem observer and the durable decoder that reconstructs the
    arms from a persisted diagnostic.
@@ -2268,7 +2262,11 @@ and land dated, grouped by document, in Task 11 step 11.2.
    with a child effect commits end to end, restriction kill cuts converge
    on both arms, and published mode-`0` recovery works through the
    boundary. A live probe grounded the design: a retained fd does not
-   bypass permissions after `fchmod(fd, 0)`.
+   bypass permissions after `fchmod(fd, 0)`. **(Vetoed in the fourteenth
+   round: pre-`COMMITTED` restriction makes rollback of a populated
+   restricted tree impossible, post-`COMMITTED` completion has no A3
+   authority, and the boundary observation cannot represent descendant
+   state. A7b refuses restrictive modes at compile time instead.)**
 2. `repair_entry_mode` joined `_DETERMINATE` (`ENOENT`/`ENOTDIR`) and the
    routing rule with a call-site race test, and its `before_change` hook is
    restated as the design's required fresh liveness gate rather than a
@@ -2283,3 +2281,41 @@ and land dated, grouped by document, in Task 11 step 11.2.
    materialization, the A3 design (union arms, authorization guard, mkdir
    table, boundary rule), and the A6 design (directory observation
    contract, represented arms).
+
+## Fourteenth-round findings closed (2026-08-14)
+
+The thirteenth round's restriction mechanism is **vetoed and replaced by
+narrowing**: restricting before `COMMITTED` makes rollback of a populated
+restricted tree impossible (rmdir refuses non-empty; it restores nothing),
+completing restriction after `COMMITTED` has no reachable state under the
+plan's own cuts and no A3 authority (the closed step union and
+authorization proof permit only the existing recovery mutations — measured
+`plan.py:102,186`, `reducer.py:986`), and a parent's identity+mode cannot
+represent descendant observations.
+
+1. `compile_spec` (A2) refuses a `CreateDirectory` whose
+   `mode & 0o700 != 0o700` with `SpecValidationError` — the engine does
+   not build a tree it cannot re-observe without mutating; a consumer
+   wanting a restrictive final mode applies it after settlement. Step 10b,
+   the committed-cleanup restriction completion, the general boundary
+   rule, and the restriction cuts are deleted; the authority amendment
+   records the mode rule.
+2. The `0o700` scaffold and the `O_PATH` observation route survive at
+   their narrow scope: the umask-masked engine work-slot survivor —
+   snapshot validation accepts occupancy-`None` only on a scratch
+   work-slot observation, and A3's scaffold-debris row leans on removal's
+   atomic `rmdir` refusal for emptiness.
+3. `open_directory_handle` is fully specified:
+   `O_PATH|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC` via `openat2` under
+   `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_XDEV`, raw backend
+   errnos, facade provenance registration like `open_child_directory`,
+   caller-owned descriptor, backend and audit tests named; the fs files
+   joined Task 5's Files list.
+4. `repair_entry_mode`'s `before_change` is the **binding-liveness gate**
+   (the store passes `lambda: gate(binding)` — measured
+   `connection.py:341-346`), invoked between the `O_PATH` pin and the
+   chmod; the spine passes `lambda: _require_admitted(lease, approved)`
+   through `create_directory.apply`'s new `gate` parameter, and
+   entry-kind validation is explicitly not the hook's job.
+5. Task 11's Files list names the A3 and A6 design documents its
+   amendments modify.
