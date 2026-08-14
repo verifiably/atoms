@@ -152,6 +152,67 @@ def test_close_attempts_every_owned_descriptor_and_preserves_the_failure(
             try:
                 assert caught.value.errno == errno.EIO
                 assert attempted == owned
+                assert table._owned == ()
+                assert table._fds == {}
+                for fd in owned:
+                    with pytest.raises(ProtocolError, match="unregistered"):
+                        backend.provenance_of(fd)
+            finally:
+                for fd in owned:
+                    try:
+                        backend.provenance_of(fd)
+                    except ProtocolError:
+                        continue
+                    backend.close_fd(fd)
+
+
+def test_construction_unwind_attempts_every_owned_descriptor_and_preserves_the_failure(
+    leased, monkeypatch
+):
+    from atoms.coordinator import descriptors
+    from atoms.coordinator.prepare import open_workspace
+    from atoms.fs.audit import AuditedBackend
+    from tests.capture_support import approved_deep_replace
+
+    with leased() as lease:
+        approved = approved_deep_replace(lease)
+        backend = lease._binding.backend
+        assert isinstance(backend, AuditedBackend)
+        with open_workspace(lease, approved) as workspace, Observation(LinuxBackend()) as observation:
+            validated: list[int] = []
+            attempted: list[int] = []
+            real_constraints = descriptors.read_lookup_constraints
+            real_close = LinuxBackend.close_fd
+
+            def fail_after_the_third_owned_descriptor(fd, filesystem_type):
+                constraints = real_constraints(fd, filesystem_type)
+                validated.append(fd)
+                if len(validated) == 4:
+                    raise PreconditionRefused("injected construction failure")
+                return constraints
+
+            def failing_close(self, fd):
+                attempted.append(fd)
+                real_close(self, fd)
+                if len(attempted) == 1:
+                    raise OSError(errno.EIO, "first injected close failure")
+                if len(attempted) == 2:
+                    raise OSError(errno.ENOSPC, "second injected close failure")
+
+            with monkeypatch.context() as patched:
+                patched.setattr(
+                    descriptors,
+                    "read_lookup_constraints",
+                    fail_after_the_third_owned_descriptor,
+                )
+                patched.setattr(LinuxBackend, "close_fd", failing_close)
+                with pytest.raises(OSError) as caught:
+                    _table(lease, approved, workspace, observation)
+            owned = validated[1:]
+            try:
+                assert len(owned) == 3
+                assert caught.value.errno == errno.EIO
+                assert attempted == owned
                 for fd in owned:
                     with pytest.raises(ProtocolError, match="unregistered"):
                         backend.provenance_of(fd)

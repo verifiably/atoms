@@ -91,6 +91,67 @@ def test_first_workspace_parent_fd_closes_when_the_second_open_fails(
     assert closed.value.errno == errno.EBADF
 
 
+@pytest.mark.parametrize("operation", ["create", "reopen", "remove"])
+def test_workspace_parent_cleanup_attempts_both_and_preserves_the_first_failure(
+    opened_store, monkeypatch, operation
+):
+    from atoms.fs.linux import LinuxBackend
+    from atoms.store import workspace as workspace_module
+
+    workspace = None
+    if operation in ("reopen", "remove"):
+        workspace = opened_store.create_workspace("tx1")
+        if operation == "reopen":
+            workspace.close()
+
+    backend = opened_store._binding.backend
+    assert isinstance(backend, LinuxBackend)
+    parents: list[int] = []
+    attempted: list[int] = []
+    real_parent_fds = workspace_module._parent_fds
+    real_close = LinuxBackend.close_fd
+
+    def recording_parent_fds(store):
+        result = real_parent_fds(store)
+        parents.extend(result)
+        return result
+
+    def failing_close(self, fd):
+        real_close(self, fd)
+        if fd not in parents:
+            return
+        attempted.append(fd)
+        code = errno.EIO if fd == parents[0] else errno.ENOSPC
+        raise OSError(code, "injected workspace-parent close failure")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(workspace_module, "_parent_fds", recording_parent_fds)
+        patched.setattr(LinuxBackend, "close_fd", failing_close)
+        with pytest.raises(OSError) as caught:
+            if operation == "create":
+                opened_store.create_workspace("tx1")
+            elif operation == "reopen":
+                opened_store.reopen_workspace("tx1")
+            else:
+                assert workspace is not None
+                opened_store.remove_workspace(workspace)
+    try:
+        assert caught.value.errno == errno.EIO
+        assert attempted == parents
+        for fd in parents:
+            with pytest.raises(OSError) as closed:
+                os.fstat(fd)
+            assert closed.value.errno == errno.EBADF
+    finally:
+        for fd in parents:
+            try:
+                os.fstat(fd)
+            except OSError as caught:
+                assert caught.errno == errno.EBADF
+                continue
+            backend.close_fd(fd)
+
+
 def test_creation_refuses_when_either_directory_exists(opened_store):
     opened_store.create_workspace("tx1").close()
     with pytest.raises(ProtocolError) as caught:
@@ -202,6 +263,51 @@ def test_close_is_idempotent(opened_store):
     workspace = opened_store.create_workspace("tx1")
     workspace.close()
     workspace.close()
+
+
+def test_close_attempts_both_anchors_and_clears_ownership_after_failure(
+    opened_store, monkeypatch
+):
+    from atoms.fs.linux import LinuxBackend
+
+    workspace = opened_store.create_workspace("tx1")
+    owned = [workspace.staging_fd, workspace.work_fd]
+    backend = opened_store._binding.backend
+    assert isinstance(backend, LinuxBackend)
+    attempted: list[int] = []
+    real_close = LinuxBackend.close_fd
+
+    def failing_close(self, fd):
+        attempted.append(fd)
+        real_close(self, fd)
+        code = errno.EIO if fd == owned[0] else errno.ENOSPC
+        raise OSError(code, "injected workspace close failure")
+
+    try:
+        with monkeypatch.context() as patched:
+            patched.setattr(LinuxBackend, "close_fd", failing_close)
+            with pytest.raises(OSError) as caught:
+                workspace.close()
+        assert caught.value.errno == errno.EIO
+        assert attempted == owned
+        assert workspace._closed
+        assert (workspace._staging_fd, workspace._work_fd) == (None, None)
+        assert workspace not in opened_store._workspaces
+        for fd in owned:
+            with pytest.raises(OSError) as closed:
+                os.fstat(fd)
+            assert closed.value.errno == errno.EBADF
+    finally:
+        for fd in owned:
+            try:
+                os.fstat(fd)
+            except OSError as caught:
+                assert caught.errno == errno.EBADF
+                continue
+            backend.close_fd(fd)
+        workspace._staging_fd = None
+        workspace._work_fd = None
+        opened_store._workspaces.discard(workspace)
 
 
 @pytest.mark.parametrize("disposition", ["both", "staging", "work"])

@@ -682,6 +682,71 @@ def test_a_failed_second_transfer_spends_staging_after_an_eexist_unlink(
             _ = workspace.staging_fd
 
 
+def test_promotion_cleanup_attempts_staging_and_blob_parent_and_preserves_first_failure(
+    opened_store, monkeypatch
+):
+    from atoms.fs.linux import LinuxBackend
+    from atoms.store.blobs import SHA256_DIRECTORY
+
+    workspace = opened_store.create_workspace("tx1")
+    stage(workspace, "one", b"first")
+    staging_fd = workspace.staging_fd
+    backend = opened_store._binding.backend
+    assert isinstance(backend, LinuxBackend)
+    sha256_fds: list[int] = []
+    attempted: list[int] = []
+    armed = False
+    real_open = backend.open_child_directory
+    real_transfer = backend.transfer_noclobber
+    real_close = LinuxBackend.close_fd
+
+    def recording_open(parent_fd, name):
+        fd = real_open(parent_fd, name)
+        if name == SHA256_DIRECTORY:
+            sha256_fds.append(fd)
+        return fd
+
+    def arm_after_transfer(*args):
+        nonlocal armed
+        result = real_transfer(*args)
+        armed = True
+        return result
+
+    def failing_close(self, fd):
+        real_close(self, fd)
+        if not armed:
+            return
+        attempted.append(fd)
+        code = errno.EIO if len(attempted) == 1 else errno.ENOSPC
+        raise OSError(code, "injected promotion cleanup failure")
+
+    try:
+        with monkeypatch.context() as patched:
+            patched.setattr(backend, "open_child_directory", recording_open)
+            patched.setattr(backend, "transfer_noclobber", arm_after_transfer)
+            patched.setattr(LinuxBackend, "close_fd", failing_close)
+            with pytest.raises(OSError) as caught, opened_store.transaction() as txn:
+                txn.promote_staging(workspace, _manifest(("one", b"first")))
+        promotion_parent = sha256_fds[-1]
+        assert caught.value.errno == errno.EIO
+        assert attempted == [staging_fd, promotion_parent]
+        assert workspace._staging_fd is None
+        for fd in attempted:
+            with pytest.raises(OSError) as closed:
+                os.fstat(fd)
+            assert closed.value.errno == errno.EBADF
+    finally:
+        workspace._staging_fd = None
+        for fd in sha256_fds:
+            try:
+                os.fstat(fd)
+            except OSError as caught:
+                assert caught.errno == errno.EBADF
+                continue
+            backend.close_fd(fd)
+        workspace.close()
+
+
 @pytest.mark.parametrize("release", RELEASES, ids=("closed_binding", "released_lock"))
 def test_each_transfer_has_a_late_gate_after_an_earlier_mutation(
     store_on, monkeypatch, release

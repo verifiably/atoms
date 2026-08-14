@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from atoms.core.errors import ProtocolError
+from atoms.fs.lock import close_all
 from atoms.store.errors import MetadataStoreInvalid, translated
 from atoms.store.records import SELECT_BLOB
 from atoms.store.workspace import STAGING_PARENT, Workspace
@@ -389,8 +390,12 @@ def promote_staging(
             )
     finally:
         if spent:
-            workspace._spend_staging()
-        backend.close_fd(parent)
+            try:
+                close_all(backend, (staging_fd, parent))
+            finally:
+                workspace._staging_fd = None
+        else:
+            backend.close_fd(parent)
 
     staging_parent = backend.open_child_directory(
         store._binding.metadata_root_fd, STAGING_PARENT

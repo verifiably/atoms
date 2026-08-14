@@ -115,6 +115,7 @@ class DescriptorTable:
             close_all(self._backend, self._owned)
         finally:
             self._fds.clear()
+            self._owned = ()
 
     def __enter__(self) -> Self:
         return self
@@ -255,8 +256,7 @@ def _build_descriptor_table(
             validate(fd, node)
             fds[node] = fd
     except BaseException:
-        for fd in owned:
-            backend.close_fd(fd)
+        close_all(backend, owned)
         raise
 
     unreachable = _closure(approved, stopped_nodes)

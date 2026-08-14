@@ -8,6 +8,7 @@ import stat
 from typing import TYPE_CHECKING, Never, Self
 
 from atoms.core.errors import ProtocolError
+from atoms.fs.lock import close_all
 from atoms.store.errors import MetadataStoreInvalid
 from atoms.store.records import require_identifier
 
@@ -87,26 +88,33 @@ class Workspace:
 
     def _spend_staging(self) -> None:
         if self._staging_fd is not None:
-            self._backend.close_fd(self._staging_fd)
-            self._staging_fd = None
+            try:
+                self._backend.close_fd(self._staging_fd)
+            finally:
+                self._staging_fd = None
 
     def _spend_work(self) -> None:
         if self._work_fd is not None:
-            self._backend.close_fd(self._work_fd)
-            self._work_fd = None
+            try:
+                self._backend.close_fd(self._work_fd)
+            finally:
+                self._work_fd = None
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        for fd in (self._staging_fd, self._work_fd):
-            if fd is not None:
-                self._backend.close_fd(fd)
-        self._staging_fd = None
-        self._work_fd = None
-        store = self._store
-        if store is not None:
-            store._workspaces.discard(self)
+        try:
+            close_all(
+                self._backend,
+                (fd for fd in (self._staging_fd, self._work_fd) if fd is not None),
+            )
+        finally:
+            self._staging_fd = None
+            self._work_fd = None
+            store = self._store
+            if store is not None:
+                store._workspaces.discard(self)
 
     def __enter__(self) -> Self:
         return self
@@ -221,8 +229,7 @@ def create_workspace(store: Store, txid: str) -> Workspace:
         backend.flush_directory(work_parent)
         return _issue(store, _open_both(store, txid, staging_parent, work_parent))
     finally:
-        backend.close_fd(staging_parent)
-        backend.close_fd(work_parent)
+        close_all(backend, (staging_parent, work_parent))
 
 
 def reopen_workspace(store: Store, txid: str) -> Workspace:
@@ -236,8 +243,7 @@ def reopen_workspace(store: Store, txid: str) -> Workspace:
             raise ProtocolError(f"no workspace on disk for txid {txid!r}")
         return _issue(store, workspace)
     finally:
-        backend.close_fd(staging_parent)
-        backend.close_fd(work_parent)
+        close_all(backend, (staging_parent, work_parent))
 
 
 def list_workspaces(store: Store) -> tuple[str, ...]:
@@ -303,6 +309,5 @@ def remove_workspace(store: Store, workspace: Workspace) -> None:
             workspace._spend_work()
             backend.flush_directory(work_parent)
     finally:
-        backend.close_fd(staging_parent)
-        backend.close_fd(work_parent)
+        close_all(backend, (staging_parent, work_parent))
     workspace.close()
