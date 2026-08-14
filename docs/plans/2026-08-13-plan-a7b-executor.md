@@ -1167,6 +1167,9 @@ The derivation is design §9.2 verbatim; every branch below gets a test:
   `approval.py:92-95`), updates to name both factories)
 - Modify: `python/src/atoms/store/records.py` (`load_record` validates the stored
   evidence through the closed decoder)
+- Modify: `python/src/atoms/store/workspace.py` (the split prepared-reopen
+  seams `require_staging_discharged` and `reopen_work_slot` — see phase 6;
+  `reopen_workspace` itself is unchanged for its existing callers)
 - Modify: `python/tests/test_fs_architecture.py` (the exact proof-schema
   guard gains `directory_paths` — criterion 21's closed field set,
   measured `:916`)
@@ -1179,7 +1182,15 @@ The derivation is design §9.2 verbatim; every branch below gets a test:
   `python/tests/test_fs_approval.py` (encoder/decoder updates),
   `python/tests/test_store_schema_v2.py` (the literal canonical-wire
   assertion and the physical work-root evidence assertion, measured
-  `:625,676` — exact-string guards the new `"path"` members change)
+  `:625,676` — exact-string guards the new `"path"` members change),
+  `python/tests/test_store_workspace.py` (the two split seams: staging
+  present after `PREPARED` → `MetadataStoreInvalid`; work-slot reopen's
+  error surface; `reopen_workspace` untouched). The `".#~work_base"`
+  route gets its own named cases in
+  `test_coordinator_assembly_halt.py`: physical work-base identity/
+  constraint drift → `WORK_ROOT_CHANGED` at `".#~work_base"`, and a
+  refusing work-base open → `MOUNT_BOUNDARY`/`ACCESS_DENIED` there,
+  distinct from the transaction slot's `".#~work_root"` cases.
 
 **Interfaces:**
 - Consumes: Tasks 5–6, `ProjectContext` with the existing txid and the new
@@ -1430,40 +1441,48 @@ Phase mapping, exactly §9.1:
    resolution, and between the proof and the table build — each ends in a
    persisted halt, never a surfaced refusal.
 6. `lease = Lease(_binding=binding, _store=store)` (internal — resolution is past);
-   reopen the workspace, build the `DescriptorTable`, observe **every** persistent
+   validate staging discharged and reopen the work slot (the split seams
+   below), build the `DescriptorTable`, observe **every** persistent
    path and **every** effect's required scratch slot in one `Observation`
    universe, `build_recovery_snapshot` from the `StoredRecord` + observations
    (its validators enforce complete coverage — trust them, add none).
-   **The reopen is guarded by a narrow WorkRoot re-diff**, because the
-   moved-world rule above ends at the seams it names and
-   `reopen_workspace` has an error surface that rule never catches: full
-   absence raises `ProtocolError` (measured `store/workspace.py:240-243`),
-   a non-directory at a slot raises `MetadataStoreInvalid` (`_open_child`,
-   measured `store/workspace.py:147-158`), and `EACCES`/`EXDEV` propagate
-   as raw `OSError` (`_open_child` re-raises every errno but
-   `ENOTDIR`/`ELOOP`). If `work/<txid>` moves between phase 5's diff and
-   this reopen, each of those escapes as an engine-defect or substrate
-   claim for what is world drift. So **exactly the `reopen_workspace`
-   call** is wrapped: on `ProtocolError`, `MetadataStoreInvalid`, or an
+   **Phase 6 does not call `reopen_workspace`** — that seam opens
+   `staging/<txid>` before `work/<txid>` inside one body (measured
+   `store/workspace.py:192-199`), so its errors are slot-untyped, and a
+   post-catch probe cannot type them either: a noncooperating writer can
+   repair the staging defect between the exception and any re-observation.
+   Origin must come from the opening seam itself. Task 7 therefore splits
+   the prepared-workspace reopen into two narrow seams in
+   `store/workspace.py` (existing callers of `reopen_workspace` —
+   `lease.py:35`, `connection.py:842` — keep it unchanged):
+   - `require_staging_discharged(store, txid) -> None`: determinately
+     looks up `staging/<txid>` and raises `MetadataStoreInvalid` on
+     **any present entry** — preparation rmdirs the emptied slot and
+     flushes its parent **before** the durable barrier that publishes
+     `PREPARED` (authority §7.3 steps 3–4, its line ~793; measured
+     `store/blobs.py:400-409`, `coordinator/prepare.py:36-43`), so after
+     `PREPARED` a present staging slot is invalid store evidence, never a
+     clean state. Absent → return.
+   - `reopen_work_slot(store, txid) -> Workspace`: opens
+     `metadata_root/work`, then `work/<txid>`, and returns a `Workspace`
+     whose staging descriptor is `None`; the slot's error surface is
+     `_open_child`'s (absent → `ProtocolError`, `ENOTDIR`/`ELOOP` →
+     `MetadataStoreInvalid`, every other errno raw).
+
+   `resolve` calls `require_staging_discharged` **outside** the guard —
+   its raises propagate untouched, staging-origin **by construction**,
+   and the store is never mutated after that substrate-invalid evidence
+   (design §12: stop, preserve, refuse mutation). Then **exactly the
+   `reopen_work_slot` call** is wrapped: every failure it raises concerns
+   the work namespace by construction of the seam — no re-observation
+   supplies the origin. On `ProtocolError`, `MetadataStoreInvalid`, or an
    `OSError` whose errno is `EACCES` or `EXDEV`, re-run
-   `_diff_approved_topology` **once**. But the caught error's origin is
-   untyped — `_open_both` opens `staging/<txid>` **before** `work/<txid>`
-   (measured `store/workspace.py:192-199`), so the same classes can come
-   from a broken staging slot — and persisting a halt on an error whose
-   origin is staging would mutate the store after substrate-invalid
-   evidence, which design §12's rule forbids (stop, preserve evidence,
-   refuse mutation). The conversion therefore demands **proof the failure
-   concerns `work/<txid>`**, two conditions conjoined:
-   (a) the re-diff emits findings **at `".#~work_root"`** — currently
-   observed, determinate work-slot drift, the conversion's justifying
-   findings (the persisted halt then carries the full re-diff result);
-   and (b) a read-only re-probe of `staging/<txid>` under
-   the same determinate lookup rules observes a present, well-kinded
-   staging slot — origin by elimination: the engine never mutates staging
-   between the catch and the probe, so a staging-origin failure is still
-   observable there. Both hold → persist the `AssemblyHalt` and raise
-   `TransactionHalted`; either fails → **re-raise the original error
-   unchanged**. Parent-level failures — `_parent_fd`'s raw
+   `_diff_approved_topology` **once**: findings at `".#~work_root"` or
+   `".#~work_base"` — the work-namespace routes matching the typed
+   origin — justify the conversion (the persisted halt carries the full
+   re-diff result), so persist the `AssemblyHalt` and raise
+   `TransactionHalted`; no work-namespace findings → **re-raise the
+   original error unchanged**. Parent-level failures — the raw
    `ENOENT`/`ENOTDIR`/`ELOOP` opening `metadata_root/work` or
    `metadata_root/staging` themselves (measured
    `store/workspace.py:131-134`) — are never converted: those directories
@@ -1471,20 +1490,16 @@ Phase mapping, exactly §9.1:
    removes, and their destruction falls under the authority's
    metadata-deletion non-guarantee (its line ~118: arbitrary corruption
    or deletion of the metadata root is not automatically repaired).
-   The handler proves drift or gets out of the way: it never converts a
-   class without both proofs, so genuine substrate corruption and engine
-   defects keep their signal, and the never-caught rule for
-   substrate-invalid classes holds everywhere outside this one
-   proven-drift conversion. Step 7.1 pins the race positively — mutate
-   the work slot (remove it, replace it with a file, chmod `0o000`)
-   after the first diff and before the reopen: each ends in a persisted
-   halt at `".#~work_root"`, never a surfaced `ProtocolError`/
-   `MetadataStoreInvalid`/raw `OSError` — and negatively, the
-   cross-products: a staging-slot reopen failure plus **unrelated project
-   drift** re-raises the original error with no `assembly_halt`
-   persisted (condition a fails), and a staging-slot reopen failure plus
-   coincident work-slot drift also re-raises the original (condition b
-   fails — substrate evidence outranks the drift).
+   Step 7.1 pins the races positively — mutate the work slot (remove it,
+   replace it with a file, chmod `0o000`) after the first diff and
+   before the reopen: each ends in a persisted halt at `".#~work_root"`,
+   never a surfaced `ProtocolError`/`MetadataStoreInvalid`/raw
+   `OSError` — and negatively: a staging slot planted after `PREPARED`
+   raises `MetadataStoreInvalid` with **no** `assembly_halt` persisted,
+   whether it stands alone, beside unrelated project drift, or beside
+   coincident work-slot drift (the validation runs before the work open
+   and outside the guard, so the cross-products never reach the
+   conversion).
    **Recovery descent rule:** `_build_descriptor_table` stops at every
    `ApprovedPlannedDirectory` whatever it observes, records a `WalkStop` only
    for the **first** planned ancestor, and merely marks the subtree unreachable
@@ -2039,8 +2054,12 @@ commit arm.
     "st_mode": <canonical int>}` and `{"kind": "contended"}` (Task 5);
     **§9.3** — the finding vocabulary gains two fact-free kinds,
     `MOUNT_BOUNDARY` for determinate `EXDEV` and `ACCESS_DENIED` for
-    determinate `EACCES` at a child of an approved directory
-    (Task 7); **§9.2** — a reconciliation append is rebuilt
+    determinate `EACCES` at a child of an approved directory, and the
+    diagnostic path namespace gains two sigil-reserved pseudo-paths:
+    `".#~work_root"` for the transaction slot `work/<txid>` and
+    `".#~work_base"` for the physical `metadata_root/work` base — two
+    directories with distinct drift stories, so their findings never
+    share a path (Task 7); **§9.2** — a reconciliation append is rebuilt
     deterministically from the durable `spec_json` (the spec's own
     `consumer_tag`/`intent_digest`), and a finished staging survivor
     satisfies the append (Task 6); **§11** — the canonical
@@ -2739,9 +2758,12 @@ represent descendant observations.
    outcomes trigger one re-diff; WorkRoot findings → persisted halt at
    `".#~work_root"`; zero findings → the original error re-raised
    unchanged, so no class is ever converted without proven drift
-   *(tightened in the twentieth round: the conversion also requires a
-   clean staging-slot re-probe — origin by elimination, since
-   `_open_both` opens staging first — and parent-level failures fall
+   *(re-typed across the twentieth and twenty-first rounds: the blanket
+   `reopen_workspace` wrap is gone — phase 6 validates staging
+   **discharged** first via `require_staging_discharged` (a present slot
+   after `PREPARED` is invalid evidence, never the clean state), then
+   guards only the split `reopen_work_slot` seam, whose failures are
+   work-namespace-origin by construction; parent-level failures fall
    under the metadata-deletion non-guarantee)*. The
    race (remove / file-replace / chmod `0o000` between diff and reopen)
    is pinned in step 7.1.
@@ -2774,7 +2796,12 @@ represent descendant observations.
    stop, preserve, refuse mutation). Conversion now demands both (a)
    re-diff findings at `".#~work_root"` and (b) a clean determinate
    re-probe of `staging/<txid>` — origin by elimination; either failing
-   re-raises the original error unchanged. The negative cross-products
+   re-raises the original error unchanged *(superseded in the
+   twenty-first round: the probe's predicate was inverted — after
+   `PREPARED`, staging is discharged, so presence is the invalid state —
+   and a post-catch probe is re-observation, not typed origin; the final
+   scheme splits the store seam and guards only `reopen_work_slot`)*. The
+   negative cross-products
    are pinned: staging failure + unrelated project drift, and staging
    failure + coincident work-slot drift, each re-raise with no
    `assembly_halt`.
@@ -2792,3 +2819,29 @@ represent descendant observations.
    (`resolve.py:219-223`); the no-folding floor holds for the sharper
    reason that `lookup_equivalence_key` accepts only `EXACT_BYTES` and
    raises `CapabilityUnavailable` otherwise (`lookup.py:115-127`).
+
+## Twenty-first-round findings closed (2026-08-14)
+
+1. The staging predicate is un-inverted and the probe is gone:
+   preparation rmdirs the emptied `staging/<txid>` and flushes its
+   parent **before** the durable barrier that publishes `PREPARED`
+   (authority §7.3 steps 3–4 ~793; `blobs.py:400-409`,
+   `prepare.py:36-43`), so after `PREPARED` a present staging slot is
+   invalid evidence — the state my round-20 condition (b) treated as
+   clean.
+2. Origin is now typed at the opening seam, not re-observed: Task 7
+   splits the prepared reopen in `store/workspace.py` into
+   `require_staging_discharged(store, txid)` (present entry →
+   `MetadataStoreInvalid`; called outside the guard, so staging-origin
+   failures propagate unmutated) and `reopen_work_slot(store, txid) ->
+   Workspace` (the only guarded call — every failure concerns the work
+   namespace by construction). `reopen_workspace` is unchanged for
+   `lease.py:35`/`connection.py:842`. `workspace.py` and
+   `test_store_workspace.py` join Task 7's Files, and the negative
+   cross-products (planted staging slot alone / + unrelated project
+   drift / + coincident work drift → `MetadataStoreInvalid`, no
+   `assembly_halt`) are pinned.
+3. Minors: the `".#~work_base"` route has named cases in
+   `test_coordinator_assembly_halt.py`, and Task 11's §9.3 amendment now
+   documents both reserved diagnostic pseudo-paths alongside the two
+   finding kinds.
