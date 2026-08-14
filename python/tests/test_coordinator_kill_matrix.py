@@ -334,8 +334,20 @@ def test_backend_and_chain_barrier_cuts_converge(
         rehearsal_metadata,
         {"record": True, "variant": variant},
     )["events"]
-    matches = [index for index, event in enumerate(events) if event.startswith(method) and selector in event]
-    assert len(matches) >= selection, [
+    matches = [
+        index
+        for index, event in enumerate(events)
+        if event.startswith(method)
+        and selector in event
+        and (
+            name != "mkdir-transfer"
+            or (
+                event.rpartition(":")[2].startswith(".#~")
+                and event.rpartition(":")[2].endswith(".e1.work->d")
+            )
+        )
+    ]
+    assert matches and len(matches) >= selection, [
         event for event in events if event.startswith(method)
     ]
     chosen = matches[selection - 1] if selection else matches[-1]
