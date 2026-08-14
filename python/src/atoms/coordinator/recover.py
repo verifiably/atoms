@@ -78,7 +78,7 @@ from atoms.core.recovery.plan import (
     RemoveScratch,
     TransformEffectTuple,
 )
-from atoms.core.recovery.snapshot import PersistentNode
+from atoms.core.recovery.snapshot import PersistentNode, TopologyNode
 from atoms.core.scratch import CHAIN_LEAF
 from atoms.core.spec import TransactionSpec
 from atoms.fs.approval import (
@@ -531,7 +531,7 @@ def _observe_snapshot(
             entry = observation.observe(
                 table.fd_for(row.parent_node),
                 row.leaf,
-                modeled=_modeled_children(paths, node),
+                modeled=_recovery_modeled_children(approved, paths, node),
             )
         persistent.append(PersistentObservation(row.path, entry))
 
@@ -589,6 +589,16 @@ def _observe_snapshot(
         journals=record.journals,
         persistent_observations=tuple(persistent),
         scratch_observations=tuple(scratch),
+    )
+
+
+def _recovery_modeled_children(
+    approved: ProjectApprovedSpec,
+    paths: dict[TopologyNode, str],
+    node: TopologyNode,
+) -> frozenset[str]:
+    return _modeled_children(paths, node) | frozenset(
+        row.leaf for row in approved.scratch if row.parent_node == node
     )
 
 

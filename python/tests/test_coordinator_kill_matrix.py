@@ -97,8 +97,9 @@ def _recover(project: Path, metadata: Path) -> dict:
         capture_output=True,
         text=True,
         timeout=120,
-        check=True,
+        check=False,
     )
+    assert completed.returncode == 0, completed.stderr
     return json.loads(completed.stdout)
 
 
@@ -134,6 +135,135 @@ def _assert_terminal(
         "mkdir": ({"d": ("directory", None), "d/f.txt": ("file", b"after")} if committed else {}),
     }[variant]
     assert world == expected
+
+
+def _effect_event_indexes(events: list[str], method: str, variant: str) -> list[int]:
+    commits = [index for index, event in enumerate(events) if event == "commit"]
+    windows = [(commits[3], commits[4])]
+    if variant == "mkdir":
+        windows.append((commits[5], commits[6]))
+    return [
+        index
+        for start, stop in windows
+        for index in range(start + 1, stop)
+        if events[index].startswith(method)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("variant", "method"),
+    [
+        (variant, method)
+        for variant in ("create", "replace", "delete", "move", "mkdir")
+        for method in ("flush_file", "flush_directory")
+        if method == "flush_directory" or variant in {"create", "replace", "mkdir"}
+    ],
+)
+@pytest.mark.parametrize("side", ["before", "after"])
+def test_every_forward_effect_flush_barrier_converges(
+    ext4_volume, monkeypatch, variant, method, side
+) -> None:
+    rehearsal_project, rehearsal_metadata = _roots(
+        ext4_volume, f"flush-rehearsal-{variant}-{method}-{side}"
+    )
+    _prepare(rehearsal_project, rehearsal_metadata, variant, monkeypatch)
+    events = _child(
+        rehearsal_project,
+        rehearsal_metadata,
+        {
+            "record": True,
+            "variant": variant,
+            "store_cut": "record",
+            "countdown": 10_000,
+        },
+    )["events"]
+    targets = _effect_event_indexes(events, method, variant)
+    assert targets
+    for ordinal, target in enumerate(targets):
+        countdown = sum(
+            event.startswith(method) for event in events[: target + 1]
+        )
+        project, metadata = _roots(
+            ext4_volume, f"flush-{variant}-{method}-{side}-{ordinal}"
+        )
+        _prepare(project, metadata, variant, monkeypatch)
+        _child(
+            project,
+            metadata,
+            {
+                "variant": variant,
+                "method": method,
+                "countdown": countdown if side == "before" else -countdown,
+            },
+            killed=True,
+        )
+        _assert_terminal(project, metadata, variant, committed=False)
+
+
+@pytest.mark.parametrize("side", ["before", "after"])
+def test_every_chain_append_barrier_converges(ext4_volume, monkeypatch, side) -> None:
+    rehearsal_project, rehearsal_metadata = _roots(
+        ext4_volume, f"chain-all-rehearsal-{side}"
+    )
+    _prepare(rehearsal_project, rehearsal_metadata, "create", monkeypatch)
+    events = _child(
+        rehearsal_project,
+        rehearsal_metadata,
+        {"record": True, "variant": "create"},
+    )["events"]
+    transfers = [
+        index
+        for index, event in enumerate(events)
+        if event.startswith("transfer_noclobber:.#~stage->")
+    ]
+    assert len(transfers) == 2
+    for append_index, transfer in enumerate(transfers):
+        create = max(
+            index
+            for index in range(transfer)
+            if events[index] == "create_exclusive:.#~stage"
+        )
+        flush_file = max(
+            index
+            for index in range(create, transfer)
+            if events[index] == "flush_file"
+        )
+        flush_directory = next(
+            index
+            for index in range(transfer + 1, len(events))
+            if events[index] == "flush_directory"
+        )
+        for site, target in (
+            ("create", create),
+            ("file-fsync", flush_file),
+            ("transfer", transfer),
+            ("directory-fsync", flush_directory),
+        ):
+            method = events[target].partition(":")[0]
+            countdown = sum(
+                event.startswith(method) for event in events[: target + 1]
+            )
+            project, metadata = _roots(
+                ext4_volume,
+                f"chain-{append_index}-{site}-{side}",
+            )
+            _prepare(project, metadata, "create", monkeypatch)
+            _child(
+                project,
+                metadata,
+                {
+                    "variant": "create",
+                    "method": method,
+                    "countdown": countdown if side == "before" else -countdown,
+                },
+                killed=True,
+            )
+            _assert_terminal(
+                project,
+                metadata,
+                "create",
+                committed=append_index == 1,
+            )
 
 
 @pytest.mark.parametrize("umask", [0o022, 0o777], ids=["umask-022", "umask-777"])

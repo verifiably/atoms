@@ -83,9 +83,9 @@ class KillingBackend:
 class RecordingBackend:
     """Delegate while recording backend method names for anchored crash cuts."""
 
-    def __init__(self, inner) -> None:
+    def __init__(self, inner, events: list[str] | None = None) -> None:
         self._inner = inner
-        self.events: list[str] = []
+        self.events = [] if events is None else events
 
     def __getattr__(self, name: str):
         target = getattr(self._inner, name)

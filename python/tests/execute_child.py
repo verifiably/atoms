@@ -119,7 +119,7 @@ def main(project_root: str, metadata_root: str) -> int:
         execute.create_directory.apply = under_umask
     recorder = None
     if config.get("record"):
-        recorder = RecordingBackend(raw)
+        recorder = RecordingBackend(raw, events)
         backend = cast(Backend, recorder)
     elif "method" in config:
         backend = cast(
@@ -139,8 +139,6 @@ def main(project_root: str, metadata_root: str) -> int:
         _spec(config["variant"]),
         _payloads(config["variant"]),
     )
-    if recorder is not None:
-        events = recorder.events
     print(json.dumps({"outcome": outcome.outcome.value, "events": events}))
     return 0
 
