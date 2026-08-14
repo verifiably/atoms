@@ -219,6 +219,7 @@ def test_the_entry_documents_list_every_implemented_sub_plan():
 def test_no_status_region_claims_the_repository_writes_nothing():
     """A7a's chain bookkeeping retires the old no-project-write claim."""
     for name, region in status_regions().items():
+        assert "no filesystem mutation code has landed" not in region, name
         assert "no project path is mutated by any code in this repository" not in region, name
         assert "no code in this repository mutates a project path" not in region, name
 
