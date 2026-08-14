@@ -8,6 +8,7 @@ import hashlib
 import itertools
 import os
 import shutil
+import signal
 import zlib
 from pathlib import Path
 
@@ -47,6 +48,57 @@ from atoms.fs.volume import (
     read_mountinfo,
     resolve_mount_entry,
 )
+
+
+class KillingBackend:
+    """Delegate to a backend and SIGKILL at one named method occurrence."""
+
+    def __init__(self, inner, *, method: str, countdown: int) -> None:
+        if not method or countdown == 0:
+            raise ValueError("a kill needs a method and a nonzero countdown")
+        self._inner = inner
+        self._method = method
+        self._countdown = abs(countdown)
+        self._after = countdown < 0
+        self._seen = 0
+
+    def __getattr__(self, name: str):
+        target = getattr(self._inner, name)
+        if name != self._method or not callable(target):
+            return target
+
+        def call(*args, **kwargs):
+            self._seen += 1
+            kill = self._seen == self._countdown
+            if kill and not self._after:
+                os.kill(os.getpid(), signal.SIGKILL)
+            result = target(*args, **kwargs)
+            if kill:
+                os.kill(os.getpid(), signal.SIGKILL)
+            return result
+
+        return call
+
+
+class RecordingBackend:
+    """Delegate while recording backend method names for anchored crash cuts."""
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+        self.events: list[str] = []
+
+    def __getattr__(self, name: str):
+        target = getattr(self._inner, name)
+        if not callable(target):
+            return target
+
+        def call(*args, **kwargs):
+            strings = [value for value in args if type(value) is str]
+            suffix = "" if not strings else ":" + "->".join(strings)
+            self.events.append(name + suffix)
+            return target(*args, **kwargs)
+
+        return call
 
 SUPPORTED_FILESYSTEMS = frozenset({"ext4", "xfs", "btrfs"})
 EXT4 = "ext4"
