@@ -169,28 +169,46 @@ the status guard refuses "implemented" claims until the tree makes them true.
       (naming the operation, the slot, and the errno) when it is in the
       resolved determinate set, and otherwise — `EIO` and kin — re-raise the
       `OSError` it is (design §9.3: never encoded as drift). The table:
-      - `unlink_child`: `ENOENT`, `EISDIR`, `EBUSY`;
-      - `rmdir_child`: `ENOENT`, `ENOTDIR`, `EBUSY`, and `ENOTEMPTY`/`EEXIST`
+      - `unlink_child`: `ENOENT`, `EISDIR`, `EBUSY`, `EACCES`, `EPERM`;
+      - `rmdir_child`: `ENOENT`, `ENOTDIR`, `EBUSY`, `EACCES`, `EPERM`,
+        and `ENOTEMPTY`/`EEXIST`
         (POSIX permits either for a nonempty directory; the authority explicitly
         requires the concurrent-child refusal to end safely, measured
         `2026-07-23-recoverable-fs-effect-engine-design.md:1227`);
-      - `transfer_noclobber`: `ENOENT`, `EEXIST`, `ENOTDIR`, `EXDEV`, `EBUSY`;
-      - `exchange`: `ENOENT`, `ENOTDIR`, `EXDEV`, `EBUSY`;
-      - `link_anchor`: `ENOENT`, `EEXIST`, `ENOTDIR`, `EXDEV`;
-      - `create_exclusive`: `ENOENT`, `EEXIST`, `ENOTDIR`;
-      - `mkdir_child`: `ENOENT`, `EEXIST`, `ENOTDIR`;
-      - `repair_entry_mode`: `ENOENT`, `ENOTDIR` (its `O_PATH` pin races the
+      - `transfer_noclobber`: `ENOENT`, `EEXIST`, `ENOTDIR`, `EXDEV`,
+        `EBUSY`, `EACCES`, `EPERM`;
+      - `exchange`: `ENOENT`, `ENOTDIR`, `EXDEV`, `EBUSY`, `EACCES`,
+        `EPERM`;
+      - `link_anchor`: `ENOENT`, `EEXIST`, `ENOTDIR`, `EXDEV`, `EACCES`,
+        `EPERM`;
+      - `create_exclusive`: `ENOENT`, `EEXIST`, `ENOTDIR`, `EACCES`;
+      - `mkdir_child`: `ENOENT`, `EEXIST`, `ENOTDIR`, `EACCES`;
+      - `repair_entry_mode`: `ENOENT`, `ENOTDIR`, `EACCES`, `EPERM` (its
+        `O_PATH` pin races the
         way a lookup does — an entry vanishing between `mkdir_child` and the
         repair must convert, not leak after `STARTED`);
-      - the verification lookups — `lstat`: `ENOENT`, `ENOTDIR`;
+      - the verification lookups — `lstat`: `ENOENT`, `ENOTDIR`, `EACCES`;
         `open_regular_nofollow`: `ENOENT`, `ENOTDIR`, `ELOOP`, `EISDIR`,
         `EACCES` (a file the engine cannot reopen is a determinate
         verification mismatch, never a raw `PermissionError`);
-        `symlink_fingerprint`: `ENOENT`, `ENOTDIR`, `EINVAL`;
-        `open_child_directory`: `ENOENT`, `ENOTDIR`, `ELOOP`, `EXDEV`
+        `symlink_fingerprint`: `ENOENT`, `ENOTDIR`, `EINVAL`, `EACCES`;
+        `open_child_directory`: `ENOENT`, `ENOTDIR`, `ELOOP`, `EXDEV`,
+        `EACCES`
         (mkdir's post-`mkdir_child` retain open mutates nothing but races
         the same way — a work-slot entry racing away between the mkdir and
         its open must convert, not escape after `STARTED`).
+      `EACCES` is determinate everywhere above: permission drift on a
+      retained parent is persistent world state, not transient noise — a
+      parent chmodded after `STARTED` makes the next rename/unlink/create
+      or the verifying `lstat` refuse, and the spine must roll back to
+      `PreconditionRefused`, never rethrow raw (one mutation race and one
+      lookup race pinned). `EPERM` converts exactly where its syscalls
+      document it as a namespace/attribute refusal — unlink/rmdir/rename
+      on a sticky-bit or immutable/append-only target, `link` under
+      immutable/append-only or `protected_hardlinks`, `fchmod` by a
+      non-owner — and stays raw for `create_exclusive`, `mkdir_child`,
+      and the lookups, where POSIX documents no namespace `EPERM`: an
+      undocumented `EPERM` there is substrate, not drift.
       The lookup entries exist because post-mutation verification reads race
       exactly the way the mutations do: an entry vanishing between the
       exchange and its verifying `lstat` is drift evidence and must surface
@@ -557,8 +575,8 @@ the status guard refuses "implemented" claims until the tree makes them true.
   arm (Task 5) represents them honestly.
   A tree the engine cannot re-observe without mutating is unrecoverable by
   design, and the engine refuses to build one; **A7b does not support
-  restrictive directory modes** (file and symlink modes keep the full
-  range). Task 11 records the authority and A2 amendments. (A deferred-restriction pass
+  restrictive directory modes or unreadable file postimages** (preimage
+  file modes and symlink modes keep the full range). Task 11 records the authority and A2 amendments. (A deferred-restriction pass
   was considered and vetoed in the thirteenth-round review: restricting
   before `COMMITTED` makes rollback of a populated restricted tree
   impossible, and completing restriction after `COMMITTED` has no A3
@@ -795,12 +813,13 @@ end:
   canonical observed mode — `ObservedContended()` — frozen and
   fact-free: the entry would not hold still for one coherent look, so there
   are no stable facts to record — and `ObservedInaccessible()` — frozen
-  and fact-free: a regular file the observer cannot open, so content
-  fingerprint and build relation are unreadable — join the closed
+  and fact-free: an entry the observation cannot reach or read — a
+  lookup or open refused `EACCES` — so kind, fingerprint, and build
+  relation are all unreadable — join the closed
   `ObservedEntry` union.
   None has an identity member: an unrecognized kind is never opened
   (opening a FIFO can block), a contended entry yielded no pinnable
-  descriptor, and an inaccessible file refused the only open that could
+  descriptor, and an inaccessible entry refused every open that could
   pin one. All are exported wherever the union's members are
   (the model's public surface and the architecture public-surface
   expectations).
@@ -811,13 +830,26 @@ end:
   errno (`ENOENT`/`ENOTDIR`/`ELOOP`/`EXDEV`, plus `EINVAL` from a
   fingerprint whose leaf stopped being a symlink) after a successful
   `lstat`, or `_open_and_pin`'s kind predicate failing (the fd is closed
-  first, as today), and `ObservedInaccessible()` where the regular-file
-  open refuses `EACCES`: `open_regular_nofollow` reopens `O_RDONLY`
-  (measured `fs/linux.py:149-153`), and the retained descriptor that let
-  a restrictive-mode file be written forward does not exist in a fresh
-  process — without this arm a chmod-`000` file makes fresh recovery
-  escape raw `PermissionError` repeatedly, neither rollback nor
-  explained halt. Observation states facts, it does not judge (ledger
+  first, as today), and `ObservedInaccessible()` wherever an observation
+  step refuses `EACCES` — **observation-level, not one open**: the
+  initial child `lstat` (a retained parent chmodded after the table was
+  built — the live probe confirmed an already-open directory fd does not
+  bypass its own new mode for child lookups), the regular-file open
+  (`open_regular_nofollow` reopens `O_RDONLY`, measured
+  `fs/linux.py:149-153`, and the retained descriptor that materialized a
+  restrictive postimage does not exist in a fresh process), the symlink
+  fingerprint's `readlink`, and a directory whose `O_PATH` fallback
+  itself refuses — the fallback stays first for directories because
+  occupancy-`None` is the richer observation; the arm is that route's
+  last resort. Without the arm each of these makes recovery escape raw
+  `PermissionError` repeatedly, neither rollback nor explained halt.
+  Pinned: a persistent parent chmodded `0o000` after `PREPARED`, on
+  **both recovery routes separately** — caught rollback observes the
+  children as `ObservedInaccessible` and halts through the guard; fresh
+  recovery reaches its halt through the phase-5/phase-6 routes (Task 7:
+  the diff's `ACCESS_DENIED`, and the descriptor walk's `EACCES`
+  translated to `PreconditionRefused` into the moved-world re-diff) —
+  with no raw `PermissionError` escaping either. Observation states facts, it does not judge (ledger
   #13's rule, already the module's charter). Exactly **two** production
   constructors of the arms exist — `fs/observe.py`, the live-filesystem
   producer, and the durable decoder in `store/records.py`, which must
@@ -955,13 +987,13 @@ end:
   wrong-typed `st_mode`, a recognized-kind `st_mode` (a regular-file
   format), a negative value, and an oversized value such as `1 << 40`
   (all `MetadataStoreInvalid`).
-- `capture.py`: capture translates either arm into `PreconditionRefused`
+- `capture.py`: capture translates each arm into `PreconditionRefused`
   naming the path (and `st_mode` where there is one) — capture runs before
   `PREPARED`, where refusal is §11's correct outcome, and §11 already names
   the contended case verbatim ("two observations of one directory or entry
   disagree within a single approval; at capture"). The judgment moves from
   the observation layer to the one consumer entitled to make it;
-  `verify_committed_surface`'s comparison likewise treats both arms as the
+  `verify_committed_surface`'s comparison likewise treats the arms as the
   mismatch they are (dataclass inequality — no special case).
 
 Tests this task owns: plant a FIFO at a covered slot between prepare and
@@ -1462,8 +1494,13 @@ Phase mapping, exactly §9.1:
    the resolver wraps phases 5–6 in one recovery rule whose catch is **exactly
    `(ProjectApprovalRefused, PreconditionRefused)`** — the factory's
    resolution and evidence comparison both raise the former, the descriptor
-   builder's identity/constraint/mount validation raises the latter, and
-   `ProtocolError` (or any broader class) is never caught. On catching one, it
+   builder's identity/constraint/mount validation raises the latter — and
+   the builder also **translates a determinate `EACCES` from its walk's
+   `open_child_directory` into `PreconditionRefused` naming the node** (a
+   retained parent chmodded after the diff makes the walk refuse; raw, it
+   would escape this rule entirely), so permission drift enters the same
+   re-diff and halts at the `ACCESS_DENIED` finding. `ProtocolError` (or
+   any broader class) is never caught. On catching one, it
    re-runs `_diff_approved_topology`
    **once**: findings now present → the world moved between passes — persist
    the `AssemblyHalt` built from them and raise `TransactionHalted`; still
@@ -2140,10 +2177,13 @@ commit arm.
     judgment (Task 7); **§9.1 (observation phase)** — recovery observation
     is total: an entry that is neither file, symlink, nor directory observes
     as `ObservedUnrecognized(st_mode)`, one that would not hold still for
-    one coherent look observes as `ObservedContended`, both halt through
+    one coherent look observes as `ObservedContended`, one whose lookup or
+    open refuses `EACCES` observes as `ObservedInaccessible`, all halting
+    through
     the shared guard — never a refusal — once a durable record exists, and
     the durable diagnostic encodes them as `{"kind": "unrecognized",
-    "st_mode": <canonical int>}` and `{"kind": "contended"}` (Task 5);
+    "st_mode": <canonical int>}`, `{"kind": "contended"}`, and
+    `{"kind": "inaccessible"}` (Task 5);
     **§9.3** — the finding vocabulary gains two fact-free kinds,
     `MOUNT_BOUNDARY` for determinate `EXDEV` and `ACCESS_DENIED` for
     determinate `EACCES` at a child of an approved directory, and the
@@ -3036,3 +3076,30 @@ represent descendant observations.
    (`workspace.py:23`) — only the constructor token error is a
    production edit; the producer-bearing docstring amendment belongs to
    the A5a design. The round-22 history claim is annotated.
+
+## Twenty-sixth-round findings closed (2026-08-14)
+
+1. Permission drift converts across the whole effect surface: every
+   mutation row and every verification-lookup row in the `_DETERMINATE`
+   table gains `EACCES` (a retained parent chmodded after `STARTED` makes
+   the next rename/unlink/create or verifying `lstat` refuse — the spine
+   rolls back to `PreconditionRefused`, never a raw rethrow; one mutation
+   race and one lookup race pinned). `EPERM` is dispositioned
+   explicitly: it converts where its syscalls document a
+   namespace/attribute refusal (unlink/rmdir/rename on sticky or
+   immutable targets, `link` under `protected_hardlinks`, non-owner
+   `fchmod`) and stays raw for `create_exclusive`, `mkdir_child`, and
+   the lookups, where an `EPERM` is undocumented substrate.
+2. `ObservedInaccessible` is observation-level: produced by the initial
+   child `lstat` (an open parent fd does not bypass its own new mode —
+   live-probed), the regular-file open, the symlink `readlink`, and a
+   directory whose `O_PATH` fallback itself refuses (the fallback stays
+   the directory route's first resort). The phase-6 descriptor walk
+   translates determinate `EACCES` into `PreconditionRefused`, entering
+   the moved-world re-diff and halting at `ACCESS_DENIED` instead of
+   escaping raw. Parent-permission races are pinned on fresh recovery
+   and caught rollback separately.
+3. Drift corrected: the A7 §9.1 observation amendment names all three
+   arms and the `{"kind": "inaccessible"}` tag; "either/both arms"
+   phrasing generalized; the compile-rule parenthetical now reads
+   "preimage file modes and symlink modes keep the full range."
