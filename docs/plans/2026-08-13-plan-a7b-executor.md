@@ -1491,7 +1491,17 @@ Phase mapping, exactly §9.1:
    today name only `Store.create_workspace`/`Store.reopen_workspace`
    (measured `store/workspace.py:37-41`) — and Task 11 amends the A5a
    design's producer contract (its line ~1418) with the historical A5a
-   plan annotated.
+   plan annotated. **Both seams are issued and failure-complete**:
+   `reopen_work_slot` routes its `Workspace` through `_issue` (measured
+   `store/workspace.py:124-126`) — registration in `store._workspaces`
+   is what lets `Store.close()` close every outstanding workspace
+   (measured `store/connection.py:835-837`) — and each seam closes its
+   parent descriptor on **every** exit, success and raise alike, under
+   `reopen_workspace`'s own `finally`-`close_all` discipline. Pinned in
+   `test_store_workspace.py`: the issued workspace closes on
+   `Store.close()`, and `descriptor_count` is flat across both seams'
+   failure exits (a planted staging slot; a missing, wrong-kind, and
+   `EACCES` work slot; a failing parent open).
 
    `resolve` calls `require_staging_discharged` **outside** the guard —
    its raises propagate untouched, staging-origin **by construction**,
@@ -1649,7 +1659,13 @@ registry's one recorded exception (Task 10 pins it).
     paths; each owned resource is context-managed (or closed in `finally`), and
     a `descriptor_count` before/after assertion wraps a lease entry that exits
     through each failure class — `ChainStateInvalid` in phase 1, the phase-2
-    short-circuits, an `AssemblyHalt` in phase 5, and a `HaltPlan` in phase 7 —
+    short-circuits, an `AssemblyHalt` in phase 5,
+    `require_staging_discharged`'s `MetadataStoreInvalid` and
+    `reopen_work_slot`'s three guard classes in phase 6, a
+    `DescriptorTable` build failure **after** `reopen_work_slot`
+    succeeded (the issued workspace must close on that exit — its
+    `_issue` registration also means a leaked one would be caught by the
+    `Store.close()` ownership pin), and a `HaltPlan` in phase 7 —
     proving no descriptor leaks on any of them. The phase-7 declared-path
     scope is a lifetime too: after a lease entry exits through the `HaltPlan`
     raise, the facade's declared set is empty again (a declared-effect
@@ -2902,3 +2918,17 @@ represent descendant observations.
    name the third factory, and Task 11 amends the A5a design's contract
    (~1418) with the historical A5a plan annotated — both files added to
    the Task 11 inventory and the self-review amendment list.
+
+## Twenty-third-round findings closed (2026-08-14)
+
+1. `reopen_work_slot` is issued and both seams are failure-complete: the
+   returned `Workspace` routes through `_issue`
+   (`workspace.py:124-126`), so `Store.close()`'s ownership sweep
+   (`connection.py:835-837`) covers it, and each seam closes its parent
+   descriptor on every exit under `reopen_workspace`'s
+   `finally`-`close_all` discipline. `test_store_workspace.py` pins
+   `Store.close()` ownership and flat `descriptor_count` across both
+   seams' failure exits; Task 7's phase-6 resource family now exits
+   through `require_staging_discharged`'s `MetadataStoreInvalid`,
+   `reopen_work_slot`'s guard classes, and a `DescriptorTable` build
+   failure after a successful reopen.
