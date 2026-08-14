@@ -1113,19 +1113,35 @@ becomes total, and the amendment documents the durable diagnostic shape.)
     `DirectoryConstraints` carries mutation authority or a parent mode),
     so reauthorization can only re-issue the step. No observation is
     fabricated to break the tie; instead a **factory-owned halt seam**
-    beside the guard's — `classifier._mutation_denied(plan, cursor,
-    authorized: AuthorizedStep, observed: JointObservation) ->
-    HaltPlan`, same module, same factory discipline, taking the freshly
-    reissued proof (consuming it, so it is never executable) and the
-    observation that re-authorized it — builds the `HaltPlan` with a new
-    A3 `HaltReason.MUTATION_DENIED` using **only the existing diagnostic
-    fields**: the effect id, the expected/observed projections of that
-    observation, and the reason. The denied operation, slot, and errno
-    stay **executor-private** — named in the raised `TransactionHalted`'s
-    message, never persisted: ledger #14's measured premise is that A3
-    names no syscall, and the durable evidence keeps it that way. The
-    halt is persisted via `_persist_halt` and surfaces as
-    `TransactionHalted` — a durable halt, ledger #14's outcome, with no
+    in `authorization.py` beside `_precondition_changed_halt`, which
+    already owns prefix reduction, coverage validation, and the
+    projection equality:
+    `authorization._mutation_denied(authorized: AuthorizedStep,
+    observed: JointObservation) -> HaltPlan`. It takes **no separate
+    plan or cursor** — the proof already carries `plan`, `step_index`,
+    and `step`, and accepting them separately would let a caller mix a
+    valid proof with a foreign plan or position. It **binds the
+    observation to the proof** before minting anything: coverage
+    validation plus authorization-projection equality against
+    `authorized.step.expected_before` (an observation that does not
+    re-authorize this exact step refuses with `ProtocolError`), then
+    reduces the exact prefix at the proof's own index and builds the
+    `HaltPlan` with a new A3 `HaltReason.MUTATION_DENIED` using **only
+    the existing diagnostic fields**: the effect id, the
+    expected/observed projections, and the reason. The proof is never
+    executable through this branch as a **mechanical property**: the
+    branch returns the `HaltPlan` without forwarding the proof to
+    settlement — control flow, not token consumption; Python values are
+    not linear. The denied operation, slot, and errno are
+    **executor-private and ephemeral**: `run_plan` returns only the
+    `HaltPlan`, and phase 7 later raises `TransactionHalted` from the
+    durable diagnostic, so the surfaced exception carries the generic
+    reason and diagnostic — the mismatch details die with the caught
+    exception, are promised nowhere, and never persist: ledger #14's
+    measured premise is that A3 names no syscall, and the durable
+    evidence keeps it that way. The
+    halt is persisted via `_persist_halt` — a durable halt, ledger #14's
+    outcome, with no
     retry. `HaltReason.MUTATION_DENIED` is a **value-only wire change**:
     the durable reason codec accepts the new value (round-trip and
     hostile unknown-reason cases), no diagnostic key or shape changes,
@@ -3198,6 +3214,29 @@ represent descendant observations.
    expected/observed projections, the reason). The denied
    operation/slot/errno stay executor-private in the `TransactionHalted`
    message — never durable — preserving ledger #14's premise that A3
-   names no syscall. `MUTATION_DENIED` is a value-only wire change: no
+   names no syscall. *(Superseded in the twenty-ninth round: the factory
+   is `authorization._mutation_denied(authorized, observed)` — plan and
+   cursor derive from the proof, the observation is validated against
+   `expected_before`, and the message promise is dropped — the details
+   are ephemeral; the surfaced exception carries only the durable
+   diagnostic.)* `MUTATION_DENIED` is a value-only wire change: no
    diagnostic key or shape changes, stored v2 diagnostics decode as
    before, and the A3 amendment records the generic-evidence rule.
+
+## Twenty-ninth-round findings closed (2026-08-14)
+
+1. The denial factory is bound and non-redundant:
+   `authorization._mutation_denied(authorized: AuthorizedStep, observed:
+   JointObservation) -> HaltPlan`, beside `_precondition_changed_halt`
+   (which already owns prefix reduction, coverage validation, and the
+   projection equality). Plan and cursor derive from the proof; the
+   observation must re-authorize exactly `authorized.step.expected_before`
+   (coverage + projection equality, else `ProtocolError`), so a valid
+   proof cannot be mixed with a foreign plan, position, or observation.
+   "Consuming" is restated as the mechanical property: the branch
+   returns without forwarding the proof to settlement.
+2. The message promise is dropped: `run_plan` returns only the
+   `HaltPlan`, phase 7 raises `TransactionHalted` from the durable
+   diagnostic, so the denied operation/slot/errno are private and
+   ephemeral — the surfaced exception carries the generic reason and
+   diagnostic only. The round-28 history claim is annotated.
