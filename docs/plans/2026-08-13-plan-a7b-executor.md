@@ -428,6 +428,23 @@ the status guard refuses "implemented" claims until the tree makes them true.
   - **Mkdir × remove** `rmdir_child`s the **live** directory only
     (`variants.py:1235-1250`); work-slot removal arrives as its own
     `RemoveScratch`.
+- **Post-authorization syscall races are determinate drift, not crashes.** The
+  authorization proof is a fresh observation, but the world can move between
+  it and the mutation syscall, and a raw `OSError` from the syscall would
+  bypass Task 5's halt path entirely. Every cell's mutation calls (in both
+  `apply_transform` and `apply_remove_scratch`) therefore run through a
+  module-private wrapper that catches `OSError` and raises `EffectMismatch`
+  (naming the operation, the slot, and the errno) exactly when the errno is in
+  that operation's determinate set — `unlink_child`: `ENOENT`, `EISDIR`;
+  `rmdir_child`: `ENOENT`, `ENOTDIR`, and `ENOTEMPTY`/`EEXIST` (POSIX permits
+  either for a nonempty directory; the authority explicitly requires the
+  concurrent-child refusal to end safely, measured
+  `2026-07-23-recoverable-fs-effect-engine-design.md:1227`);
+  `transfer_noclobber`: `ENOENT`, `EEXIST`, `ENOTDIR`; `exchange`: `ENOENT`,
+  `ENOTDIR`. Every other errno — `EIO` and kin — propagates as the `OSError`
+  it is (design §9.3: never encoded as drift). The resulting `EffectMismatch`
+  rides Task 5's existing post-mutation path: reauthorize once solely to
+  obtain the factory `HaltPlan`.
 
 - [ ] **Step 4.1: Failing tests.** Drive each of the six cells through a real
   prepared state: build the mid-flight filesystem shape by running the forward
@@ -439,7 +456,13 @@ the status guard refuses "implemented" claims until the tree makes them true.
   before return). Assert a raw `TransformEffectTuple` (not an `AuthorizedStep`)
   is refused with `ProtocolError`. Assert every out-of-census pair refuses.
   Assert `apply_remove_scratch` removes exactly the named slot and nothing else
-  (plant a sibling scratch leaf; it must survive). Run: expect import failure.
+  (plant a sibling scratch leaf; it must survive). Assert the
+  post-authorization race maps per operation: a wrapper backend that mutates
+  the world immediately before invoking the inner call — adds a child to the
+  directory before `rmdir_child`, removes the slot before `unlink_child`,
+  occupies the destination before `transfer_noclobber` — makes the cell raise
+  `EffectMismatch`, never a raw `OSError`; an injected `OSError(EIO)` from the
+  same sites propagates unchanged. Run: expect import failure.
 - [ ] **Step 4.2: Implement** `settle.py` as a dict-of-dispatch keyed by the six
   `(EffectVariant, SettlementKind)` pairs; every cell reuses Task 1–3 helpers; no
   cell re-derives scratch names (they come from `approved.scratch` via
@@ -794,8 +817,14 @@ Phase mapping, exactly §9.1:
      ever persisted) — its constraints can drift independently of every
      ancestor, and letting phase 6's descriptor validation discover that would
      surface as `PreconditionRefused` (measured `descriptors.py:163-175`)
-     after the durable `PREPARED`, violating the halt-not-refuse rule. Drift
-     there emits `CONSTRAINTS_CHANGED`/`MOUNT_CHANGED` like any other node.
+     after the durable `PREPARED`, violating the halt-not-refuse rule.
+     Constraint drift there emits `CONSTRAINTS_CHANGED`; a determinate `EXDEV`
+     opening the planned child emits `MOUNT_BOUNDARY` under exactly the
+     existing-entry rule — the boundary rule is uniform wherever the walk's
+     `RESOLVE_NO_XDEV` open refuses, including the `metadata_root/work` open
+     for the work-root comparison. `MOUNT_CHANGED` appears only where a bound
+     descriptor's mount id is actually readable (the project root's own
+     comparison).
 
    An indeterminate errno — `EIO` and kin — propagates as the `OSError` it is
    (design §9.3: never encoded as drift). Any findings → build the
@@ -879,15 +908,25 @@ Phase mapping, exactly §9.1:
    A planned node whose original stop observed a file or symlink is never
    descended: the observation feeds the snapshot and A3's classification rules
    on it.
-7. `plan = classify_recovery(snapshot)`; `run_plan(lease, approved, table, plan)`;
-   a returned `HaltPlan` raises `TransactionHalted` with its diagnostic.
+7. `plan = classify_recovery(snapshot)`; then, because a fresh process has never
+   installed audit authority, `backend.set_declared_paths(frozenset(p.path for
+   p in approved.paths))` — the facade type-checks for an **exact** `frozenset`
+   and refuses every declared-effect target while none is installed (measured
+   `fs/audit.py:143-148, 387-389`), so without this scope every persistent
+   recovery mutation dies as unauthorized — then `run_plan(lease, approved,
+   table, plan)` with `clear_declared_paths()` in a `finally`; a returned
+   `HaltPlan` raises `TransactionHalted` with its diagnostic. (The
+   reconciliation appends of phase 3 correctly run before authority is
+   installed: scratch and chain targets classify as
+   `ENGINE_SCRATCH`/`CHAIN_BOOKKEEPING` and need no declared scope.)
 
 The `AssemblyHalt` diff: over the closed-decoded expected document and the
 observed facts the diff walk gathered; for each directory node in
 the union, emit findings under the closed vocabulary with `NODE_MISSING`/
 `WRONG_ENTRY_KIND` as a node's **sole** finding when applicable, else every
 applicable changed-kind finding; `MOUNT_CHANGED`/`WORK_ROOT_CHANGED` from the top-
-level members; order by `(path, finding-kind enum order)`; `expected` is
+level members (`MOUNT_BOUNDARY` instead when the work-root open itself refuses
+with a determinate `EXDEV`); order by `(path, finding-kind enum order)`; `expected` is
 `record.approval_evidence` verbatim. The narrow persistence path is one function,
 `recover._persist_assembly_halt(store, halt)` — it takes **no proof** (that is the
 point: the proof is exactly what could not be issued) and is the architecture
@@ -920,8 +959,8 @@ registry's one recorded exception (Task 10 pins it).
   stays a stop, and the classification rules on it (this is the test ordinary
   `approve_for_project` would make unpassable). The conditional planned
   comparison gets its own pair: a planned node present as a directory with
-  drifted constraints (or on a foreign mount) persists an `AssemblyHalt` with
-  `CONSTRAINTS_CHANGED`/`MOUNT_CHANGED` at the planned path — never a
+  drifted constraints (or behind a bind mount) persists an `AssemblyHalt` with
+  `CONSTRAINTS_CHANGED`/`MOUNT_BOUNDARY` at the planned path — never a
   `PreconditionRefused` from the table builder — while the same directory with
   intact constraints resolves and recovers normally. The mount findings are
   exercised for real where the harness allows: a bind mount over an approved
@@ -941,7 +980,10 @@ registry's one recorded exception (Task 10 pins it).
     a `descriptor_count` before/after assertion wraps a lease entry that exits
     through each failure class — `ChainStateInvalid` in phase 1, the phase-2
     short-circuits, an `AssemblyHalt` in phase 5, and a `HaltPlan` in phase 7 —
-    proving no descriptor leaks on any of them.
+    proving no descriptor leaks on any of them. The phase-7 declared-path
+    scope is a lifetime too: after a lease entry exits through the `HaltPlan`
+    raise, the facade's declared set is empty again (a declared-effect
+    mutation through the same facade refuses).
 - [ ] **Step 7.2: Implement** phases 1–7 as one `resolve` function calling private
   per-phase helpers in order, with an early return per short-circuit; wire
   `root.py`; delete `lease._resolve`; convert the A5b trap tests.
@@ -1002,7 +1044,9 @@ def run_transaction(backend, project_root, metadata_root, storage,
 `execute._run_under_lease`, steps 2–9: `admit` (2) → `open_workspace` +
 `capture_initial_surface` (3) → `prepare_transaction` (4, PREPARED COMMIT — the
 spec, tag and intent digest included, is durable in `spec_json` from here) →
-`set_declared_paths({p.path for p in approved.paths})` → `append_entry` of
+`set_declared_paths(frozenset(p.path for p in approved.paths))` — the facade
+refuses anything but an exact `frozenset` (measured `fs/audit.py:143-145`) →
+`append_entry` of
 `_registration_entry(spec, approved.txid)` (5 — the builder is Task 6's,
 imported from `recover`: txid, `spec.intent_digest`, `spec.consumer_tag`,
 initial/final = `state_to_json` of the surface states restricted to
@@ -1012,7 +1056,9 @@ initial/final = `state_to_json` of the surface states restricted to
 the variant module's `apply` (a `CreateDirectory` return descriptor is adopted
 via `table.adopt(node, fd)` under transfer-or-close: the spine closes it if
 adoption raises) → `DONE` journal COMMIT (8) → `APPLIED` transition (9).
-`clear_declared_paths()` in the `finally`.
+`clear_declared_paths()` in a `finally` whose `try` spans through the catch,
+so `_roll_back`'s `RESTORE_PRE` transforms mutate declared paths under the
+same installed authority.
 
 `commit.py`, split across the catch boundary (see the catch below) — note
 **no `validated` parameter on either half**: the proof taken at entry is stale
@@ -1192,7 +1238,18 @@ cut:
   return, move's rename-back and anchor removal, mkdir's work-slot removal),
   a kill **between the compensation mutation and its `flush_directory`** —
   recovery must converge from the unflushed state, which is exactly why the
-  forward modules flush before raising.
+  forward modules flush before raising. A clean run never executes a
+  compensation, so these cuts cannot be counted off the clean rehearsal: each
+  cut's child configures the **same adverse scenario its Task 1–3 unit test
+  defines** — a pre-planted live occupant for create-file's and mkdir's
+  `EEXIST`, a beneath-facade tamper hook for replace's verification failure,
+  delete's tombstone-validation failure, and move's anchor-validation and
+  post-transfer identity failures — with `execute_child`'s env JSON naming the
+  scenario alongside the kill site. The rehearsal for such a cut runs that
+  identical adverse scenario un-killed, asserts the recorded sequence actually
+  contains the compensation's own events (the exchange back, the staging
+  unlink, the tombstone-return transfer, the rename back, the anchor unlink,
+  the work-slot rmdir), and reads the countdown off that adverse rehearsal.
 
 Each case: (1) child runs `run_transaction` with the kill configuration from an
 env-passed JSON and dies; (2) parent asserts the child was killed (exit signal 9);
@@ -1510,7 +1567,9 @@ step 11.2.
    classified as `MOUNT_CHANGED` (the errno is the mount evidence — no
    descriptor exists to read an id from), and the test exercises a real bind
    mount via `find_distinct_mount` where available instead of mocking
-   `read_mount_id`.
+   `read_mount_id`. (The kind is superseded by the sixth round: an errno
+   cannot fill `MOUNT_CHANGED`'s closed fact set, so the finding is the
+   fact-free `MOUNT_BOUNDARY`.)
 3. The kill matrix cuts both sides of every store COMMIT: `_run_barrier` fires
    only pre-commit, so a second child wrapper kills immediately after the
    `_COMMIT` statement returns; both cuts are enumerated per barrier.
@@ -1547,3 +1606,31 @@ step 11.2.
    PreconditionRefused)`: `_approve_for_recovery`'s evidence comparison raises
    `ProjectApprovalRefused` like its resolution does, and `ProtocolError` is
    never caught.
+
+## Seventh-round findings closed (2026-08-14)
+
+1. Phase 7 installs audit authority before `run_plan` —
+   `set_declared_paths(frozenset(p.path for p in approved.paths))` with
+   `clear_declared_paths()` in a `finally` — because a fresh process has never
+   installed a declared scope and the facade refuses every declared-effect
+   target without one; the forward spine's call gains the same exact
+   `frozenset(...)` the facade type-checks for, and its `finally` explicitly
+   spans the catch so `_roll_back`'s transforms run under the installed
+   authority. The scope's clearance is asserted in the lifetime tests.
+2. Task 4's mutation calls map operation-specific determinate errnos
+   (`ENOENT`/`EISDIR` on unlink, `ENOENT`/`ENOTDIR`/`ENOTEMPTY`/`EEXIST` on
+   rmdir, `ENOENT`/`EEXIST`/`ENOTDIR` on transfer, `ENOENT`/`ENOTDIR` on
+   exchange) to `EffectMismatch`, so a post-authorization race rides Task 5's
+   halt path instead of escaping as a raw `OSError`; `EIO` and kin still
+   propagate. Race-injection and `EIO`-propagation tests are specified per
+   operation.
+3. The kill matrix's compensation cuts each configure the same adverse
+   scenario their Task 1–3 unit tests define, and their rehearsals run that
+   identical adverse scenario un-killed — asserting the recorded sequence
+   contains the compensation's own events — before reading off the countdown;
+   a clean rehearsal never reaches a compensation.
+4. The boundary rule is uniform: planned children and the
+   `metadata_root/work` open also emit `MOUNT_BOUNDARY` on a determinate
+   `EXDEV` (`MOUNT_CHANGED` only where a mount id is readable), the
+   planned-node test expects it, and the fifth-round history's superseded
+   `MOUNT_CHANGED` claim is annotated.
