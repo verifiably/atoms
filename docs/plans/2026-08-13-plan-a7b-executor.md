@@ -1232,10 +1232,16 @@ Phase mapping, exactly §9.1:
      prefixes folding under their parent's policy share one node (its
      contract, measured `fs/topology.py:116`; one entry per prefix,
      measured `fs/topology.py:186-189`; the folding fixture,
-     `test_fs_topology.py:289`) — but no production lookup proof folds:
-     `UNREPRODUCIBLE_CASEFOLD`'s only source occurrence is its definition
-     (measured `fs/lookup.py:41`), and the fixture needs an injected
-     equivalence to reach the shape. The factory therefore **requires
+     `test_fs_topology.py:289`) — but no production topology folds:
+     `read_lookup_constraints` does produce `UNREPRODUCIBLE_CASEFOLD` for
+     a casefold directory (measured `fs/lookup.py:92-96`) and resolution
+     refuses a casefold project root outright (measured
+     `fs/resolve.py:219-223`), and the sharper floor is
+     `lookup_equivalence_key`: it accepts only `EXACT_BYTES` and raises
+     `CapabilityUnavailable` for every other proof (measured
+     `fs/lookup.py:115-127`), so folding — which needs an equivalence
+     key — can never build a foldable topology in production; the fixture
+     injects an equivalence to reach the shape. The factory therefore **requires
      exactly one route per non-`WorkRoot` approved directory** when
      building `directory_paths`, raising `ProtocolError` on zero or on
      more than one — under the exact-bytes production floor that world is
@@ -1440,17 +1446,45 @@ Phase mapping, exactly §9.1:
    claim for what is world drift. So **exactly the `reopen_workspace`
    call** is wrapped: on `ProtocolError`, `MetadataStoreInvalid`, or an
    `OSError` whose errno is `EACCES` or `EXDEV`, re-run
-   `_diff_approved_topology` **once** — findings present → persist the
-   `AssemblyHalt` and raise `TransactionHalted`; zero findings →
-   **re-raise the original error unchanged**. The handler proves drift or
-   gets out of the way: it never converts a class, so genuine substrate
-   corruption and engine defects keep their signal, and the never-caught
-   rule for substrate-invalid classes holds everywhere outside this one
-   proven-drift conversion. Step 7.1 pins the race: mutate the work slot
-   (remove it, replace it with a file, chmod `0o000`) after the first
-   diff and before the reopen — each ends in a persisted halt at
-   `".#~work_root"`, never a surfaced `ProtocolError`/
-   `MetadataStoreInvalid`/raw `OSError`.
+   `_diff_approved_topology` **once**. But the caught error's origin is
+   untyped — `_open_both` opens `staging/<txid>` **before** `work/<txid>`
+   (measured `store/workspace.py:192-199`), so the same classes can come
+   from a broken staging slot — and persisting a halt on an error whose
+   origin is staging would mutate the store after substrate-invalid
+   evidence, which design §12's rule forbids (stop, preserve evidence,
+   refuse mutation). The conversion therefore demands **proof the failure
+   concerns `work/<txid>`**, two conditions conjoined:
+   (a) the re-diff emits findings **at `".#~work_root"`** — currently
+   observed, determinate work-slot drift, the conversion's justifying
+   findings (the persisted halt then carries the full re-diff result);
+   and (b) a read-only re-probe of `staging/<txid>` under
+   the same determinate lookup rules observes a present, well-kinded
+   staging slot — origin by elimination: the engine never mutates staging
+   between the catch and the probe, so a staging-origin failure is still
+   observable there. Both hold → persist the `AssemblyHalt` and raise
+   `TransactionHalted`; either fails → **re-raise the original error
+   unchanged**. Parent-level failures — `_parent_fd`'s raw
+   `ENOENT`/`ENOTDIR`/`ELOOP` opening `metadata_root/work` or
+   `metadata_root/staging` themselves (measured
+   `store/workspace.py:131-134`) — are never converted: those directories
+   are store substrate the engine creates at initialization and never
+   removes, and their destruction falls under the authority's
+   metadata-deletion non-guarantee (its line ~118: arbitrary corruption
+   or deletion of the metadata root is not automatically repaired).
+   The handler proves drift or gets out of the way: it never converts a
+   class without both proofs, so genuine substrate corruption and engine
+   defects keep their signal, and the never-caught rule for
+   substrate-invalid classes holds everywhere outside this one
+   proven-drift conversion. Step 7.1 pins the race positively — mutate
+   the work slot (remove it, replace it with a file, chmod `0o000`)
+   after the first diff and before the reopen: each ends in a persisted
+   halt at `".#~work_root"`, never a surfaced `ProtocolError`/
+   `MetadataStoreInvalid`/raw `OSError` — and negatively, the
+   cross-products: a staging-slot reopen failure plus **unrelated project
+   drift** re-raises the original error with no `assembly_halt`
+   persisted (condition a fails), and a staging-slot reopen failure plus
+   coincident work-slot drift also re-raises the original (condition b
+   fails — substrate evidence outranks the drift).
    **Recovery descent rule:** `_build_descriptor_table` stops at every
    `ApprovedPlannedDirectory` whatever it observes, records a `WalkStop` only
    for the **first** planned ancestor, and merely marks the subtree unreachable
@@ -1505,9 +1539,16 @@ The `AssemblyHalt` diff: over the closed-decoded expected document and the
 observed facts the diff walk gathered; for each directory node in
 the union, emit findings under the closed vocabulary with `NODE_MISSING`/
 `WRONG_ENTRY_KIND` as a node's **sole** finding when applicable, else every
-applicable changed-kind finding; `MOUNT_CHANGED`/`WORK_ROOT_CHANGED` from the top-
-level members (`MOUNT_BOUNDARY` instead when the work-root open itself refuses
-with a determinate `EXDEV`); order by `(path, finding-kind enum order)`; `expected` is
+applicable changed-kind finding; `MOUNT_CHANGED` from the top-level mount
+member at the project root's own path. The **physical work base**
+(`metadata_root/work`, the top-level `work_root` evidence member) gets its
+own reserved pseudo-path, the literal **`".#~work_base"`** — sigil-reserved
+exactly like `".#~work_root"`, so no compiled project path can collide —
+distinct from the transaction slot's path because the two are different
+directories with different drift stories: `WORK_ROOT_CHANGED` is emitted
+there, and when the work-base open itself refuses, a determinate `EXDEV` →
+`MOUNT_BOUNDARY` and a determinate `EACCES` → `ACCESS_DENIED`, at
+`".#~work_base"`. Order by `(path, finding-kind enum order)`; `expected` is
 `record.approval_evidence` verbatim. The narrow persistence path is one function,
 `recover._persist_assembly_halt(store, halt)` — it takes **no proof** (that is the
 point: the proof is exactly what could not be issued) and is the architecture
@@ -2697,7 +2738,11 @@ represent descendant observations.
    PreconditionRefused)` catch. Exactly the reopen call is wrapped: those
    outcomes trigger one re-diff; WorkRoot findings → persisted halt at
    `".#~work_root"`; zero findings → the original error re-raised
-   unchanged, so no class is ever converted without proven drift. The
+   unchanged, so no class is ever converted without proven drift
+   *(tightened in the twentieth round: the conversion also requires a
+   clean staging-slot re-probe — origin by elimination, since
+   `_open_both` opens staging first — and parent-level failures fall
+   under the metadata-deletion non-guarantee)*. The
    race (remove / file-replace / chmod `0o000` between diff and reopen)
    is pinned in step 7.1.
 2. The decoded-evidence handoff is specified minimally: `load_record`
@@ -2709,10 +2754,41 @@ represent descendant observations.
 3. `directory_paths` route selection is closed: `directory_nodes` is a
    multimap (`topology.py:116,186-189`; folding fixture
    `test_fs_topology.py:289`), but no production proof folds
-   (`UNREPRODUCIBLE_CASEFOLD` has no producer, `lookup.py:41`), so the
+   (`UNREPRODUCIBLE_CASEFOLD` has no producer, `lookup.py:41`) *(corrected
+   in the twentieth round: it is produced at `lookup.py:92-96` and checked
+   at `resolve.py:219-223`; the floor holds because
+   `lookup_equivalence_key` accepts only `EXACT_BYTES`)*, so the
    factory requires exactly one route per non-WorkRoot approved
    directory and raises `ProtocolError` on zero or several — fail-early,
    never an invented canonical choice.
 4. Task 11's Files list gains the historical A4b2 plan, and the A7 §11
    amendment names the project-node/`WorkRoot` split instead of claiming
    every route comes from `directory_paths`.
+
+## Twentieth-round findings closed (2026-08-14)
+
+1. The reopen conversion is origin-proven: `_open_both` opens
+   `staging/<txid>` before `work/<txid>` (`workspace.py:192-199`), so the
+   handler's classes can be staging-origin, and persisting a halt on
+   those would mutate after substrate-invalid evidence (design §12:
+   stop, preserve, refuse mutation). Conversion now demands both (a)
+   re-diff findings at `".#~work_root"` and (b) a clean determinate
+   re-probe of `staging/<txid>` — origin by elimination; either failing
+   re-raises the original error unchanged. The negative cross-products
+   are pinned: staging failure + unrelated project drift, and staging
+   failure + coincident work-slot drift, each re-raise with no
+   `assembly_halt`.
+2. The physical work base gets its own reserved pseudo-path,
+   `".#~work_base"`: `WORK_ROOT_CHANGED` — and `MOUNT_BOUNDARY`/
+   `ACCESS_DENIED` when the work-base open itself refuses — emit there,
+   distinct from the transaction slot's `".#~work_root"`. Post-diff
+   parent-level failures (`_parent_fd`'s raw `ENOENT`/`ENOTDIR`/`ELOOP`
+   opening `metadata_root/work` or `metadata_root/staging`,
+   `workspace.py:131-134`) are never converted: those directories are
+   store substrate under the authority's metadata-deletion non-guarantee
+   (its line ~118).
+3. The false measured fact is corrected in place:
+   `UNREPRODUCIBLE_CASEFOLD` is produced (`lookup.py:92-96`) and checked
+   (`resolve.py:219-223`); the no-folding floor holds for the sharper
+   reason that `lookup_equivalence_key` accepts only `EXACT_BYTES` and
+   raises `CapabilityUnavailable` otherwise (`lookup.py:115-127`).
