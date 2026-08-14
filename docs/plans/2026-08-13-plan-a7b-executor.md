@@ -148,8 +148,42 @@ the status guard refuses "implemented" claims until the tree makes them true.
       `retained_fd` (`os.lseek(fd, 0, SEEK_SET)` + `os.read` loop), sha256 equals
       `state.content_hash`, size equals `state.byte_len`, `stat.S_IMODE` equals
       `state.mode`. Any disagreement raises `EffectMismatch` naming the axis.
+    - `run_determinate(operation: str, slot: str, call: Callable[[], _T], *,
+      passthrough: tuple[int, ...] = ()) -> _T` — the **one** `OSError`-conversion
+      seam every mutation call in Tasks 1–4 routes through, forward and recovery
+      alike. The world can move between any observation and its mutation syscall;
+      design §11 requires that interference to end as a clean refusal after
+      restoration (`2026-07-23-...-design.md:1275-1283`), and the spine's catch
+      only translates `EffectMismatch`/`PreconditionRefused` — a raw `OSError`
+      would roll back and then escape raw. The wrapper invokes `call`, catches
+      `OSError`, re-raises it unchanged when its errno is in `passthrough` (the
+      caller owns that branch), raises `EffectMismatch` (naming the operation,
+      the slot, and the errno) when it is in the module-level closed table
+      `_DETERMINATE[operation]`, and otherwise — `EIO` and kin — re-raises the
+      `OSError` it is (design §9.3: never encoded as drift). The table:
+      - `unlink_child`: `ENOENT`, `EISDIR`, `EBUSY`;
+      - `rmdir_child`: `ENOENT`, `ENOTDIR`, `EBUSY`, and `ENOTEMPTY`/`EEXIST`
+        (POSIX permits either for a nonempty directory; the authority explicitly
+        requires the concurrent-child refusal to end safely, measured
+        `2026-07-23-recoverable-fs-effect-engine-design.md:1227`);
+      - `transfer_noclobber`: `ENOENT`, `EEXIST`, `ENOTDIR`, `EXDEV`, `EBUSY`;
+      - `exchange`: `ENOENT`, `ENOTDIR`, `EXDEV`, `EBUSY`;
+      - `link_anchor`: `ENOENT`, `EEXIST`, `ENOTDIR`, `EXDEV`.
+      The boundary errnos are determinate for the same reason the diff walk's
+      `EXDEV` is: a mount planted mid-flight makes rename/link refuse `EXDEV`,
+      and a mount point pinned under a name makes unlink/rmdir/rename refuse
+      `EBUSY` — both are world-drift evidence, not substrate failure. An
+      unknown `operation` key is `ProtocolError`.
 - `replace_file.apply(backend: AuditedBackend, store: Store, site: ReplaceSite,
   effect: ReplaceFile) -> None` — design §7's sequence verbatim, spelled in Step 1.3.
+  **Routing rule for Tasks 1–4:** every forward-sequence and recovery-cell
+  mutation call (`exchange`, `transfer_noclobber`, `link_anchor`,
+  `unlink_child`, `rmdir_child`) goes through `run_determinate`; create-file's
+  and mkdir's publication transfers pass `passthrough=(errno.EEXIST,)` so their
+  compensating occupancy branch still sees the raw `EEXIST`. Compensation
+  mutations inside `except` blocks stay raw — they run under an exception
+  already in flight, and their own failure semantics are each spelled at the
+  call site.
 
 - [ ] **Step 1.1: Spec builders.** In `tests/coordinator_support.py` add
   `replace_spec()`, `delete_spec()`, `move_spec()`, `create_file_spec()` returning
@@ -162,7 +196,12 @@ the status guard refuses "implemented" claims until the tree makes them true.
   blob file short by hand through the store's staging seam);
   `verify_live_file` accepts the built state and raises `EffectMismatch` on each
   axis (foreign inode swapped in via a raw `LinuxBackend` beneath the facade, mode
-  drift via raw `fchmod`, byte drift via raw write). `test_effects_replace.py`:
+  drift via raw `fchmod`, byte drift via raw write); `run_determinate`,
+  parametrized over every `(operation, errno)` pair in `_DETERMINATE`, converts a
+  stub raising that `OSError` into an `EffectMismatch` naming operation, slot,
+  and errno — while `OSError(EIO)` from every operation propagates unchanged, a
+  `passthrough` errno re-raises the raw `OSError`, and an unknown operation key
+  is `ProtocolError`. `test_effects_replace.py`:
   forward success publishes the postimage at the live path with the preimage
   displaced onto the staging leaf; verification failure with the live path still
   ours exchanges back (preimage restored) and raises `EffectMismatch`; a foreign
@@ -182,7 +221,13 @@ the status guard refuses "implemented" claims until the tree makes them true.
           backend, store, site.parent_fd, site.staging_leaf, effect.post
       )
       try:
-          backend.exchange(site.parent_fd, site.live_leaf, site.staging_leaf)
+          run_determinate(
+              "exchange",
+              str(effect.path),
+              lambda: backend.exchange(
+                  site.parent_fd, site.live_leaf, site.staging_leaf
+              ),
+          )
           verify_live_file(
               backend, staged_fd, site.parent_fd, site.live_leaf, effect.post
           )
@@ -248,12 +293,17 @@ the status guard refuses "implemented" claims until the tree makes them true.
       )
       try:
           try:
-              backend.transfer_noclobber(
-                  site.parent_fd, site.staging_leaf, site.parent_fd, site.live_leaf
+              run_determinate(
+                  "transfer_noclobber",
+                  str(effect.path),
+                  lambda: backend.transfer_noclobber(
+                      site.parent_fd, site.staging_leaf, site.parent_fd, site.live_leaf
+                  ),
+                  passthrough=(errno.EEXIST,),
               )
           except OSError as caught:
-              if caught.errno != errno.EEXIST:
-                  raise
+              # passthrough admits exactly EEXIST; other determinate errnos
+              # already left as EffectMismatch
               _remove_attributable_staging(backend, staged_fd, site)
               backend.flush_directory(site.parent_fd)   # compensation barrier
               raise PreconditionRefused(
@@ -331,8 +381,10 @@ the status guard refuses "implemented" claims until the tree makes them true.
   stopped planned node makes `fd_for` serve the fd and `close()` close it;
   adopting an open node, an unknown node, or after `close()` refuses with
   `ProtocolError`. Run: expect import failures.
-- [ ] **Step 3.2: Implement.** Move, design §7 order exactly: `link_anchor(source_fd,
-  source_leaf, source_fd, anchor_leaf)` → `flush_directory(source_fd)` → validate
+- [ ] **Step 3.2: Implement.** Move, design §7 order exactly (each mutation
+  through `common.run_determinate`, per Task 1's routing rule):
+  `link_anchor(source_fd, source_leaf, source_fd, anchor_leaf)` →
+  `flush_directory(source_fd)` → validate
   the anchor against `effect.source_pre` → `transfer_noclobber(source_fd,
   source_leaf, destination_fd, destination_leaf)` → require destination and anchor
   to name one inode still at the expected fingerprint → `flush_directory
@@ -424,7 +476,9 @@ the status guard refuses "implemented" claims until the tree makes them true.
     removes it). **Move × repair** covers the other two mid-move shapes
     (`variants.py:990-1035`): the dual-name tuple removes the anchor-owned
     destination, and the anchor-only tuple restores the source from the anchor
-    — neither transform removes the anchor; the following `RemoveScratch` does.
+    via `link_anchor` (a hard link from the retained anchor to the source
+    leaf — the anchor stays) — neither transform removes the anchor; the
+    following `RemoveScratch` does.
   - **Mkdir × remove** `rmdir_child`s the **live** directory only
     (`variants.py:1235-1250`); work-slot removal arrives as its own
     `RemoveScratch`.
@@ -432,19 +486,14 @@ the status guard refuses "implemented" claims until the tree makes them true.
   authorization proof is a fresh observation, but the world can move between
   it and the mutation syscall, and a raw `OSError` from the syscall would
   bypass Task 5's halt path entirely. Every cell's mutation calls (in both
-  `apply_transform` and `apply_remove_scratch`) therefore run through a
-  module-private wrapper that catches `OSError` and raises `EffectMismatch`
-  (naming the operation, the slot, and the errno) exactly when the errno is in
-  that operation's determinate set — `unlink_child`: `ENOENT`, `EISDIR`;
-  `rmdir_child`: `ENOENT`, `ENOTDIR`, and `ENOTEMPTY`/`EEXIST` (POSIX permits
-  either for a nonempty directory; the authority explicitly requires the
-  concurrent-child refusal to end safely, measured
-  `2026-07-23-recoverable-fs-effect-engine-design.md:1227`);
-  `transfer_noclobber`: `ENOENT`, `EEXIST`, `ENOTDIR`; `exchange`: `ENOENT`,
-  `ENOTDIR`. Every other errno — `EIO` and kin — propagates as the `OSError`
-  it is (design §9.3: never encoded as drift). The resulting `EffectMismatch`
-  rides Task 5's existing post-mutation path: reauthorize once solely to
-  obtain the factory `HaltPlan`.
+  `apply_transform` and `apply_remove_scratch`) therefore route through Task
+  1's shared `common.run_determinate` seam and its closed `_DETERMINATE`
+  table — the same seam the forward modules use, covering `unlink_child`,
+  `rmdir_child`, `transfer_noclobber`, `exchange`, **and `link_anchor`** (the
+  anchor-only repair restores the source by hard-linking from the retained
+  anchor, so its `ENOENT`/`EEXIST`/`EXDEV` races must convert too). The
+  resulting `EffectMismatch` rides Task 5's existing post-mutation path:
+  reauthorize once solely to obtain the factory `HaltPlan`.
 
 - [ ] **Step 4.1: Failing tests.** Drive each of the six cells through a real
   prepared state: build the mid-flight filesystem shape by running the forward
@@ -460,8 +509,12 @@ the status guard refuses "implemented" claims until the tree makes them true.
   post-authorization race maps per operation: a wrapper backend that mutates
   the world immediately before invoking the inner call — adds a child to the
   directory before `rmdir_child`, removes the slot before `unlink_child`,
-  occupies the destination before `transfer_noclobber` — makes the cell raise
-  `EffectMismatch`, never a raw `OSError`; an injected `OSError(EIO)` from the
+  occupies the destination before `transfer_noclobber`, removes the anchor
+  before the anchor-only repair's `link_anchor` and occupies its source leaf
+  in a second case — makes the cell raise `EffectMismatch`, never a raw
+  `OSError`; a bind mount planted over the covered slot's parent (via
+  `find_distinct_mount`, skip-with-reason when unavailable) makes the
+  boundary errno convert the same way; an injected `OSError(EIO)` from the
   same sites propagates unchanged. Run: expect import failure.
 - [ ] **Step 4.2: Implement** `settle.py` as a dict-of-dispatch keyed by the six
   `(EffectVariant, SettlementKind)` pairs; every cell reuses Task 1–3 helpers; no
@@ -1170,7 +1223,13 @@ is proved). A `HaltPlan` from the loop raises `TransactionHalted` instead.
   `finalize_commit` after the `COMMITTED` transaction (pre-settlement)
   propagates without any rollback mutation, the record stays committed, and a
   fresh lease entry converges on the commit arm (settlement appended, bound,
-  cleaned, detached). Lifetimes: the spine's owned resources — the `Workspace`,
+  cleaned, detached). The clean-refusal contract holds against forward races:
+  a beneath-facade hook that removes the live entry immediately before
+  replace's `exchange` makes `run_transaction` roll back fully and raise
+  `PreconditionRefused` chained to the converted mismatch — never a raw
+  `OSError` (design §11: once mutation may have begun, the refusal comes only
+  after restoration, `2026-07-23-...-design.md:1275-1283`). Lifetimes: the
+  spine's owned resources — the `Workspace`,
   `Captured`'s descriptor table, adopted `CreateDirectory` fds, the chain fd —
   are context-managed or `finally`-closed, and a `descriptor_count`
   before/after assertion wraps a run exiting through each class (clean commit,
@@ -1241,11 +1300,14 @@ cut:
   forward modules flush before raising. A clean run never executes a
   compensation, so these cuts cannot be counted off the clean rehearsal: each
   cut's child configures the **same adverse scenario its Task 1–3 unit test
-  defines** — a pre-planted live occupant for create-file's and mkdir's
-  `EEXIST`, a beneath-facade tamper hook for replace's verification failure,
-  delete's tombstone-validation failure, and move's anchor-validation and
-  post-transfer identity failures — with `execute_child`'s env JSON naming the
-  scenario alongside the kill site. The rehearsal for such a cut runs that
+  defines**, injected beneath the facade **mid-run**: for create-file's and
+  mkdir's `EEXIST`, a hook that plants the live occupant immediately before
+  the publication `transfer_noclobber` — planting it before `run_transaction`
+  would refuse at capture (step 3, before `PREPARED`), and the compensation
+  would never execute; for replace's verification failure, delete's
+  tombstone-validation failure, and move's anchor-validation and
+  post-transfer identity failures, the corresponding tamper hook — with
+  `execute_child`'s env JSON naming the scenario alongside the kill site. The rehearsal for such a cut runs that
   identical adverse scenario un-killed, asserts the recorded sequence actually
   contains the compensation's own events (the exchange back, the staging
   unlink, the tombstone-return transfer, the rename back, the anchor unlink,
@@ -1623,7 +1685,9 @@ step 11.2.
    exchange) to `EffectMismatch`, so a post-authorization race rides Task 5's
    halt path instead of escaping as a raw `OSError`; `EIO` and kin still
    propagate. Race-injection and `EIO`-propagation tests are specified per
-   operation.
+   operation. (Superseded in scope by the eighth round: the seam moved to
+   `effects/common.py`, shared with the forward modules, and the table gained
+   `link_anchor` and the boundary errnos.)
 3. The kill matrix's compensation cuts each configure the same adverse
    scenario their Task 1–3 unit tests define, and their rehearsals run that
    identical adverse scenario un-killed — asserting the recorded sequence
@@ -1634,3 +1698,30 @@ step 11.2.
    `EXDEV` (`MOUNT_CHANGED` only where a mount id is readable), the
    planned-node test expects it, and the fifth-round history's superseded
    `MOUNT_CHANGED` claim is annotated.
+
+## Eighth-round findings closed (2026-08-14)
+
+1. The errno-conversion seam moved from Task 4 into Task 1's
+   `effects/common.py` as `run_determinate(operation, slot, call, *,
+   passthrough=())`, and **forward** mutations route through it too: design
+   §11 requires post-mutation interference to end as a clean refusal after
+   restoration, and the spine's catch only translates
+   `EffectMismatch`/`PreconditionRefused` — a raw forward `OSError` would
+   roll back and then escape raw. Create-file's and mkdir's publication
+   transfers pass `passthrough=(EEXIST,)` so their compensating occupancy
+   branches keep the raw errno; compensation mutations inside `except`
+   blocks stay raw. Task 8 gains the spine-level test: a mid-run race
+   converges to `PreconditionRefused`, never a raw `OSError`.
+2. The `_DETERMINATE` table is completed: `link_anchor` joins it
+   (`ENOENT`/`EEXIST`/`ENOTDIR`/`EXDEV`) because the anchor-only repair
+   restores the source by hard-linking from the retained anchor
+   (`variants.py:1023-1040`), and the boundary errnos join the existing
+   operations (`EXDEV` on transfer/exchange/link, `EBUSY` on
+   unlink/rmdir/transfer/exchange) — the plan already rules `EXDEV`
+   determinate in the diff walk, so "every other errno propagates" was
+   wrong. Task 4's race tests gain the anchor-removal, source-occupancy,
+   and bind-mount cases.
+3. The create/mkdir compensation rehearsals inject the occupant beneath the
+   facade immediately before the publication `transfer_noclobber`, mid-run —
+   a pre-planted occupant refuses at capture (step 3, before `PREPARED`), so
+   the compensation would never be reached and no countdown could be read.
