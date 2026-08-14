@@ -196,10 +196,16 @@ the status guard refuses "implemented" claims until the tree makes them true.
   ```
 
   `_exchange_back_if_ours` re-checks that the live leaf still names the retained
-  identity before exchanging back; when it does not (both changed), it mutates
-  nothing. `_verify_displaced_pre` validates the displaced staging entry against
-  `effect.pre` through a fresh `open_regular_nofollow` descriptor, closed via
-  `close_fd`.
+  identity before exchanging back, and after the exchange **flushes the parent
+  before re-raising** — authority §9.1 is explicit: "exchange it back … fsync,
+  and refuse". An unflushed compensation is a time bomb: rollback observes the
+  restored pre-world, detaches durably, and a power cut then loses the
+  exchange, leaving a detached store claiming a world the disk does not hold.
+  **Every compensation mutation in Tasks 1–3 carries the same rule — mutate,
+  then `flush_directory` the mutated parent(s), then raise.** When the live
+  leaf does not match (both changed), it mutates nothing. `_verify_displaced_pre`
+  validates the displaced staging entry against `effect.pre` through a fresh
+  `open_regular_nofollow` descriptor, closed via `close_fd`.
 - [ ] **Step 1.4:** `uv run pytest tests/test_effects_common.py
   tests/test_effects_replace.py -x` — expected: PASS. Then the full gate:
   `uv run pytest && uv run ruff check . && uv run pyright`.
@@ -249,6 +255,7 @@ the status guard refuses "implemented" claims until the tree makes them true.
               if caught.errno != errno.EEXIST:
                   raise
               _remove_attributable_staging(backend, staged_fd, site)
+              backend.flush_directory(site.parent_fd)   # compensation barrier
               raise PreconditionRefused(
                   f"{effect.path!r} already exists; CreateFileNoClobber refuses"
               ) from caught
@@ -261,9 +268,10 @@ the status guard refuses "implemented" claims until the tree makes them true.
   ```
 
   Delete: `transfer_noclobber(live → tombstone)` → validate per preimage type →
-  on mismatch `transfer_noclobber(tombstone → live)` back (an `EEXIST` there is
-  the reappeared-live case: raise `EffectMismatch` naming both facts, mutate
-  nothing further) → `flush_directory(site.parent_fd)`.
+  on mismatch `transfer_noclobber(tombstone → live)` back **then
+  `flush_directory(site.parent_fd)` before raising** (the compensation-barrier
+  rule; an `EEXIST` there is the reappeared-live case: raise `EffectMismatch`
+  naming both facts, mutate nothing further).
 - [ ] **Step 2.3:** Task tests pass, then the full gate (pytest, ruff, pyright).
 - [ ] **Step 2.4:** `git commit -m "feat(effects): CreateFileNoClobber and DeletePath forward execution"`
 
@@ -308,13 +316,15 @@ the status guard refuses "implemented" claims until the tree makes them true.
   and raises `EffectMismatch` (rename-back only applies after destination
   publication); post-transfer, destination and anchor must name one inode at the
   expected fingerprint — a non-identity renames the destination back no-clobber
-  and raises `EffectMismatch`; a reappeared source after that failed validation
+  and flushes both parents (restored-source parent first, the reverse-move
+  mirror) before raising `EffectMismatch`; a reappeared source after that failed validation
   raises `EffectMismatch` without further mutation. Mkdir: forward success
   publishes an empty directory with the approved mode at the live path, identity
   verified through the retained descriptor, and the descriptor's facade
   provenance now names the live path (assert via `provenance_of`); occupancy
   (`EEXIST` on the cross-directory transfer) raises `PreconditionRefused` after
-  removing only the attributable work-slot directory; an injected failure at
+  removing only the attributable work-slot directory and flushing `work_fd`
+  (the compensation-barrier rule); an injected failure at
   each of `set_mode`, `flush_file`, the transfer, and verification closes the
   retained fd before the exception escapes (descriptor-count assertion via
   `tests/fs_support.descriptor_count`). `DescriptorTable.adopt`: adopting a
@@ -677,6 +687,8 @@ The derivation is design §9.2 verbatim; every branch below gets a test:
 - Modify: `python/src/atoms/coordinator/lease.py` (delete `_resolve`; the trap is gone)
 - Modify: `python/src/atoms/coordinator/descriptors.py` (recovery descent through
   created planned directories — see phase 6)
+- Modify: `python/src/atoms/core/assembly.py` (the fact-free `MOUNT_BOUNDARY`
+  finding kind — see phase 5)
 - Modify: `python/src/atoms/fs/approval.py` (`directory_paths` on the proof, the
   evidence `"path"` member, `decode_approval_evidence`, the `_approve_for_recovery`
   factory — see phase 5; the `ProjectApprovedSpec` constructor's token error,
@@ -756,15 +768,23 @@ Phase mapping, exactly §9.1:
    **conditionally by entry class**:
    - **Existing entries** (non-null `identity`): a determinate `ENOENT` →
      `NODE_MISSING`; a determinate non-directory kind → `WRONG_ENTRY_KIND`; a
-     determinate `EXDEV` → `MOUNT_CHANGED` — the walk's
-     `open_child_directory` carries `RESOLVE_NO_XDEV` (measured
-     `fs/linux.py:111-118`), so a bind-mounted child refuses **before** any
-     descriptor exists to read a mount id from; the errno itself is the
-     determinate mount evidence (each of these three is the node's **sole**
-     finding — the facts the other kinds would carry are unreadable behind
-     it). Otherwise compare identity, constraints, mount membership, and
-     work-root facts against the expected document and emit every applicable
-     changed-kind finding.
+     determinate `EXDEV` → **`MOUNT_BOUNDARY`**, a new fact-free finding kind
+     this task adds to `core/assembly.py`'s closed vocabulary
+     (`_FACT_KEYS[MOUNT_BOUNDARY] = ()`): the walk's `open_child_directory`
+     carries `RESOLVE_NO_XDEV` (measured `fs/linux.py:111-118`), so a
+     bind-mounted child refuses **before** any descriptor exists to read a
+     mount id from — and `MOUNT_CHANGED` cannot carry the refusal, because its
+     closed fact set requires a canonical `("mount_id", …)` (measured
+     `core/assembly.py:35`) that an errno does not supply. The boundary's
+     existence is the determinate evidence; probing the foreign mount for an
+     id would cross exactly the boundary the resolver refuses to cross.
+     `MOUNT_CHANGED` remains the finding for the project root's own mount
+     comparison, where the bound descriptor's id is readable. Each of these
+     is the node's **sole** finding — the facts the other kinds would carry
+     are unreadable behind it. Otherwise compare identity, constraints, mount
+     membership, and work-root facts against the expected document and emit
+     every applicable changed-kind finding. Design §9.3's vocabulary gains
+     `MOUNT_BOUNDARY` as a dated amendment (Task 11).
    - **Planned entries** (`identity = null`, measured `fs/approval.py:170-176`):
      **absent or non-directory emits nothing** — those states are legitimately
      variable at recovery (not yet created, or a foreign blocker) and are
@@ -793,8 +813,10 @@ Phase mapping, exactly §9.1:
    construction, and token-guarded proof assembly, but it **skips the
    forward-planning viability judgment of planned paths** (those rules judge a
    plan not yet executed; this plan already ran, and A3 classifies what it
-   left) and instead asserts the resolved existing facts match `evidence`.
-   The construction token stays module-private, the function itself is
+   left) and instead asserts the resolved existing facts match `evidence` —
+   raising **`ProjectApprovalRefused`** on a mismatch, the same class its
+   resolution raises, so the moved-world rule below has exactly one factory
+   signal to catch. The construction token stays module-private, the function itself is
    underscore-private (it deliberately issues a weaker proof from a plain
    `dict`, and `_require_admitted` checks only exact type and binding — it
    cannot tell recovery-issued from fabricated), and Task 10 adds the guard:
@@ -807,11 +829,12 @@ Phase mapping, exactly §9.1:
    the world more than once (the diff walk, the factory's resolution, the
    descriptor build), and #19's rule holds at every one of them: after durable
    `PREPARED`, a deterministic mismatch is an assembly halt, not a refusal. So
-   the resolver wraps phases 5–6 in one recovery rule — on catching a
-   deterministic world-mismatch signal (`ProjectApprovalRefused` from the
-   factory's resolution, `PreconditionRefused` from the descriptor builder's
-   identity/constraint/mount validation, or the factory's own
-   evidence-comparison failure), it re-runs `_diff_approved_topology`
+   the resolver wraps phases 5–6 in one recovery rule whose catch is **exactly
+   `(ProjectApprovalRefused, PreconditionRefused)`** — the factory's
+   resolution and evidence comparison both raise the former, the descriptor
+   builder's identity/constraint/mount validation raises the latter, and
+   `ProtocolError` (or any broader class) is never caught. On catching one, it
+   re-runs `_diff_approved_topology`
    **once**: findings now present → the world moved between passes — persist
    the `AssemblyHalt` built from them and raise `TransactionHalted`; still
    zero findings → the two seams deterministically disagree about an unmoved
@@ -900,11 +923,11 @@ registry's one recorded exception (Task 10 pins it).
   drifted constraints (or on a foreign mount) persists an `AssemblyHalt` with
   `CONSTRAINTS_CHANGED`/`MOUNT_CHANGED` at the planned path — never a
   `PreconditionRefused` from the table builder — while the same directory with
-  intact constraints resolves and recovers normally. The `MOUNT_CHANGED` case
-  is exercised for real where the harness allows: a bind mount over an
-  approved directory via `tests/fs_support.find_distinct_mount` (skip with the
-  named reason when unavailable), asserting the `EXDEV` route produces the
-  finding — not a mocked `read_mount_id`.
+  intact constraints resolves and recovers normally. The mount findings are
+  exercised for real where the harness allows: a bind mount over an approved
+  directory via `tests/fs_support.find_distinct_mount` (skip with the named
+  reason when unavailable), asserting the `EXDEV` route produces
+  `MOUNT_BOUNDARY` — not a mocked `read_mount_id`.
 
   Two more test families this step owns:
   - **Hostile stored evidence**, parametrized: duplicate JSON keys, noncanonical
@@ -1154,8 +1177,9 @@ cut:
   one hook cannot cut both sides). Two child wrappers: the **pre-commit** cut
   monkeypatches `atoms.store.connection._StoreTransaction._run_barrier` to
   count invocations and `SIGKILL` before the nth; the **post-commit** cut
-  wraps the store connection's `execute` to detect the `_COMMIT` statement and
-  `SIGKILL` immediately after it returns, before control reaches the caller.
+  wraps the store's `_connection` (the repository's existing proxy pattern) to
+  detect the `_COMMIT` statement and `SIGKILL` immediately after it returns,
+  before control reaches the caller.
   Both cuts are enumerated per barrier: PREPARED, registration binding,
   APPLYING, each STARTED/DONE, APPLIED, COMMITTED, settlement binding, detach.
 - Chain barriers: registration and settlement appends killed between staging
@@ -1163,6 +1187,12 @@ cut:
   append sequence, measured `chain/append.py:211-254`).
 - Both terminal arms: including between settlement append and binding, and between
   binding and detach; and mid-rollback (kill inside a `RESTORE_PRE` transform).
+- Compensation barriers: for each in-process compensation (replace's
+  exchange-back, create-file's `EEXIST` staging removal, delete's tombstone
+  return, move's rename-back and anchor removal, mkdir's work-slot removal),
+  a kill **between the compensation mutation and its `flush_directory`** —
+  recovery must converge from the unflushed state, which is exactly why the
+  forward modules flush before raising.
 
 Each case: (1) child runs `run_transaction` with the kill configuration from an
 env-passed JSON and dies; (2) parent asserts the child was killed (exit signal 9);
@@ -1264,10 +1294,12 @@ commit arm.
   (implemented, with the landing date), the authority design's status field
   ("A8–A9 … remain"), README and AGENTS status sections. Grep both docs trees for
   "A7b" and "A7–A9" to catch propagation beyond what the guard names (per the
-  design-doc drift rule). In the same commit, land the four design amendments
+  design-doc drift rule). In the same commit, land the five design amendments
   this plan carries as candidates: **§9.1** — the phase-5 proof is issued by the
   factory-owned `_approve_for_recovery` path, which admits A3-variable planned
-  states and skips forward-planning viability judgment (Task 7); **§9.2** — a
+  states and skips forward-planning viability judgment (Task 7); **§9.3** — the
+  finding vocabulary gains the fact-free `MOUNT_BOUNDARY` kind for determinate
+  `EXDEV` at a child of an approved directory (Task 7); **§9.2** — a
   reconciliation append is rebuilt
   deterministically from the durable `spec_json` (the spec's own
   `consumer_tag`/`intent_digest`), and a finished staging survivor satisfies the
@@ -1328,7 +1360,7 @@ tag and digest from the spec itself; `DescriptorTable.adopt` and
 
 **Known open decisions surfaced to the executor-of-this-plan:** the two the tree
 left open (`transitions.py`'s stop set and the projection-comparison comment) are
-decided in Task 5's "Decisions" block; the four design amendments (§9.1 recovery approval; §9.2 rebuild
+decided in Task 5's "Decisions" block; the five design amendments (§9.1 recovery approval; §9.3 MOUNT_BOUNDARY; §9.2 rebuild
 and survivor-satisfies-append; §11 evidence path member; §7 narrowing to the
 A3-authorized pairs) are decided in Tasks 6, 7, and 4 and land dated in Task 11
 step 11.2.
@@ -1496,3 +1528,22 @@ step 11.2.
    `build_recovery_snapshot` — asserted by counting constructions — and
    phase 6's descent is explicitly the same single universe as its
    observations.
+
+## Sixth-round findings closed (2026-08-14)
+
+1. Determinate `EXDEV` maps to a new fact-free `MOUNT_BOUNDARY` finding kind
+   (added to `core/assembly.py`'s closed vocabulary, design §9.3 amendment) —
+   `MOUNT_CHANGED`'s closed fact set demands a canonical `mount_id` an errno
+   cannot supply, and probing the foreign mount for one would cross exactly
+   the boundary the resolver refuses. `MOUNT_CHANGED` stays for the root's
+   own readable-id comparison.
+2. Every in-process compensation mutation — replace's exchange-back (the
+   authority's own "exchange it back … fsync, and refuse"), create-file's
+   staging removal, delete's tombstone return, move's rename-back and anchor
+   removal, mkdir's work-slot removal — flushes its mutated parent(s) before
+   raising, and the kill matrix gains a cut between each compensation and its
+   flush.
+3. The moved-world catch is exactly `(ProjectApprovalRefused,
+   PreconditionRefused)`: `_approve_for_recovery`'s evidence comparison raises
+   `ProjectApprovalRefused` like its resolution does, and `ProtocolError` is
+   never caught.
