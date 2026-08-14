@@ -8,6 +8,7 @@ from typing import cast
 from atoms.chain.append import append_entry
 from atoms.chain.model import ChainOutcome, SettledEntry
 from atoms.chain.read import validate_chain
+from atoms.coordinator.admission import _require_admitted
 from atoms.coordinator.descriptors import DescriptorTable
 from atoms.coordinator.effects.common import EffectMismatch
 from atoms.coordinator.lease import Lease
@@ -63,6 +64,7 @@ def _matches(entry, state) -> bool:
 def verify_committed_surface(
     lease: Lease, approved: ProjectApprovedSpec, table: DescriptorTable
 ) -> None:
+    _require_admitted(lease, approved)
     record = lease._store.read_active()
     if record is None or record.txid != approved.txid:
         raise ProtocolError("the proof's transaction is not active")
@@ -117,6 +119,7 @@ def finalize_commit(
     table: DescriptorTable,
     chain_fd: int,
 ) -> _CommitResult:
+    _require_admitted(lease, approved)
     with lease._store.transaction() as txn:
         txn.set_commit_decision(approved.txid, CommitDecision.COMMITTED)
         txn.set_transaction_state(approved.txid, TransactionState.COMMITTED)

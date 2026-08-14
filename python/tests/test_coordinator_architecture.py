@@ -142,3 +142,78 @@ def test_the_coordinator_fixture_registry_covers_every_test_argument():
         )
     )
     assert misplaced == [], f"fixtures must be declared in conftest.py: {misplaced}"
+
+
+def _named_callers(name: str) -> set[str]:
+    callers = set()
+    for path in sorted((SOURCE_ROOT / "coordinator").rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for function in (
+            node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+        ):
+            if any(
+                isinstance(node, ast.Call)
+                and (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id == name
+                    or isinstance(node.func, ast.Attribute)
+                    and node.func.attr == name
+                )
+                for node in ast.walk(function)
+            ):
+                callers.add(f"{path.name}::{function.name}")
+    return callers
+
+
+def test_authority_minting_and_halt_persistence_have_one_caller_each():
+    assert _named_callers("_approve_for_recovery") == {"recover.py::resolve"}
+    assert _named_callers("_mutation_denied") == {"recover.py::run_plan"}
+    assert _named_callers("set_assembly_halt") == {
+        "recover.py::_persist_assembly_halt"
+    }
+    tree = ast.parse(
+        (SOURCE_ROOT / "coordinator" / "recover.py").read_text(encoding="utf-8")
+    )
+    persist = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_persist_assembly_halt"
+    )
+    annotations = ast.unparse(persist.args)
+    assert "ProjectApprovedSpec" not in annotations  # Design §9.3 exception.
+
+
+def test_effect_modules_are_syscall_only_and_execution_ignores_dependencies():
+    forbidden = {
+        "atoms.chain",
+        "atoms.coordinator.commands",
+        "atoms.coordinator.commit",
+        "atoms.coordinator.execute",
+        "atoms.coordinator.recover",
+    }
+    for path in sorted((SOURCE_ROOT / "coordinator" / "effects").glob("*.py")):
+        imports = _resolved_imports(
+            ast.parse(path.read_text(encoding="utf-8")),
+            package="atoms.coordinator.effects",
+        )
+        assert not any(
+            item == blocked or item.startswith(f"{blocked}.")
+            for item in imports
+            for blocked in forbidden
+        ), path.name
+    for name in ("commit.py", "execute.py", "recover.py"):
+        tree = ast.parse(
+            (SOURCE_ROOT / "coordinator" / name).read_text(encoding="utf-8")
+        )
+        assert not any(
+            isinstance(node, ast.Attribute) and node.attr == "dependencies"
+            for node in ast.walk(tree)
+        ), name
+
+
+def test_only_the_recovery_loop_forwards_authorized_mutations_to_settle():
+    assert _named_callers("apply_transform") == {"recover.py::_execute_mutating"}
+    assert _named_callers("apply_remove_scratch") == {
+        "recover.py::_execute_mutating"
+    }

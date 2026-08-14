@@ -1087,6 +1087,11 @@ def test_the_approved_spec_is_not_exported():
 
 _TRANSACTION_STAGE_ENTRY_POINTS = {
     "atoms/coordinator/capture.py": ("capture_initial_surface",),
+    "atoms/coordinator/commit.py": ("finalize_commit", "verify_committed_surface"),
+    "atoms/coordinator/effects/settle.py": (
+        "apply_remove_scratch",
+        "apply_transform",
+    ),
     "atoms/coordinator/prepare.py": ("open_workspace", "prepare_transaction"),
     "atoms/coordinator/transitions.py": ("persist_detach", "persist_plan_prefix"),
     "atoms/coordinator/recover.py": ("run_plan",),
@@ -1154,7 +1159,7 @@ def test_no_unregistered_public_function_accepts_the_proof():
         for name in names
     }
     found = set()
-    for path in sorted((SOURCE_ROOT / "coordinator").glob("*.py")):
+    for path in sorted((SOURCE_ROOT / "coordinator").rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         relative = str(path.relative_to(SOURCE_ROOT.parent))
         for node in tree.body:
@@ -1170,6 +1175,8 @@ def test_no_unregistered_public_function_accepts_the_proof():
 
 
 def test_chain_commands_keep_the_lease_and_approval_proofs_private():
+    from atoms.coordinator import commands
+
     tree = ast.parse(
         (SOURCE_ROOT / "coordinator" / "commands.py").read_text(encoding="utf-8")
     )
@@ -1183,7 +1190,13 @@ def test_chain_commands_keep_the_lease_and_approval_proofs_private():
         for name, function in functions.items()
         if not name.startswith("_")
     }
-    assert set(public) == {"register_root", "append_intent"}
+    assert commands.__all__ == (
+        "TransactionOutcome",
+        "append_intent",
+        "register_root",
+        "run_transaction",
+    )
+    assert set(public) == {"register_root", "append_intent", "run_transaction"}
 
     for name, function in public.items():
         assert any(
