@@ -833,7 +833,11 @@ end:
   with the boundary observation in evidence (never `ProtocolError`); a
   traversable scaffold survivor (umask `0o022` → mode `0o700`,
   observed-empty) auto-classifies to `RemoveScratch`; a persistent
-  directory chmodded `0o000` after `PREPARED` halts with evidence.
+  directory chmodded `0o000` after `PREPARED` halts with evidence on
+  **both recovery routes, pinned separately** — fresh recovery halts at
+  the phase-5 diff with the `ACCESS_DENIED` assembly finding before any
+  proof is issued (Task 7's suite), and caught rollback reaches this
+  guard through the unadopted stop for the factory halt (Task 8's suite).
   Capture refuses on `None` like the arms, and `EACCES` from a *file*
   open stays raw.
 - **One shared non-authorizable-arm guard — the arms never reach a
@@ -862,11 +866,14 @@ end:
   `_entry_state`, `_classify_entry`, `_at_frontier`, and `_observed_state`
   stay closed exactly as they are — an arm reaching one is an engine
   defect, and the existing `ProtocolError`s say so. A census test walks
-  every fixture-family classification with each arm planted at each covered
-  slot and asserts no `ActionPlan` mutating step's
-  `expected_before`/`result_after` ever contains either arm; the
-  authorization tests plant each arm in the fresh observation and assert
-  the factory halt — never an `AuthorizedStep`.
+  every fixture-family classification with **each of the three guard
+  triggers** — `ObservedUnrecognized`, `ObservedContended`, and
+  `ObservedDirectory(..., has_unmodeled_child=None)` — planted at each
+  covered slot and asserts no `ActionPlan` mutating step's
+  `expected_before`/`result_after` ever contains a trigger; the
+  authorization tests plant each trigger in the fresh observation and
+  assert the factory halt — never an `AuthorizedStep`; and a capture-time
+  case asserts capture refuses each trigger.
 - **The halt must be reachable and durable**, so the closed layers between
   observation and the persisted diagnostic each gain the arms:
   `snapshot._validate_observed_entry` accepts both (measured refusal today
@@ -1127,6 +1134,7 @@ The derivation is design §9.2 verbatim; every branch below gets a test:
 - Modify: `python/src/atoms/coordinator/descriptors.py` (recovery descent through
   created planned directories — see phase 6)
 - Modify: `python/src/atoms/core/assembly.py` (the fact-free `MOUNT_BOUNDARY`
+  and `ACCESS_DENIED`
   finding kind — see phase 5)
 - Modify: `python/src/atoms/fs/approval.py` (`directory_paths` on the proof, the
   evidence `"path"` member, `decode_approval_evidence`, the `_approve_for_recovery`
@@ -1218,12 +1226,18 @@ Phase mapping, exactly §9.1:
      existence is the determinate evidence; probing the foreign mount for an
      id would cross exactly the boundary the resolver refuses to cross.
      `MOUNT_CHANGED` remains the finding for the project root's own mount
-     comparison, where the bound descriptor's id is readable. Each of these
+     comparison, where the bound descriptor's id is readable. A determinate
+     `EACCES` → **`ACCESS_DENIED`**, a second fact-free kind this task adds
+     (`_FACT_KEYS[ACCESS_DENIED] = ()`): an untraversable directory
+     withholds every fact the other kinds would carry, and the diff halts
+     before proof issuance instead of letting the raw `OSError` escape —
+     this is fresh recovery's route for a persistent directory chmodded
+     `0o000` after `PREPARED`. Each of these
      is the node's **sole** finding — the facts the other kinds would carry
      are unreadable behind it. Otherwise compare identity, constraints, mount
      membership, and work-root facts against the expected document and emit
      every applicable changed-kind finding. Design §9.3's vocabulary gains
-     `MOUNT_BOUNDARY` as a dated amendment (Task 11).
+     `MOUNT_BOUNDARY` and `ACCESS_DENIED` as a dated amendment (Task 11).
    - **Planned entries** (`identity = null`, measured `fs/approval.py:170-176`):
      **absent or non-directory emits nothing** — those states are legitimately
      variable at recovery (not yet created, or a foreign blocker) and are
@@ -1235,9 +1249,10 @@ Phase mapping, exactly §9.1:
      surface as `PreconditionRefused` (measured `descriptors.py:163-175`)
      after the durable `PREPARED`, violating the halt-not-refuse rule.
      Constraint drift there emits `CONSTRAINTS_CHANGED`; a determinate `EXDEV`
-     opening the planned child emits `MOUNT_BOUNDARY` under exactly the
-     existing-entry rule — the boundary rule is uniform wherever the walk's
-     `RESOLVE_NO_XDEV` open refuses, including the `metadata_root/work` open
+     opening the planned child emits `MOUNT_BOUNDARY` and a determinate
+     `EACCES` emits `ACCESS_DENIED`, under exactly the
+     existing-entry rule — both rules are uniform wherever the walk's
+     open refuses, including the `metadata_root/work` open
      for the work-root comparison. `MOUNT_CHANGED` appears only where a bound
      descriptor's mount id is actually readable (the project root's own
      comparison).
@@ -1310,7 +1325,15 @@ Phase mapping, exactly §9.1:
    1. Open the stop's directory (`open_child_directory` from the stop's
       `parent_fd`/`component`), validate it with the same constraint checks the
       builder applies, and `table.adopt(node, fd)` — ownership passes to the
-      table (transfer-or-close on the way in).
+      table (transfer-or-close on the way in). A determinate `EACCES` on
+      that open leaves the stop **unadopted and unreachable** — no descent,
+      no raw escape: the snapshot's observation of the path goes through
+      the `O_PATH` route (occupancy-`None`) and the classifier's
+      non-authorizable guard produces the factory halt. This is caught
+      rollback's route for an untraversable directory — the same world
+      state fresh recovery's phase-5 diff halts on with `ACCESS_DENIED`,
+      pinned as **separate tests** (assembly halt in Task 7's suite,
+      factory halt in Task 8's).
    2. Walk the node's descendant directory nodes shallowest-first (the builder's
       `_walk_order`/`_component` machinery over the approved paths mapping,
       restricted to the adopted subtree — every such node is itself planned, so
@@ -1675,13 +1698,17 @@ cut:
 - Both terminal arms: including between settlement append and binding, and between
   binding and detach; and mid-rollback (kill inside a `RESTORE_PRE` transform).
 - Mkdir scaffold cuts: a kill between `mkdir_child` and `repair_entry_mode`
-  and between the repair and the retain open, twice each — under
-  `umask(0o022)` the survivor stays traversable and observed-empty, so
-  recovery classifies it as attributable `RemoveScratch` debris and
-  converges to a clean rollback; under `umask(0o777)` the survivor is
-  opaque, so recovery converges to the factory halt with the boundary
-  observation in evidence (an explained `TransactionHalted` is a
-  convergence arm, and the second pass returns the same halt unchanged).
+  and between the repair and the retain open, each under both umasks. The
+  post-crash mode decides the arm, and the two cuts differ under
+  `umask(0o777)`: **before the repair** the survivor's mode is the masked
+  `000` — opaque, so recovery converges to the factory halt with the
+  boundary observation in evidence (an explained `TransactionHalted` is a
+  convergence arm, and the second pass returns the same halt unchanged);
+  **after the repair** the mode is exactly `0o700` regardless of umask —
+  traversable and observed-empty, so recovery classifies the survivor as
+  attributable `RemoveScratch` debris and rolls back cleanly. Under
+  `umask(0o022)` both cuts leave a traversable survivor and both roll
+  back.
 - Compensation barriers: for each in-process compensation (replace's
   exchange-back, create-file's `EEXIST` staging removal, delete's tombstone
   return, move's rename-back and anchor removal, mkdir's work-slot removal),
@@ -1824,8 +1851,9 @@ commit arm.
     the shared guard — never a refusal — once a durable record exists, and
     the durable diagnostic encodes them as `{"kind": "unrecognized",
     "st_mode": <canonical int>}` and `{"kind": "contended"}` (Task 5);
-    **§9.3** — the finding vocabulary gains the fact-free `MOUNT_BOUNDARY`
-    kind for determinate `EXDEV` at a child of an approved directory
+    **§9.3** — the finding vocabulary gains two fact-free kinds,
+    `MOUNT_BOUNDARY` for determinate `EXDEV` and `ACCESS_DENIED` for
+    determinate `EACCES` at a child of an approved directory
     (Task 7); **§9.2** — a reconciliation append is rebuilt
     deterministically from the durable `spec_json` (the spec's own
     `consumer_tag`/`intent_digest`), and a finished staging survivor
@@ -1848,7 +1876,13 @@ commit arm.
     attributable construction debris; spec semantics — a `CreateDirectory`
     mode must satisfy `mode & 0o700 == 0o700` (`SpecValidationError` at
     compile): the engine refuses to build a tree it cannot re-observe
-    without mutating (Task 3).
+    without mutating (Task 3); acceptance criteria (its line ~1737) — the
+    fresh-process criterion gains the explained-halt arm: recovery rolls
+    back every uncommitted transaction **or leaves an explained halt when
+    the world withholds the evidence rollback needs** (the opaque work
+    survivor and the non-authorizable observation arms are the cases),
+    matching the arm the caught-failure criterion already carries
+    (Task 5).
   - **A2 design** (`2026-07-28-a2-...-design.md`, model section, ~256):
     the "every `mode` is an integer in `0..0o7777`" clause narrows for
     `DirectoryState` — directory modes must satisfy
@@ -1859,14 +1893,16 @@ commit arm.
     union (its line ~246) gains the two arms and
     `ObservedDirectory.has_unmodeled_child: bool | None`; the
     `authorize_recovery_step` contract (~361) gains the
-    non-authorizable-arm guard ahead of the equality rule; the mkdir
-    classification table (~812) gains the scaffold-debris row with the
-    occupancy-`None` acceptance for the work-slot observation — removal's
-    `rmdir` atomic refusal is the emptiness authority (Tasks 3, 5).
+    non-authorizable-arm guard ahead of the equality rule, with
+    occupancy-`None` as its third trigger; the mkdir
+    classification table (~812) gains the scaffold-debris row demanding an
+    **observed-empty** survivor — an opaque survivor halts before
+    mutation (Tasks 3, 5).
   - **A6 design** (`2026-08-07-a6-...-design.md`, per-kind observation,
     ~340): directory observation's "every directory uses
-    `open_child_directory`" claim is amended with the `EACCES → O_PATH`
-    fallback for the umask-masked work-slot survivor (occupancy-`None`),
+    `open_child_directory`" claim is amended with the deliberately
+    role-blind `EACCES → O_PATH`
+    fallback (occupancy-`None`, on any directory observation),
     and the FIFO/socket/device and contended outcomes move from refusal to
     the represented arms (Task 5).
 
@@ -2390,7 +2426,9 @@ represent descendant observations.
    `ProtocolError`, with no path to `DIRECTORY_NOT_EMPTY`. Mode-`000`
    empty and non-empty survivors both halt (pinned); the traversable
    observed-empty scaffold still auto-removes; the scaffold kill cuts run
-   under both umasks with their two convergence arms.
+   under both umasks with their two convergence arms. (Refined by the
+   sixteenth round: only the pre-repair cut under `umask(0o777)` is opaque
+   — the post-repair survivor is exactly `0o700` and rolls back.)
 3. The `EACCES → O_PATH` fallback is explicitly role-blind and
    occupancy-`None` is the non-authorizable guard's third trigger:
    a persistent directory chmodded untraversable after `PREPARED` is
@@ -2401,3 +2439,29 @@ represent descendant observations.
    the stale "modes go down to `0`" sentence is corrected, and the
    restrictive-mode posture is stated as "A7b does not support it" rather
    than prescribing an unmanaged post-settlement chmod.
+
+## Sixteenth-round findings closed (2026-08-14)
+
+1. Persistent occupancy-`None` now reaches a halt on both recovery routes,
+   through existing seams: fresh recovery's phase-5 diff maps determinate
+   `EACCES` to `ACCESS_DENIED` — a second fact-free assembly-finding kind
+   beside `MOUNT_BOUNDARY` — and halts before proof issuance; caught
+   rollback's `_resume_descent` leaves an `EACCES` stop unadopted and
+   unreachable, so the snapshot's `O_PATH` observation carries
+   occupancy-`None` into the classifier's guard for the factory halt. The
+   two routes are pinned as separate tests (assembly halt in Task 7,
+   factory halt in Task 8). No new recovery step.
+2. The authority's fresh-process acceptance criterion is amended (Task
+   11): recovery rolls back every uncommitted transaction **or leaves an
+   explained halt when the world withholds the evidence rollback needs**
+   — the arm the caught-failure criterion already carries; without it the
+   opaque-survivor halt would contradict a criterion Task 11 records as
+   met.
+3. The scaffold kill cuts distinguish the two post-crash modes under
+   `umask(0o777)`: pre-repair is masked `000` (halt), post-repair is
+   exactly `0o700` (observed-empty rollback).
+4. Task 11's A3 amendment states the observed-empty demand and the
+   guard's third trigger (not occupancy-`None` acceptance for removal),
+   and the A6 amendment states the fallback as deliberately role-blind.
+5. The census and capture tests cover all three guard triggers, not just
+   the two arms.
