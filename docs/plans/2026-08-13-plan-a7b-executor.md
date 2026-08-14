@@ -136,7 +136,9 @@ the status guard refuses "implemented" claims until the tree makes them true.
       barrier was supposed to make this impossible — disagreement is substrate
       evidence, not a precondition).
     - `build_staged_file(backend, store, parent_fd, leaf, state: FileState) -> int`
-      — `create_exclusive(parent_fd, leaf, 0o600)` → `stream_blob` → `set_mode(fd,
+      — `create_exclusive(parent_fd, leaf, 0o600)` (through `run_determinate`,
+      so a raced-in staging occupant converts instead of leaking raw `EEXIST`
+      after `STARTED`) → `stream_blob` → `set_mode(fd,
       state.mode)` → `flush_file(fd)` → return the retained fd. Ownership is
       failure-complete: on **any** exception after the create — stream, mode,
       flush — the helper closes the fd via `close_fd` before re-raising, so the
@@ -155,11 +157,16 @@ the status guard refuses "implemented" claims until the tree makes them true.
       design §11 requires that interference to end as a clean refusal after
       restoration (`2026-07-23-...-design.md:1275-1283`), and the spine's catch
       only translates `EffectMismatch`/`PreconditionRefused` — a raw `OSError`
-      would roll back and then escape raw. The wrapper invokes `call`, catches
-      `OSError`, re-raises it unchanged when its errno is in `passthrough` (the
-      caller owns that branch), raises `EffectMismatch` (naming the operation,
-      the slot, and the errno) when it is in the module-level closed table
-      `_DETERMINATE[operation]`, and otherwise — `EIO` and kin — re-raises the
+      would roll back and then escape raw. The wrapper **validates before it
+      invokes**: it resolves `_DETERMINATE[operation]` first — an unknown
+      operation is `ProtocolError` raised with the callable never invoked,
+      since a misuse whose callable happens to succeed would otherwise mutate
+      the world under an unvalidated operation — and requires every
+      `passthrough` member to be an `int`. Only then does it invoke `call`,
+      catch `OSError`, re-raise it unchanged when its errno is in
+      `passthrough` (the caller owns that branch), raise `EffectMismatch`
+      (naming the operation, the slot, and the errno) when it is in the
+      resolved determinate set, and otherwise — `EIO` and kin — re-raise the
       `OSError` it is (design §9.3: never encoded as drift). The table:
       - `unlink_child`: `ENOENT`, `EISDIR`, `EBUSY`;
       - `rmdir_child`: `ENOENT`, `ENOTDIR`, `EBUSY`, and `ENOTEMPTY`/`EEXIST`
@@ -168,22 +175,34 @@ the status guard refuses "implemented" claims until the tree makes them true.
         `2026-07-23-recoverable-fs-effect-engine-design.md:1227`);
       - `transfer_noclobber`: `ENOENT`, `EEXIST`, `ENOTDIR`, `EXDEV`, `EBUSY`;
       - `exchange`: `ENOENT`, `ENOTDIR`, `EXDEV`, `EBUSY`;
-      - `link_anchor`: `ENOENT`, `EEXIST`, `ENOTDIR`, `EXDEV`.
+      - `link_anchor`: `ENOENT`, `EEXIST`, `ENOTDIR`, `EXDEV`;
+      - `create_exclusive`: `ENOENT`, `EEXIST`, `ENOTDIR`;
+      - `mkdir_child`: `ENOENT`, `EEXIST`, `ENOTDIR`.
       The boundary errnos are determinate for the same reason the diff walk's
       `EXDEV` is: a mount planted mid-flight makes rename/link refuse `EXDEV`,
       and a mount point pinned under a name makes unlink/rmdir/rename refuse
-      `EBUSY` — both are world-drift evidence, not substrate failure. An
-      unknown `operation` key is `ProtocolError`.
+      `EBUSY` — both are world-drift evidence, not substrate failure. The two
+      creation entries exist because a scratch or work occupant racing in
+      after admission — or a vanished parent — is the same post-`STARTED`
+      world drift: design §11 classifies scratch-leaf occupancy as a refusal
+      case, and this conversion is what routes it there through the spine.
 - `replace_file.apply(backend: AuditedBackend, store: Store, site: ReplaceSite,
   effect: ReplaceFile) -> None` — design §7's sequence verbatim, spelled in Step 1.3.
   **Routing rule for Tasks 1–4:** every forward-sequence and recovery-cell
-  mutation call (`exchange`, `transfer_noclobber`, `link_anchor`,
-  `unlink_child`, `rmdir_child`) goes through `run_determinate`; create-file's
-  and mkdir's publication transfers pass `passthrough=(errno.EEXIST,)` so their
-  compensating occupancy branch still sees the raw `EEXIST`. Compensation
-  mutations inside `except` blocks stay raw — they run under an exception
-  already in flight, and their own failure semantics are each spelled at the
-  call site.
+  mutation call (`create_exclusive`, `mkdir_child`, `exchange`,
+  `transfer_noclobber`, `link_anchor`, `unlink_child`, `rmdir_child`) goes
+  through `run_determinate` — `build_staged_file`'s exclusive create and
+  mkdir's work-slot `mkdir_child` included; create-file's and mkdir's
+  publication transfers pass `passthrough=(errno.EEXIST,)` so their
+  compensating occupancy branch still sees the raw `EEXIST`. **Compensation
+  mutations inside `except` blocks route through the same seam**: an `ENOENT`
+  during staging cleanup, an `EEXIST` during rename-back, an `ENOTEMPTY`
+  during work-slot removal are determinate drift and convert to
+  `EffectMismatch` like any other (delete's transfer-back hitting `EEXIST` —
+  the reappeared-live case — is exactly this conversion), while an
+  indeterminate error propagates raw. Either way §11's refusal-or-halt
+  contract owns the outcome — the plan loop must still prove restoration
+  before any refusal is surfaced.
 
 - [ ] **Step 1.1: Spec builders.** In `tests/coordinator_support.py` add
   `replace_spec()`, `delete_spec()`, `move_spec()`, `create_file_spec()` returning
@@ -196,12 +215,16 @@ the status guard refuses "implemented" claims until the tree makes them true.
   blob file short by hand through the store's staging seam);
   `verify_live_file` accepts the built state and raises `EffectMismatch` on each
   axis (foreign inode swapped in via a raw `LinuxBackend` beneath the facade, mode
-  drift via raw `fchmod`, byte drift via raw write); `run_determinate`,
-  parametrized over every `(operation, errno)` pair in `_DETERMINATE`, converts a
-  stub raising that `OSError` into an `EffectMismatch` naming operation, slot,
-  and errno — while `OSError(EIO)` from every operation propagates unchanged, a
-  `passthrough` errno re-raises the raw `OSError`, and an unknown operation key
-  is `ProtocolError`. `test_effects_replace.py`:
+  drift via raw `fchmod`, byte drift via raw write); `run_determinate` — first
+  an equality assertion that `_DETERMINATE` matches the expected mapping
+  **spelled literally in the test** (a missing operation fails the equality;
+  parametrizing from the module's own table could never detect one), then,
+  parametrized over that literal's `(operation, errno)` pairs, a stub raising
+  that `OSError` converts into an `EffectMismatch` naming operation, slot, and
+  errno — while `OSError(EIO)` from every operation propagates unchanged, a
+  `passthrough` errno re-raises the raw `OSError`, and an unknown operation
+  raises `ProtocolError` with a sentinel callable left **uninvoked** (assert
+  via a flag the sentinel would set). `test_effects_replace.py`:
   forward success publishes the postimage at the live path with the preimage
   displaced onto the staging leaf; verification failure with the live path still
   ours exchanges back (preimage restored) and raises `EffectMismatch`; a foreign
@@ -276,7 +299,11 @@ the status guard refuses "implemented" claims until the tree makes them true.
   through the retained fd before `unlink_child`) and raises `PreconditionRefused`
   (design §7: this refusal is a real precondition, not a verification mismatch —
   the world already held the path); byte-equivalence of the occupant is never
-  adopted (test: occupant with identical bytes still refuses). Delete: forward
+  adopted (test: occupant with identical bytes still refuses); an injected
+  `OSError(EIO)` from the publication transfer propagates raw — no
+  compensation runs, the staging entry survives (the apply-level counterpart
+  of the seam's own `EIO` test: the `except OSError` branch must not treat an
+  indeterminate error as occupancy). Delete: forward
   success moves the live entry to the tombstone slot and validates it against
   `effect.pre` (file: descriptor-coherent via `verify_live_file` against the
   tombstone leaf; symlink: `symlink_fingerprint(parent_fd, tombstone_leaf)`
@@ -302,8 +329,8 @@ the status guard refuses "implemented" claims until the tree makes them true.
                   passthrough=(errno.EEXIST,),
               )
           except OSError as caught:
-              # passthrough admits exactly EEXIST; other determinate errnos
-              # already left as EffectMismatch
+              if caught.errno != errno.EEXIST:
+                  raise      # indeterminate (EIO and kin) re-raised raw by the seam
               _remove_attributable_staging(backend, staged_fd, site)
               backend.flush_directory(site.parent_fd)   # compensation barrier
               raise PreconditionRefused(
@@ -320,8 +347,8 @@ the status guard refuses "implemented" claims until the tree makes them true.
   Delete: `transfer_noclobber(live → tombstone)` → validate per preimage type →
   on mismatch `transfer_noclobber(tombstone → live)` back **then
   `flush_directory(site.parent_fd)` before raising** (the compensation-barrier
-  rule; an `EEXIST` there is the reappeared-live case: raise `EffectMismatch`
-  naming both facts, mutate nothing further).
+  rule; the seam converts an `EEXIST` there — the reappeared-live case — into
+  the `EffectMismatch` that stops further mutation).
 - [ ] **Step 2.3:** Task tests pass, then the full gate (pytest, ruff, pyright).
 - [ ] **Step 2.4:** `git commit -m "feat(effects): CreateFileNoClobber and DeletePath forward execution"`
 
@@ -374,7 +401,8 @@ the status guard refuses "implemented" claims until the tree makes them true.
   provenance now names the live path (assert via `provenance_of`); occupancy
   (`EEXIST` on the cross-directory transfer) raises `PreconditionRefused` after
   removing only the attributable work-slot directory and flushing `work_fd`
-  (the compensation-barrier rule); an injected failure at
+  (the compensation-barrier rule); an injected `OSError(EIO)` from that same
+  transfer propagates raw with no compensation and the work slot intact; an injected failure at
   each of `set_mode`, `flush_file`, the transfer, and verification closes the
   retained fd before the exception escapes (descriptor-count assertion via
   `tests/fs_support.descriptor_count`). `DescriptorTable.adopt`: adopting a
@@ -1152,7 +1180,8 @@ try:
 except (ChainStateInvalid, MetadataStoreInvalid):
     raise                                # substrate-invalid: no rollback, evidence preserved
 except BaseException as caught:          # KeyboardInterrupt and SystemExit included
-    _roll_back(lease, approved, table, chain_fd, caught)   # raises after restoring
+    _roll_back(lease, approved, table, chain_fd, caught)   # returns after restoring;
+                                                           # raises only on halt/failure
     if isinstance(caught, (EffectMismatch, PreconditionRefused)):
         raise PreconditionRefused(str(caught)) from caught
     raise
@@ -1711,7 +1740,9 @@ step 11.2.
    transfers pass `passthrough=(EEXIST,)` so their compensating occupancy
    branches keep the raw errno; compensation mutations inside `except`
    blocks stay raw. Task 8 gains the spine-level test: a mid-run race
-   converges to `PreconditionRefused`, never a raw `OSError`.
+   converges to `PreconditionRefused`, never a raw `OSError`. (The
+   compensation carve-out is superseded by the ninth round: compensations
+   route through the same seam.)
 2. The `_DETERMINATE` table is completed: `link_anchor` joins it
    (`ENOENT`/`EEXIST`/`ENOTDIR`/`EXDEV`) because the anchor-only repair
    restores the source by hard-linking from the retained anchor
@@ -1725,3 +1756,32 @@ step 11.2.
    facade immediately before the publication `transfer_noclobber`, mid-run —
    a pre-planted occupant refuses at capture (step 3, before `PREPARED`), so
    the compensation would never be reached and no countdown could be read.
+
+## Ninth-round findings closed (2026-08-14)
+
+1. Create-file's `except OSError` branch regained its explicit
+   `caught.errno != errno.EEXIST` guard — the seam re-raises indeterminate
+   errors raw, so the broad branch would have treated an `EIO` as occupancy,
+   removed the staging, and refused. Both create-file and mkdir gain
+   apply-level tests: an injected `OSError(EIO)` from the publication
+   transfer propagates raw with no compensation and the staged object intact.
+2. Compensation mutations route through the same `run_determinate` seam —
+   an `ENOENT` during staging cleanup, an `EEXIST` during rename-back, an
+   `ENOTEMPTY` during work-slot removal are determinate drift like any
+   other, and a raw compensation `OSError` would survive rollback in
+   violation of §11. Delete's reappeared-live `EEXIST` case is now spelled
+   as this conversion rather than a hand-raised mismatch.
+3. `create_exclusive` and `mkdir_child` joined the `_DETERMINATE` table
+   (`ENOENT`/`EEXIST`/`ENOTDIR` each) and the routing rule —
+   `build_staged_file`'s exclusive create and mkdir's work-slot creation
+   included — because a scratch or work occupant racing in after admission
+   surfaces after `STARTED` and must convert, not leak.
+4. `run_determinate` validates before it invokes: `_DETERMINATE[operation]`
+   is resolved (unknown → `ProtocolError`, callable never invoked) and
+   `passthrough` members type-checked before the callable runs; the table
+   test asserts equality against a literal expected mapping (a missing
+   operation fails the equality) and the unknown-operation test asserts a
+   sentinel callable was left uninvoked.
+5. The spine snippet's `_roll_back` comment now reads "returns after
+   restoring; raises only on halt/failure" — the translation lines after it
+   are reachable.
