@@ -117,7 +117,7 @@ the status guard refuses "implemented" claims until the tree makes them true.
     `DeleteSite(effect_id, parent_fd, live_leaf, tombstone_leaf)`,
     `MoveSite(effect_id, source_fd, source_leaf, anchor_leaf, destination_fd, destination_leaf)`,
     `MkdirSite(effect_id, work_fd, work_leaf, parent_fd, live_leaf)`;
-    `site_for(approved: ProjectApprovedSpec, table: DescriptorTable, effect: Effect) -> Site`
+    `_site_for(approved: ProjectApprovedSpec, table: DescriptorTable, effect: Effect) -> Site`
     — parent fds from `table.fd_for(ApprovedPath.parent_node)` (borrowed, never
     closed), leaves from `ApprovedPath.leaf`, scratch leaves from `approved.scratch`
     matched on `(effect_id, role)`; a missing approved path or scratch row is
@@ -433,7 +433,7 @@ the status guard refuses "implemented" claims until the tree makes them true.
 - [ ] **Step 4.2: Implement** `settle.py` as a dict-of-dispatch keyed by the six
   `(EffectVariant, SettlementKind)` pairs; every cell reuses Task 1–3 helpers; no
   cell re-derives scratch names (they come from `approved.scratch` via
-  `site_for`, ledger #12).
+  `_site_for`, ledger #12).
 - [ ] **Step 4.3:** Task tests pass, then the full gate.
 - [ ] **Step 4.4:** `git commit -m "feat(effects): the variant-by-settlement recovery-mutation mapping"`
 
@@ -464,9 +464,11 @@ the status guard refuses "implemented" claims until the tree makes them true.
     enumerated in the transaction-stage entry-point registry (Task 10). Returns
     the plan it finished (an `ActionPlan` driven to completion, or the
     `HaltPlan` it persisted — the caller decides whether that raises).
-  - `transitions.persist_detach(lease, approved, plan, cursor) -> int` — persists
-    exactly one `DetachActive` step after asserting the active record carries
-    **both** `registration_digest` and `settlement_digest`; any other step type at
+  - `transitions.persist_detach(lease, approved, plan, cursor) -> int` — opens
+    with `_require_admitted(lease, approved)` (it is a registered
+    transaction-stage entry point, Task 10) and persists exactly one
+    `DetachActive` step after asserting the active record carries **both**
+    `registration_digest` and `settlement_digest`; any other step type at
     `cursor`, or a missing binding, is `ProtocolError`.
 
 **Decisions this task encodes (both were left open in the tree):**
@@ -500,6 +502,7 @@ the status guard refuses "implemented" claims until the tree makes them true.
 
   ```python
   def run_plan(lease, approved, table, plan):
+      _require_admitted(lease, approved)   # first statement: the registry's proof gate
       if type(plan) is NoRecoveryPlan:
           return plan
       cursor = 0
@@ -746,29 +749,48 @@ Phase mapping, exactly §9.1:
    The seam itself: `recover._diff_approved_topology(binding, expected: dict) ->
    tuple[AssemblyFinding, ...]` walks the decoded evidence's directory entries
    by their `"path"`, shallowest-first, with descriptor-relative
-   `open_child_directory`/`lstat` lookups from the project root — **but only
-   the entries with a non-null `identity`** (the approved-existing
-   directories). A planned directory is encoded with `identity = null`
-   (measured `fs/approval.py:170-176`) and its state at recovery is
-   legitimately variable — absent, created by this transaction, or occupied by
-   a foreign blocker — all of which are **A3's** to classify through phase 6's
-   stops and observations, never assembly drift; encoding them as drift would
-   also make the promised planned-node-stays-a-stop case unreachable. A
-   planned node's inherited constraints are covered by validating its approved
-   ancestors and the descent's own checks. For the existing entries: a
-   determinate `ENOENT` → `NODE_MISSING`; a determinate non-directory kind →
-   `WRONG_ENTRY_KIND` (each the node's **sole** finding); otherwise compare
-   identity, constraints, mount membership, and work-root facts against the
-   expected document and emit every applicable changed-kind finding. An
-   indeterminate errno — `EIO` and kin — propagates as the `OSError` it is
-   (design §9.3: never encoded as drift). Zero findings → `approved =
-   approve_for_project(compiled, ProjectContext(binding, record.txid))` and
-   assert `encode_approval_evidence(approved) == record.approval_evidence` — a
-   mismatch after a clean diff is `ProtocolError` (the diff seam and the encoder
-   disagree about the same world; that is an engine defect, not drift). Any
-   findings → build the `AssemblyHalt` (below), persist it through the narrow
-   path, raise `TransactionHalted`. `CapabilityUnavailable` from the proof step
-   propagates.
+   `open_child_directory`/`lstat` lookups from the project root, comparing
+   **conditionally by entry class**:
+   - **Existing entries** (non-null `identity`): a determinate `ENOENT` →
+     `NODE_MISSING`; a determinate non-directory kind → `WRONG_ENTRY_KIND`
+     (each the node's **sole** finding); otherwise compare identity,
+     constraints, mount membership, and work-root facts against the expected
+     document and emit every applicable changed-kind finding.
+   - **Planned entries** (`identity = null`, measured `fs/approval.py:170-176`):
+     **absent or non-directory emits nothing** — those states are legitimately
+     variable at recovery (not yet created, or a foreign blocker) and are
+     **A3's** to classify through phase 6's stops and observations. But a
+     planned node **present as a directory** is compared on what the evidence
+     does pin: constraints and mount membership, identity ignored (none was
+     ever persisted) — its constraints can drift independently of every
+     ancestor, and letting phase 6's descriptor validation discover that would
+     surface as `PreconditionRefused` (measured `descriptors.py:163-175`)
+     after the durable `PREPARED`, violating the halt-not-refuse rule. Drift
+     there emits `CONSTRAINTS_CHANGED`/`MOUNT_CHANGED` like any other node.
+
+   An indeterminate errno — `EIO` and kin — propagates as the `OSError` it is
+   (design §9.3: never encoded as drift). Any findings → build the
+   `AssemblyHalt` (below), persist it through the narrow path, raise
+   `TransactionHalted`.
+
+   **Zero findings → the recovery approval path.** Ordinary
+   `approve_for_project` cannot issue this proof: its planned-path judgment
+   rejects exactly the A3-variable worlds recovery exists for — a foreign file
+   at a planned node fails `_require_removed_before_creation` (measured
+   `fs/judgment.py:86-91`) because the frozen spec does not remove an occupant
+   that appeared after approval. So `fs/approval.py` gains a second
+   factory-owned entry, `approve_for_recovery(compiled, context: ProjectContext,
+   *, evidence: dict) -> ProjectApprovedSpec`: the same resolution, evidence
+   construction, and token-guarded proof assembly, but it **skips the
+   forward-planning viability judgment of planned paths** (those rules judge a
+   plan not yet executed; this plan already ran, and A3 classifies what it
+   left) and instead asserts the resolved existing facts match `evidence`
+   byte-for-byte — a mismatch after the clean diff is `ProtocolError` (the two
+   seams disagree about the same world; an engine defect, not drift). The
+   construction token stays module-private, so the proof remains
+   factory-issued. `CapabilityUnavailable` propagates. Task 11's §9.1
+   amendment records that recovery's "fresh factory-controlled
+   `ProjectApprovedSpec`" is issued by this path.
 6. `lease = Lease(_binding=binding, _store=store)` (internal — resolution is past);
    reopen the workspace, build the `DescriptorTable`, observe **every** persistent
    path and **every** effect's required scratch slot in one `Observation`
@@ -837,9 +859,15 @@ registry's one recorded exception (Task 10 pins it).
   The descent rule gets its own tests: a mid-flight `CreateDirectory`
   transaction killed after publication recovers with the created directory's
   descendants observed (a nested effect's slot appears in the snapshot); a
-  planned node occupied by a foreign file at recovery stays a stop and the
-  classification rules on it — which also proves the diff skipped it (no
-  assembly halt was persisted for a planned node's occupant).
+  planned node occupied by a foreign file at recovery **reaches phase 6** — the
+  diff emits nothing for it and `approve_for_recovery` still issues the proof —
+  stays a stop, and the classification rules on it (this is the test ordinary
+  `approve_for_project` would make unpassable). The conditional planned
+  comparison gets its own pair: a planned node present as a directory with
+  drifted constraints (or on a foreign mount) persists an `AssemblyHalt` with
+  `CONSTRAINTS_CHANGED`/`MOUNT_CHANGED` at the planned path — never a
+  `PreconditionRefused` from the table builder — while the same directory with
+  intact constraints resolves and recovers normally.
 
   Two more test families this step owns:
   - **Hostile stored evidence**, parametrized: duplicate JSON keys, noncanonical
@@ -914,48 +942,78 @@ imported from `recover`: txid, `spec.intent_digest`, `spec.consumer_tag`,
 initial/final = `state_to_json` of the surface states restricted to
 `spec.registered_paths` in sorted order, `fulfills=spec.fulfills`) →
 `set_registration_digest` in one store transaction (6) → `APPLYING` transition
-(7) → per effect in `compiled` order: `STARTED` journal COMMIT → `site_for` →
+(7) → per effect in `compiled` order: `STARTED` journal COMMIT → `_site_for` →
 the variant module's `apply` (a `CreateDirectory` return descriptor is adopted
 via `table.adopt(node, fd)` under transfer-or-close: the spine closes it if
 adoption raises) → `DONE` journal COMMIT (8) → `APPLIED` transition (9).
 `clear_declared_paths()` in the `finally`.
 
-`commit.commit_prepared(lease, approved, table, chain_fd)`, steps 10–14 — note
-**no `validated` parameter**: the proof taken at entry is stale the moment the
-registration append lands (`append_entry` refuses a proof whose history no
-longer matches, measured `chain/append.py:224-226`), so every later append works
-from a fresh proof taken under the still-held `chain_fd` immediately before it.
-The steps: one fresh `Observation` universe observing the **complete compiled
-final surface first, then the complete scratch vector** (10) — any disagreement
-raises `EffectMismatch` (a caught failure; the plan loop rolls back) →
-`COMMITTED` state + commit decision in **one** store transaction (11) → fresh
-`validate_chain(backend, chain_fd)` → `settled(committed)` append against that
-fresh proof, referencing the bound registration digest (12) → settlement
-binding COMMIT (13) → committed cleanup and detach **through the plan loop**
-(14): assemble a fresh snapshot, `classify_recovery` (disposition
-`COMMITTED_CLEANUP`), `run_plan` — the detach stop finds the settlement already
-bound and detaches. (The rollback arm's settlement goes through `run_plan`'s
-`_reconcile_settlement`, which already opens and validates its own chain view.)
+`commit.py`, split across the catch boundary (see the catch below) — note
+**no `validated` parameter on either half**: the proof taken at entry is stale
+the moment the registration append lands (`append_entry` refuses a proof whose
+history no longer matches, measured `chain/append.py:224-226`), so every later
+append works from a fresh proof taken under the still-held `chain_fd`
+immediately before it.
+- `commit.verify_committed_surface(lease, approved, table)` — step 10: one
+  fresh `Observation` universe observing the **complete compiled final surface
+  first, then the complete scratch vector**; any disagreement raises
+  `EffectMismatch` (a caught failure; the plan loop rolls back). Runs as the
+  `try` block's last statement.
+- `commit.finalize_commit(lease, approved, table, chain_fd) ->
+  TransactionOutcome` — steps 11–14, **outside** the catch: `COMMITTED` state +
+  commit decision in **one** store transaction (11) → fresh
+  `validate_chain(backend, chain_fd)` → `settled(committed)` append against
+  that fresh proof, referencing the bound registration digest (12) →
+  settlement binding COMMIT (13) → committed cleanup and detach **through the
+  plan loop** (14): assemble a fresh snapshot, `classify_recovery`
+  (disposition `COMMITTED_CLEANUP`), `run_plan` — the detach stop finds the
+  settlement already bound and detaches. (The rollback arm's settlement goes
+  through `run_plan`'s `_reconcile_settlement`, which already opens and
+  validates its own chain view.)
 
-The catch (design §6, last paragraph), in `execute.py`:
+The catch (design §6, last paragraph), in `execute.py` — **the `try` covers
+steps 5–10 only**; the commit decision and everything after it (11–14) sit
+outside, because a failure past `COMMITTED` must preserve the committed arm for
+recovery, never enter rollback:
 
 ```python
 try:
-    ...steps 5-10...
+    ...steps 5-10...                     # registration through the two proofs
 except (ChainStateInvalid, MetadataStoreInvalid):
     raise                                # substrate-invalid: no rollback, evidence preserved
 except BaseException as caught:          # KeyboardInterrupt and SystemExit included
-    outcome = _roll_back(lease, approved, table, caught)
+    outcome = _roll_back(lease, approved, table, chain_fd, caught)
     if isinstance(caught, (EffectMismatch, PreconditionRefused)):
         raise PreconditionRefused(str(caught)) from caught
     raise
+return finalize_commit(lease, approved, table, chain_fd)   # steps 11-14, outside the catch
 ```
 
-`_roll_back` assembles a snapshot, classifies (`ROLL_BACK`), runs the plan loop to
-`ROLLED_BACK` + `settled(rolled-back)` + binding + detach, and only then lets the
-refusal or the original exception surface (authority §11: `PreconditionRefused`
-only after restoration is proved). A `HaltPlan` from the loop raises
-`TransactionHalted` instead.
+This is why `commit.py` splits in two: `verify_committed_surface(lease,
+approved, table)` is step 10 — the two proofs — called as the `try`'s last
+statement; `finalize_commit(lease, approved, table, chain_fd)` owns steps
+11–14. A single function owning 10–14 cannot be placed on either side of the
+catch correctly. An exception inside `finalize_commit` propagates as-is; a
+fresh lease entry finds the durable `COMMITTED` decision and finishes
+settlement, binding, cleanup, and detach through resolution (Step 8.1 tests
+exactly this: a post-`COMMITTED`, pre-settlement exception leaves the record
+committed, and re-entry converges on the commit arm).
+
+`_roll_back` first **reconciles registration under the held `chain_fd`** —
+Task 6's derive-then-perform pair, whose backfill window (`PREPARED`, every
+journal `PENDING`) is exactly this state — because a caught failure at step 5
+or 6 leaves `registration_digest` NULL (possibly with a staging survivor or a
+published unbound entry), and the schema refuses **every** transition away
+from `PREPARED` while it is NULL, so the `ROLLING_BACK` transition would be
+structurally impossible. Then, for any planned-node stop whose entry is now a
+directory (a `CreateDirectory` that published before the failure),
+`_resume_descent` runs so the snapshot can observe descendants — without it
+the stale stopped table cannot cover what the transaction already created.
+Only then: assemble the snapshot, classify (`ROLL_BACK`), run the plan loop to
+`ROLLED_BACK` + `settled(rolled-back)` + binding + detach, and let the refusal
+or original exception surface (authority §11: `PreconditionRefused` only after
+restoration is proved). A `HaltPlan` from the loop raises `TransactionHalted`
+instead.
 
 - [ ] **Step 8.1: Failing tests.** `test_coordinator_run.py`: a clean two-effect
   transaction returns `TransactionOutcome` with `outcome is ChainOutcome.COMMITTED`,
@@ -969,12 +1027,26 @@ only after restoration is proved). A `HaltPlan` from the loop raises
   byte-for-byte, record `ROLLED_BACK`, `settled(rolled-back)` appended and bound,
   `PreconditionRefused` raised; `KeyboardInterrupt` injected beneath the facade
   rolls back then re-raises `KeyboardInterrupt`; a `ChainStateInvalid` planted
-  mid-apply propagates with **no** rollback mutation. `test_coordinator_commit.py`:
+  mid-apply propagates with **no** rollback mutation. The registration crash
+  window, caught in-process (not killed): an exception raised (i) before the
+  registration append, (ii) during append publication (leaving a staging
+  survivor), and (iii) between the append and the binding — each rolls back
+  cleanly because `_roll_back` reconciled registration first; without that the
+  `ROLLING_BACK` transition is trigger-refused (assert the world restored and
+  both digests bound in the final record). The mkdir descent case: a foreign
+  entry inserted (beneath the facade) into a published `CreateDirectory`
+  between publication and verification rolls back with the created directory's
+  descendants observed — `_roll_back`'s `_resume_descent` pass, not the stale
+  stopped table. `test_coordinator_commit.py`:
   the proof order is observable — inject a fault that makes the scratch proof fail
   and assert the final-surface proof already ran (call recording beneath the
   facade); commit decision and state land in one transaction (kill between them
   is impossible — assert via the store's single-COMMIT counter, measured
-  `_run_barrier`). Lifetimes: the spine's owned resources — the `Workspace`,
+  `_run_barrier`); the catch boundary holds — an exception injected inside
+  `finalize_commit` after the `COMMITTED` transaction (pre-settlement)
+  propagates without any rollback mutation, the record stays committed, and a
+  fresh lease entry converges on the commit arm (settlement appended, bound,
+  cleaned, detached). Lifetimes: the spine's owned resources — the `Workspace`,
   `Captured`'s descriptor table, adopted `CreateDirectory` fds, the chain fd —
   are context-managed or `finally`-closed, and a `descriptor_count`
   before/after assertion wraps a run exiting through each class (clean commit,
@@ -1071,7 +1143,7 @@ commit arm.
   prepared state, then rebuild the A3 snapshot from the **durable** result and
   assert: the executor's terminal `StoredRecord` projection (state, decision,
   rollback result, journal vector, active flag) equals
-  `apply_recovery_plan(classify_recovery(snapshot_before)).` The full
+  `apply_recovery_plan(snapshot_before, classify_recovery(snapshot_before))` (the reducer takes both the snapshot and the plan — measured `reducer.py:123-129`). The full
   model/real/persistence-cut agreement matrix stays A8's (ledger #15) — this test
   pins the fixed points only.
 - [ ] **Step 10.2: Architecture.** Add to the existing guard files:
@@ -1084,14 +1156,16 @@ commit arm.
     proof type — recorded as the registry's one exception with a comment naming
     design §9.3.
   - `_TRANSACTION_STAGE_ENTRY_POINTS` (measured
-    `test_fs_architecture.py:1126-1143`) gains every new proof consumer —
-    `settle.apply_transform`, `settle.apply_remove_scratch`, and
-    `recover.run_plan` — so the registry's `_require_admitted`-first rule
-    covers them; a source scan asserts no production call site constructs or
-    forwards a raw `TransformEffectTuple`/`RemoveScratch` into the `settle`
+    `test_fs_architecture.py:1126-1143`) gains **every** new proof consumer
+    the source scan will find — `settle.apply_transform`,
+    `settle.apply_remove_scratch`, `recover.run_plan`,
+    `transitions.persist_detach`, `commit.verify_committed_surface`, and
+    `commit.finalize_commit` — each opening with `_require_admitted` as its
+    first statement; a source scan asserts no production call site constructs
+    or forwards a raw `TransformEffectTuple`/`RemoveScratch` into the `settle`
     pair (they demand `AuthorizedStep`). One-use helpers below these entry
-    points (`_resume_descent`, `_diff_approved_topology`, `site_for`) stay
-    private and unregistered.
+    points (`_resume_descent`, `_diff_approved_topology`, `_site_for`) stay
+    genuinely private — underscore-prefixed and unregistered.
   - Effects modules import no `atoms.chain`, no `atoms.coordinator.execute`/
     `commit`/`recover`/`commands` (syscall execution only, design §4); `execute`/
     `commit`/`recover` never read `TransactionSpec.dependencies` (attribute scan —
@@ -1120,8 +1194,11 @@ commit arm.
   (implemented, with the landing date), the authority design's status field
   ("A8–A9 … remain"), README and AGENTS status sections. Grep both docs trees for
   "A7b" and "A7–A9" to catch propagation beyond what the guard names (per the
-  design-doc drift rule). In the same commit, land the three design amendments
-  this plan carries as candidates: **§9.2** — a reconciliation append is rebuilt
+  design-doc drift rule). In the same commit, land the four design amendments
+  this plan carries as candidates: **§9.1** — the phase-5 proof is issued by the
+  factory-owned `approve_for_recovery` path, which admits A3-variable planned
+  states and skips forward-planning viability judgment (Task 7); **§9.2** — a
+  reconciliation append is rebuilt
   deterministically from the durable `spec_json` (the spec's own
   `consumer_tag`/`intent_digest`), and a finished staging survivor satisfies the
   append (Task 6); **§11** — the canonical recovery-approval evidence carries a
@@ -1169,7 +1246,7 @@ architecture), 1–4 (per-variant fault injection). §15 criteria → Task 11 st
 signatures, refusal types, and expected run outcomes.
 
 **Type consistency.** `run_plan(lease, approved, table, plan)` is consumed with
-that shape in Tasks 7 and 8; `site_for(approved, table, effect)` in Tasks 4, 5
+that shape in Tasks 7 and 8; `_site_for(approved, table, effect)` in Tasks 4, 5
 and 8; `_registered_root` keeps its measured `(chain_fd, ValidatedChain)` yield
 across Tasks 5–8; `AuthorizedStep` flows `authorize_recovery_step` → `run_plan`
 → `_execute_mutating` → `settle.*` with no raw-step bypass; `TransactionOutcome`
@@ -1287,3 +1364,32 @@ step 11.2.
    parametrized hostile-evidence family (duplicate keys, noncanonical bytes,
    duplicate/inconsistent nodes, wrong types) must surface as
    `MetadataStoreInvalid` from `load_record`.
+
+## Fourth-round findings closed (2026-08-14)
+
+1. Phase 5's planned entries are compared conditionally: absent/non-directory
+   stays A3-variable (no finding), but a planned node present as a directory is
+   compared on constraints and mount (identity ignored) so drift halts durably
+   instead of surfacing as the table builder's `PreconditionRefused`. Proof
+   issuance moves to the factory-owned `approve_for_recovery`, which skips the
+   forward-planning viability judgment that made ordinary approval reject
+   foreign blockers at planned nodes — the promised foreign-blocker-reaches-A3
+   test is now passable, and §9.1's amendment records the path.
+2. `_roll_back` reconciles registration under the held chain fd before any
+   snapshot or classification — the §9.2 backfill window is exactly the caught
+   pre-binding state, and without the binding the `ROLLING_BACK` transition is
+   trigger-refused. Step 8.1 tests all three caught windows (before append,
+   during publication, between append and binding).
+3. `commit.py` splits at the catch boundary: `verify_committed_surface`
+   (step 10) is the `try`'s last statement; `finalize_commit` (steps 11–14)
+   runs outside it, so a post-`COMMITTED` pre-settlement exception preserves
+   the committed arm — tested via injected failure plus re-entry convergence.
+4. The registry is complete: `persist_detach`, `verify_committed_surface`, and
+   `finalize_commit` join the six previously listed entry points, `run_plan`'s
+   pseudocode opens with the gate, and `site_for` became `_site_for`.
+5. `_roll_back` runs `_resume_descent` for planned stops now observed as
+   directories before assembling its snapshot, with the foreign-insertion
+   mkdir test covering the published-then-failed-verification window.
+6. Task 10's conformance assertion calls
+   `apply_recovery_plan(snapshot_before, classify_recovery(snapshot_before))`
+   — the reducer's real two-argument shape.
