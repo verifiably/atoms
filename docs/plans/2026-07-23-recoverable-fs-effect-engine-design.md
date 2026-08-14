@@ -1,11 +1,11 @@
 # Recoverable filesystem effect engine — design
 
 **Date:** 2026-07-23
-**Status:** Approved — authority design for `atoms`. Plan A implementation underway; A1–A7a are
+**Status:** Approved — authority design for `atoms`. Plan A implementation underway; A1–A7b are
 implemented (pure model and compilation, recovery reference model, capability backend, path resolution
 and project approval, SQLite-WAL metadata store, recovery-resolve lease, coherent capture and the
-observation mechanism; A7a adds the audited facade, spec/schema v2, the chain, and the root/intent
-commands); A7b–A9 (effect/recovery execution, synthetic exerciser, macOS backend) remain.
+observation mechanism; A7 adds the audited facade, chain, effect/recovery executor, and public
+transaction command); A8–A9 (synthetic exerciser, macOS backend) remain.
 **Repository:** `atoms` (`~/d/atoms`) — Python-first physical durability substrate below `nodes`
 **Supersedes:** the science-framed [`2026-07-20-recoverable-fs-effect-engine-design.md`](2026-07-20-recoverable-fs-effect-engine-design.md), retained as the historical, review-hardened record.
 
@@ -1740,3 +1740,15 @@ The architecture is complete when:
 - actual persistent, scratch, and metadata mutations stay within their declared surfaces, absent a §3.2
   ancestor relocation by a noncooperating writer;
 - the full engine test suite, lint (`ruff`), and type checks (`pyright`) pass on both backends.
+
+## 2026-08-14 A7b amendments
+
+Restartable `CreateDirectory` materialization uses a `0o700` scaffold: mkdir, entry-mode repair,
+then umask-immune descriptor chmod to the approved mode. An observed-empty work-slot directory whose
+mode is a subset of `0o700` is attributable construction debris; an opaque survivor halts.
+
+Compilation requires `DirectoryState.mode & 0o700 == 0o700` and requires the postimage of
+`CreateFileNoClobber` or `ReplaceFile` to include `0o400`. The engine refuses to construct a tree it
+cannot later re-observe without mutation. The fresh-process acceptance arm therefore reads:
+recovery rolls back every uncommitted transaction or leaves an explained halt when the world
+withholds evidence rollback needs. The caught-failure criterion has the same explained-halt arm.

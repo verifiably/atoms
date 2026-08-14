@@ -680,3 +680,10 @@ it before their plans are written.
 The final-review production corrections specified in the implementation plan are implemented and
 verified. The durability-allowlist configuration tuples and SQLite I/O layer still belong to A4 and A5
 respectively and are untouched here.
+
+## 2026-08-14 mode amendment
+
+The general `0..0o7777` mode range remains, narrowed for two executable roles:
+`DirectoryState` requires `mode & 0o700 == 0o700`, and file postimages materialized by
+`CreateFileNoClobber` or `ReplaceFile` require `mode & 0o400 != 0`. File preimages and symlink modes
+retain the full range.

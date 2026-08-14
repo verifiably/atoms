@@ -1,6 +1,6 @@
 # A4b-2 Rooted Project Approval Implementation Plan
 
-**Status:** Implemented on 2026-07-31. A7b–A8 remain unimplemented. A4b-2 reads project
+**Status:** Implemented on 2026-07-31. A8 remains unimplemented. A4b-2 reads project
 space and never writes to it.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
@@ -3603,3 +3603,7 @@ options:
 
 **2. Inline Execution** — execute tasks in this session using `superpowers:executing-plans`, batch
 execution with checkpoints for review.
+
+**2026-08-14 annotation:** The current proof fields and exact schema are amended by the
+`directory_paths` and per-node evidence-path note in
+[`2026-07-31-a4b2-project-approval-design.md`](2026-07-31-a4b2-project-approval-design.md).

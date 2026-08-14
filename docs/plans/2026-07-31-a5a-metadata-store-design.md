@@ -1,6 +1,6 @@
 # A5a — the durable metadata store
 
-**Status:** Implemented on 2026-08-01. A7b–A8 remain unimplemented.
+**Status:** Implemented on 2026-08-01. A8 remains unimplemented.
 **Authority:** [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md)
 authority §7, §7.2, §11. Where this design and the authority disagreed, the authority was amended in the same
 commit; §3.3 lists every amendment.
@@ -2556,3 +2556,11 @@ table shapes, and §11 refusal vocabulary (§3.3).
     A second swallow anywhere in the package fails the count, so the exemption cannot spread by
     resembling itself. A total AST inventory additionally requires every SQLite execution site outside
     that exemption to be inside a one-statement `translated` scope.
+
+## 2026-08-14 Workspace split-seam amendment
+
+The complete post-prepare seam is `require_staging_discharged` plus `reopen_work_slot`.
+`require_staging_discharged` treats staging presence after `PREPARED` as invalid store evidence;
+`reopen_work_slot` is the third Workspace producer, issued through `_issue`, with an absent work slot
+classified `MetadataStoreInvalid` for §8.5's reason. Both use §5.5's liveness and txid validation like
+the existing openers.

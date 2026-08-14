@@ -3359,3 +3359,8 @@ git commit -m "fix(core): close A2 compilation proof gaps"
 
 No trailer is added. The controller then produces one scoped diff and dispatches exactly one scoped
 re-review.
+
+**2026-08-14 annotation:** The implemented mode contract is amended by
+[`2026-07-28-a2-compilation-validation-design.md`](2026-07-28-a2-compilation-validation-design.md)'s
+2026-08-14 note: observable directories require owner rwx and engine-materialized file postimages
+require owner read.

@@ -3,8 +3,7 @@
 **Date:** 2026-07-28
 **Status:** Implemented on 2026-07-29 according to
 [`2026-07-28-plan-a3-recovery-reference-model.md`](2026-07-28-plan-a3-recovery-reference-model.md).
-A7b–A8 remain unimplemented; A7a writes engine bookkeeping at the reserved `.#~chain/` leaf,
-while A7b has not yet executed an effect against a project path.
+A8 remains unimplemented; A7 executes effects and recovery against project paths.
 **Depends on:** A1 core model and A2 compilation validation (implemented)
 **Authority:** [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md)
 §8.4 and §13.1
@@ -978,3 +977,12 @@ A3 is complete when:
 
 No filesystem call, SQLite layer, concrete scratch-name binding, `ProjectApprovedSpec`
 implementation, compatibility API, or A7 effect operation belongs in A3.
+
+## 2026-08-14 observation and halt amendment
+
+The observed-entry union includes `ObservedUnrecognized(st_mode)`, `ObservedContended`, and
+`ObservedInaccessible`; `ObservedDirectory.has_unmodeled_child` is `bool | None`. Authorization
+rejects those three arms and occupancy `None` before equality comparison. `MUTATION_DENIED` is the
+factory halt for a permission-denied mutation whose fresh reauthorization still issues the same step;
+its durable evidence is generic and records no syscall. The mkdir table accepts an observed-empty
+`0o700`-subset scaffold survivor as removable debris, while opaque occupancy halts before mutation.

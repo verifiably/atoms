@@ -20,7 +20,7 @@ Plan B is written only after Plan A's interfaces settle.
 - **A3 — executable recovery reference model: implemented.** The pure production authority exposes
   `build_recovery_snapshot`, `classify_recovery`, `authorize_recovery_step`,
   `reduce_recovery_plan_prefix`, and `apply_recovery_plan` with the closed recovery model, fresh-step
-  authorization, and abstract reducer. A5, A6, and A7a are implemented; A7b–A9 remain unimplemented.
+  authorization, and abstract reducer. A5, A6, and A7 are implemented; A8–A9 remain unimplemented.
 - **A4a — capability backend and project volume binding: implemented on 2026-07-30.**
   `python/src/atoms/fs/`
   holds the `Backend` protocol and its Linux implementation, `ctypes` bindings for `openat2` and
@@ -35,7 +35,7 @@ Plan B is written only after Plan A's interfaces settle.
   A4b-2 owns the judgment in `atoms/fs/approval.py`, `atoms/fs/judgment.py`, and
   `atoms/fs/topology.py`: `approve_for_project`, `ProjectApprovedSpec`, and ledger entries #2,
   #3 (its part), #4, #5, #6, #10, #11, #16, and #20 are discharged. The factory half of #9
-  is complete; A5's and A6's entry points enforce it and A7b–A8's remain open.
+  is complete; A5–A7's entry points enforce it and A8's remains open.
   It admits #21, the txid binding, owned by A5.
   A4b-1 approves only non-casefold ext4; XFS, Btrfs, and casefold directories fail closed.
 - **A5 — durable metadata store and recovery lease: A5a implemented on 2026-08-01, A5b implemented on
@@ -43,12 +43,10 @@ Plan B is written only after Plan A's interfaces settle.
   reopen under the verified `metadata_root`, the pinned connection profile, the schema, typed
   record read/write, guarded blob promotion of both preimages and planned postimages bound to the
   COMMIT that references them, and per-txid workspaces. A5b composes it into the recovery-resolve
-  lease, discharging #7, #18, #21, #22, and #23 while leaving #9, #12, #17, and #19 open for later stages.
+  lease, discharging #7, #18, #21, #22, and #23; A7b discharged the executor halves it left open.
   Its design is [`docs/plans/2026-08-02-a5b-recovery-lease-design.md`](docs/plans/2026-08-02-a5b-recovery-lease-design.md):
   a new `atoms/coordinator/` package holding the lease, the admission gate, preparation, and A3
-  transition persistence. Because A7b has no executor yet, a live record at lease entry still raises a
-  temporary build-stage trap, so #12 and #17 remain at their write and lease halves. A6 discharged the
-  observation half it was waiting on.
+  transition persistence. A7b replaces the former build-stage trap with pinned recovery resolution.
 - **A6 — coherent capture and the observation mechanism: implemented on 2026-08-07.**
   `python/src/atoms/fs/observe.py` holds `Observation.observe`, the coherent single-descriptor read of
   a held file, directory, or symlink used throughout capture. `python/src/atoms/coordinator/` gains
@@ -57,16 +55,18 @@ Plan B is written only after Plan A's interfaces settle.
   (absence inference over both §6 branches, preimage streaming into workspace staging, flush, and the
   manifest `prepare_transaction` consumes). Its design is
   [`docs/plans/2026-08-07-a6-coherent-capture-design.md`](docs/plans/2026-08-07-a6-coherent-capture-design.md).
-  Ledger entries #1, #3, #13, and #19 are half-discharged; each keeps an A7b half open.
-  A7a closed the design's six further §13 gaps; A7b inherits only the remaining executor work.
+  A7b discharges the executor halves of ledger entries #1, #3, #13, and #19.
 - **A7a — execution substrate: implemented on 2026-08-13.** Its design is
   [`docs/plans/2026-08-13-a7-effect-recovery-execution-design.md`](docs/plans/2026-08-13-a7-effect-recovery-execution-design.md):
   the audited facade, spec/schema v2, `AssemblyHalt`, the tamper-evident chain, and the root and intent commands.
+- **A7b — effect and recovery executor: implemented on 2026-08-14.** The coordinator now owns
+  the five forward effects, A3-authorized recovery mutations, registration/settlement reconciliation,
+  pinned recovery resolution, `run_transaction`, and the fresh-process SIGKILL matrix.
 
 Work lives under `python/` (`uv run pytest`, `uv run ruff check`, `uv run pyright`, all from
 `python/`).
 A4a, A5a, and A6 write only to engine-owned paths under `metadata_root`; A7a also writes engine
-bookkeeping at the reserved `.#~chain/` leaf. A7b is the first stage to execute effects against project paths.
+bookkeeping at the reserved `.#~chain/` leaf, and A7b executes approved effects against project paths.
 
 ## Authority order
 

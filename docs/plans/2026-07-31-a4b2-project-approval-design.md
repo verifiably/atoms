@@ -1,6 +1,6 @@
 # A4b-2 — rooted project approval
 
-**Status:** Implemented on 2026-07-31. A7b–A8 remain unimplemented. A4b-2 reads project space
+**Status:** Implemented on 2026-07-31. A8 remains unimplemented. A4b-2 reads project space
 and never writes to it.
 
 **Authority:** [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md).
@@ -826,3 +826,9 @@ amendment covering approval-time drift (§3.3).
 23. No production consumer of `ProjectApprovedSpec` exists, asserted rather than assumed; ledger #9
     remains open until each A5–A8 entry point accepts only that proof.
 24. Approval issues no write of any kind to project space.
+
+## 2026-08-14 proof-schema amendment
+
+`ProjectApprovedSpec` gains `directory_paths`, widening criterion 21's closed field set by exactly
+that member. Canonical approval evidence gains a `path` member for every directory node: each project
+node has exactly one project-path route, while `WorkRoot` has the closed `{"path": null}` route.

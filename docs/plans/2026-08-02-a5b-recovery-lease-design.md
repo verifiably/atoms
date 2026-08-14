@@ -1,6 +1,6 @@
 # A5b — the recovery-resolve lease
 
-**Status:** Implemented on 2026-08-02. A7b–A8 remain unimplemented.
+**Status:** Implemented on 2026-08-02. A8 remains unimplemented.
 
 **Authority:** [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md)
 §4.2, §5.4, §7.1, §7.3, §7.4, §11, §13.3, §13.5.

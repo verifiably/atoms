@@ -8706,3 +8706,7 @@ Plan complete and saved to `docs/plans/2026-08-01-plan-a5a-metadata-store.md`. T
 
 **2. Inline Execution** — execute tasks in this session using `superpowers:executing-plans`, batch
 execution with checkpoints for review.
+
+**2026-08-14 annotation:** The Workspace producer contract is amended by the complete split seam in
+[`2026-07-31-a5a-metadata-store-design.md`](2026-07-31-a5a-metadata-store-design.md), including
+`require_staging_discharged` and `reopen_work_slot`.

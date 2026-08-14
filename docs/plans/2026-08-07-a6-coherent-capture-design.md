@@ -1,6 +1,6 @@
 # A6 — coherent capture and the observation mechanism
 
-**Status:** Implemented on 2026-08-07. A7b–A8 remain unimplemented.
+**Status:** Implemented on 2026-08-07. A8 remains unimplemented.
 
 **Authority:** [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md)
 §4.1, §4.2, §5.5, §6, §7.3, §10, §11, §13.1, §13.2, §14.
@@ -791,3 +791,10 @@ the register that A2's three review rounds justified.
 
 One item is not A6's and is noted only so it is not rediscovered: `coordinator_on`'s docstring says
 two calls model two projects, and they share one `ext4_project_root`. It predates A6.
+
+## 2026-08-14 per-kind observation amendment
+
+Directory observation remains role-blind but now falls back on determinate `EACCES` to a guarded
+`O_PATH` directory handle, reporting occupancy as `None`. FIFO/socket/device nodes report
+`ObservedUnrecognized`; lookup/open/readlink contention reports `ObservedContended`; and `EACCES`
+from child lookup, file open, readlink, or the failed handle fallback reports `ObservedInaccessible`.

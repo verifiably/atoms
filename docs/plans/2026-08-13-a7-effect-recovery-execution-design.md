@@ -1,6 +1,10 @@
 # A7 — effect execution, recovery execution, and the tamper-evident chain
 
-**Status:** Design accepted 2026-08-13 after three review rounds; **A7a implemented, A7b–A9 remain unimplemented.**
+**Status:** Implemented on 2026-08-14. A8–A9 remain unimplemented. §15 acceptance is met:
+(1) per-variant effect tests plus `test_coordinator_kill_matrix.py`; (2) resolver and assembly-halt
+tests; (3) chain, run, and kill-matrix tests; (4) filesystem/coordinator architecture guards;
+(5) the named suites in the deferred-obligation ledger; and (6) `test_docs_status.py` plus the full
+pytest, ruff, and pyright gate.
 
 **Authority:** [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md)
 §5.5, §7.3–§7.5, §8, §9, §10, §11, §13.2, §13.5, §14, §15 — and, consumed as the
@@ -681,7 +685,7 @@ validation, persisted through `spec_json`.
     6's "both backends" resolves to Linux at A7/A8, macOS suites at A9); §15
     points at ledger entries #24–#29.
 12. `test_docs_status.py` — `STAGES` gains `"A9"`; the label regexes widen to
-    `A[1-9]`; AGENTS.md and README.md status sections say A7–A9 remain.
+    `A[1-9]`; at design time AGENTS.md and README.md status sections said A7–A9 remained.
 13. The ledger gains #24–#29 (§3).
 
 ## 14. Verification strategy
@@ -762,3 +766,23 @@ A7 lands with its own suites; the ledger halves it discharges name them.
 7. **Chain compaction and size** — one file per entry is unbounded;
    compaction, if ever, is a future design under the log design's anchor
    rules, not an A8 item.
+
+## 2026-08-14 implementation amendments
+
+- §9.1: recovery approval is issued only by factory-owned `_approve_for_recovery`; it admits
+  A3-variable planned states and does not repeat forward-planning viability judgment. Recovery
+  observation is total: unsupported kinds, lookup contention, and access denial become
+  `ObservedUnrecognized(st_mode)`, `ObservedContended`, and `ObservedInaccessible`, encoded as
+  `{"kind":"unrecognized","st_mode":<int>}`, `{"kind":"contended"}`, and
+  `{"kind":"inaccessible"}`, and halt through the shared guard after a record exists.
+- §9.2: reconciliation deterministically rebuilds an append from durable `spec_json`, including the
+  spec's consumer tag and intent digest; a validated finished staging survivor satisfies that append.
+- §9.3: assembly findings add fact-free `MOUNT_BOUNDARY` and `ACCESS_DENIED`; `.#~work_root` names
+  `work/<txid>` and `.#~work_base` names physical `metadata_root/work`.
+- §11: recovery-approval evidence records one `path` per directory node; project nodes have exactly
+  one route from `directory_paths`, while `WorkRoot` has the closed `null` route.
+- §7: recovery mutation is exactly A3's six authorized variant/settlement pairs. The former staged
+  re-creation and symlink-restore prose names classifier-unreachable cells and is not implemented.
+- Primitive contract: `open_directory_handle` is the guarded
+  `O_PATH|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC` route with beneath/no-symlink/no-cross-mount resolution,
+  used when an umask-masked work survivor cannot be read normally.
