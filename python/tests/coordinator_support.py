@@ -16,7 +16,13 @@ from typing import cast
 from atoms.coordinator.lease import Lease
 from atoms.core.canonical import canonical_json
 from atoms.core.compiler import CompiledSpec, compile_spec
-from atoms.core.effects import CreateDirectory, CreateFileNoClobber
+from atoms.core.effects import (
+    CreateDirectory,
+    CreateFileNoClobber,
+    DeletePath,
+    MoveNoClobber,
+    ReplaceFile,
+)
 from atoms.core.fingerprint import ABSENT, DirectoryState
 from atoms.core.recovery import (
     OBSERVED_ABSENT,
@@ -48,6 +54,8 @@ from atoms.store.workspace import Workspace
 from tests.store_support import digest_of, file_state, registration_digest, stage
 
 AFTER = b"after"
+BEFORE = b"before"
+PRE = file_state(BEFORE)
 POST = file_state(AFTER)
 DIRECTORY_POST = DirectoryState(mode=0o755)
 
@@ -96,6 +104,53 @@ def directory_spec() -> TransactionSpec:
             CreateDirectory(effect_id="e1", path="d", post=DIRECTORY_POST),
             CreateFileNoClobber(effect_id="e2", path="d/f.txt", post=POST),
         ],
+    )
+
+
+def replace_spec() -> TransactionSpec:
+    return build_spec(
+        consumer_tag="test",
+        intent_digest="sha256:" + "4" * 64,
+        initial_surface={"d/f.txt": PRE},
+        final_surface={"d/f.txt": POST},
+        effects=[ReplaceFile(effect_id="e1", path="d/f.txt", pre=PRE, post=POST)],
+    )
+
+
+def delete_spec() -> TransactionSpec:
+    return build_spec(
+        consumer_tag="test",
+        intent_digest="sha256:" + "5" * 64,
+        initial_surface={"d/f.txt": PRE},
+        final_surface={"d/f.txt": ABSENT},
+        effects=[DeletePath(effect_id="e1", path="d/f.txt", pre=PRE)],
+    )
+
+
+def move_spec() -> TransactionSpec:
+    return build_spec(
+        consumer_tag="test",
+        intent_digest="sha256:" + "6" * 64,
+        initial_surface={"d/source.txt": PRE, "d/destination.txt": ABSENT},
+        final_surface={"d/source.txt": ABSENT, "d/destination.txt": PRE},
+        effects=[
+            MoveNoClobber(
+                effect_id="e1",
+                source="d/source.txt",
+                destination="d/destination.txt",
+                source_pre=PRE,
+            )
+        ],
+    )
+
+
+def create_file_spec() -> TransactionSpec:
+    return build_spec(
+        consumer_tag="test",
+        intent_digest="sha256:" + "7" * 64,
+        initial_surface={"d/f.txt": ABSENT},
+        final_surface={"d/f.txt": POST},
+        effects=[CreateFileNoClobber(effect_id="e1", path="d/f.txt", post=POST)],
     )
 
 
