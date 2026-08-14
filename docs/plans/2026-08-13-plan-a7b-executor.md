@@ -167,10 +167,15 @@ the status guard refuses "implemented" claims until the tree makes them true.
       catch `OSError`, re-raise it unchanged when its errno is in
       `passthrough` (the caller owns that branch), raise `EffectMismatch`
       carrying the operation, the slot, and the errno as **structured
-      members** (`.operation: str`, `.slot: str`, `.errno: int` — not
-      message text; Task 5's recovery loop dispatches on `.errno`) when it
-      is in the
-      resolved determinate set, and otherwise — `EIO` and kin — re-raise the
+      members** (`.operation: str`, `.slot: str`, `.errno: int | None` —
+      not message text; Task 5's recovery loop dispatches on `.errno`).
+      Only `run_determinate` supplies a real errno; the **semantic**
+      producers — `verify_live_file`'s identity/content/mode
+      disagreement, settlement verification's post-state comparison —
+      construct with `errno=None`, which keeps the unchanged-world
+      `ProtocolError` path: no sentinel is invented for a mismatch that
+      has no errno. The conversion applies when the errno is in the
+      resolved determinate set, and otherwise — `EIO` and kin — re-raises the
       `OSError` it is (design §9.3: never encoded as drift). The table:
       - `unlink_child`: `ENOENT`, `EISDIR`, `EBUSY`, `EACCES`, `EPERM`;
       - `rmdir_child`: `ENOENT`, `ENOTDIR`, `EBUSY`, `EACCES`, `EPERM`,
@@ -1108,14 +1113,24 @@ becomes total, and the amendment documents the durable diagnostic shape.)
     `DirectoryConstraints` carries mutation authority or a parent mode),
     so reauthorization can only re-issue the step. No observation is
     fabricated to break the tie; instead a **factory-owned halt seam**
-    beside the guard's (same module, same factory discipline) builds the
-    `HaltPlan` with a new A3 `HaltReason.MUTATION_DENIED`, evidence the
-    fresh joint observation plus the denied operation, slot, and errno;
-    it is persisted via `_persist_halt` and surfaces as
+    beside the guard's — `classifier._mutation_denied(plan, cursor,
+    authorized: AuthorizedStep, observed: JointObservation) ->
+    HaltPlan`, same module, same factory discipline, taking the freshly
+    reissued proof (consuming it, so it is never executable) and the
+    observation that re-authorized it — builds the `HaltPlan` with a new
+    A3 `HaltReason.MUTATION_DENIED` using **only the existing diagnostic
+    fields**: the effect id, the expected/observed projections of that
+    observation, and the reason. The denied operation, slot, and errno
+    stay **executor-private** — named in the raised `TransactionHalted`'s
+    message, never persisted: ledger #14's measured premise is that A3
+    names no syscall, and the durable evidence keeps it that way. The
+    halt is persisted via `_persist_halt` and surfaces as
     `TransactionHalted` — a durable halt, ledger #14's outcome, with no
-    retry. `HaltReason.MUTATION_DENIED` threads like the arms: the
-    durable reason codec accepts it (round-trip and hostile
-    unknown-reason cases), the operator action stays
+    retry. `HaltReason.MUTATION_DENIED` is a **value-only wire change**:
+    the durable reason codec accepts the new value (round-trip and
+    hostile unknown-reason cases), no diagnostic key or shape changes,
+    so the closed decoder is otherwise untouched and stored v2
+    diagnostics decode exactly as before; the operator action stays
     `INSPECT_PRESERVED_EVIDENCE` (the default arm of the existing
     mapping), and the A3 design's halt vocabulary is amended (Task 11).
   - any other `.errno` → raise `ProtocolError` immediately — **do not
@@ -2288,7 +2303,10 @@ commit arm.
     arms and occupancy-`None` as its four triggers; the halt vocabulary
     gains `MUTATION_DENIED` — the factory halt for a kernel-denied
     mutation of an unchanged namespace (permission-errno
-    `EffectMismatch` whose reauthorization re-issues the step); the mkdir
+    `EffectMismatch` whose reauthorization re-issues the step), carrying
+    generic diagnostic evidence only: the denied syscall stays out of
+    durable state, preserving ledger #14's premise that A3 names no
+    syscall; the mkdir
     classification table (~812) gains the scaffold-debris row demanding an
     **observed-empty** survivor — an opaque survivor halts before
     mutation (Tasks 3, 5).
@@ -3146,7 +3164,10 @@ represent descendant observations.
 
 1. Kernel-denied mutation of an unchanged namespace reaches a durable
    halt instead of `ProtocolError`: `EffectMismatch` carries operation,
-   slot, and errno as structured members, and the recovery loop's
+   slot, and errno as structured members *(refined in the twenty-eighth
+   round: `.errno` is `int | None` — semantic verification supplies
+   `None`, and the denial evidence stays executor-private)*, and the
+   recovery loop's
    unchanged-reauthorization branch splits on the errno — `EACCES`/
    `EPERM` (a parent flipped `0555`, sticky bit, immutable attribute:
    states no `ParentOccupancy` or `DirectoryConstraints` fact observes)
@@ -3162,3 +3183,21 @@ represent descendant observations.
    amendment states observation-level inaccessibility; Task 3's Files
    entry and the self-review inventory name the file-postimage rule
    beside the directory-mode rule.
+
+## Twenty-eighth-round findings closed (2026-08-14)
+
+1. `EffectMismatch.errno` is `int | None`: only `run_determinate`
+   supplies a real errno; the semantic producers — `verify_live_file`'s
+   identity/content/mode disagreement and settlement verification's
+   post-state comparison — construct with `None`, which keeps the
+   unchanged-world `ProtocolError` path. No sentinel is invented.
+2. The denial factory has an implementable contract:
+   `classifier._mutation_denied(plan, cursor, authorized, observed) ->
+   HaltPlan`, consuming the freshly reissued proof and building the
+   diagnostic from **existing fields only** (effect id, the
+   expected/observed projections, the reason). The denied
+   operation/slot/errno stay executor-private in the `TransactionHalted`
+   message — never durable — preserving ledger #14's premise that A3
+   names no syscall. `MUTATION_DENIED` is a value-only wire change: no
+   diagnostic key or shape changes, stored v2 diagnostics decode as
+   before, and the A3 amendment records the generic-evidence rule.
