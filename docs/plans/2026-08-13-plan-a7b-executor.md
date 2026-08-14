@@ -707,7 +707,9 @@ the status guard refuses "implemented" claims until the tree makes them true.
   `python/src/atoms/core/recovery/authorization.py`,
   `python/src/atoms/core/recovery/snapshot.py`,
   `python/src/atoms/core/recovery/diagnostics.py`,
+  `python/src/atoms/core/recovery/reducer.py`,
   `python/src/atoms/core/recovery/__init__.py`,
+  `python/src/atoms/fs/platform.py` (`BACKEND_REVISION` → `linux-4`),
   `python/src/atoms/store/records.py`, `python/src/atoms/fs/observe.py`,
   `python/src/atoms/fs/backend.py`, `python/src/atoms/fs/linux.py`,
   `python/src/atoms/fs/audit.py` (`open_directory_handle`),
@@ -721,8 +723,11 @@ the status guard refuses "implemented" claims until the tree makes them true.
   `python/tests/test_recovery_authorization.py`,
   `python/tests/test_recovery_snapshot.py`, `python/tests/test_store_records.py`,
   `python/tests/test_coordinator_capture.py` for the new observed arms;
-  `python/tests/test_fs_backend.py`, `python/tests/test_fs_audit.py` for
-  `open_directory_handle`
+  `python/tests/test_recovery_reducer.py` for the `ProtocolError`-on-`None`
+  fact; `python/tests/test_fs_backend.py`, `python/tests/test_fs_audit.py`
+  for `open_directory_handle`; `python/tests/test_fs_architecture.py`,
+  `python/tests/test_fs_volume.py` for the `linux-4` revision and exact
+  protocol expectations
 
 **Interfaces:**
 - Consumes: `classify_recovery`, `persist_plan_prefix`, `authorize_recovery_step`,
@@ -808,7 +813,13 @@ end:
   unregistered parent refuses, `..` is never accepted); ownership
   transfers to the caller — the observation pins it or closes it on the
   way out. Backend and audit tests live in `test_fs_backend.py` /
-  `test_fs_audit.py`. The result is an `ObservedDirectory` with identity
+  `test_fs_audit.py`. Adding the member changes the backend's
+  syscall/flag contract, so **`BACKEND_REVISION` bumps to `linux-4` in
+  this task** — the contract text demands a deliberate bump exactly here
+  (measured `fs/platform.py:11-16`), and the exact protocol/revision
+  expectations (`test_fs_architecture.py:668` pins the member set and the
+  revision string; `test_fs_volume.py` certifies against it) update
+  before this task's own full gate, not in Task 10. The result is an `ObservedDirectory` with identity
   pinned from its `fstat`, the mode read, and
   `has_unmodeled_child` widened to `bool | None`: `None` means occupancy
   was unobservable and is produced **only** by this route. The fallback is
@@ -818,7 +829,12 @@ end:
   drift that must be *represented*, never rejected as hostile. The widened
   field threads the same layers as the arms (snapshot validators accept
   `None` on any directory observation, diagnostics projection, the durable
-  codec encodes `null`, authorization equality compares it exactly), and
+  codec encodes `null`, authorization equality compares it exactly — and
+  the **reducer**, whose `_current_directory_unmodeled_fact` returns the
+  field as a `bool` (measured `reducer.py:864-870`): it now raises
+  `ProtocolError` on `None`, because opaque occupancy crossing the
+  classifier boundary means the guard was bypassed — an engine defect,
+  never a value to coerce), and
   **occupancy-`None` is the non-authorizable guard's third trigger**: a
   directory whose occupancy the engine cannot read authorizes nothing —
   the classifier issues the factory halt with the observation as evidence,
@@ -1143,10 +1159,16 @@ The derivation is design §9.2 verbatim; every branch below gets a test:
   `approval.py:92-95`), updates to name both factories)
 - Modify: `python/src/atoms/store/records.py` (`load_record` validates the stored
   evidence through the closed decoder)
+- Modify: `python/tests/test_fs_architecture.py` (the exact proof-schema
+  guard gains `directory_paths` — criterion 21's closed field set,
+  measured `:916`)
 - Test: `python/tests/test_coordinator_resolve.py`,
   `python/tests/test_coordinator_assembly_halt.py`; update
   `python/tests/test_coordinator_lease.py` (trap tests convert to recovery tests
-  preserving record/`active`/lock/descriptor discipline, per design §9.1)
+  preserving record/`active`/lock/descriptor discipline, per design §9.1),
+  `python/tests/test_core_assembly.py` (the exhaustive wire test grows with
+  the enum; the widened exclusivity's hostile case),
+  `python/tests/test_fs_approval.py` (encoder/decoder updates)
 
 **Interfaces:**
 - Consumes: Tasks 5–6, `ProjectContext` with the existing txid and the new
@@ -1195,9 +1217,24 @@ Phase mapping, exactly §9.1:
      `ResolvedTopology.directory_nodes`, the (path, node) pairs resolution
      already builds (measured `fs/topology.py:95`) — and each directory object
      in `encode_approval_evidence` gains a `"path"` member (project-relative,
-     `""` for the project root; `work_root` stays its own member). No production
-     data exists; A7a's encoder tests update. Design §11's evidence clause is
-     amended with the member (Task 11).
+     `""` for the project root). **`WorkRoot` gets a closed special route**:
+     it never enters `directory_nodes` — it is appended to the directory
+     set *after* the path-bearing mapping is built (measured
+     `fs/topology.py:170-172`) — yet the encoder iterates every approved
+     directory (measured `fs/approval.py:166`), so its evidence object
+     carries `"path": null` and `directory_paths` carries a matching
+     `WorkRoot` entry. The diff resolves it against
+     `metadata_root/work/<txid>` — the transaction's own work slot, distinct
+     from the physical `metadata_root/work` baseline — which is why
+     `_diff_approved_topology` takes the **txid**. Without this route, the
+     descriptor builder's `workspace.work_fd` validation (measured
+     `descriptors.py:149`) would refuse on work-slot drift, the moved-world
+     re-diff would find nothing, and the resolver would wrongly claim an
+     engine defect via `ProtocolError`. Since `directory_paths` joins the
+     proof, Task 7 also updates the **exact proof-schema guard** (measured
+     `test_fs_architecture.py:916`, criterion 21's closed field set). No
+     production data exists; A7a's encoder tests update. Design §11's
+     evidence clause and the **A4b2 proof schema** are amended (Task 11).
    - **The stored document is decoded closed, at load.** `load_record` today
      passes `approval_evidence` through as an unchecked string (measured
      `store/records.py:573`), so raw SQLite tampering could reach phase 5 as
@@ -1208,10 +1245,16 @@ Phase mapping, exactly §9.1:
      `load_record` calls it, translating any refusal to `MetadataStoreInvalid`;
      phase 5 consumes the decoded value, never raw `json.loads`.
 
-   The seam itself: `recover._diff_approved_topology(binding, expected: dict) ->
+   The seam itself: `recover._diff_approved_topology(binding, expected: dict,
+   txid: str) ->
    tuple[AssemblyFinding, ...]` walks the decoded evidence's directory entries
    by their `"path"`, shallowest-first, with descriptor-relative
-   `open_child_directory`/`lstat` lookups from the project root, comparing
+   `open_child_directory`/`lstat` lookups from the project root — except the
+   `"path": null` `WorkRoot` entry, which resolves against
+   `metadata_root/work/<txid>` under the same comparison and errno rules,
+   emitted at the closed work-root pseudo-path (pinned tests: missing,
+   wrong-kind, constraint drift, `EXDEV`, and `EACCES` at the work slot) —
+   comparing
    **conditionally by entry class**:
    - **Existing entries** (non-null `identity`): a determinate `ENOENT` →
      `NODE_MISSING`; a determinate non-directory kind → `WRONG_ENTRY_KIND`; a
@@ -1234,7 +1277,13 @@ Phase mapping, exactly §9.1:
      this is fresh recovery's route for a persistent directory chmodded
      `0o000` after `PREPARED`. Each of these
      is the node's **sole** finding — the facts the other kinds would carry
-     are unreadable behind it. Otherwise compare identity, constraints, mount
+     are unreadable behind it — and `AssemblyHalt.__post_init__`'s
+     exclusivity check, today limited to missing/wrong-kind (measured
+     `core/assembly.py:137-142`), **widens to the two fact-free kinds**, so
+     a hostile durable payload pairing `ACCESS_DENIED` with
+     `IDENTITY_CHANGED` refuses to decode (hostile test added; the
+     exhaustive wire test in `test_core_assembly.py:22` grows with the
+     enum). Otherwise compare identity, constraints, mount
      membership, and work-root facts against the expected document and emit
      every applicable changed-kind finding. Design §9.3's vocabulary gains
      `MOUNT_BOUNDARY` and `ACCESS_DENIED` as a dated amendment (Task 11).
@@ -1828,6 +1877,8 @@ commit arm.
 - Modify: `docs/plans/2026-07-28-a2-compilation-validation-design.md`
   (amendment), `docs/plans/2026-07-28-plan-a2-compilation-validation.md`
   (dated annotation pointing at it)
+- Modify: `docs/plans/2026-07-31-a4b2-project-approval-design.md`
+  (proof-schema amendment)
 - Modify: `docs/deferred-obligation-ledger.md`, `README.md`, `AGENTS.md`
 
 - [ ] **Step 11.1:** Flip `FIRST_UNIMPLEMENTED` to `"A8"`. Run
@@ -1889,6 +1940,11 @@ commit arm.
     `mode & 0o700 == 0o700`; file and symlink modes keep the full range.
     The historical A2 plan gets a dated annotation pointing at the
     amendment (Task 3).
+  - **A4b2 design** (`2026-07-31-a4b2-...-design.md`): the proof schema
+    gains `directory_paths` (criterion 21's closed field set widens by
+    exactly that member), and the canonical evidence gains the per-node
+    `"path"` member with `WorkRoot`'s closed `"path": null` route
+    (Task 7).
   - **A3 design** (`2026-07-28-a3-...-design.md`): the observed-entry
     union (its line ~246) gains the two arms and
     `ObservedDirectory.has_unmodeled_child: bool | None`; the
@@ -2465,3 +2521,31 @@ represent descendant observations.
    and the A6 amendment states the fallback as deliberately role-blind.
 5. The census and capture tests cover all three guard triggers, not just
    the two arms.
+
+## Seventeenth-round findings closed (2026-08-14)
+
+1. `WorkRoot` gets a durable route: it never enters
+   `ResolvedTopology.directory_nodes` (appended after the path-bearing
+   mapping, `topology.py:170-172`) yet the encoder iterates every approved
+   directory, so its evidence object carries the closed `"path": null`
+   route, `directory_paths` carries a matching entry,
+   `_diff_approved_topology` takes the txid and resolves it against
+   `metadata_root/work/<txid>` (missing, wrong-kind, constraint, `EXDEV`,
+   and `EACCES` cases pinned) — without which the descriptor builder's
+   work-slot validation would refuse into a wrongful `ProtocolError`.
+   Task 7 updates the exact proof-schema guard
+   (`test_fs_architecture.py:916`), and Task 11 amends the A4b2 proof
+   schema.
+2. `open_directory_handle` bumps `BACKEND_REVISION` to `linux-4` inside
+   Task 5, with the exact protocol/revision expectations
+   (`test_fs_architecture.py:668`, `test_fs_volume.py`) updated before
+   that task's own gate.
+3. `AssemblyHalt.__post_init__`'s sole-finding exclusivity widens to
+   `MOUNT_BOUNDARY` and `ACCESS_DENIED` (today it covers only
+   missing/wrong-kind, `assembly.py:137-142`), with the hostile
+   pairing-decode case and `test_core_assembly.py`'s exhaustive wire test
+   named in Task 7.
+4. The reducer joins Task 5's threading: `_current_directory_unmodeled_fact`
+   raises `ProtocolError` on an occupancy-`None` fact — opaque occupancy
+   past the classifier boundary means the guard was bypassed, never a
+   value to coerce (`reducer.py` and `test_recovery_reducer.py` added).
