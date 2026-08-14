@@ -137,4 +137,3 @@ def test_unknown_operation_refuses_before_invoking_the_callable() -> None:
         run_determinate("invented", "slot", call)
 
     assert not invoked
-
