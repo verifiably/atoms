@@ -1456,7 +1456,13 @@ Phase mapping, exactly §9.1:
    Origin must come from the opening seam itself. Task 7 therefore splits
    the prepared-workspace reopen into two narrow seams in
    `store/workspace.py` (existing callers of `reopen_workspace` —
-   `lease.py:35`, `connection.py:842` — keep it unchanged):
+   `lease.py:35`, `connection.py:842` — keep it unchanged). Both seams
+   inherit A5a's mandatory entry validation: each begins with
+   `store._require_live()` then `require_identifier("txid", txid)`,
+   with **no filesystem call on refusal** — §5.5's rule that every
+   caller-supplied pathname component is validated before it reaches a
+   syscall (its line ~508), which both existing openers already follow
+   (~1544):
    - `require_staging_discharged(store, txid) -> None`: determinately
      looks up `staging/<txid>` and raises `MetadataStoreInvalid` on
      **any present entry** — preparation rmdirs the emptied slot and
@@ -1491,7 +1497,8 @@ Phase mapping, exactly §9.1:
    today name only `Store.create_workspace`/`Store.reopen_workspace`
    (measured `store/workspace.py:37-41`) — and Task 11 amends the A5a
    design's producer contract (its line ~1418) with the historical A5a
-   plan annotated. **Both seams are issued and failure-complete**:
+   plan annotated. **`reopen_work_slot` is issued, and both seams are
+   failure-complete**:
    `reopen_work_slot` routes its `Workspace` through `_issue` (measured
    `store/workspace.py:124-126`) — registration in `store._workspaces`
    is what lets `Store.close()` close every outstanding workspace
@@ -1501,7 +1508,8 @@ Phase mapping, exactly §9.1:
    `test_store_workspace.py`: the issued workspace closes on
    `Store.close()`, and `descriptor_count` is flat across both seams'
    failure exits (a planted staging slot; a missing, wrong-kind, and
-   `EACCES` work slot; a failing parent open).
+   `EACCES` work slot; a failing parent open; a refused liveness or
+   txid — proving no filesystem call precedes validation).
 
    `resolve` calls `require_staging_discharged` **outside** the guard —
    its raises propagate untouched, staging-origin **by construction**,
@@ -1509,8 +1517,14 @@ Phase mapping, exactly §9.1:
    (design §12: stop, preserve, refuse mutation). Then **exactly the
    `reopen_work_slot` call** is wrapped: every failure it raises concerns
    the work namespace by construction of the seam — no re-observation
-   supplies the origin. On `ProtocolError`, `MetadataStoreInvalid`, or an
-   `OSError` whose errno is `EACCES` or `EXDEV`, re-run
+   supplies the origin. The catch is **exactly `MetadataStoreInvalid` or
+   an `OSError` whose errno is `EACCES` or `EXDEV`** — `ProtocolError` is
+   deliberately absent: with absence classified `MetadataStoreInvalid`,
+   no recoverable `ProtocolError` originates in this seam; its remaining
+   sources are liveness and identifier misuse (`_require_live`,
+   `require_identifier`), engine/caller defects that must surface, and
+   coincident work drift must never mask one as an `AssemblyHalt`. On a
+   caught failure, re-run
    `_diff_approved_topology` **once**: findings at `".#~work_root"` or
    `".#~work_base"` — the work-namespace routes matching the typed
    origin — justify the conversion (the persisted halt carries the full
@@ -1527,7 +1541,7 @@ Phase mapping, exactly §9.1:
    Step 7.1 pins the races positively — mutate the work slot (remove it,
    replace it with a file, chmod `0o000`) after the first diff and
    before the reopen: each ends in a persisted halt at `".#~work_root"`,
-   never a surfaced `ProtocolError`/`MetadataStoreInvalid`/raw
+   never a surfaced `MetadataStoreInvalid`/raw
    `OSError` — and negatively: a staging slot planted after `PREPARED`
    raises `MetadataStoreInvalid` with **no** `assembly_halt` persisted,
    whether it stands alone, beside unrelated project drift, or beside
@@ -1661,7 +1675,7 @@ registry's one recorded exception (Task 10 pins it).
     through each failure class — `ChainStateInvalid` in phase 1, the phase-2
     short-circuits, an `AssemblyHalt` in phase 5,
     `require_staging_discharged`'s `MetadataStoreInvalid` and
-    `reopen_work_slot`'s three guard classes in phase 6, a
+    `reopen_work_slot`'s two guard classes in phase 6, a
     `DescriptorTable` build failure **after** `reopen_work_slot`
     succeeded (the issued workspace must close on that exit — its
     `_issue` registration also means a leaked one would be caught by the
@@ -2149,10 +2163,13 @@ commit arm.
     annotation pointing at the amendment, same shape as the A2 plan's
     (Task 7).
   - **A5a design** (`2026-07-31-a5a-...-design.md`, the `Workspace`
-    contract, ~1418): the producer set gains `reopen_work_slot` beside
-    `create_workspace`/`reopen_workspace` — the prepared-only reopen
-    whose absence classification is `MetadataStoreInvalid` for the
-    design's own §8.5 reason. The historical A5a plan gets a dated
+    contract, ~1418): the amendment documents the **complete split
+    seam**, not only the producer list — `require_staging_discharged`
+    (post-`PREPARED` staging presence is invalid store evidence) and
+    `reopen_work_slot` (the third producer, issued through `_issue`,
+    absence classified `MetadataStoreInvalid` for the design's own §8.5
+    reason), both entering through §5.5's liveness and txid validation
+    like the existing openers. The historical A5a plan gets a dated
     annotation pointing at the amendment (Task 7).
   - **A3 design** (`2026-07-28-a3-...-design.md`): the observed-entry
     union (its line ~246) gains the two arms and
@@ -2932,3 +2949,21 @@ represent descendant observations.
    through `require_staging_discharged`'s `MetadataStoreInvalid`,
    `reopen_work_slot`'s guard classes, and a `DescriptorTable` build
    failure after a successful reopen.
+
+## Twenty-fourth-round findings closed (2026-08-14)
+
+1. `ProtocolError` is out of the reopen conversion catch: with absence
+   classified `MetadataStoreInvalid`, its only remaining sources in the
+   seam are liveness and identifier misuse (`_require_live`,
+   `require_identifier`) — engine/caller defects that coincident work
+   drift must never mask as an `AssemblyHalt`. The catch is exactly
+   `MetadataStoreInvalid` or `OSError` with errno `EACCES`/`EXDEV`, and
+   the guard-class tests count two.
+2. Both seams inherit A5a §5.5's entry validation:
+   `store._require_live()` then `require_identifier("txid", txid)`
+   before any filesystem call, with a pinned no-syscall-on-refusal case;
+   Task 11's A5a amendment now documents the complete split seam —
+   both functions, their validation, issuance, and the absence
+   classification — not merely a third name in the producer list.
+3. Minor: "Both seams are issued" corrected to "`reopen_work_slot` is
+   issued, and both seams are failure-complete."
