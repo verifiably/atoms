@@ -181,7 +181,11 @@ the status guard refuses "implemented" claims until the tree makes them true.
       - `mkdir_child`: `ENOENT`, `EEXIST`, `ENOTDIR`;
       - the verification lookups — `lstat`: `ENOENT`, `ENOTDIR`;
         `open_regular_nofollow`: `ENOENT`, `ENOTDIR`, `ELOOP`, `EISDIR`;
-        `symlink_fingerprint`: `ENOENT`, `ENOTDIR`, `EINVAL`.
+        `symlink_fingerprint`: `ENOENT`, `ENOTDIR`, `EINVAL`;
+        `open_child_directory`: `ENOENT`, `ENOTDIR`, `ELOOP`, `EXDEV`
+        (mkdir's post-`mkdir_child` retain open mutates nothing but races
+        the same way — a work-slot entry racing away between the mkdir and
+        its open must convert, not escape after `STARTED`).
       The lookup entries exist because post-mutation verification reads race
       exactly the way the mutations do: an entry vanishing between the
       exchange and its verifying `lstat` is drift evidence and must surface
@@ -212,8 +216,14 @@ the status guard refuses "implemented" claims until the tree makes them true.
   indeterminate error propagates raw. **Post-mutation verification lookups
   route the same way**: `verify_live_file`'s identity `lstat`,
   `_verify_displaced_pre`'s `open_regular_nofollow`, delete's tombstone
-  `symlink_fingerprint`, move's anchor-validation lookups, and mkdir's
-  identity lookup all go through the seam under their lookup operation keys.
+  `symlink_fingerprint`, move's anchor-validation lookups, mkdir's
+  identity lookup and its post-`mkdir_child` retain `open_child_directory`,
+  and the two compensation identity guards — `_exchange_back_if_ours`'
+  live-identity `lstat` and `_remove_attributable_staging`'s
+  staging-identity lookup — all go through the seam under their lookup
+  operation keys. A guard lookup failing determinately is itself the answer
+  "no longer ours": the seam's `EffectMismatch` propagates (chained under
+  the in-flight mismatch) and the guard mutates nothing.
   Either way §11's refusal-or-halt contract owns the outcome — the plan loop
   must still prove restoration before any refusal is surfaced.
 
@@ -247,7 +257,8 @@ the status guard refuses "implemented" claims until the tree makes them true.
   step fails (inject each beneath the facade; assert with
   `tests/fs_support.descriptor_count` before/after). Call-site routing is
   tested where it matters, with the same injecting backend: a determinate
-  failure injected into the exchange-back compensation, the verifying
+  failure injected into the exchange-back compensation, **its live-identity
+  guard `lstat`**, the verifying
   `lstat` (entry removed beneath the facade after the exchange), and
   `build_staged_file`'s `create_exclusive` (staging occupant raced in) each
   surfaces as `EffectMismatch` — a raw `OSError` escaping any `apply` fails
@@ -323,7 +334,9 @@ the status guard refuses "implemented" claims until the tree makes them true.
   compensation runs, the staging entry survives (the apply-level counterpart
   of the seam's own `EIO` test: the `except OSError` branch must not treat an
   indeterminate error as occupancy); call-site routing: an `ENOENT` injected
-  into the staging-cleanup `unlink_child`, an `EEXIST` into delete's
+  into the staging-cleanup `unlink_child`, into
+  `_remove_attributable_staging`'s staging-identity guard lookup, an
+  `EEXIST` into delete's
   tombstone-return transfer, and a determinate failure into either variant's
   verification lookup each surfaces as `EffectMismatch`, never a raw
   `OSError`. Delete: forward
@@ -428,8 +441,10 @@ the status guard refuses "implemented" claims until the tree makes them true.
   transfer propagates raw with no compensation and the work slot intact;
   call-site routing: an `ENOENT` injected into the anchor-removal
   `unlink_child`, an `EEXIST` into move's rename-back transfer, an
-  `ENOTEMPTY` into the work-slot `rmdir_child`, and an `EEXIST` from a
-  raced-in work-slot occupant at `mkdir_child` each surfaces as
+  `ENOTEMPTY` into the work-slot `rmdir_child`, an `EEXIST` from a
+  raced-in work-slot occupant at `mkdir_child`, and an `ENOENT` from the
+  work-slot entry racing away between `mkdir_child` and the retain
+  `open_child_directory` each surfaces as
   `EffectMismatch`, never a raw `OSError`; an injected failure at
   each of `set_mode`, `flush_file`, the transfer, and verification closes the
   retained fd before the exception escapes (descriptor-count assertion via
@@ -588,14 +603,18 @@ the status guard refuses "implemented" claims until the tree makes them true.
   `persist_detach`, and the projection-comment decision)
 - Modify: `python/src/atoms/coordinator/commands.py` (`_registered_root` moves out)
 - Modify: `python/src/atoms/core/recovery/model.py`,
-  `python/src/atoms/core/recovery/variants.py`, `python/src/atoms/fs/observe.py`,
+  `python/src/atoms/core/recovery/variants.py`,
+  `python/src/atoms/core/recovery/snapshot.py`,
+  `python/src/atoms/core/recovery/diagnostics.py`,
+  `python/src/atoms/store/records.py`, `python/src/atoms/fs/observe.py`,
   `python/src/atoms/coordinator/capture.py` (the total-observation substrate
   change below)
 - Test: `python/tests/test_coordinator_recover.py`; update
   `python/tests/test_coordinator_transitions.py` for the new stop; update
   `python/tests/test_fs_observe.py`, `python/tests/test_recovery_variants_files.py`,
   `python/tests/test_recovery_variants_paths.py`,
-  `python/tests/test_coordinator_capture.py` for the new observed arm
+  `python/tests/test_recovery_snapshot.py`, `python/tests/test_store_records.py`,
+  `python/tests/test_coordinator_capture.py` for the new observed arms
 
 **Interfaces:**
 - Consumes: `classify_recovery`, `persist_plan_prefix`, `authorize_recovery_step`,
@@ -631,40 +650,79 @@ moved-world rule, which re-diffs a *clean* topology (the diff walks
 directories only) and raises `ProtocolError` claiming an engine defect;
 makes `_roll_back`'s re-observation escape before restoration is proved; and
 leaves `_observe_for_step` unable to build the `JointObservation` a factory
-`HaltPlan` needs. Four coordinated changes:
+`HaltPlan` needs. The same failure has a **transient twin**: a namespace
+change between `observe`'s initial `lstat` and its open/readlink — the open
+refusing through `translated_lookup` (measured `fs/observe.py:107,242`) or
+the kind predicate failing after a successful open (measured
+`fs/observe.py:246-249`) — also surfaces as `PreconditionRefused`, and a
+racer that moved an entry away and back converts to the same wrongful
+`ProtocolError` through the moved-world rule. Two new arms, threaded end to
+end:
 
 - `model.py`: `ObservedUnrecognized(st_mode: int)` — frozen, carrying the
-  canonical observed mode — joins the closed `ObservedEntry` union. No
-  identity member: these kinds are never opened (opening a FIFO can block),
-  so like `ObservedSymlink` there is no descriptor to pin.
+  canonical observed mode — and `ObservedContended()` — frozen and
+  fact-free: the entry would not hold still for one coherent look, so there
+  are no stable facts to record — join the closed `ObservedEntry` union.
+  Neither has an identity member: an unrecognized kind is never opened
+  (opening a FIFO can block), and a contended entry yielded no pinnable
+  descriptor. Both are exported wherever the union's members are
+  (the model's public surface and the architecture public-surface
+  expectations).
 - `observe.py`: `observe` returns `ObservedUnrecognized(st_mode=info.st_mode)`
-  where it today raises — observation states facts, it does not judge
-  (ledger #13's rule, already the module's charter). `fs/observe.py` is the
-  **only production constructor**, pinned by a source scan in the
+  where it today raises for a FIFO/socket/device, and
+  `ObservedContended()` where a lookup→open or lookup→readlink race today
+  refuses: the open or fingerprint failing with a namespace-contradiction
+  errno (`ENOENT`/`ENOTDIR`/`ELOOP`/`EXDEV`, plus `EINVAL` from a
+  fingerprint whose leaf stopped being a symlink) after a successful
+  `lstat`, or `_open_and_pin`'s kind predicate failing (the fd is closed
+  first, as today). Observation states facts, it does not judge (ledger
+  #13's rule, already the module's charter). `fs/observe.py` is the **only
+  production constructor of both arms**, pinned by a source scan in the
   architecture tests (the `_approve_for_recovery` sole-caller pattern).
-- `variants.py`: `_classify_entry` returns `EntryClass.EXTERNAL` for the new
-  arm **before** `_entry_state` is consulted (`_entry_state` stays closed
+  Streaming and enumeration through pinned descriptors are untouched —
+  their errors are substrate, not namespace.
+- `variants.py`: `_classify_entry` returns `EntryClass.EXTERNAL` for both
+  arms **before** `_entry_state` is consulted (`_entry_state` stays closed
   over the kinds that carry a declared `PathState`, measured
   `variants.py:149-159`). `EXTERNAL` is already every family's
   no-restorable-survivor route, so classification lands on the existing
-  `HaltPlan` arms and persists through the untouched `HaltDiagnostic`
-  encoding — no new decision table.
-- `capture.py`: capture translates an `ObservedUnrecognized` into
-  `PreconditionRefused` naming the path and `st_mode` — capture runs before
-  `PREPARED`, where refusal is §11's correct outcome. The judgment moves
-  from the observation layer to the one consumer entitled to make it;
-  `verify_committed_surface`'s comparison likewise treats the arm as the
-  mismatch it is (dataclass inequality — no special case).
+  `HaltPlan` arms — no new decision table.
+- **The halt must be reachable and durable**, so the closed layers between
+  observation and the persisted diagnostic each gain the arms:
+  `snapshot._validate_observed_entry` accepts both (validating `st_mode` as
+  an exact `int`; measured refusal today at `snapshot.py:400-414`);
+  `diagnostics._entry_fields` projects them (measured refusal at
+  `diagnostics.py:38-49`) with `DiagnosticEntry.state` widened to
+  `PathState | ObservedUnrecognized | ObservedContended` (measured
+  `model.py:130`); and the durable codec (measured four-state `_state_obj`,
+  `records.py:61-73`) gains two tags — `{"kind": "unrecognized",
+  "st_mode": <canonical int>}` and `{"kind": "contended"}` — with the
+  decoder closed over them. Round-trip tests cover a diagnostic carrying
+  each arm; hostile tests cover an unknown state kind and a wrong-typed
+  `st_mode` (both `MetadataStoreInvalid`).
+- `capture.py`: capture translates either arm into `PreconditionRefused`
+  naming the path (and `st_mode` where there is one) — capture runs before
+  `PREPARED`, where refusal is §11's correct outcome, and §11 already names
+  the contended case verbatim ("two observations of one directory or entry
+  disagree within a single approval; at capture"). The judgment moves from
+  the observation layer to the one consumer entitled to make it;
+  `verify_committed_surface`'s comparison likewise treats both arms as the
+  mismatch they are (dataclass inequality — no special case).
 
 Tests this task owns: plant a FIFO at a covered slot between prepare and
 `run_plan` — authorization mismatch yields the factory `HaltPlan`
 (`PLAN_PRECONDITION_CHANGED`), record `HALTED`, evidence preserved, and
-neither `PreconditionRefused` nor `ProtocolError` escapes; the observe unit
-tests convert from asserting the refusal to asserting the returned arm; the
-variants tests pin `EXTERNAL` classification for the arm; the capture tests
-keep the refusal at capture. (Task 7 and Task 8 pin the fresh-recovery and
-caught-rollback FIFO paths; Task 11 records the design amendment — §9.1's
-observation phase becomes total over entry kinds.)
+neither `PreconditionRefused` nor `ProtocolError` escapes; the same
+assertion with an injected lstat→open race and an injected lstat→readlink
+race at the covered slot (a backend wrapper that removes or swaps the entry
+between the calls) — the observation reads `ObservedContended`, the halt is
+factory-issued, and no exception parsing or fabricated state is involved;
+the observe unit tests convert from asserting the refusals to asserting the
+returned arms; the variants tests pin `EXTERNAL` classification for both
+arms; the capture tests keep the refusal at capture for both. (Task 7 and
+Task 8 pin the fresh-recovery and caught-rollback paths for the FIFO and
+both races; Task 11 records the design amendment — §9.1's observation phase
+becomes total, and the amendment documents the durable diagnostic shape.)
 
 **Decisions this task encodes (both were left open in the tree):**
 
@@ -1134,7 +1192,10 @@ registry's one recorded exception (Task 10 pins it).
   `HaltPlan` (record `HALTED`, evidence preserved) — never a `ProtocolError`
   from the moved-world rule, because the observation returns
   `ObservedUnrecognized` instead of refusing and the halt comes from
-  classification, not assembly.
+  classification, not assembly. The contended twin is pinned the same way:
+  an injected lstat→open race and an injected lstat→readlink race at a
+  covered slot each observe `ObservedContended` and resolve to the same
+  factory halt, never `ProtocolError`.
 
   Two more test families this step owns:
   - **Hostile stored evidence**, parametrized: duplicate JSON keys, noncanonical
@@ -1349,7 +1410,9 @@ is proved). A `HaltPlan` from the loop raises `TransactionHalted` instead.
   beneath the facade at a covered slot mid-flight drives `_roll_back`'s
   re-observation into a classified halt — `TransactionHalted` with the
   record `HALTED` and evidence preserved, never an escaping
-  `PreconditionRefused` before restoration is proved. Lifetimes: the
+  `PreconditionRefused` before restoration is proved — and the injected
+  lstat→open and lstat→readlink races during that re-observation land on
+  the same halt through `ObservedContended`. Lifetimes: the
   spine's owned resources — the `Workspace`,
   `Captured`'s descriptor table, adopted `CreateDirectory` fds, the chain fd —
   are context-managed or `finally`-closed, and a `descriptor_count`
@@ -1549,9 +1612,12 @@ commit arm.
   six pairs, and the closing paragraph's staged re-creation/symlink-restore
   cases are unreachable through A3's classifier today, so the executor does not
   implement them (Task 4); **§9.1 (observation phase)** — recovery observation
-  is total over entry kinds: an entry that is neither file, symlink, nor
-  directory observes as `ObservedUnrecognized` and classifies to a `HaltPlan`,
-  never a refusal, once a durable record exists (Task 5). Each amendment is one
+  is total: an entry that is neither file, symlink, nor directory observes
+  as `ObservedUnrecognized(st_mode)`, an entry that would not hold still for
+  one coherent look observes as `ObservedContended`, both classify to a
+  `HaltPlan` — never a refusal — once a durable record exists, and the
+  durable diagnostic encodes them as `{"kind": "unrecognized", "st_mode":
+  <canonical int>}` and `{"kind": "contended"}` (Task 5). Each amendment is one
   dated note in the design, same
   shape as the 2026-08-13 §5.1 amendments.
 - [ ] **Step 11.3:** Ledger: mark the A7 halves of #1, #3, #8, #12, #13, #14, #17,
@@ -1900,10 +1966,39 @@ step 11.2.
    caught rollback (Task 8), and step authorization (Task 5) each pin the
    FIFO case: halt with evidence preserved, never `ProtocolError` from the
    moved-world rule or an escaping refusal. Design amendment recorded (§9.1
-   observation phase); the amendment count is six.
+   observation phase); the amendment count is six. (Superseded in scope by
+   the eleventh round: the arm threads through snapshot validation,
+   diagnostics, and the durable codec, and gains a contended twin.)
 3. Call-site routing is tested at the sites the helper test cannot see:
    injected determinate failures in the exchange-back, staging cleanup,
    tombstone return, anchor removal, work-slot removal, rename-back,
    `create_exclusive`, `mkdir_child`, and the verification lookups each
    surface as `EffectMismatch` — a raw `OSError` escaping any `apply` fails
    the test, reusing the existing injecting backend.
+
+## Eleventh-round findings closed (2026-08-14)
+
+1. The unrecognized arm now threads end to end:
+   `snapshot._validate_observed_entry`, `diagnostics._entry_fields` (with
+   `DiagnosticEntry.state` widened to
+   `PathState | ObservedUnrecognized | ObservedContended`), the durable
+   codec (two new closed state tags), and the public exports — each layer
+   was measured refusing the arm, so the promised FIFO halt could neither
+   be built nor persisted. Round-trip and hostile decode tests are pinned,
+   and the §9.1 amendment documents the durable diagnostic shape.
+2. Observation's transient twin is represented, not refused:
+   `ObservedContended()` (fact-free, factory-controlled in `fs/observe.py`)
+   is returned where a lookup→open or lookup→readlink race or a
+   kind-predicate failure today raises `PreconditionRefused`; it classifies
+   `EXTERNAL` to the existing `HaltPlan` arms, capture keeps §11's refusal
+   (which names this case verbatim), and injected-race tests are pinned
+   across step authorization, fresh recovery, and caught rollback.
+3. `open_child_directory` joined `_DETERMINATE`
+   (`ENOENT`/`ENOTDIR`/`ELOOP`/`EXDEV`) and the routing rule — mkdir's
+   post-`mkdir_child` retain open races the same way — with its call-site
+   injection test.
+4. The two compensation identity guards (`_exchange_back_if_ours`' live
+   `lstat`, `_remove_attributable_staging`'s staging lookup) are explicitly
+   routed with injected-failure tests; a guard lookup failing determinately
+   is itself the answer "no longer ours", chained under the in-flight
+   mismatch, and the guard mutates nothing.
