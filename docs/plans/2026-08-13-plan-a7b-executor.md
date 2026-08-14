@@ -1169,7 +1169,9 @@ The derivation is design §9.2 verbatim; every branch below gets a test:
   evidence through the closed decoder)
 - Modify: `python/src/atoms/store/workspace.py` (the split prepared-reopen
   seams `require_staging_discharged` and `reopen_work_slot` — see phase 6;
-  `reopen_workspace` itself is unchanged for its existing callers)
+  `reopen_workspace` itself is unchanged for its existing callers; the
+  `Workspace` constructor token error and class docstring update to name
+  the third producer)
 - Modify: `python/tests/test_fs_architecture.py` (the exact proof-schema
   guard gains `directory_paths` — criterion 21's closed field set,
   measured `:916`)
@@ -1466,8 +1468,30 @@ Phase mapping, exactly §9.1:
    - `reopen_work_slot(store, txid) -> Workspace`: opens
      `metadata_root/work`, then `work/<txid>`, and returns a `Workspace`
      whose staging descriptor is `None`; the slot's error surface is
-     `_open_child`'s (absent → `ProtocolError`, `ENOTDIR`/`ELOOP` →
-     `MetadataStoreInvalid`, every other errno raw).
+     `ENOTDIR`/`ELOOP` → `MetadataStoreInvalid`, every other errno raw —
+     and **absence → `MetadataStoreInvalid` too**, not `ProtocolError`:
+     in this prepared-only seam the durable record references the
+     workspace and successful promotion leaves `work/<txid>` present (A5a
+     §8.1 step 4, its line ~1511 — work-only is "the most ordinary
+     survivor there is"; A5b ~225), so a missing slot is broken durable
+     store evidence. The classification matters for **file-only
+     transactions**: without a `CreateDirectory` effect no `work_base` or
+     `WorkRoot` evidence exists (measured `fs/approval.py:252-257`), the
+     re-diff can never emit a work-namespace finding, and a
+     `ProtocolError` here would escape the guard as a wrongful
+     engine-defect claim. As `MetadataStoreInvalid` it re-raises
+     unconverted — the correct substrate signal — while create-directory
+     transactions still convert it when the re-diff supplies the matching
+     `NODE_MISSING` at `".#~work_root"`. The file-only regression is
+     pinned: active file-only record, `work/<txid>` removed →
+     `MetadataStoreInvalid` surfaces with no `assembly_halt` and no
+     mutation.
+   `reopen_work_slot` is a third `Workspace` producer, so Task 7 also
+   updates the constructor's token error and the class docstring — both
+   today name only `Store.create_workspace`/`Store.reopen_workspace`
+   (measured `store/workspace.py:37-41`) — and Task 11 amends the A5a
+   design's producer contract (its line ~1418) with the historical A5a
+   plan annotated.
 
    `resolve` calls `require_staging_discharged` **outside** the guard —
    its raises propagate untouched, staging-origin **by construction**,
@@ -2029,6 +2053,10 @@ commit arm.
 - Modify: `docs/plans/2026-07-31-a4b2-project-approval-design.md`
   (proof-schema amendment), `docs/plans/2026-07-31-plan-a4b2-project-approval.md`
   (dated annotation pointing at it)
+- Modify: `docs/plans/2026-07-31-a5a-metadata-store-design.md`
+  (Workspace producer-contract amendment),
+  `docs/plans/2026-08-01-plan-a5a-metadata-store.md` (dated annotation
+  pointing at it)
 - Modify: `docs/deferred-obligation-ledger.md`, `README.md`, `AGENTS.md`
 
 - [ ] **Step 11.1:** Flip `FIRST_UNIMPLEMENTED` to `"A8"`. Run
@@ -2104,6 +2132,12 @@ commit arm.
     schema guard are presented as current (its line ~2602) — gets a dated
     annotation pointing at the amendment, same shape as the A2 plan's
     (Task 7).
+  - **A5a design** (`2026-07-31-a5a-...-design.md`, the `Workspace`
+    contract, ~1418): the producer set gains `reopen_work_slot` beside
+    `create_workspace`/`reopen_workspace` — the prepared-only reopen
+    whose absence classification is `MetadataStoreInvalid` for the
+    design's own §8.5 reason. The historical A5a plan gets a dated
+    annotation pointing at the amendment (Task 7).
   - **A3 design** (`2026-07-28-a3-...-design.md`): the observed-entry
     union (its line ~246) gains the two arms and
     `ObservedDirectory.has_unmodeled_child: bool | None`; the
@@ -2178,7 +2212,9 @@ A7 design (§9.1 twice, §9.3, §9.2, §11, §7, the primitive contract), the
 authority (restartable materialization and the compile-time directory-mode
 rule), the A2 design (the directory-mode narrowing, with the historical A2
 plan annotated), the A4b2 design (the proof schema and evidence `"path"`
-member, with the historical A4b2 plan annotated), the A3 design (union
+member, with the historical A4b2 plan annotated), the A5a design (the
+`Workspace` producer contract, with the historical A5a plan annotated),
+the A3 design (union
 arms, authorization guard, mkdir
 table), and
 the A6 design (directory observation contract) — are decided in Tasks 3–8
@@ -2845,3 +2881,24 @@ represent descendant observations.
    `test_coordinator_assembly_halt.py`, and Task 11's §9.3 amendment now
    documents both reserved diagnostic pseudo-paths alongside the two
    finding kinds.
+
+## Twenty-second-round findings closed (2026-08-14)
+
+1. `reopen_work_slot` classifies absence as `MetadataStoreInvalid`, not
+   `ProtocolError`: the durable record references the workspace and
+   promotion leaves `work/<txid>` present (A5a §8.1 step 4 ~1511, A5b
+   ~225), so in the prepared-only seam absence is broken durable-store
+   evidence. This closes the file-only hole — without `CreateDirectory`
+   no `work_base`/`WorkRoot` evidence exists (`approval.py:252-257`), the
+   re-diff can emit no work-namespace finding, and the old
+   `ProtocolError` would have escaped as a wrongful engine-defect claim.
+   The file-only regression (active record, slot removed →
+   `MetadataStoreInvalid`, no `assembly_halt`, no mutation) is pinned;
+   create-directory cases still convert on the matching `NODE_MISSING`
+   at `".#~work_root"`.
+2. The `Workspace` producer contract is amended, not contradicted: Task 7
+   updates the constructor token error and class docstring (today naming
+   only `create_workspace`/`reopen_workspace`, `workspace.py:37-41`) to
+   name the third factory, and Task 11 amends the A5a design's contract
+   (~1418) with the historical A5a plan annotated — both files added to
+   the Task 11 inventory and the self-review amendment list.
