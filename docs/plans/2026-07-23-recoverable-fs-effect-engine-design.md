@@ -1,10 +1,11 @@
 # Recoverable filesystem effect engine — design
 
 **Date:** 2026-07-23
-**Status:** Approved — authority design for `atoms`. Plan A implementation underway; A1–A6 are
+**Status:** Approved — authority design for `atoms`. Plan A implementation underway; A1–A7a are
 implemented (pure model and compilation, recovery reference model, capability backend, path resolution
 and project approval, SQLite-WAL metadata store, recovery-resolve lease, coherent capture and the
-observation mechanism); A7–A9 (effect/recovery execution, synthetic exerciser, macOS backend) remain.
+observation mechanism; A7a adds the audited facade, spec/schema v2, the chain, and the root/intent
+commands); A7b–A9 (effect/recovery execution, synthetic exerciser, macOS backend) remain.
 **Repository:** `atoms` (`~/d/atoms`) — Python-first physical durability substrate below `nodes`
 **Supersedes:** the science-framed [`2026-07-20-recoverable-fs-effect-engine-design.md`](2026-07-20-recoverable-fs-effect-engine-design.md), retained as the historical, review-hardened record.
 
@@ -1600,6 +1601,10 @@ primitive with the same crash-recovery table and no explicit directory-entry dur
 Windows backend would need a divergent recovery classification; a Windows operation refuses at
 preparation with `CapabilityUnavailable`. A Windows backend may be added later without changing the
 transaction model.
+
+A7 is delivered as **A7a** (the substrate: audited facade, spec/schema v2, `AssemblyHalt`, the chain,
+the root and intent commands) and **A7b** (the executor: forward spine, five effects, plan executor,
+trap removal), split 2026-08-13 at plan time on the design's §1 layering.
 
 ### Plan A — engine core and synthetic exerciser
 

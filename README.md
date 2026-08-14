@@ -28,9 +28,9 @@ design's banking commit, so the macOS arm of Plan A item 6 has an owner).
 
 The pure core (`atoms.core`) is joined under `python/` by `atoms.fs` (capability backend,
 volume binding, project approval) and `atoms.store` (SQLite-in-WAL metadata store) beneath an
-`atoms.coordinator` package holding the recovery lease, admission, and preparation. No project
-path is mutated by any code in this repository today; the only paths written are engine-owned,
-under `metadata_root`.
+`atoms.coordinator` package holding the recovery lease, admission, and preparation. A7a writes
+only engine bookkeeping at the reserved `.#~chain/` leaf; A7b is the first stage to execute effects
+against project paths.
 
 - **Authority design:** [`docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md`](docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md)
   — standalone `atoms` engine, SQLite-in-WAL metadata store, `nodes`/science as deferred consumers.
@@ -57,7 +57,11 @@ under `metadata_root`.
 - **A6 — coherent capture and the observation mechanism (implemented):**
   [`docs/plans/2026-08-07-a6-coherent-capture-design.md`](docs/plans/2026-08-07-a6-coherent-capture-design.md)
   — the descriptor table, the observation pass, and preimage capture into the workspace staging
-  directory. A7–A9 remain unimplemented: nothing yet executes an effect against a project path.
+  directory.
+- **A7a — execution substrate (implemented):**
+  [`docs/plans/2026-08-13-a7-effect-recovery-execution-design.md`](docs/plans/2026-08-13-a7-effect-recovery-execution-design.md)
+  — the audited facade, spec/schema v2, `AssemblyHalt`, the tamper-evident chain, and the root and intent commands.
+  A7b–A9 remain unimplemented: nothing yet executes an effect against a project path.
 - Historical (superseded): the science-framed [`2026-07-20-*`](docs/plans/2026-07-20-recoverable-fs-effect-engine-design.md)
   design + roadmap, retained as the record of the review that hardened the effect/recovery contracts.
 

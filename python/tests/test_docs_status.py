@@ -28,10 +28,10 @@ ROOT = Path(__file__).parents[2]
 PLANS = ROOT / "docs" / "plans"
 
 #: Every sub-plan of authority §14's Plan A roadmap, in delivery order.
-STAGES = ("A1", "A2", "A3", "A4a", "A4b", "A5a", "A5b", "A6", "A7", "A8", "A9")
+STAGES = ("A1", "A2", "A3", "A4a", "A4b", "A5a", "A5b", "A6", "A7a", "A7b", "A8", "A9")
 
 #: The one fact this file exists to hold. Landing a sub-plan moves this boundary.
-FIRST_UNIMPLEMENTED = "A7"
+FIRST_UNIMPLEMENTED = "A7b"
 
 IMPLEMENTED = STAGES[: STAGES.index(FIRST_UNIMPLEMENTED)]
 UNIMPLEMENTED = STAGES[STAGES.index(FIRST_UNIMPLEMENTED) :]
@@ -63,6 +63,8 @@ def _stages_of(label: str) -> tuple[str, ...]:
     base = label.split("-")[0]
     if base in STAGES:
         return (base,)
+    if base == "A7":
+        return ("A7b",)
     covered = tuple(stage for stage in STAGES if stage.startswith(base))
     assert covered, f"unknown stage label {label!r}"
     return covered
@@ -147,7 +149,8 @@ def _documented_stage(path: Path) -> str | None:
     match = re.search(r"-(?:plan-)?(a[1-9][ab]?)[12]?-", path.name)
     if match is None:
         return None
-    return match.group(1).replace("a", "A", 1)
+    stage = match.group(1).replace("a", "A", 1)
+    return "A7a" if stage == "A7" else stage
 
 
 def status_regions() -> dict[str, str]:
@@ -175,8 +178,10 @@ def test_every_implemented_sub_plan_has_a_document_declaring_it_implemented():
     declared = {
         _documented_stage(path)
         for path in live_plan_documents()
-        if (status_field(path.read_text(encoding="utf-8")) or "").startswith(
-            "**Status:** Implemented"
+        if (field := status_field(path.read_text(encoding="utf-8"))) is not None
+        and (
+            field.startswith("**Status:** Implemented")
+            or f"**{_documented_stage(path)} implemented" in field
         )
     }
     assert set(IMPLEMENTED) - declared == set()
@@ -223,7 +228,7 @@ def test_no_status_region_claims_the_repository_writes_nothing():
 def test_the_authority_header_names_the_implemented_prefix():
     """The authority outranks every other document, and spells its remainder its own way.
 
-    It says "A1-A6 are implemented ... A7-A9 (...) remain" rather than the sentence the
+    It says "A1-A7a are implemented ... A7b-A9 (...) remain" rather than the sentence the
     sub-plans share, so the shared parse is backed up by a positive check here.
     """
     field = status_field(AUTHORITY.read_text(encoding="utf-8"))
@@ -235,18 +240,19 @@ def test_the_authority_header_names_the_implemented_prefix():
 def test_the_claim_parser_attaches_a_claim_to_the_span_that_owns_it():
     """The parse this file rests on, against the shapes the corpus actually uses."""
     assert unimplemented_claims("A5 and A6 are implemented; A7–A8 remain unimplemented.") == {
-        "A7",
+        "A7b",
         "A8",
     }
     assert unimplemented_claims(
         "A7–A8 (effect/recovery execution, synthetic exerciser) remain."
-    ) == {"A7", "A8"}
+    ) == {"A7b", "A8"}
     assert unimplemented_claims("A4b-2 and A5–A8 remain unimplemented.") == {
         "A4b",
         "A5a",
         "A5b",
         "A6",
-        "A7",
+        "A7a",
+        "A7b",
         "A8",
     }
     # A requirement about a stage is not a claim that the stage is unimplemented.
