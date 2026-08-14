@@ -183,7 +183,9 @@ the status guard refuses "implemented" claims until the tree makes them true.
         way a lookup does — an entry vanishing between `mkdir_child` and the
         repair must convert, not leak after `STARTED`);
       - the verification lookups — `lstat`: `ENOENT`, `ENOTDIR`;
-        `open_regular_nofollow`: `ENOENT`, `ENOTDIR`, `ELOOP`, `EISDIR`;
+        `open_regular_nofollow`: `ENOENT`, `ENOTDIR`, `ELOOP`, `EISDIR`,
+        `EACCES` (a file the engine cannot reopen is a determinate
+        verification mismatch, never a raw `PermissionError`);
         `symlink_fingerprint`: `ENOENT`, `ENOTDIR`, `EINVAL`;
         `open_child_directory`: `ENOENT`, `ENOTDIR`, `ELOOP`, `EXDEV`
         (mkdir's post-`mkdir_child` retain open mutates nothing but races
@@ -458,7 +460,10 @@ the status guard refuses "implemented" claims until the tree makes them true.
   (asserted: the returned descriptor's `fstat` mode equals the approved
   mode); a spec holding a `CreateDirectory` with `mode & 0o700 != 0o700`
   (`0o644`, `0`) refuses at `compile_spec` with `SpecValidationError` —
-  before any project context exists; a
+  before any project context exists — and so does a `CreateFileNoClobber`
+  or `ReplaceFile` whose `post` mode lacks `0o400` (`0o200`, `0`), while
+  the same modes on a `ReplaceFile`/`DeletePath` **pre** state still
+  compile; a
   scaffold-mode work survivor (empty, mode subset of `0o700`) classifies to
   `RemoveScratch` in the variants tests while a non-empty or
   wider-than-`0o700` occupant stays a preserved blocker; an `ENOENT`
@@ -541,6 +546,15 @@ the status guard refuses "implemented" claims until the tree makes them true.
   `fchmod(fd, 0)`, creating a child through the pre-opened fd fails
   `EACCES`) — so a restrictive published directory would break descendant
   effects, the fresh final-surface proof, and every recovery observation.
+  **The same rule narrows engine-materialized file postimages**: the
+  `post` `FileState` of a `CreateFileNoClobber` or `ReplaceFile` with
+  `mode & 0o400 == 0` refuses at `compile_spec` with
+  `SpecValidationError` — `open_regular_nofollow` reopens `O_RDONLY`
+  (measured `fs/linux.py:149-153`), so a mode-`000` postimage succeeds
+  forward through its retained descriptor and then cannot be reopened by
+  any fresh process for verification or recovery. Preimages stay
+  unrestricted — the world made them, and the inaccessible observation
+  arm (Task 5) represents them honestly.
   A tree the engine cannot re-observe without mutating is unrecoverable by
   design, and the engine refuses to build one; **A7b does not support
   restrictive directory modes** (file and symlink modes keep the full
@@ -774,26 +788,36 @@ refusing through `translated_lookup` (measured `fs/observe.py:107,242`) or
 the kind predicate failing after a successful open (measured
 `fs/observe.py:246-249`) — also surfaces as `PreconditionRefused`, and a
 racer that moved an entry away and back converts to the same wrongful
-`ProtocolError` through the moved-world rule. Two new arms, threaded end to
+`ProtocolError` through the moved-world rule. Three new arms, threaded end to
 end:
 
 - `model.py`: `ObservedUnrecognized(st_mode: int)` — frozen, carrying the
-  canonical observed mode — and `ObservedContended()` — frozen and
+  canonical observed mode — `ObservedContended()` — frozen and
   fact-free: the entry would not hold still for one coherent look, so there
-  are no stable facts to record — join the closed `ObservedEntry` union.
-  Neither has an identity member: an unrecognized kind is never opened
-  (opening a FIFO can block), and a contended entry yielded no pinnable
-  descriptor. Both are exported wherever the union's members are
+  are no stable facts to record — and `ObservedInaccessible()` — frozen
+  and fact-free: a regular file the observer cannot open, so content
+  fingerprint and build relation are unreadable — join the closed
+  `ObservedEntry` union.
+  None has an identity member: an unrecognized kind is never opened
+  (opening a FIFO can block), a contended entry yielded no pinnable
+  descriptor, and an inaccessible file refused the only open that could
+  pin one. All are exported wherever the union's members are
   (the model's public surface and the architecture public-surface
   expectations).
 - `observe.py`: `observe` returns `ObservedUnrecognized(st_mode=info.st_mode)`
-  where it today raises for a FIFO/socket/device, and
+  where it today raises for a FIFO/socket/device,
   `ObservedContended()` where a lookup→open or lookup→readlink race today
   refuses: the open or fingerprint failing with a namespace-contradiction
   errno (`ENOENT`/`ENOTDIR`/`ELOOP`/`EXDEV`, plus `EINVAL` from a
   fingerprint whose leaf stopped being a symlink) after a successful
   `lstat`, or `_open_and_pin`'s kind predicate failing (the fd is closed
-  first, as today). Observation states facts, it does not judge (ledger
+  first, as today), and `ObservedInaccessible()` where the regular-file
+  open refuses `EACCES`: `open_regular_nofollow` reopens `O_RDONLY`
+  (measured `fs/linux.py:149-153`), and the retained descriptor that let
+  a restrictive-mode file be written forward does not exist in a fresh
+  process — without this arm a chmod-`000` file makes fresh recovery
+  escape raw `PermissionError` repeatedly, neither rollback nor
+  explained halt. Observation states facts, it does not judge (ledger
   #13's rule, already the module's charter). Exactly **two** production
   constructors of the arms exist — `fs/observe.py`, the live-filesystem
   producer, and the durable decoder in `store/records.py`, which must
@@ -843,10 +867,10 @@ end:
   `ProtocolError` on `None`, because opaque occupancy crossing the
   classifier boundary means the guard was bypassed — an engine defect,
   never a value to coerce), and
-  **occupancy-`None` is the non-authorizable guard's third trigger**: a
+  **occupancy-`None` is a non-authorizable guard trigger**: a
   directory whose occupancy the engine cannot read authorizes nothing —
   the classifier issues the factory halt with the observation as evidence,
-  exactly like the two arms. In particular A3's scaffold-debris row
+  exactly like the arms. In particular A3's scaffold-debris row
   requires an **observed-empty** survivor (`has_unmodeled_child is
   False`): an opaque work survivor halts before mutation, because
   authorizing its `RemoveScratch` and leaning on `rmdir`'s refusal would
@@ -862,8 +886,13 @@ end:
   the phase-5 diff with the `ACCESS_DENIED` assembly finding before any
   proof is issued (Task 7's suite), and caught rollback reaches this
   guard through the unadopted stop for the factory halt (Task 8's suite).
-  Capture refuses on `None` like the arms, and `EACCES` from a *file*
-  open stays raw.
+  Capture refuses on `None` and on `ObservedInaccessible` like the other
+  arms; `EACCES` from a *file* open observes as `ObservedInaccessible`,
+  never raw. The file analog of the directory dual-route pin: a
+  persistent regular file chmodded `0o000` after `PREPARED` halts with
+  the arm in evidence on **both recovery routes, pinned separately** —
+  fresh recovery and caught rollback — with no raw `PermissionError`
+  escaping either.
 - **One shared non-authorizable-arm guard — the arms never reach a
   classification table.** Mapping them into `EntryClass` would be wrong:
   `EXTERNAL` does not always halt (Replace `STARTED` with live `POST` and
@@ -875,9 +904,9 @@ end:
   model invariant "recovery never mutates an unattributable state"
   (measured `2026-07-23-...-design.md:1419`). Instead **one guard
   function** in `classifier.py` scans a `JointObservation`'s persistent and
-  scratch entries for its three triggers — `ObservedUnrecognized`,
-  `ObservedContended`, and an `ObservedDirectory` whose
-  `has_unmodeled_child` is `None` (the `O_PATH` route below) — and
+  scratch entries for its four triggers — `ObservedUnrecognized`,
+  `ObservedContended`, `ObservedInaccessible`, and an `ObservedDirectory`
+  whose `has_unmodeled_child` is `None` (the `O_PATH` route below) — and
   produces the factory halt. It runs in
   exactly two places: at `classify_recovery`'s entry over the snapshot's
   observations — before any variant table, before `_at_frontier`'s direct
@@ -890,8 +919,9 @@ end:
   `_entry_state`, `_classify_entry`, `_at_frontier`, and `_observed_state`
   stay closed exactly as they are — an arm reaching one is an engine
   defect, and the existing `ProtocolError`s say so. A census test walks
-  every fixture-family classification with **each of the three guard
-  triggers** — `ObservedUnrecognized`, `ObservedContended`, and
+  every fixture-family classification with **each of the four guard
+  triggers** — `ObservedUnrecognized`, `ObservedContended`,
+  `ObservedInaccessible`, and
   `ObservedDirectory(..., has_unmodeled_child=None)` — planted at each
   covered slot and asserts no `ActionPlan` mutating step's
   `expected_before`/`result_after` ever contains a trigger; the
@@ -903,13 +933,15 @@ end:
   `snapshot._validate_observed_entry` accepts both (measured refusal today
   at `snapshot.py:400-414`); `diagnostics._entry_fields` projects them
   (measured refusal at `diagnostics.py:38-49`) with `DiagnosticEntry.state`
-  widened to `PathState | ObservedUnrecognized | ObservedContended`
+  widened to `PathState | ObservedUnrecognized | ObservedContended |
+  ObservedInaccessible`
   (measured `model.py:130`); the **persisted-diagnostic validators** accept
   the widened state (the diagnostic-entry state check admits only the four
   declared states today, measured `snapshot.py:490-500`); and the durable
-  codec (measured four-state `_state_obj`, `records.py:61-73`) gains two
-  tags — `{"kind": "unrecognized", "st_mode": <canonical int>}` and
-  `{"kind": "contended"}` — with the decoder closed over them. `st_mode`
+  codec (measured four-state `_state_obj`, `records.py:61-73`) gains three
+  tags — `{"kind": "unrecognized", "st_mode": <canonical int>}`,
+  `{"kind": "contended"}`, and `{"kind": "inaccessible"}` — with the
+  decoder closed over them. `st_mode`
   validation is **semantic, stated once and used by validator and decoder
   both**, and it bounds before it classifies: an exact `int` in
   `[0, 0o177777]` (the kernel's 16-bit `st_mode` domain — `stat.S_IFMT`
@@ -1170,8 +1202,8 @@ The derivation is design §9.2 verbatim; every branch below gets a test:
 - Modify: `python/src/atoms/store/workspace.py` (the split prepared-reopen
   seams `require_staging_discharged` and `reopen_work_slot` — see phase 6;
   `reopen_workspace` itself is unchanged for its existing callers; the
-  `Workspace` constructor token error and class docstring update to name
-  the third producer)
+  `Workspace` constructor token error updates to name
+  the third producer — the production class docstring names none)
 - Modify: `python/tests/test_fs_architecture.py` (the exact proof-schema
   guard gains `directory_paths` — criterion 21's closed field set,
   measured `:916`)
@@ -1493,9 +1525,11 @@ Phase mapping, exactly §9.1:
      `MetadataStoreInvalid` surfaces with no `assembly_halt` and no
      mutation.
    `reopen_work_slot` is a third `Workspace` producer, so Task 7 also
-   updates the constructor's token error and the class docstring — both
-   today name only `Store.create_workspace`/`Store.reopen_workspace`
-   (measured `store/workspace.py:37-41`) — and Task 11 amends the A5a
+   updates the constructor's token error — today naming only
+   `Store.create_workspace`/`Store.reopen_workspace` (measured
+   `store/workspace.py:37-41`); the production class docstring names no
+   producers (measured `workspace.py:23`), so the producer-bearing
+   docstring to amend is the A5a design's — and Task 11 amends that
    design's producer contract (its line ~1418) with the historical A5a
    plan annotated. **`reopen_work_slot` is issued, and both seams are
    failure-complete**:
@@ -2139,7 +2173,9 @@ commit arm.
     entry-mode repair, then the approved mode via umask-immune fchmod),
     and an empty work-slot directory whose mode is a subset of `0o700` is
     attributable construction debris; spec semantics — a `CreateDirectory`
-    mode must satisfy `mode & 0o700 == 0o700` (`SpecValidationError` at
+    mode must satisfy `mode & 0o700 == 0o700`, and an engine-materialized
+    file postimage (`CreateFileNoClobber`/`ReplaceFile` `post`) must
+    satisfy `mode & 0o400 != 0` (`SpecValidationError` at
     compile): the engine refuses to build a tree it cannot re-observe
     without mutating (Task 3); acceptance criteria (its line ~1737) — the
     fresh-process criterion gains the explained-halt arm: recovery rolls
@@ -2149,10 +2185,12 @@ commit arm.
     matching the arm the caught-failure criterion already carries
     (Task 5).
   - **A2 design** (`2026-07-28-a2-...-design.md`, model section, ~256):
-    the "every `mode` is an integer in `0..0o7777`" clause narrows for
-    `DirectoryState` — directory modes must satisfy
-    `mode & 0o700 == 0o700`; file and symlink modes keep the full range.
-    The historical A2 plan gets a dated annotation pointing at the
+    the "every `mode` is an integer in `0..0o7777`" clause narrows twice —
+    for `DirectoryState`, directory modes must satisfy
+    `mode & 0o700 == 0o700`; for engine-materialized file postimages
+    (the `post` of `CreateFileNoClobber`/`ReplaceFile`), modes must
+    include `0o400`. Preimage file modes and symlink modes keep the full
+    range. The historical A2 plan gets a dated annotation pointing at the
     amendment (Task 3).
   - **A4b2 design** (`2026-07-31-a4b2-...-design.md`): the proof schema
     gains `directory_paths` (criterion 21's closed field set widens by
@@ -2172,11 +2210,11 @@ commit arm.
     like the existing openers. The historical A5a plan gets a dated
     annotation pointing at the amendment (Task 7).
   - **A3 design** (`2026-07-28-a3-...-design.md`): the observed-entry
-    union (its line ~246) gains the two arms and
+    union (its line ~246) gains the three arms and
     `ObservedDirectory.has_unmodeled_child: bool | None`; the
     `authorize_recovery_step` contract (~361) gains the
-    non-authorizable-arm guard ahead of the equality rule, with
-    occupancy-`None` as its third trigger; the mkdir
+    non-authorizable-arm guard ahead of the equality rule, with the
+    arms and occupancy-`None` as its four triggers; the mkdir
     classification table (~812) gains the scaffold-debris row demanding an
     **observed-empty** survivor — an opaque survivor halts before
     mutation (Tasks 3, 5).
@@ -2185,8 +2223,9 @@ commit arm.
     `open_child_directory`" claim is amended with the deliberately
     role-blind `EACCES → O_PATH`
     fallback (occupancy-`None`, on any directory observation),
-    and the FIFO/socket/device and contended outcomes move from refusal to
-    the represented arms (Task 5).
+    and the FIFO/socket/device, contended, and inaccessible-file
+    (`EACCES` on the regular-file open) outcomes move from refusal or raw
+    escape to the represented arms (Task 5).
 
   Each amendment is one dated note in its document, same shape as the
   2026-08-13 §5.1 amendments.
@@ -2931,7 +2970,10 @@ represent descendant observations.
    at `".#~work_root"`.
 2. The `Workspace` producer contract is amended, not contradicted: Task 7
    updates the constructor token error and class docstring (today naming
-   only `create_workspace`/`reopen_workspace`, `workspace.py:37-41`) to
+   only `create_workspace`/`reopen_workspace`, `workspace.py:37-41`)
+   *(corrected in the twenty-fifth round: only the token error names
+   producers in production — the class docstring at `workspace.py:23`
+   names none, so the docstring amendment belongs to the A5a design)* to
    name the third factory, and Task 11 amends the A5a design's contract
    (~1418) with the historical A5a plan annotated — both files added to
    the Task 11 inventory and the self-review amendment list.
@@ -2967,3 +3009,30 @@ represent descendant observations.
    classification — not merely a third name in the producer list.
 3. Minor: "Both seams are issued" corrected to "`reopen_work_slot` is
    issued, and both seams are failure-complete."
+
+## Twenty-fifth-round findings closed (2026-08-14)
+
+1. Regular-file `EACCES` no longer breaks recovery totality, closed on
+   both routes:
+   - Task 3: `compile_spec` refuses an engine-materialized file postimage
+     (`CreateFileNoClobber`/`ReplaceFile` `post`) with
+     `mode & 0o400 == 0` — `open_regular_nofollow` is `O_RDONLY`
+     (`linux.py:149-153`), so a mode-`000` postimage succeeds forward
+     through its retained descriptor and is unreopenable by any fresh
+     process. Preimages stay unrestricted (the world made them). Refusal
+     and pre-state-still-compiles cases pinned.
+   - Task 5: `ObservedInaccessible()` joins the union as the third
+     fact-free arm (file open refusing `EACCES`), threaded through the
+     guard (now four triggers), census, diagnostics, and the durable
+     codec (`{"kind": "inaccessible"}`); capture refuses it; the
+     chmod-`000` file halts with evidence on fresh recovery and caught
+     rollback, pinned separately, no raw `PermissionError`.
+   - Task 1: the `open_regular_nofollow` table row gains `EACCES`, so
+     effect-verification lookups convert instead of leaking.
+   - The authority and A2 amendments state the file-postimage narrowing;
+     "file and symlink modes keep the full range" is corrected to
+     preimage-and-symlink only.
+2. Minor: the production `Workspace` docstring names no producers
+   (`workspace.py:23`) — only the constructor token error is a
+   production edit; the producer-bearing docstring amendment belongs to
+   the A5a design. The round-22 history claim is annotated.
