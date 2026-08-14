@@ -6,11 +6,14 @@ import errno
 from typing import cast as _cast
 
 from atoms.chain.append import append_entry as _append_entry
-from atoms.chain.append import apply_survivors as _apply_survivors
 from atoms.chain.append import bootstrap_chain as _bootstrap_chain
 from atoms.chain.model import GenesisEntry, IntentEntry, state_to_json
 from atoms.chain.read import validate_chain as _validate_chain
-from atoms.coordinator.recover import _registered_root
+from atoms.coordinator.recover import (
+    _derive_reconciliation,
+    _perform_reconciliation,
+    _registered_root,
+)
 from atoms.coordinator.root import _recovery_lease, _require_chain_publication
 from atoms.core.errors import PreconditionRefused, ProtocolError, SpecValidationError
 from atoms.core.fingerprint import ABSENT, PathState
@@ -110,10 +113,13 @@ def register_root(
             chain_backend, lease._binding.project_root_fd
         )
         try:
-            validated = _apply_survivors(
+            validated = _validate_chain(chain_backend, chain_fd)
+            validated = _perform_reconciliation(
                 chain_backend,
+                lease._store,
                 chain_fd,
-                _validate_chain(chain_backend, chain_fd),
+                validated,
+                _derive_reconciliation(lease._store.read_active(), validated),
             )
             if validated.entries:
                 digest, genesis = validated.entries[0]
@@ -154,6 +160,13 @@ def append_intent(
         chain_backend = _cast(AuditedBackend, lease._binding.backend)
         _require_chain_publication(lease._binding.evidence)
         with _registered_root(lease) as (chain_fd, validated):
+            validated = _perform_reconciliation(
+                chain_backend,
+                lease._store,
+                chain_fd,
+                validated,
+                _derive_reconciliation(lease._store.read_active(), validated),
+            )
             return _append_entry(
                 chain_backend, chain_fd, validated, IntentEntry(payload)
             )

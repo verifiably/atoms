@@ -5,11 +5,20 @@ from __future__ import annotations
 import contextlib
 import errno
 from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import cast
 
 from atoms.chain.append import append_entry, apply_survivors
 from atoms.chain.errors import ChainStateInvalid
-from atoms.chain.model import ChainOutcome, SettledEntry
+from atoms.chain.model import (
+    ChainOutcome,
+    Entry,
+    RegisteredEntry,
+    SettledEntry,
+    encode_entry,
+    entry_digest,
+    state_to_json,
+)
 from atoms.chain.read import ValidatedChain, validate_chain
 from atoms.coordinator.admission import _require_admitted
 from atoms.coordinator.descriptors import DescriptorTable
@@ -26,7 +35,7 @@ from atoms.coordinator.transitions import (
 )
 from atoms.core.errors import PreconditionRefused, ProtocolError
 from atoms.core.recovery.authorization import _mutation_denied, authorize_recovery_step
-from atoms.core.recovery.model import TransactionState
+from atoms.core.recovery.model import JournalState, TransactionState
 from atoms.core.recovery.plan import (
     AuthorizedStep,
     DetachActive,
@@ -37,8 +46,202 @@ from atoms.core.recovery.plan import (
     TransformEffectTuple,
 )
 from atoms.core.scratch import CHAIN_LEAF
+from atoms.core.spec import TransactionSpec
 from atoms.fs.approval import ProjectApprovedSpec
 from atoms.fs.audit import AuditedBackend
+from atoms.store import Store, StoredRecord
+
+
+@dataclass(frozen=True, slots=True)
+class _Backfill:
+    digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class _Append:
+    entry: Entry
+
+
+_ReconciliationAction = _Backfill | _Append
+
+
+@dataclass(frozen=True, slots=True)
+class Reconciliation:
+    registration: _ReconciliationAction | None
+    settlement: _ReconciliationAction | None
+
+
+def _registration_entry(spec: TransactionSpec, txid: str) -> RegisteredEntry:
+    initial = {item.path: item.state for item in spec.initial_surface}
+    final = {item.path: item.state for item in spec.final_surface}
+    return RegisteredEntry(
+        txid=txid,
+        intent_digest=spec.intent_digest,
+        consumer_tag=spec.consumer_tag,
+        initial=tuple(
+            (path, state_to_json(initial[path])) for path in spec.registered_paths
+        ),
+        final=tuple(
+            (path, state_to_json(final[path])) for path in spec.registered_paths
+        ),
+        fulfills=spec.fulfills,
+    )
+
+
+def _terminal_outcome(record: StoredRecord) -> ChainOutcome | None:
+    if record.state is TransactionState.COMMITTED:
+        return ChainOutcome.COMMITTED
+    if record.state is TransactionState.ROLLED_BACK:
+        return ChainOutcome.ROLLED_BACK
+    return None
+
+
+def _derive_reconciliation(
+    record: StoredRecord | None, validated: ValidatedChain
+) -> Reconciliation:
+    """Derive the exact chain/store repairs without writing either substrate."""
+
+    if record is None:
+        return Reconciliation(None, None)
+
+    entries = dict(validated.entries)
+    registrations = [
+        (digest, entry)
+        for digest, entry in validated.entries
+        if type(entry) is RegisteredEntry and entry.txid == record.txid
+    ]
+    if len(registrations) > 1:
+        raise ChainStateInvalid("the chain contains duplicate registration entries")
+
+    registration: _ReconciliationAction | None = None
+    if record.registration_digest is not None:
+        bound = entries.get(record.registration_digest)
+        if type(bound) is not RegisteredEntry or bound.txid != record.txid:
+            raise ChainStateInvalid(
+                "the registration binding does not resolve to this transaction"
+            )
+    else:
+        registration_window = (
+            record.state is TransactionState.PREPARED
+            and all(journal.state is JournalState.PENDING for journal in record.journals)
+        )
+        if not registration_window:
+            raise ChainStateInvalid("the durable record is missing its registration")
+        registration = (
+            _Backfill(registrations[0][0])
+            if registrations
+            else _Append(_registration_entry(record.spec, record.txid))
+        )
+
+    settlements = [
+        (digest, entry)
+        for digest, entry in validated.entries
+        if type(entry) is SettledEntry and entry.txid == record.txid
+    ]
+    if len(settlements) > 1:
+        raise ChainStateInvalid("the chain contains duplicate settlement entries")
+
+    outcome = _terminal_outcome(record)
+    committed_halt = (
+        record.state is TransactionState.HALTED
+        and record.halt_diagnostic is not None
+        and record.halt_diagnostic.pre_halt_state is TransactionState.COMMITTED
+    )
+    settlement: _ReconciliationAction | None = None
+    if record.settlement_digest is not None:
+        bound = entries.get(record.settlement_digest)
+        expected_outcome = ChainOutcome.COMMITTED if committed_halt else outcome
+        if (
+            type(bound) is not SettledEntry
+            or bound.txid != record.txid
+            or bound.registration != record.registration_digest
+            or bound.outcome is not expected_outcome
+        ):
+            raise ChainStateInvalid(
+                "the settlement binding contradicts the durable record"
+            )
+        if outcome is None and not committed_halt:
+            raise ChainStateInvalid(
+                "only a committed halt may retain a terminal settlement"
+            )
+    elif outcome is not None:
+        expected = SettledEntry(
+            txid=record.txid,
+            registration=cast(str, record.registration_digest),
+            outcome=outcome,
+        )
+        if settlements:
+            digest, found = settlements[0]
+            if found != expected:
+                raise ChainStateInvalid(
+                    "the unbound settlement contradicts the durable record"
+                )
+            settlement = _Backfill(digest)
+        else:
+            settlement = _Append(expected)
+    elif settlements:
+        raise ChainStateInvalid("a nonterminal record has a settlement entry")
+
+    return Reconciliation(registration, settlement)
+
+
+def _perform_reconciliation(
+    backend: AuditedBackend,
+    store: Store,
+    chain_fd: int,
+    validated: ValidatedChain,
+    actions: Reconciliation,
+) -> ValidatedChain:
+    """Apply exactly one derived reconciliation decision."""
+
+    appends = tuple(
+        action
+        for action in (actions.registration, actions.settlement)
+        if type(action) is _Append
+    )
+    if len(appends) > 1:
+        raise ProtocolError("one reconciliation cannot append two chain entries")
+    envelope = (
+        encode_entry(validated.tip, cast(_Append, appends[0]).entry)
+        if appends
+        else None
+    )
+    fresh = validate_chain(
+        backend, chain_fd, () if envelope is None else (envelope,)
+    )
+    if fresh.entries != validated.entries or fresh.tip != validated.tip:
+        raise ChainStateInvalid("the chain changed after reconciliation derivation")
+    fresh = apply_survivors(backend, chain_fd, fresh)
+    record = store.read_active()
+    if any(action is not None for action in (actions.registration, actions.settlement)):
+        if record is None:
+            raise ProtocolError("reconciliation actions require an active record")
+        txid = record.txid
+
+    for column, action in (
+        ("registration", actions.registration),
+        ("settlement", actions.settlement),
+    ):
+        if action is None:
+            continue
+        if type(action) is _Backfill:
+            digest = action.digest
+        else:
+            planned = cast(bytes, envelope)
+            digest = entry_digest(planned)
+            if not any(found == digest for found, _ in fresh.entries):
+                appended = append_entry(
+                    backend, chain_fd, fresh, cast(_Append, action).entry
+                )
+                if appended != digest:
+                    raise ProtocolError("the chain append returned an unexpected digest")
+                fresh = validate_chain(backend, chain_fd)
+        with store.transaction() as txn:
+            if column == "registration":
+                txn.set_registration_digest(txid, digest)
+            else:
+                txn.set_settlement_digest(txid, digest)
+    return fresh
 
 
 @contextlib.contextmanager
@@ -62,9 +265,7 @@ def _registered_root(lease: Lease) -> Iterator[tuple[int, ValidatedChain]]:
         raise
 
     try:
-        validated = apply_survivors(
-            backend, chain_fd, validate_chain(backend, chain_fd)
-        )
+        validated = validate_chain(backend, chain_fd)
         if not validated.entries:
             if lease._store.read_active() is not None:
                 raise ChainStateInvalid(
@@ -159,47 +360,13 @@ def _reconcile_settlement(lease: Lease, approved: ProjectApprovedSpec) -> None:
     record = lease._store.read_active()
     if record is None or record.txid != approved.txid:
         raise ProtocolError("the proof's transaction is not active")
-    if record.registration_digest is None:
-        raise ProtocolError("settlement requires a registration binding")
-    if record.state is TransactionState.COMMITTED:
-        outcome = ChainOutcome.COMMITTED
-    elif record.state is TransactionState.ROLLED_BACK:
-        outcome = ChainOutcome.ROLLED_BACK
-    else:
-        raise ProtocolError("only a terminal transaction can settle")
 
     with _registered_root(lease) as (chain_fd, validated):
-        matching = [
-            (digest, entry)
-            for digest, entry in validated.entries
-            if type(entry) is SettledEntry and entry.txid == approved.txid
-        ]
-        if len(matching) > 1:
-            raise ChainStateInvalid("the chain contains duplicate settlement entries")
-        if record.settlement_digest is not None:
-            if not matching or matching[0][0] != record.settlement_digest:
-                raise ChainStateInvalid(
-                    "the settlement binding does not resolve to this transaction"
-                )
-            entry = cast(SettledEntry, matching[0][1])
-            if entry.registration != record.registration_digest or entry.outcome is not outcome:
-                raise ChainStateInvalid("the bound settlement contradicts the durable record")
-            return
-        if matching:
-            digest, entry = matching[0]
-            settled = cast(SettledEntry, entry)
-            if settled.registration != record.registration_digest or settled.outcome is not outcome:
-                raise ChainStateInvalid("the unbound settlement contradicts the durable record")
-        else:
-            digest = append_entry(
-                cast(AuditedBackend, lease._binding.backend),
-                chain_fd,
-                validated,
-                SettledEntry(
-                    txid=approved.txid,
-                    registration=record.registration_digest,
-                    outcome=outcome,
-                ),
-            )
-    with lease._store.transaction() as txn:
-        txn.set_settlement_digest(approved.txid, digest)
+        actions = _derive_reconciliation(record, validated)
+        _perform_reconciliation(
+            cast(AuditedBackend, lease._binding.backend),
+            lease._store,
+            chain_fd,
+            validated,
+            actions,
+        )

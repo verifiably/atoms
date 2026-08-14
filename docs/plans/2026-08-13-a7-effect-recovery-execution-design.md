@@ -442,6 +442,10 @@ Settlement, symmetric:
   `pre_halt_state = COMMITTED`. An uncommitted halt must have no settlement
   — one there is `ChainStateInvalid`.
 
+As implemented on 2026-08-14, reconciliation rebuilds an appended entry from
+the durable canonical `spec_json`; completing its byte-identical staging survivor
+satisfies that append rather than publishing a duplicate.
+
 ### 9.3 The assembly halt
 
 Two failure classes, deliberately separate (§12). Malformed chain evidence
