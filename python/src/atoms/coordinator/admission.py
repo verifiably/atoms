@@ -56,6 +56,8 @@ def _require_admitted(lease: Lease, approved: ProjectApprovedSpec) -> None:
             "the proof's binding is not this lease's binding; a proof resolved against "
             "one project volume authorizes nothing on another"
         )
+    backend = approved.binding.backend
+    del backend
 
 
 def admit(lease: Lease, compiled: CompiledSpec) -> ProjectApprovedSpec:

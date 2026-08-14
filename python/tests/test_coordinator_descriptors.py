@@ -399,6 +399,33 @@ def test_an_absent_planned_directory_is_a_stop_with_an_absent_observation(leased
             assert type(stop.observed) is ObservedAbsent
 
 
+def test_a_stopped_planned_directory_can_adopt_its_published_descriptor(leased):
+    from atoms.coordinator.admission import admit
+    from atoms.coordinator.prepare import open_workspace
+    from atoms.core.recovery.snapshot import PersistentNode
+
+    with leased() as lease:
+        approved = admit(lease, compiled_creating_a_directory(lease))
+        with open_workspace(lease, approved) as workspace, Observation(
+            LinuxBackend()
+        ) as observation:
+            table = _table(lease, approved, workspace, observation)
+            node = PersistentNode("d")
+            os.mkdir("d", dir_fd=lease._binding.project_root_fd)
+            fd = lease._binding.backend.open_child_directory(
+                lease._binding.project_root_fd, "d"
+            )
+
+            table.adopt(node, fd)
+
+            assert table.fd_for(node) == fd
+            assert not table.is_unreachable(node)
+            table.close()
+            with pytest.raises(OSError) as caught:
+                os.fstat(fd)
+            assert caught.value.errno == errno.EBADF
+
+
 def test_an_occupied_planned_directory_reports_what_occupies_it(leased):
     """A planned directory is LOOKED UP, not assumed absent.
 

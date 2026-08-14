@@ -219,6 +219,17 @@ def test_create_directory_joint_table(
         assert decision.halt_reason is HaltReason.DIRECTORY_NOT_EMPTY
 
 
+def test_empty_mode_masked_scaffold_is_attributable_work(directory_case):
+    snapshot, frontiers = directory_case(
+        "absent", "scaffold", None, False
+    )
+
+    decision = classify_effect(snapshot, 0, frontiers)
+
+    assert decision.kind is EffectDecisionKind.REMOVE_WORK
+    assert type(decision.steps[0]) is RemoveScratch
+
+
 def test_directory_parent_waits_for_resolved_descendant_reversal():
     before, before_frontiers = make_directory_descendant_case(
         descendant_present=True,

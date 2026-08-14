@@ -1071,6 +1071,7 @@ def _classify_directory(
         post=directory.post,
         build_relation=None,
     )
+    work_attributable = work_class is EntryClass.POST or _is_directory_scaffold(work)
     same_identity = _same_identity(live, work)
     journal = _journal(snapshot, directory.effect_id)
 
@@ -1118,7 +1119,7 @@ def _classify_directory(
         )
     if (
         live_class is EntryClass.ABSENT
-        and work_class is EntryClass.POST
+        and work_attributable
     ):
         if not _directory_is_empty(
             observed,
@@ -1149,7 +1150,7 @@ def _classify_directory(
         return _remove_live_directory(directory, observed)
     if (
         live_class is EntryClass.POST
-        and work_class is EntryClass.POST
+        and work_attributable
         and same_identity
     ):
         if not (
@@ -1191,7 +1192,7 @@ def _classify_directory(
         )
     if (
         live_class in {EntryClass.POST, EntryClass.EXTERNAL}
-        and work_class is EntryClass.POST
+        and work_attributable
         and not same_identity
     ):
         if not _directory_is_empty(
@@ -1214,6 +1215,14 @@ def _classify_directory(
             refused=True,
         )
     return _halt(observed, observed)
+
+
+def _is_directory_scaffold(entry: ObservedEntry) -> bool:
+    return (
+        type(entry) is ObservedDirectory
+        and cast(ObservedDirectory, entry).state.mode & ~0o700 == 0
+        and not cast(ObservedDirectory, entry).has_unmodeled_child
+    )
 
 
 def _directory_is_empty(

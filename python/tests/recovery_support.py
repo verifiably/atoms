@@ -831,6 +831,8 @@ def make_directory_case(
             return OBSERVED_ABSENT
         if name == "post":
             return ObservedDirectory(D, identity, unmodeled)
+        if name == "scaffold":
+            return ObservedDirectory(DirectoryState(0), identity, unmodeled)
         if name == "external":
             return ObservedDirectory(
                 _EXTERNAL_DIRECTORY,

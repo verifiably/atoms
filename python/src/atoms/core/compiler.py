@@ -317,6 +317,17 @@ def _phase2_fingerprints(spec: TransactionSpec) -> None:
                 0 <= state.mode <= MAX_MODE,
                 f"{what}.mode must be permission bits in 0..0o7777",
             )
+    for index, effect in enumerate(spec.effects):
+        if type(effect) is CreateDirectory:
+            _require(
+                effect.post.mode & 0o700 == 0o700,
+                f"effects[{index}].post.mode must grant owner read, write, and execute",
+            )
+        if isinstance(effect, (CreateFileNoClobber, ReplaceFile)):
+            _require(
+                effect.post.mode & 0o400 == 0o400,
+                f"effects[{index}].post.mode must grant owner read access",
+            )
 
 
 def _declared_paths(spec: TransactionSpec) -> list[tuple[str, str]]:

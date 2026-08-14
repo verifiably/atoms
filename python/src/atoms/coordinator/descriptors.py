@@ -107,6 +107,18 @@ class DescriptorTable:
             raise ProtocolError("this descriptor table is closed")
         return node in self._unreachable
 
+    def adopt(self, node: TopologyNode, fd: int) -> None:
+        if self._closed:
+            raise ProtocolError("this descriptor table is closed")
+        if node in self._fds:
+            raise ProtocolError(f"{node!r} already has a descriptor in this table")
+        if not any(stop.node == node for stop in self._stops):
+            raise ProtocolError(f"{node!r} is not a stopped planned directory")
+        self._fds[node] = fd
+        self._owned = (*self._owned, fd)
+        self._stops = tuple(stop for stop in self._stops if stop.node != node)
+        self._unreachable = self._unreachable - {node}
+
     def close(self) -> None:
         if self._closed:
             return

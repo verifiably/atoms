@@ -9,10 +9,47 @@ from atoms.core.compiler import CompiledSpec, compile_spec
 from atoms.core.effects import CreateDirectory, CreateFileNoClobber, DeletePath, ReplaceFile
 from atoms.core.errors import SpecValidationError
 from atoms.core.fingerprint import ABSENT, DirectoryState, FileState, SymlinkState
-from atoms.core.spec import SCHEMA_VERSION, Dependency, SurfaceEntry, TransactionSpec
+from atoms.core.spec import SCHEMA_VERSION, Dependency, SurfaceEntry, TransactionSpec, build_spec
 from tests.support import EMPTY, F, valid_spec
 
 MAX_SQLITE_INTEGER = 2**63 - 1
+
+
+@pytest.mark.parametrize("mode", [0o644, 0])
+def test_created_directory_must_remain_owner_traversable(mode):
+    post = DirectoryState(mode)
+    spec = build_spec(
+        consumer_tag="test",
+        intent_digest="sha256:" + "1" * 64,
+        initial_surface={"d": ABSENT},
+        final_surface={"d": post},
+        effects=[CreateDirectory("e1", "d", post)],
+    )
+
+    with pytest.raises(SpecValidationError, match="owner read, write, and execute"):
+        compile_spec(spec)
+
+
+@pytest.mark.parametrize("variant", ["create", "replace"])
+@pytest.mark.parametrize("mode", [0o200, 0])
+def test_materialized_file_postimage_must_remain_owner_readable(variant, mode):
+    pre = FileState("sha256:" + "0" * 64, 0, 1)
+    post = FileState("sha256:" + "1" * 64, mode, 1)
+    effect = (
+        CreateFileNoClobber("e1", "f", post)
+        if variant == "create"
+        else ReplaceFile("e1", "f", pre, post)
+    )
+    spec = build_spec(
+        consumer_tag="test",
+        intent_digest="sha256:" + "2" * 64,
+        initial_surface={"f": ABSENT if variant == "create" else pre},
+        final_surface={"f": post},
+        effects=[effect],
+    )
+
+    with pytest.raises(SpecValidationError, match="owner read access"):
+        compile_spec(spec)
 
 
 def test_a_valid_spec_compiles():

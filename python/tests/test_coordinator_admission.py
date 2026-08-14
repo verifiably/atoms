@@ -71,6 +71,16 @@ def test_the_proof_binds_to_the_lease_that_issued_it(leased):
         assert _require_admitted(lease, approved) is None
 
 
+def test_the_admission_gate_rechecks_binding_liveness(leased):
+    from atoms.coordinator.admission import _require_admitted, admit
+
+    with leased() as lease:
+        approved = admit(lease, compiled_for(lease))
+
+    with pytest.raises(ProtocolError, match="closed"):
+        _require_admitted(lease, approved)
+
+
 def test_a_proof_from_another_binding_is_refused(leased):
     from atoms.coordinator.admission import _require_admitted, admit
 
