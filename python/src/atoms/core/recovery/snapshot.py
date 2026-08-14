@@ -27,16 +27,20 @@ from atoms.core.recovery.model import (
     IdentityRelation,
     JournalState,
     ObservedAbsent,
+    ObservedContended,
     ObservedDirectory,
     ObservedEntry,
     ObservedFile,
+    ObservedInaccessible,
     ObservedSymlink,
+    ObservedUnrecognized,
     OperatorAction,
     PersistentObservation,
     RollbackResult,
     ScratchObservation,
     ScratchRole,
     TransactionState,
+    is_unrecognized_st_mode,
 )
 
 
@@ -414,7 +418,13 @@ def _validate_observed_entry(entry: object, label: str) -> None:
         directory_entry = cast(ObservedDirectory, entry)
         _validate_directory_state(directory_entry.state, label)
         _require_exact(directory_entry.identity, EntryIdentity, label)
-        _require_exact(directory_entry.has_unmodeled_child, bool, label)
+        _require_optional_exact(directory_entry.has_unmodeled_child, bool, label)
+        return
+    if entry_type is ObservedUnrecognized:
+        if not is_unrecognized_st_mode(cast(ObservedUnrecognized, entry).st_mode):
+            _fail(f"{label} unrecognized st_mode is outside the closed kernel kinds")
+        return
+    if entry_type in {ObservedContended, ObservedInaccessible}:
         return
     _fail(f"{label} entry has the wrong exact runtime type")
 
@@ -498,7 +508,14 @@ def _validate_diagnostic_entries(items: object, label: str) -> None:
         _require_exact(item, DiagnosticEntry, label)
         entry = cast(DiagnosticEntry, item)
         _require_exact(entry.slot, str, label)
-        _validate_path_state(entry.state, label)
+        if type(entry.state) in {
+            ObservedUnrecognized,
+            ObservedContended,
+            ObservedInaccessible,
+        }:
+            _validate_observed_entry(entry.state, label)
+        else:
+            _validate_path_state(entry.state, label)
         _require_optional_exact(entry.has_unmodeled_child, bool, label)
         _require_optional_exact(entry.file_build_relation, FileBuildRelation, label)
         slots.append(entry.slot)

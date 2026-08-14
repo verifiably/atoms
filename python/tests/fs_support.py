@@ -331,6 +331,16 @@ class RestrictedBackend:
             name=name,
         )
 
+    def open_directory_handle(self, parent_fd, name):
+        return self._dispatch(
+            Capability.ANCHORED_TRAVERSAL,
+            "open_directory_handle",
+            parent_fd,
+            name,
+            contract="traversal",
+            name=name,
+        )
+
     def exchange(self, parent_fd, left, right):
         return self._dispatch(
             Capability.ATOMIC_EXCHANGE,

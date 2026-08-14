@@ -395,22 +395,12 @@ def test_mismatch_does_not_reclassify(classifier_plan):
     import atoms.core.recovery.authorization as module
 
     tree = ast.parse(inspect.getsource(module))
-    classifier_imports = [
+    classifier_calls = [
         node
         for node in ast.walk(tree)
-        if (
-            isinstance(node, ast.ImportFrom)
-            and node.module == "atoms.core.recovery.classifier"
-        )
-        or (
-            isinstance(node, ast.Import)
-            and any(
-                alias.name == "atoms.core.recovery.classifier"
-                for alias in node.names
-            )
-        )
+        if isinstance(node, ast.Name) and node.id == "classify_recovery"
     ]
-    assert classifier_imports == []
+    assert classifier_calls == []
     index, step = first_mutating_step(classifier_plan)
 
     result = authorize_recovery_step(

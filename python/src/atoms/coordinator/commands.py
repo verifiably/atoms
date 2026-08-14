@@ -2,19 +2,15 @@
 
 from __future__ import annotations
 
-import contextlib
 import errno
-from collections.abc import Iterator
 from typing import cast as _cast
 
 from atoms.chain.append import append_entry as _append_entry
 from atoms.chain.append import apply_survivors as _apply_survivors
 from atoms.chain.append import bootstrap_chain as _bootstrap_chain
-from atoms.chain.errors import ChainStateInvalid
 from atoms.chain.model import GenesisEntry, IntentEntry, state_to_json
-from atoms.chain.read import ValidatedChain
 from atoms.chain.read import validate_chain as _validate_chain
-from atoms.coordinator.lease import Lease
+from atoms.coordinator.recover import _registered_root
 from atoms.coordinator.root import _recovery_lease, _require_chain_publication
 from atoms.core.errors import PreconditionRefused, ProtocolError, SpecValidationError
 from atoms.core.fingerprint import ABSENT, PathState
@@ -25,7 +21,6 @@ from atoms.core.recovery.model import (
     ObservedFile,
     ObservedSymlink,
 )
-from atoms.core.scratch import CHAIN_LEAF
 from atoms.fs.audit import AuditedBackend
 from atoms.fs.backend import Backend
 from atoms.fs.lock import close_all
@@ -33,43 +28,6 @@ from atoms.fs.observe import Observation
 from atoms.fs.volume import StorageProfile
 
 __all__ = ("append_intent", "register_root")
-
-
-@contextlib.contextmanager
-def _registered_root(lease: Lease) -> Iterator[tuple[int, ValidatedChain]]:
-    backend = _cast(AuditedBackend, lease._binding.backend)
-    try:
-        chain_fd = backend.open_child_directory(
-            lease._binding.project_root_fd, CHAIN_LEAF
-        )
-    except OSError as caught:
-        if caught.errno == errno.ENOENT:
-            if lease._store.read_active() is not None:
-                raise ChainStateInvalid(
-                    "a live transaction record exists without its project chain"
-                ) from caught
-            raise PreconditionRefused(
-                "the project root is not registered"
-            ) from caught
-        if caught.errno in {errno.ENOTDIR, errno.ELOOP, errno.EXDEV}:
-            raise ChainStateInvalid(
-                "the reserved chain leaf is not a stable directory"
-            ) from caught
-        raise
-
-    try:
-        validated = _apply_survivors(
-            backend, chain_fd, _validate_chain(backend, chain_fd)
-        )
-        if not validated.entries:
-            if lease._store.read_active() is not None:
-                raise ChainStateInvalid(
-                    "a live transaction record exists without a chain genesis"
-                )
-            raise PreconditionRefused("the project root is not registered")
-        yield chain_fd, validated
-    finally:
-        backend.close_fd(chain_fd)
 
 
 def _capture_baseline(

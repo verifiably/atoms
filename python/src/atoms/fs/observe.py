@@ -26,10 +26,13 @@ from atoms.core.recovery.model import (
     OBSERVED_ABSENT,
     EntryIdentity,
     FileBuildRelation,
+    ObservedContended,
     ObservedDirectory,
     ObservedEntry,
     ObservedFile,
+    ObservedInaccessible,
     ObservedSymlink,
+    ObservedUnrecognized,
 )
 from atoms.fs.backend import Backend
 from atoms.fs.lock import close_all
@@ -109,21 +112,29 @@ class Observation:
                 info = os.lstat(leaf, dir_fd=parent_fd)
             except FileNotFoundError:
                 return OBSERVED_ABSENT
-        if stat.S_ISLNK(info.st_mode):
-            return self._observe_symlink(parent_fd, leaf)
-        if stat.S_ISDIR(info.st_mode):
-            if modeled is None:
-                raise ProtocolError(
-                    f"{leaf!r} is a directory; observing one requires its modeled child "
-                    "names, because occupancy evidence may not be fabricated"
-                )
-            return self._observe_directory(parent_fd, leaf, modeled)
-        if stat.S_ISREG(info.st_mode):
-            return self._observe_file(parent_fd, leaf, sink_fd)
-        raise PreconditionRefused(
-            f"{leaf!r} is neither a regular file, directory, nor symlink "
-            f"(st_mode {info.st_mode:#o}); no declared state can describe it"
-        )
+            except OSError as caught:
+                if caught.errno == errno.EACCES:
+                    return ObservedInaccessible()
+                raise
+        try:
+            if stat.S_ISLNK(info.st_mode):
+                return self._observe_symlink(parent_fd, leaf)
+            if stat.S_ISDIR(info.st_mode):
+                if modeled is None:
+                    raise ProtocolError(
+                        f"{leaf!r} is a directory; observing one requires its modeled child "
+                        "names, because occupancy evidence may not be fabricated"
+                    )
+                return self._observe_directory(parent_fd, leaf, modeled)
+            if stat.S_ISREG(info.st_mode):
+                return self._observe_file(parent_fd, leaf, sink_fd)
+            return ObservedUnrecognized(st_mode=info.st_mode)
+        except PreconditionRefused:
+            return ObservedContended()
+        except OSError as caught:
+            if caught.errno == errno.EACCES:
+                return ObservedInaccessible()
+            raise
 
     def pinned_descriptor(self, identity: EntryIdentity) -> int:
         """The retained descriptor for an observed identity. Borrowed, never closed."""
@@ -211,15 +222,44 @@ class Observation:
 
     def _observe_directory(
         self, parent_fd: int, leaf: str, modeled: frozenset[str]
-    ) -> ObservedDirectory:
-        identity, info = self._open_and_pin(
-            lambda: self._backend.open_child_directory(parent_fd, leaf),
-            leaf,
-            stat.S_ISDIR,
-            "a directory",
-        )
-        with translated_lookup(f"enumerating {leaf!r}"):
-            present = os.listdir(self._pins[identity])
+    ) -> ObservedDirectory | ObservedInaccessible:
+        try:
+            identity, info = self._open_and_pin(
+                lambda: self._backend.open_child_directory(parent_fd, leaf),
+                leaf,
+                stat.S_ISDIR,
+                "a directory",
+            )
+        except OSError as caught:
+            if caught.errno != errno.EACCES:
+                raise
+            try:
+                identity, info = self._open_and_pin(
+                    lambda: self._backend.open_directory_handle(parent_fd, leaf),
+                    leaf,
+                    stat.S_ISDIR,
+                    "a directory",
+                )
+            except OSError as fallback:
+                if fallback.errno == errno.EACCES:
+                    return ObservedInaccessible()
+                raise
+            return ObservedDirectory(
+                state=DirectoryState(mode=stat.S_IMODE(info.st_mode)),
+                identity=identity,
+                has_unmodeled_child=None,
+            )
+        try:
+            with translated_lookup(f"enumerating {leaf!r}"):
+                present = os.listdir(self._pins[identity])
+        except OSError as caught:
+            if caught.errno != errno.EACCES:
+                raise
+            return ObservedDirectory(
+                state=DirectoryState(mode=stat.S_IMODE(info.st_mode)),
+                identity=identity,
+                has_unmodeled_child=None,
+            )
         return ObservedDirectory(
             state=DirectoryState(mode=stat.S_IMODE(info.st_mode)),
             identity=identity,
@@ -227,8 +267,15 @@ class Observation:
         )
 
     def _observe_symlink(self, parent_fd: int, leaf: str) -> ObservedSymlink:
-        with translated_lookup(f"fingerprinting symlink {leaf!r}"):
-            info, target = self._backend.symlink_fingerprint(parent_fd, leaf)
+        try:
+            with translated_lookup(f"fingerprinting symlink {leaf!r}"):
+                info, target = self._backend.symlink_fingerprint(parent_fd, leaf)
+        except OSError as caught:
+            if caught.errno == errno.EINVAL:
+                raise PreconditionRefused(
+                    f"{leaf!r} stopped being a symlink during fingerprinting"
+                ) from caught
+            raise
         # No descriptor and no identity: O_NOFOLLOW fails by design on a symlink leaf,
         # so there is nothing to be coherent about (design §6.2).
         return ObservedSymlink(

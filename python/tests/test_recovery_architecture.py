@@ -93,7 +93,7 @@ def test_classifier_journal_and_variants_ignore_dependencies():
         assert accesses == [], source_path
 
 
-def test_authorization_does_not_import_the_classifier():
+def test_authorization_imports_only_the_shared_classifier_guard():
     source_path = (
         Path(__file__).parents[1]
         / "src"
@@ -102,10 +102,12 @@ def test_authorization_does_not_import_the_classifier():
         / "recovery"
         / "authorization.py"
     )
-    assert not _imports_classifier(
-        source_path.read_text(encoding="utf-8"),
-        package="atoms.core.recovery",
+    targets = _resolved_import_targets(
+        source_path.read_text(encoding="utf-8"), package="atoms.core.recovery"
     )
+    assert {
+        target for target in targets if target.startswith(_CLASSIFIER_MODULE)
+    } == {_CLASSIFIER_MODULE, f"{_CLASSIFIER_MODULE}._non_authorizable"}
 
 
 @pytest.mark.parametrize(

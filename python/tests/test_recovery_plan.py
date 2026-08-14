@@ -61,16 +61,16 @@ def test_action_plan_is_source_bound_frozen_and_factory_controlled():
     assert plan.bound_snapshot == snapshot
     with pytest.raises(FrozenInstanceError):
         plan.steps = ()  # type: ignore[misc]
-    with pytest.raises(TypeError, match="classify_recovery"):
+    with pytest.raises(TypeError, match="classification and authorization"):
         ActionPlan(
             bound_snapshot=snapshot,
             disposition=PlanDisposition.ROLL_BACK,
             steps=(),
             rollback_result=RollbackResult.RESTORED,
         )
-    with pytest.raises(TypeError, match="classify_recovery"):
+    with pytest.raises(TypeError, match="classification and authorization"):
         replace(plan)
-    with pytest.raises(TypeError, match="classify_recovery"):
+    with pytest.raises(TypeError, match="classification and authorization"):
         replace(plan, bound_snapshot=snapshot)
 
 
@@ -105,11 +105,11 @@ def test_no_recovery_plan_is_a_distinct_variant_and_factory_controlled():
     assert type(plan) is NoRecoveryPlan
     assert plan.disposition is PlanDisposition.NO_RECOVERY
     assert not isinstance(plan, (ActionPlan, HaltPlan))
-    with pytest.raises(TypeError, match="classify_recovery"):
+    with pytest.raises(TypeError, match="classification and authorization"):
         NoRecoveryPlan(bound_snapshot=snapshot)
-    with pytest.raises(TypeError, match="classify_recovery"):
+    with pytest.raises(TypeError, match="classification and authorization"):
         replace(plan)
-    with pytest.raises(TypeError, match="classify_recovery"):
+    with pytest.raises(TypeError, match="classification and authorization"):
         replace(plan, bound_snapshot=snapshot)
 
 
@@ -129,11 +129,11 @@ def test_halt_plan_is_factory_controlled_with_guarded_replace_paths():
     )
     assert plan.disposition is PlanDisposition.HALT
 
-    with pytest.raises(TypeError, match="classify_recovery"):
+    with pytest.raises(TypeError, match="classification and authorization"):
         HaltPlan(bound_snapshot=snapshot, diagnostic=diagnostic, steps=())
-    with pytest.raises(TypeError, match="classify_recovery"):
+    with pytest.raises(TypeError, match="classification and authorization"):
         replace(plan)
-    with pytest.raises(TypeError, match="classify_recovery"):
+    with pytest.raises(TypeError, match="classification and authorization"):
         replace(plan, bound_snapshot=snapshot)
 
 

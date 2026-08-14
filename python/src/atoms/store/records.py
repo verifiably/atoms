@@ -16,7 +16,6 @@ from atoms.core.fingerprint import (
     AbsentState,
     DirectoryState,
     FileState,
-    PathState,
     SymlinkState,
 )
 from atoms.core.identifiers import is_valid_identifier
@@ -30,9 +29,13 @@ from atoms.core.recovery.model import (
     HaltReason,
     IdentityRelation,
     JournalState,
+    ObservedContended,
+    ObservedInaccessible,
+    ObservedUnrecognized,
     OperatorAction,
     RollbackResult,
     TransactionState,
+    is_unrecognized_st_mode,
 )
 from atoms.core.spec import TransactionSpec
 from atoms.store.errors import MetadataStoreInvalid, translated
@@ -58,7 +61,13 @@ def _refuse(message: str) -> None:
     raise MetadataStoreInvalid(f"halt diagnostic payload is malformed: {message}")
 
 
-def _state_obj(state: PathState) -> dict[str, Any]:
+def _state_obj(state) -> dict[str, Any]:
+    if type(state) is ObservedUnrecognized:
+        return {"kind": "unrecognized", "st_mode": state.st_mode}
+    if type(state) is ObservedContended:
+        return {"kind": "contended"}
+    if type(state) is ObservedInaccessible:
+        return {"kind": "inaccessible"}
     if isinstance(state, AbsentState):
         return {"kind": "absent"}
     if isinstance(state, FileState):
@@ -201,7 +210,7 @@ def _sequence(obj: dict[str, Any], key: str) -> list[Any]:
     return value
 
 
-def _decode_state(obj: Any) -> PathState:
+def _decode_state(obj: Any):
     if not isinstance(obj, dict):
         _refuse("a path state must be an object")
     kind = obj.get("kind")
@@ -221,6 +230,18 @@ def _decode_state(obj: Any) -> PathState:
     if kind == "symlink":
         _require_keys(obj, {"kind", "target", "mode"})
         return SymlinkState(target=_text(obj, "target"), mode=_integer(obj, "mode"))
+    if kind == "unrecognized":
+        _require_keys(obj, {"kind", "st_mode"})
+        mode = _integer(obj, "st_mode")
+        if not is_unrecognized_st_mode(mode):
+            _refuse("st_mode is not a bounded unrecognized kernel entry kind")
+        return ObservedUnrecognized(mode)
+    if kind == "contended":
+        _require_keys(obj, {"kind"})
+        return ObservedContended()
+    if kind == "inaccessible":
+        _require_keys(obj, {"kind"})
+        return ObservedInaccessible()
     _refuse(f"{kind!r} is not a path-state kind")
     raise AssertionError("unreachable")
 

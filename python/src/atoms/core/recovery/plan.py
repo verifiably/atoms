@@ -46,7 +46,7 @@ class EffectVariant(Enum):
 class ParentOccupancy:
     parent: TopologyNode
     present_children: tuple[TopologyNode, ...]
-    has_unmodeled_child: bool
+    has_unmodeled_child: bool | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,7 +128,10 @@ class ActionPlan:
         _construction_token: object | None = None,
     ) -> None:
         if _construction_token is not _PLAN_TOKEN:
-            raise TypeError("RecoveryPlan values are created only by classify_recovery")
+            raise TypeError(
+                "RecoveryPlan values are issued only by the recovery model's "
+                "classification and authorization factories"
+            )
         object.__setattr__(self, "bound_snapshot", bound_snapshot)
         object.__setattr__(self, "disposition", disposition)
         object.__setattr__(self, "steps", steps)
@@ -151,7 +154,10 @@ class HaltPlan:
         _construction_token: object | None = None,
     ) -> None:
         if _construction_token is not _PLAN_TOKEN:
-            raise TypeError("RecoveryPlan values are created only by classify_recovery")
+            raise TypeError(
+                "RecoveryPlan values are issued only by the recovery model's "
+                "classification and authorization factories"
+            )
         object.__setattr__(self, "bound_snapshot", bound_snapshot)
         object.__setattr__(self, "disposition", PlanDisposition.HALT)
         object.__setattr__(self, "diagnostic", diagnostic)
@@ -171,7 +177,10 @@ class NoRecoveryPlan:
         _construction_token: object | None = None,
     ) -> None:
         if _construction_token is not _PLAN_TOKEN:
-            raise TypeError("RecoveryPlan values are created only by classify_recovery")
+            raise TypeError(
+                "RecoveryPlan values are issued only by the recovery model's "
+                "classification and authorization factories"
+            )
         object.__setattr__(self, "bound_snapshot", bound_snapshot)
         object.__setattr__(self, "disposition", PlanDisposition.NO_RECOVERY)
         object.__setattr__(self, "steps", ())

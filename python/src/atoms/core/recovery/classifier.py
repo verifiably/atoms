@@ -16,10 +16,13 @@ from atoms.core.recovery.model import (
     HaltReason,
     JournalState,
     ObservedAbsent,
+    ObservedContended,
     ObservedDirectory,
     ObservedEntry,
     ObservedFile,
+    ObservedInaccessible,
     ObservedSymlink,
+    ObservedUnrecognized,
     RollbackResult,
     ScratchRole,
     TransactionState,
@@ -54,6 +57,7 @@ from atoms.core.recovery.snapshot import (
 from atoms.core.recovery.variants import (
     EffectDecision,
     EffectDecisionKind,
+    _joint,
     classify_committed_cleanup,
     classify_effect,
 )
@@ -137,9 +141,36 @@ def classify_recovery(snapshot: RecoverySnapshot) -> RecoveryPlan:
     if authority.kind is not AuthorityKind.CLASSIFY:
         raise ProtocolError("transaction authority decision is outside the closed set")
 
+    for effect in snapshot.compiled.spec.effects:
+        observed = _joint(snapshot, effect)
+        if _non_authorizable(observed):
+            return _halt_plan(
+                snapshot,
+                HaltReason.EFFECT_TUPLE_UNATTRIBUTABLE,
+                effect.effect_id,
+                observed=observed,
+            )
+
     if snapshot.transaction_state is TransactionState.COMMITTED:
         return _committed_plan(snapshot)
     return _rollback_plan(snapshot)
+
+
+def _non_authorizable(observed: JointObservation) -> bool:
+    entries = (
+        *(item.entry for item in observed.persistent),
+        *(item.entry for item in observed.scratch),
+    )
+    return any(
+        type(entry) in {
+            ObservedUnrecognized,
+            ObservedContended,
+            ObservedInaccessible,
+        }
+        or type(entry) is ObservedDirectory
+        and entry.has_unmodeled_child is None
+        for entry in entries
+    )
 
 
 def _stable_halt_plan(source: RecoverySnapshot) -> RecoveryPlan:

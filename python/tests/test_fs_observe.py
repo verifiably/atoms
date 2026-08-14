@@ -16,6 +16,7 @@ from atoms.core.recovery.model import (
     ObservedDirectory,
     ObservedFile,
     ObservedSymlink,
+    ObservedUnrecognized,
 )
 from atoms.fs.linux import LinuxBackend
 from atoms.fs.observe import Observation, translated_lookup
@@ -163,16 +164,15 @@ def test_an_absent_name_is_observed_as_absent(project):
         assert type(observation.observe(fd, "missing")) is ObservedAbsent
 
 
-def test_a_kind_with_no_declarable_state_refuses(project):
-    """A socket, FIFO, or device node. No declared state can describe one."""
+def test_a_kind_with_no_declarable_state_is_observed(project):
     root, fd = project
     os.mkfifo(root / "pipe")
 
-    with (
-        Observation(LinuxBackend()) as observation,
-        pytest.raises(PreconditionRefused, match="neither"),
-    ):
-        observation.observe(fd, "pipe")
+    with Observation(LinuxBackend()) as observation:
+        entry = observation.observe(fd, "pipe")
+
+    assert type(entry) is ObservedUnrecognized
+    assert entry.st_mode == os.lstat(root / "pipe").st_mode
 
 
 def test_a_sink_receives_the_bytes_from_the_same_read(project):

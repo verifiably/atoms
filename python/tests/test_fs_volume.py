@@ -361,7 +361,7 @@ def test_build_configuration_carries_the_exact_kernel_and_backend_revision(mount
     configuration = build_configuration(entry, "7.1.5-arch1-1")
     # Not a major.minor truncation: one crash test must not certify a whole kernel line.
     assert configuration.kernel_identifier == "7.1.5-arch1-1"
-    assert configuration.backend_revision == "linux-3"
+    assert configuration.backend_revision == "linux-4"
 
 
 def test_build_configuration_refuses_an_unlisted_filesystem(mountinfo_text):

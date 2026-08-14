@@ -94,6 +94,7 @@ _CORE_IMPORT_ALLOWLIST = {
     "itertools",
     "json",
     "re",
+    "stat",
     "typing",
     "unicodedata",
 }
@@ -669,7 +670,7 @@ def test_the_backend_protocol_and_revision_are_exact():
     from atoms.fs.backend import Backend
     from atoms.fs.platform import BACKEND_REVISION
 
-    assert BACKEND_REVISION == "linux-3"
+    assert BACKEND_REVISION == "linux-4"
     assert {
         name
         for name, member in inspect.getmembers(Backend, inspect.isfunction)
@@ -686,6 +687,7 @@ def test_the_backend_protocol_and_revision_are_exact():
         "lock_exclusive",
         "mkdir_child",
         "open_child_directory",
+        "open_directory_handle",
         "open_existing",
         "open_regular_nofollow",
         "open_root",
@@ -1085,7 +1087,8 @@ def test_the_approved_spec_is_not_exported():
 _TRANSACTION_STAGE_ENTRY_POINTS = {
     "atoms/coordinator/capture.py": ("capture_initial_surface",),
     "atoms/coordinator/prepare.py": ("open_workspace", "prepare_transaction"),
-    "atoms/coordinator/transitions.py": ("persist_plan_prefix",),
+    "atoms/coordinator/transitions.py": ("persist_detach", "persist_plan_prefix"),
+    "atoms/coordinator/recover.py": ("run_plan",),
 }
 
 
@@ -1215,7 +1218,7 @@ def test_chain_commands_keep_the_lease_and_approval_proofs_private():
             for argument in function.args.args
         )
     }
-    assert lease_acceptors == {"_registered_root"}
+    assert lease_acceptors == set()
 
 
 def test_ledger_entry_nine_stays_open_against_the_stages_that_owe_it():

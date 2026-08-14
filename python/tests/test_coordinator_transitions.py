@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import sqlite3
-
 import pytest
 
 from atoms.core.errors import ProtocolError
@@ -31,8 +29,8 @@ def test_a_metadata_only_plan_detaches_only_after_settlement_binding(leased):
         approved, plan = prepared_metadata_only(lease)
         assert type(plan.steps[-1]) is DetachActive
 
-        with pytest.raises(sqlite3.IntegrityError, match="active delete requires"):
-            persist_plan_prefix(lease, approved, plan, 0)
+        cursor = persist_plan_prefix(lease, approved, plan, 0)
+        assert cursor == len(plan.steps) - 1
 
         record = lease._store.read_record(approved.txid)
         assert record is not None
@@ -42,9 +40,9 @@ def test_a_metadata_only_plan_detaches_only_after_settlement_binding(leased):
 
         with lease._store.transaction() as txn:
             txn.set_settlement_digest(approved.txid, "1" * 64)
-        assert persist_plan_prefix(
-            lease, approved, plan, len(plan.steps) - 1
-        ) == len(plan.steps)
+        from atoms.coordinator.transitions import persist_detach
+
+        assert persist_detach(lease, approved, plan, cursor) == len(plan.steps)
         assert lease._store.read_active() is None
 
 
@@ -77,6 +75,27 @@ def test_the_cursor_stops_at_a_transform(leased):
         assert type(plan.steps[cursor]) is TransformEffectTuple
 
 
+def test_detach_requires_the_settlement_binding(leased):
+    from atoms.coordinator.transitions import persist_detach, persist_plan_prefix
+
+    with leased() as lease:
+        approved, plan = prepared_metadata_only(lease)
+        cursor = persist_plan_prefix(lease, approved, plan, 0)
+
+        with pytest.raises(ProtocolError, match="settlement"):
+            persist_detach(lease, approved, plan, cursor)
+
+
+def test_detach_cursor_must_name_detach_active(leased):
+    from atoms.coordinator.transitions import persist_detach
+
+    with leased() as lease:
+        approved, plan = prepared_metadata_only(lease)
+
+        with pytest.raises(ProtocolError, match="does not name"):
+            persist_detach(lease, approved, plan, 0)
+
+
 def test_preserve_external_writes_nothing_durable(leased):
     from atoms.coordinator.transitions import _persist_one
 
@@ -97,8 +116,7 @@ def test_a_preserve_external_plan_still_reaches_its_terminal_state(leased):
     with leased() as lease:
         approved, plan = prepared_with_preserve_external(lease)
 
-        with pytest.raises(sqlite3.IntegrityError, match="active delete requires"):
-            persist_plan_prefix(lease, approved, plan, 0)
+        assert persist_plan_prefix(lease, approved, plan, 0) == len(plan.steps) - 1
 
         record = lease._store.read_record(approved.txid)
         assert record is not None
@@ -258,11 +276,12 @@ def test_no_active_record_refuses(leased):
 
     with leased() as lease:
         approved, plan = prepared_metadata_only(lease)
-        with pytest.raises(sqlite3.IntegrityError, match="active delete requires"):
-            persist_plan_prefix(lease, approved, plan, 0)
+        cursor = persist_plan_prefix(lease, approved, plan, 0)
         with lease._store.transaction() as txn:
             txn.set_settlement_digest(approved.txid, "2" * 64)
-        persist_plan_prefix(lease, approved, plan, len(plan.steps) - 1)
+        from atoms.coordinator.transitions import persist_detach
+
+        persist_detach(lease, approved, plan, cursor)
 
         with pytest.raises(ProtocolError) as caught:
             persist_plan_prefix(lease, approved, plan, 0)

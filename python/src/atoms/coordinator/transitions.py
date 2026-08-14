@@ -20,7 +20,7 @@ from atoms.core.recovery.reducer import reduce_recovery_plan_prefix
 from atoms.fs.approval import ProjectApprovedSpec
 from atoms.store.records import StoredRecord
 
-_MUTATING = (TransformEffectTuple, RemoveScratch)
+_STOP = (TransformEffectTuple, RemoveScratch, DetachActive)
 
 
 def persist_plan_prefix(
@@ -46,7 +46,7 @@ def persist_plan_prefix(
     cursor = start
     while cursor < len(plan.steps):
         step = plan.steps[cursor]
-        if type(step) in _MUTATING:
+        if type(step) in _STOP:
             return cursor
         _persist_one(lease, record.txid, step)
         cursor += 1
@@ -60,8 +60,8 @@ def _require_projection_matches(
     approved: ProjectApprovedSpec,
 ) -> None:
     """Compare every durable field with the plan prefix reduced to `start`."""
-    # Registration, settlement, approval evidence, and assembly halt are outside A3's
-    # transition projection. A7b decides whether this comparison must grow to include them.
+    # Chain bindings and assembly evidence are enforced at their owning seams; they are
+    # deliberately outside A3's transition projection.
     snapshot = plan.bound_snapshot
     if snapshot.compiled != approved.compiled:
         raise ProtocolError(
@@ -102,11 +102,6 @@ def _persist_one(lease: Lease, txid: str, step: RecoveryStep) -> None:
     if type(step) is PreserveExternal:
         return
 
-    if type(step) is DetachActive:
-        with lease._store.transaction() as txn:
-            txn.set_active(None)
-        return
-
     if type(step) is TransitionEffectState:
         with lease._store.transaction() as txn:
             txn.set_journal_state(txid, step.effect_id, step.to_state)
@@ -125,3 +120,25 @@ def _persist_one(lease: Lease, txid: str, step: RecoveryStep) -> None:
         f"step {type(step).__name__} is neither mutating nor persistable; the walk "
         "should have returned before reaching it"
     )
+
+
+def persist_detach(
+    lease: Lease,
+    approved: ProjectApprovedSpec,
+    plan: RecoveryPlan,
+    cursor: int,
+) -> int:
+    _require_admitted(lease, approved)
+    if type(cursor) is not int or not 0 <= cursor < len(plan.steps):
+        raise ProtocolError("detach cursor is outside the plan step range")
+    if type(plan.steps[cursor]) is not DetachActive:
+        raise ProtocolError("detach cursor does not name DetachActive")
+    record = lease._store.read_active()
+    if record is None or record.txid != approved.txid:
+        raise ProtocolError("the proof's transaction is not active")
+    _require_projection_matches(record, plan, cursor, approved)
+    if record.registration_digest is None or record.settlement_digest is None:
+        raise ProtocolError("detach requires registration and settlement bindings")
+    with lease._store.transaction() as txn:
+        txn.set_active(None)
+    return cursor + 1

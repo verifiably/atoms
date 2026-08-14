@@ -288,6 +288,13 @@ class AuditedBackend:
         self.register(fd, child_provenance)
         return fd
 
+    def open_directory_handle(self, parent_fd: int, name: str) -> int:
+        provenance = self.provenance_of(parent_fd)
+        path = _join(provenance, name)
+        fd = self._inner.open_directory_handle(parent_fd, name)
+        self.register(fd, Provenance(provenance.root, path))
+        return fd
+
     def exchange(self, parent_fd: int, left: str, right: str) -> None:
         provenance = self.provenance_of(parent_fd)
         targets = (

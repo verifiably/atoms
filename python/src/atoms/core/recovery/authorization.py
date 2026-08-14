@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import cast
 
 from atoms.core.errors import ProtocolError
+from atoms.core.recovery.classifier import _non_authorizable
 from atoms.core.recovery.diagnostics import (
     _diagnostic,
     _project_entries,
@@ -60,6 +61,13 @@ def authorize_recovery_step(
     )
     expected = step.expected_before
     _validate_joint_coverage(expected, observed)
+    if _non_authorizable(observed):
+        return _halt_for_observation(
+            prefix,
+            expected,
+            observed,
+            HaltReason.PLAN_PRECONDITION_CHANGED,
+        )
     if _authorization_projection(observed) == _authorization_projection(
         expected
     ):
@@ -80,6 +88,38 @@ def _precondition_changed_halt(
     expected: JointObservation,
     observed: JointObservation,
 ) -> HaltPlan:
+    return _halt_for_observation(
+        prefix, expected, observed, HaltReason.PLAN_PRECONDITION_CHANGED
+    )
+
+
+def _mutation_denied(
+    authorized: AuthorizedStep, observed: JointObservation
+) -> HaltPlan:
+    if type(authorized) is not AuthorizedStep:
+        raise ProtocolError("authorized must be an exact AuthorizedStep")
+    if type(observed) is not JointObservation:
+        raise ProtocolError("observed must be an exact JointObservation")
+    expected = authorized.step.expected_before
+    _validate_joint_coverage(expected, observed)
+    if _authorization_projection(observed) != _authorization_projection(expected):
+        raise ProtocolError("observed no longer authorizes the supplied step")
+    prefix = reduce_recovery_plan_prefix(
+        authorized.plan.bound_snapshot,
+        authorized.plan,
+        completed_steps=authorized.step_index,
+    )
+    return _halt_for_observation(
+        prefix, expected, observed, HaltReason.MUTATION_DENIED
+    )
+
+
+def _halt_for_observation(
+    prefix: RecoverySnapshot,
+    expected: JointObservation,
+    observed: JointObservation,
+    reason: HaltReason,
+) -> HaltPlan:
     normalized = _normalize_joint_observation(prefix, observed)
     persistent, scratch = _merge_joint_observation(prefix, normalized)
     conflicting_prefix = build_recovery_snapshot(
@@ -96,7 +136,7 @@ def _precondition_changed_halt(
     )
     diagnostic = _diagnostic(
         conflicting_prefix,
-        reason=HaltReason.PLAN_PRECONDITION_CHANGED,
+        reason=reason,
         expected=expected,
         observed=observed,
     )

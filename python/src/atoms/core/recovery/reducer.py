@@ -636,7 +636,7 @@ def _joint_keys(
         _validate_topology_node(item.parent)
         if type(item.present_children) is not tuple:
             raise ProtocolError("step present children must be an exact tuple")
-        if type(item.has_unmodeled_child) is not bool:
+        if item.has_unmodeled_child is not None and type(item.has_unmodeled_child) is not bool:
             raise ProtocolError("step parent occupancy flag must be an exact bool")
         for child in item.present_children:
             if type(child) not in _TOPOLOGY_NODE_TYPES:
@@ -878,6 +878,8 @@ def _current_directory_unmodeled_fact(
         raise ProtocolError(
             "current occupancy parent is absent or not an exact directory"
         )
+    if entry.has_unmodeled_child is None:
+        raise ProtocolError("current directory occupancy is unobservable")
     return entry.has_unmodeled_child
 
 

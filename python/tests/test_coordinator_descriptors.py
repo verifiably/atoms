@@ -8,7 +8,12 @@ import os
 import pytest
 
 from atoms.core.errors import PreconditionRefused, ProtocolError
-from atoms.core.recovery.model import ObservedAbsent, ObservedFile, ObservedSymlink
+from atoms.core.recovery.model import (
+    ObservedAbsent,
+    ObservedFile,
+    ObservedSymlink,
+    ObservedUnrecognized,
+)
 from atoms.core.recovery.snapshot import ProjectRoot, TopologyDirectory, WorkRoot
 from atoms.fs.linux import LinuxBackend
 from atoms.fs.observe import Observation
@@ -462,14 +467,13 @@ def test_a_fifo_blocker_is_not_reported_as_a_regular_file(leased):
         os.unlink("p", dir_fd=root_fd)
         os.mkfifo("p", 0o644, dir_fd=root_fd)
 
-        # The observer refuses a kind no declared state can describe, rather
-        # than inventing one from the errno.
         with (
             open_workspace(lease, approved) as workspace,
             Observation(LinuxBackend()) as observation,
-            pytest.raises(PreconditionRefused, match="neither"),
+            _table(lease, approved, workspace, observation) as table,
         ):
-            _table(lease, approved, workspace, observation)
+            (stop,) = [item for item in table.stops if item.component == "p"]
+            assert type(stop.observed) is ObservedUnrecognized
 
 
 def test_a_symlink_blocker_is_reported_as_a_symlink(leased):

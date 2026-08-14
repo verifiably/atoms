@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import stat
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -43,6 +44,7 @@ class HaltReason(Enum):
     DIRECTORY_NOT_EMPTY = "directory_not_empty"
     COMMITTED_SURFACE_MISMATCH = "committed_surface_mismatch"
     PLAN_PRECONDITION_CHANGED = "plan_precondition_changed"
+    MUTATION_DENIED = "mutation_denied"
 
 
 class ScratchRole(Enum):
@@ -99,10 +101,33 @@ class ObservedSymlink:
 class ObservedDirectory:
     state: DirectoryState
     identity: EntryIdentity
-    has_unmodeled_child: bool
+    has_unmodeled_child: bool | None
 
 
-ObservedEntry = ObservedAbsent | ObservedFile | ObservedSymlink | ObservedDirectory
+@dataclass(frozen=True, slots=True)
+class ObservedUnrecognized:
+    st_mode: int
+
+
+@dataclass(frozen=True, slots=True)
+class ObservedContended:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class ObservedInaccessible:
+    pass
+
+
+ObservedEntry = (
+    ObservedAbsent
+    | ObservedFile
+    | ObservedSymlink
+    | ObservedDirectory
+    | ObservedUnrecognized
+    | ObservedContended
+    | ObservedInaccessible
+)
 OBSERVED_ABSENT = ObservedAbsent()
 
 
@@ -129,9 +154,18 @@ class ScratchObservation:
 @dataclass(frozen=True, slots=True)
 class DiagnosticEntry:
     slot: str
-    state: PathState
+    state: PathState | ObservedUnrecognized | ObservedContended | ObservedInaccessible
     has_unmodeled_child: bool | None
     file_build_relation: FileBuildRelation | None
+
+
+def is_unrecognized_st_mode(value: object) -> bool:
+    return (
+        type(value) is int
+        and 0 <= value <= 0o177777
+        and stat.S_IFMT(value)
+        in {stat.S_IFIFO, stat.S_IFSOCK, stat.S_IFBLK, stat.S_IFCHR}
+    )
 
 
 @dataclass(frozen=True, slots=True)

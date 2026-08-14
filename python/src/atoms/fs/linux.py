@@ -10,6 +10,7 @@ from collections.abc import Callable
 from atoms.fs.syscalls import linux as sys_linux
 
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+_DIR_HANDLE_FLAGS = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
 def _c_string_path(value: str) -> bytes:
@@ -113,6 +114,17 @@ class LinuxBackend:
             parent_fd,
             _c_string_path(name),
             _DIR_FLAGS,
+            0,
+            sys_linux.RESOLVE_BENEATH
+            | sys_linux.RESOLVE_NO_SYMLINKS
+            | sys_linux.RESOLVE_NO_XDEV,
+        )
+
+    def open_directory_handle(self, parent_fd: int, name: str) -> int:
+        return sys_linux.openat2(
+            parent_fd,
+            _c_string_path(name),
+            _DIR_HANDLE_FLAGS,
             0,
             sys_linux.RESOLVE_BENEATH
             | sys_linux.RESOLVE_NO_SYMLINKS

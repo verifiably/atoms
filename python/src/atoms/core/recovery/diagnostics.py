@@ -11,10 +11,13 @@ from atoms.core.recovery.model import (
     HaltReason,
     IdentityRelation,
     ObservedAbsent,
+    ObservedContended,
     ObservedDirectory,
     ObservedEntry,
     ObservedFile,
+    ObservedInaccessible,
     ObservedSymlink,
+    ObservedUnrecognized,
     OperatorAction,
     PersistentObservation,
     ScratchObservation,
@@ -37,7 +40,11 @@ def _scratch_slot(effect_id: str, role: ScratchRole) -> str:
 
 def _entry_fields(
     entry: ObservedEntry,
-) -> tuple[PathState, bool | None, EntryIdentity | None]:
+) -> tuple[
+    PathState | ObservedUnrecognized | ObservedContended | ObservedInaccessible,
+    bool | None,
+    EntryIdentity | None,
+]:
     if type(entry) is ObservedAbsent:
         return ABSENT, None, None
     if type(entry) is ObservedFile:
@@ -46,6 +53,12 @@ def _entry_fields(
         return entry.state, None, None
     if type(entry) is ObservedDirectory:
         return entry.state, entry.has_unmodeled_child, entry.identity
+    if type(entry) is ObservedUnrecognized:
+        return entry, None, None
+    if type(entry) is ObservedContended:
+        return entry, None, None
+    if type(entry) is ObservedInaccessible:
+        return entry, None, None
     raise ProtocolError("diagnostic observation entry has the wrong exact runtime type")
 
 
@@ -124,7 +137,7 @@ def _validate_parent_occupancy(
             )
         for child in item.present_children:
             _validate_topology_node(child)
-        if type(item.has_unmodeled_child) is not bool:
+        if item.has_unmodeled_child is not None and type(item.has_unmodeled_child) is not bool:
             raise ProtocolError(
                 "diagnostic parent occupancy flag must be an exact bool"
             )
