@@ -274,9 +274,13 @@ git commit -m "test(exerciser): scenario model and the five minimal variant scen
   family `"rollback"`), `drift-blocker` (a `DeletePath` scenario whose `drift` plants a foreign
   file at the target between seed and run, family `"rollback"`), `refusal-capability`
   (family `"refusal"`, driven only by Task 2's refusal test, never by the matrix).
-- Produces: `run_caught(entry, ingredients, monkeypatch) -> TransactionOutcome` — like
-  `run_clean` but patches `atoms.coordinator.execute.<inject_failure>.apply` to raise after
-  `PREPARED`, following `test_coordinator_conformance.py:110`'s idiom.
+- Produces: `run_caught(entry, ingredients, monkeypatch) -> dict` — like `run_clean` but
+  patches `atoms.coordinator.execute.<inject_failure>.apply` to raise after `PREPARED`,
+  following `test_coordinator_conformance.py:110`'s idiom. **Caught-rollback semantics are
+  preserved (erratum 1): rollback durably completes, then the injected exception propagates to
+  the caller** — so `run_caught` captures the expected exception and returns the canonical
+  durable projection (the `_durable_projection` shape read through a fresh binding), never a
+  synthesized `TransactionOutcome`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -290,12 +294,14 @@ def test_compound_scenarios_commit_clean(exerciser_run):
         assert outcome.outcome.name == "COMMITTED"
 
 
-def test_caught_rollback_rolls_back(coordinator_on, monkeypatch):
+def test_caught_rollback_completes_durably_then_propagates(coordinator_on, monkeypatch):
+    """Erratum 1: rollback lands durably; the injected exception reaches the caller."""
     from tests.exerciser import scenario
 
     ingredients = coordinator_on()
-    outcome = run_caught(scenario("caught-rollback"), ingredients, monkeypatch)
-    assert outcome.outcome.name == "ROLLED_BACK"
+    projection = run_caught(scenario("caught-rollback"), ingredients, monkeypatch)
+    assert projection["state"] == "ROLLED_BACK"
+    assert projection["active"] is False
 
 
 def test_capability_refusal_precedes_metadata_and_mutation(coordinator_on, monkeypatch):
@@ -380,7 +386,11 @@ def run_caught(entry: Scenario, ingredients, monkeypatch):
         raise OSError("exerciser-injected failure")
 
     monkeypatch.setattr(module, "apply", failing)
-    ...  # run_transaction; the engine catches, rolls back, returns ROLLED_BACK
+    # run_transaction: the engine rolls back durably, then the injected OSError
+    # propagates (erratum 1). Catch exactly it, assert calls["n"] > 0, then read
+    # and return the canonical durable projection through a fresh binding
+    # (_durable_projection's body, as a dict with keys state/committed/
+    # rollback_result/halt_diagnostic/journals/active).
 
 
 def run_refused(entry: Scenario, ingredients, monkeypatch):
@@ -766,10 +776,12 @@ git commit -m "test(cut-model): durable-state derivation, reconstruction, fideli
 - Modify: `python/tests/test_persistence_model.py`
 
 **Interfaces:**
-- Produces: `enumerate_cells(stream, *, pending_cap: int = 12) -> Iterator[Cell]` where
+- Produces: `enumerate_cells(stream, *, pending_cap: int = 12) ->
+  tuple[tuple[Cell, ...], SweepAccounting]` (erratum 2 — a materialized pair, not an iterator)
+  where
   `Cell(cut: int, survivors: frozenset[UnitKey], state: WorldState)`; deduplicates identical
   `(state digest, backup_id)` worlds; raises `PendingCapExceeded` (loud, never sampling) past
-  the cap; returns alongside a `SweepAccounting(cells: int, deduped: int,
+  the cap; the accounting half is `SweepAccounting(cells: int, deduped: int,
   skips: dict[str, int])`.
 - Produces: `named_tuples(stream) -> dict[str, Cell]` — locates `dual-name-forward`,
   `anchor-only-forward` in a move scenario's stream (and the reverse pair in a caught-rollback
@@ -955,7 +967,8 @@ def test_compound_scenarios_sweep_clean(cut_matrix):
     for name in ("corpus-write", "archive-move", "caught-rollback", "caught-rollback-move"):
         report = cut_matrix(name, caught=name.startswith("caught"))
         assert report.disagreements == ()
-        assert report.named_tuple_cells_ran > 0
+        if name in ("archive-move", "caught-rollback-move"):  # erratum 3: move-bearing only
+            assert report.named_tuple_cells_ran > 0
 
 
 def test_drift_cells_preserve_external_blockers(cut_matrix):
@@ -1004,7 +1017,10 @@ def test_sigkill_arm_covers_the_compound_scenarios(exerciser_kill_matrix):
 ```
 
 and after the outcome, when `config.get("projection")`, print the projection dict read through a
-fresh `bind_project_volume`/`open_store` (copy `_durable_projection`'s body). The sweep's
+fresh `bind_project_volume`/`open_store` (copy `_durable_projection`'s body). For a caught
+scenario the child applies erratum 1: it patches the failing `apply`, catches exactly the
+injected exception after the durable rollback, and still prints the projection — it never
+synthesizes an outcome. The sweep's
 `subprocess_subset` selection is **declared, not sampled** (design §8): the subset rule is stated
 in `run_cell`'s docstring and its size asserted nonzero per scenario.
 
@@ -1078,13 +1094,15 @@ def test_same_inode_work_survivor_is_landed_not_blocker(ext4_volume, coordinator
 - [ ] **Step 2: Run to verify failure.**
 
 - [ ] **Step 3: Implement the injection.** The seam: `atoms.fs.observe.Observation` mints
-identity tokens at `_pin` (`fs/observe.py:302`). Patch at the *recovery assembly* level instead —
-`coordinator/recover.py`'s observation collection — replacing the two observations' identity
-values for the live directory and the work survivor with one shared token after observation and
-before classification (a `monkeypatch.setattr` wrapper around `recover`'s snapshot-building
-function; probe `build_recovery_snapshot`'s call site in `recover.py` around `:605-700` and wrap
-the function it calls with a post-processor). The directed test asserts the wrapper actually
-fired (a call counter), so the test cannot pass vacuously if the seam moves.
+identity tokens at `_pin` (`fs/observe.py:302`). Patch at the *recovery observation* level —
+`coordinator/recover.py` — and cover **both** observation routes (erratum 4): the initial
+classification observations (`_observe_snapshot`) **and** the fresh per-step authorization
+observations (`_observe_for_step`); probe both names around `recover.py:605-800` and wrap each
+with a post-processor that replaces the live directory's and the work survivor's identity values
+with one shared token. Injecting only classification would let authorization observe the true
+distinct identities and halt on plan-step mismatch — the exact false-blocker misreading this
+test exists to exclude. The directed test asserts **each** wrapper fired (two call counters), so
+the test cannot pass vacuously if either seam moves.
 
 - [ ] **Step 4: Run and pass**, full gates.
 
