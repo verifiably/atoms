@@ -21,6 +21,17 @@ effect-counted schedule (`tests/test_coordinator_kill_matrix.py`'s `STORE_BARRIE
 hardcode nine names because every kill-matrix variant is single-effect; the exerciser's
 `corpus-write` and `archive-move` scenarios are not, so this file derives the label from
 the write that happened rather than from a position).
+
+Two known bounds of the Task-6 runner in this module, both deliberate and both cheap to
+lift if a later task needs them:
+
+- `realign_durable_identities` counts an `lstat` hit as a rewritten identity even when
+  the reconstructed object is not a directory, so its return value is an upper bound on
+  "directories realigned", not an exact count. It is used as evidence the step ran, never
+  as an assertion target.
+- `_inspect` projects the **last** `transaction_record` row only. Every exerciser
+  scenario records exactly one transaction, so the last row is the transaction; a future
+  multi-transaction scenario would need the projection widened to a per-txid mapping.
 """
 
 from __future__ import annotations
@@ -31,6 +42,7 @@ import hashlib
 import itertools
 import json
 import os
+import shutil
 import sqlite3
 import stat
 import time
@@ -39,6 +51,7 @@ from pathlib import Path
 from typing import NewType, cast
 
 DB_FAMILY = ("atoms.db", "atoms.db-wal", "atoms.db-shm", "atoms.db-journal")
+LOCK_LEAF = "lock"  # `acquire_project_lock`'s metadata_root child (`fs/lock.py:217`)
 
 UnitKey = NewType("UnitKey", tuple)
 
@@ -57,6 +70,12 @@ class ModelInode:
 
 @dataclass(frozen=True)
 class Unit:
+    """One durability unit. `payload` carries the data image for an `image` unit and the
+    mode/xattr value for a `mode`/`xattr` unit. A *creation's* mode is not a unit at all
+    (design §4.1 as amended 2026-08-15) -- it rides with the typed model inode, in
+    `Stream.creation_modes`.
+    """
+
     key: tuple
     change: str  # "insert" | "remove" | "replace" | "image" | "mode" | "xattr"
     object_token: int | None = None
@@ -112,6 +131,15 @@ class Stream:
         self.identity: dict[tuple[int, int], int] = {}
         self.identity_reverse: dict[int, tuple[int, int]] = {}
         self.inodes: dict[int, ModelInode] = {}
+        # The mode each recorded object was CREATED with (design §4.1 as amended
+        # 2026-08-15: creation-time mode is atomic with inode creation). It is a
+        # property of the model inode, not a durability unit, so keyed replacement --
+        # a rename's `remove` superseding the pending creating `insert` at the same
+        # entry key -- cannot lose it, and a survivor subset can never reconstruct an
+        # object at a mode it was never created with. Only a later `set_mode`/
+        # `repair_entry_mode` *change* emits a `("meta", token, "mode")` unit, which
+        # tears independently and overrides this fallback wherever it applies.
+        self.creation_modes: dict[int, int] = {}
         self.entries: dict[tuple[int, str], int] = {}
         self.images: dict[int, bytearray] = {}
 
@@ -372,7 +400,11 @@ class RecordingCutBackend:
         stream.fd_token.pop(fd, None)
         stream.fd_offset.pop(fd, None)
 
-    # --- creation: mint a token, register the entry, emit insert(+mode) ------------
+    # --- creation: mint a token, register the entry, emit ONE insert carrying the
+    # creation mode (design §4.1 as amended 2026-08-15 -- a create journals its inode
+    # with its entry, so the mode cannot tear away beneath a durable entry; only a
+    # later `set_mode`/`repair_entry_mode` change emits an independently tearing
+    # `meta` unit) ----------------------------------------------------------------
     def create_exclusive(self, parent_fd: int, name: str, mode: int) -> int:
         stream = self._stream
         parent = stream.fd_token[parent_fd]
@@ -381,10 +413,8 @@ class RecordingCutBackend:
         stream.entries[(parent, name)] = token
         stream.fd_token[fd] = token
         stream.fd_offset[fd] = 0
-        self._emit_mutation(
-            Unit(("entry", parent, name), "insert", token),
-            Unit(("meta", token, "mode"), "mode", token, mode),
-        )
+        stream.creation_modes.setdefault(token, mode)
+        self._emit_mutation(Unit(("entry", parent, name), "insert", token))
         return fd
 
     def create_or_open(self, parent_fd: int, name: str, mode: int) -> int:
@@ -401,10 +431,8 @@ class RecordingCutBackend:
         stream.fd_offset[fd] = 0
         if not existed:
             stream.entries[(parent, name)] = token
-            self._emit_mutation(
-                Unit(("entry", parent, name), "insert", token),
-                Unit(("meta", token, "mode"), "mode", token, mode),
-            )
+            stream.creation_modes.setdefault(token, mode)
+            self._emit_mutation(Unit(("entry", parent, name), "insert", token))
         return fd
 
     def mkdir_child(self, parent_fd: int, name: str, mode: int) -> None:
@@ -413,10 +441,8 @@ class RecordingCutBackend:
         self._inner.mkdir_child(parent_fd, name, mode)
         token = self._register_identity(os.lstat(name, dir_fd=parent_fd))
         stream.entries[(parent, name)] = token
-        self._emit_mutation(
-            Unit(("entry", parent, name), "insert", token),
-            Unit(("meta", token, "mode"), "mode", token, mode),
-        )
+        stream.creation_modes.setdefault(token, mode)
+        self._emit_mutation(Unit(("entry", parent, name), "insert", token))
 
     def symlink_child(self, parent_fd: int, name: str, target: str) -> None:
         stream = self._stream
@@ -963,10 +989,13 @@ def _materialize_tree(
     tree: WorldTree = {}
     token_paths: dict[int, list[str]] = {}
 
+    def mode_of(token: int) -> int:
+        return modes.get(token, stream.creation_modes.get(token, 0))
+
     def walk(token: int, path: str) -> None:
         inode = stream.inodes[token]
         if inode.kind == "directory":
-            tree[path] = ("dir", modes.get(token, 0))
+            tree[path] = ("dir", mode_of(token))
             for name, child in sorted(by_parent.get(token, ())):
                 walk(child, f"{path}/{name}")
         elif inode.kind == "symlink":
@@ -980,7 +1009,7 @@ def _materialize_tree(
 
     for token, paths in token_paths.items():
         content = images.get(token, b"")
-        mode = modes.get(token, 0)
+        mode = mode_of(token)
         if len(paths) > 1:
             for path in paths:
                 tree[path] = ("file", content, mode, ("link-group", token))
@@ -1412,16 +1441,41 @@ def named_tuples(stream: Stream) -> dict[str, Cell]:
     except KeyError:
         boundary = len(stream.events)
 
+    # An anchor insert is a single-unit entry `insert` that leaves its token with a
+    # SECOND live name -- `index_after`'s discriminator, applied here too. Shape alone
+    # is not enough since design §4.1's creation-mode ruling made a creation a
+    # single-unit entry insert as well (it used to carry a paired `meta mode` unit, and
+    # a two-unit event was excluded from this scan for free): without the second-name
+    # test, every `create_exclusive`/`mkdir_child` token would register as an anchor,
+    # and every work->live publication transfer would then match the tuple shape --
+    # measured, `minimal-create` grew a spurious `anchor-only-forward`.
     anchor_tokens: set[int] = set()
+    live: dict[tuple[int, str], int] = dict(stream.seed_entries)
+    names: dict[int, set[tuple[int, str]]] = {}
+    for entry_key, token in live.items():
+        names.setdefault(token, set()).add(entry_key)
     for event in stream.events:
-        if type(event) is not Mutation or len(event.units) != 1:
+        if type(event) is not Mutation:
+            continue
+        for unit in event.units:
+            if unit.key[0] != "entry":
+                continue
+            entry_key = (unit.key[1], unit.key[2])
+            displaced = live.pop(entry_key, None)
+            if displaced is not None:
+                names[displaced].discard(entry_key)
+            if unit.change in ("insert", "replace") and unit.object_token is not None:
+                live[entry_key] = unit.object_token
+                names.setdefault(unit.object_token, set()).add(entry_key)
+        if len(event.units) != 1:
             continue
         unit = event.units[0]
         if unit.key[0] != "entry" or unit.change != "insert" or unit.object_token is None:
             continue
         if unit.key[1] in probe_tokens:
             continue
-        anchor_tokens.add(unit.object_token)
+        if len(names.get(unit.object_token, ())) > 1:
+            anchor_tokens.add(unit.object_token)
 
     result: dict[str, Cell] = {}
     for index, event in enumerate(stream.events):
@@ -1470,17 +1524,21 @@ def complete_named_cell(cell: Cell, stream: Stream) -> Cell:
     *entry* key, so every other pending key at that cut is dropped. Design §9.4 defines
     those tuples purely by which **names** are live -- dual-name keeps the transfer's
     insert, anchor-only keeps its remove -- and says nothing about the modes and byte
-    images of unrelated objects. Dropping every pending `meta mode` unit does say
-    something, though: it reconstructs each affected object at mode `0`, and the engine
-    then refuses the lease on an inaccessible leaf instead of performing the repair the
-    directed test exists to observe (measured: both `minimal-move` tuples at cut 69
-    refused on a mode-`0` `metadata/work/<txid>` before this completion).
+    images of unrelated objects, which the bare cell would silently drop along with
+    everything else: unwritten file content, and every pending mode *change*.
 
     So the entry topology is left exactly as the tuple names it -- no other `entry` key
     is ever folded in, since that is precisely what distinguishes the two tuples -- and
     every non-`entry` pending key, plus the probe-noise keys `enumerate_cells` folds
     anyway, is offered to the same `_fold` pass the sweep uses. Two survivor
     vocabularies, one physical cell, one applicability engine.
+
+    History worth keeping: before design §4.1's creation-mode ruling (2026-08-15) a
+    dropped *creation* mode unit reconstructed its object at mode `0`, and both
+    `minimal-move` tuples then refused the lease on an inaccessible
+    `metadata/work/<txid>` instead of performing the repair their directed tests exist
+    to observe. The ruling removed that failure mode at the source; this completion is
+    still required for the tears that remain.
     """
     probe_tokens, token_parents = _probe_classification(stream)
     positioned = _pending_with_positions(stream, cell.cut)
@@ -1627,6 +1685,8 @@ def realign_durable_identities(project_root: Path, metadata_root: Path) -> int:
     Returns the number of identities rewritten, so a caller can assert the step was not
     a silent no-op.
     """
+    from atoms.fs.bootstrap import WORK_DIRECTORY
+
     db_path = Path(metadata_root) / "atoms.db"
     if not db_path.exists():
         return 0
@@ -1655,11 +1715,24 @@ def realign_durable_identities(project_root: Path, metadata_root: Path) -> int:
     connection = sqlite3.connect(db_path)
     try:
         rows = connection.execute(
-            "SELECT txid, approval_evidence FROM transaction_record"
+            "SELECT txid, approval_evidence, assembly_halt FROM transaction_record"
         ).fetchall()
-        for txid, evidence in rows:
+        for txid, evidence, stored_halt in rows:
+            # `require_assembly_halt_binding` (`store/records.py:456`) demands
+            # `halt.expected == record.approval_evidence`, so rewriting the evidence
+            # under a stored halt would break that binding and surface as a
+            # `ProtocolError` from deep inside recovery -- read as an engine bug, not as
+            # the model's doing. Failing loud here is preferred over silently rewriting
+            # `halt.expected` too: no exerciser scenario records a durable assembly halt
+            # (measured: none, before or after the creation-mode ruling), and a future
+            # sabotage arm that deliberately plants one must be *seen* by the model
+            # rather than quietly repaired by it.
+            assert stored_halt is None, (
+                f"transaction_record {txid} carries a durable assembly halt; realigning "
+                "its approval evidence would break the halt binding"
+            )
             document = json.loads(evidence)
-            work_base = Path(metadata_root) / "work"
+            work_base = Path(metadata_root) / WORK_DIRECTORY
             work_root = document["work_root"]
             if work_root is not None:
                 found = identity_of(work_base)
@@ -1986,11 +2059,21 @@ def _model_projection(snapshot, plan) -> tuple:
 class _Refused(Exception):
     """A lease entry the reconstructed world's own durable modes made impossible.
 
-    Design §4.3 branches an entry unit independently of its paired `meta mode` unit, so
-    the survivor product contains worlds holding a mode-`0` workspace, chain-staging
-    file, or effect-scratch file. The engine meets those with an access refusal
-    (`PermissionError`, or a typed `ChainStateInvalid`/`MetadataStoreInvalid` naming the
-    unreadable leaf) rather than a recovery plan, and never reaches `classify_recovery`.
+    A reconstructed world can hold an object whose durable mode denies the engine the
+    access it needs -- a mode-`0` workspace, chain-staging file, or effect-scratch file.
+    The engine meets those with an access refusal (`PermissionError`, or a typed
+    `ChainStateInvalid`/`MetadataStoreInvalid` naming the unreadable leaf) rather than a
+    recovery plan, and never reaches `classify_recovery`.
+
+    **Post-ruling scope (2026-08-15).** This used to be ~48% of every sweep, because a
+    creation's mode was an independently tearing unit and half the product dropped it.
+    Design §4.1's creation-mode ruling deleted that class outright, and the bucket now
+    measures **0 on every minimal scenario**. What can still reach it is a mode *change*
+    to a denying mode (`set_mode`/`repair_entry_mode` are the only remaining sources) --
+    which no current scenario performs. The machinery is kept rather than deleted
+    because it is the guard that turns such a world into an explicit, explained outcome
+    instead of a raw traceback out of a sweep; if `refused_cells` starts counting again,
+    a mode-changing scenario (or a regression) is what put it there.
     Such a cell still carries a real obligation -- the refusal must be deterministic and
     must not mutate the world further -- which is what `run_cell` asserts for it. A
     refusal that NO inaccessible object in the reconstructed world explains is a
@@ -2057,10 +2140,17 @@ def _engine_owned(rel: str) -> bool:
     every unindexed blob at every entry), and any reserved scratch leaf. What is left is
     the *external* world -- the state design §5 requires recovery to preserve."""
     from atoms.core.scratch import is_engine_reserved_leaf
+    from atoms.fs.bootstrap import PROBE_DIRECTORY
+    from atoms.store.blobs import BLOBS_DIRECTORY
+    from atoms.store.workspace import STAGING_PARENT, WORK_PARENT
 
-    if rel.startswith(
-        ("metadata/probe", "metadata/staging", "metadata/work", "metadata/blobs")
-    ):
+    # The metadata root's own furniture: the layout directories every lease entry
+    # (re)creates and verifies (`ensure_metadata_layout`), and the lock file
+    # `acquire_project_lock` opens or creates (`fs/lock.py:217`). A lease entered over a
+    # world that predates them creates them -- correctly -- so they are engine-owned in
+    # both directions of the external-state comparison, never "spurious external state".
+    owned = (PROBE_DIRECTORY, STAGING_PARENT, WORK_PARENT, BLOBS_DIRECTORY, LOCK_LEAF)
+    if rel.startswith(tuple(f"metadata/{name}" for name in owned)):
         return True
     return any(is_engine_reserved_leaf(part) for part in rel.split("/")[1:])
 
@@ -2088,24 +2178,67 @@ def _occupied_slots(tree: WorldTree) -> tuple[str, ...]:
     row forever. What design §5 requires is that the slots are *empty* -- every staged
     blob promoted or dropped, every work-slot scratch published or removed.
     """
+    from atoms.store.workspace import STAGING_PARENT, WORK_PARENT
+
+    slots = (f"metadata/{STAGING_PARENT}/", f"metadata/{WORK_PARENT}/")
     return tuple(
-        rel
-        for rel in sorted(tree)
-        if rel.startswith(("metadata/staging/", "metadata/work/"))
-        and rel.count("/") > 2
+        rel for rel in sorted(tree) if rel.startswith(slots) and rel.count("/") > 2
     )
 
 
-def _preserved_external(before: WorldTree, after: WorldTree) -> tuple[str, ...]:
-    """Paths of `before`'s external (non-engine-owned) state that recovery did not
-    preserve. Used for the no-record cells, whose whole obligation is that recovery
-    reclaims engine scratch and touches nothing else."""
+def _external_differences(before: WorldTree, after: WorldTree) -> tuple[str, ...]:
+    """Every way `after`'s external (non-engine-owned) state differs from `before`'s --
+    in **both** directions.
+
+    Used for the no-record cells, whose whole obligation is that recovery reclaims
+    engine scratch and touches nothing else. One direction is not enough: a recovery
+    that faithfully preserved every prior path while *creating* a spurious one (an
+    un-reclaimed staged file promoted into the project, a restored tombstone) would pass
+    a survivors-only check while having invented external state out of a world with no
+    durable record to authorize it.
+    """
     left, right = _normalized_tree(before), _normalized_tree(after)
-    return tuple(
-        rel
+    lost = [
+        f"lost {rel}"
         for rel, value in sorted(left.items())
         if not _engine_owned(rel) and right.get(rel) != value
-    )
+    ]
+    created = [
+        f"created {rel}"
+        for rel in sorted(right)
+        if not _engine_owned(rel) and rel not in left
+    ]
+    return tuple(lost + created)
+
+
+def cell_roots(ext4_volume: Path, slot: str) -> tuple[Path, Path]:
+    """The roots `run_cell(slot=...)` reconstructs into, named here rather than spelled
+    twice: a caller that passes `retain=True` needs to find them afterwards."""
+    return Path(ext4_volume) / f"{slot}-project", Path(ext4_volume) / f"{slot}-metadata"
+
+
+def _discard_roots(*roots: Path) -> None:
+    """Remove a finished cell's reconstructed trees.
+
+    Task 7's compound sweeps run ~700 cells; keeping every cell's two trees would leave
+    ~1,400 of them (each with its own `atoms.db`) in one temporary volume for the whole
+    session. Everything the sweep asserts on is already in memory by the time this runs:
+    the projections, the `world` tree, and the digests.
+
+    A durable mode can still deny the walk `rmtree` needs -- rarer since design §4.1's
+    creation-mode ruling, but a `set_mode` change to `0` is still representable -- so a
+    permission failure retries once with every directory opened up. Cleanup never fails
+    a cell: the assertions are complete before it is called.
+    """
+    for root in roots:
+        try:
+            shutil.rmtree(root)
+        except PermissionError:
+            for parent, directories, _files in os.walk(root):
+                for name in directories:
+                    with contextlib.suppress(OSError):
+                        os.chmod(os.path.join(parent, name), 0o700)
+            shutil.rmtree(root, ignore_errors=True)
 
 
 def run_cell(
@@ -2118,6 +2251,7 @@ def run_cell(
     slot: str,
     allowlist,
     drift=None,
+    retain: bool = False,
 ) -> CellResult:
     """Reconstruct one cell, recover it through the real composition path, and judge it
     against A3 (design §5).
@@ -2148,6 +2282,10 @@ def run_cell(
     leave the world byte-identical, and an unexplained refusal is a side-assertion
     failure.
 
+    The reconstructed roots are removed on the way out unless `retain=True`, which a
+    caller that wants to inspect the finished world through the store itself (the
+    directed absent-directory test) passes.
+
     `named_tuples`' cells arrive here too, from the other survivor vocabulary
     (`apply_survivors` on a bare chosen key, rather than `enumerate_cells`' folded set).
     Nothing below reads `cell.survivors` -- a `Cell` is a `Cell` -- so both run
@@ -2155,8 +2293,7 @@ def run_cell(
     """
     from atoms.core.recovery import HaltPlan, TransactionState
 
-    project_root = ext4_volume / f"{slot}-project"
-    metadata_root = ext4_volume / f"{slot}-metadata"
+    project_root, metadata_root = cell_roots(ext4_volume, slot)
     project_root.mkdir()
     metadata_root.mkdir()
     reconstruct(cell.state, project_root, metadata_root)
@@ -2168,6 +2305,7 @@ def run_cell(
         "assembly_halted": 0,
         "refused": 0,
         "no_record": 0,
+        "settled": 0,
         "drifted": 0,
         "drift_preserved": 0,
     }
@@ -2178,10 +2316,12 @@ def run_cell(
         # drifted at all -- `_drift_delete_target` writes into `d/`, which several cells
         # legitimately do not have. That is a property of the cell, not a failure: the
         # drift family's obligation ("the external blocker survives recovery") is over
-        # the cells that could carry a blocker, counted in `drift_preserved`.
+        # the cells that could carry a blocker, counted in `drift_preserved`. Only the
+        # missing-target errnos are absorbed; any other failure inside a drift callable
+        # is a bug in the callable and propagates.
         try:
             drift(Path(project_root))
-        except OSError:
+        except (FileNotFoundError, NotADirectoryError):
             counts["drifted"] = 0
         else:
             counts["drifted"] = 1
@@ -2231,6 +2371,8 @@ def run_cell(
             if second == refusal and world_digest(project_root, metadata_root) == digest
             else f"first pass refused {refusal!r}; second pass gave {second!r}"
         )
+        if not retain:
+            _discard_roots(project_root, metadata_root)
         return CellResult(
             agrees=True,
             halted=False,
@@ -2241,6 +2383,11 @@ def run_cell(
             second_pass_violation=violation,
             side_assertion_failures=tuple(failures),
         )
+
+    # `recover.resolve` classifies exactly once per resolution (`recover.py:712`), so a
+    # second capture would mean the lease resolved twice inside one entry -- the spy is
+    # the only place that could ever notice.
+    assert len(captured) <= 1, f"classify_recovery ran {len(captured)} times in one entry"
 
     facts = _inspect(project_root, metadata_root, storage, allowlist)
     projection = facts["projection"]
@@ -2254,13 +2401,30 @@ def run_cell(
         ):
             failures.append("a halt was raised without a durable halt record")
 
+    if projection is not None and not captured and not halted:
+        # The fifth outcome: a durable record `resolve` had nothing to classify, because
+        # it was already settled and detached before the cut. Without its own bucket
+        # these cells hide inside "cells - everything else", and a regression that
+        # silently stopped classifying would look like a sweep full of settled cells.
+        counts["settled"] = 1
+        record = facts["record"]
+        assert record is not None
+        if facts["active"] or record.state not in {
+            TransactionState.COMMITTED,
+            TransactionState.ROLLED_BACK,
+        }:
+            failures.append(
+                f"a durable record was neither classified nor settled: state="
+                f"{record.state.name} active={facts['active']}"
+            )
+
     if projection is None:
         counts["no_record"] = 1
         if captured:
             failures.append("recovery classified a world holding no durable record")
-        missing = _preserved_external(before, world)
-        if missing:
-            failures.append(f"external state not preserved at {missing}")
+        differences = _external_differences(before, world)
+        if differences:
+            failures.append(f"external state not preserved: {differences}")
     elif captured:
         if projection != model_projection:
             disagreement = (
@@ -2277,13 +2441,17 @@ def run_cell(
                     f"{record.halt_diagnostic!r} != {plan.diagnostic!r}"
                 )
 
-    if captured:
+    if captured and drift_footprint:
         # Counted only where recovery actually classified the world: a refused or
         # record-free cell preserves the blocker by never looking at it, which is not
-        # the property design §6's drift family is about.
-        for rel in drift_footprint:
-            if _normalized_tree(world).get(rel) == _normalized_tree(before).get(rel):
-                counts["drift_preserved"] = 1
+        # the property design §6's drift family is about. ALL of the footprint must
+        # survive -- a drift that plants three paths and keeps one is not "the external
+        # blocker was preserved".
+        planted = _normalized_tree(before)
+        settled_world = _normalized_tree(world)
+        counts["drift_preserved"] = int(
+            all(settled_world.get(rel) == planted.get(rel) for rel in drift_footprint)
+        )
 
     # --- side assertions A3 does not model (design §5) ------------------------------
     chain = facts["chain"]
@@ -2333,6 +2501,8 @@ def run_cell(
         elif world_digest(project_root, metadata_root) != digest:
             violation = "the second pass moved the world"
 
+    if not retain:
+        _discard_roots(project_root, metadata_root)
     return CellResult(
         agrees=disagreement is None,
         halted=halted,
@@ -2356,7 +2526,7 @@ class SweepReport:
 
     cells: int
     deduped: int
-    skips: dict[str, int]
+    skips: dict[str, int]  # a copy: a frozen report must not alias the accounting's dict
     disagreements: tuple[str, ...]
     second_pass_violations: tuple[str, ...]
     side_assertion_failures: tuple[str, ...]
@@ -2368,6 +2538,7 @@ class SweepReport:
     classified_cells: int = 0
     halted_cells: int = 0
     plan_halted_cells: int = 0
+    settled_cells: int = 0
     refused_cells: int = 0
     no_record_cells: int = 0
     seconds: float = 0.0
@@ -2502,8 +2673,10 @@ class Sweeper:
             "classified": 0,
             "halted": 0,
             "plan_halted": 0,
+            "assembly_halted": 0,
             "refused": 0,
             "no_record": 0,
+            "settled": 0,
             "drift": 0,
         }
 
@@ -2517,8 +2690,10 @@ class Sweeper:
             totals["classified"] += min(result.counts["classified"], 1)
             totals["halted"] += result.counts["halted"]
             totals["plan_halted"] += result.counts["plan_halted"]
+            totals["assembly_halted"] += result.counts["assembly_halted"]
             totals["refused"] += result.counts["refused"]
             totals["no_record"] += result.counts["no_record"]
+            totals["settled"] += result.counts["settled"]
             totals["drift"] += result.counts["drift_preserved"]
 
         for index, cell in enumerate(cells):
@@ -2527,10 +2702,34 @@ class Sweeper:
             cell = complete_named_cell(named_cell, stream)
             absorb(tuple_name, cell, self._run(scenario_name, cell, stream, planted))
 
+        # Every cell lands in exactly one outcome bucket, and the buckets must add back
+        # up to the cells run. This is the assertion that keeps the sweep honest about
+        # what it actually exercised: a regression that stopped classifying (as the
+        # pre-realignment assembly halt did, silently, for *every* record-bearing cell)
+        # moves cells between buckets rather than failing anything, so only a partition
+        # check notices. `classified` counts cells that reached `classify_recovery`,
+        # A3-halts included; `assembly_halted` are halts raised before classification.
+        partition = (
+            totals["classified"]
+            + totals["assembly_halted"]
+            + totals["refused"]
+            + totals["no_record"]
+            + totals["settled"]
+        )
+        run = len(cells) + len(named)
+        if partition != run:
+            side.append(
+                f"{scenario_name}: outcome buckets do not partition the sweep -- "
+                f"classified={totals['classified']} "
+                f"assembly_halted={totals['assembly_halted']} "
+                f"refused={totals['refused']} no_record={totals['no_record']} "
+                f"settled={totals['settled']} sum={partition} cells={run}"
+            )
+
         report = SweepReport(
             cells=accounting.cells + len(named),
             deduped=accounting.deduped,
-            skips=accounting.skips,
+            skips=dict(accounting.skips),
             disagreements=tuple(disagreements),
             second_pass_violations=tuple(second_pass),
             side_assertion_failures=tuple(side),
@@ -2542,6 +2741,7 @@ class Sweeper:
             classified_cells=totals["classified"],
             halted_cells=totals["halted"],
             plan_halted_cells=totals["plan_halted"],
+            settled_cells=totals["settled"],
             refused_cells=totals["refused"],
             no_record_cells=totals["no_record"],
             seconds=time.monotonic() - started,
@@ -2551,6 +2751,7 @@ class Sweeper:
             f"(classified={report.classified_cells} halted={report.halted_cells} "
             f"a3-halted={report.plan_halted_cells} "
             f"refused={report.refused_cells} no-record={report.no_record_cells} "
+            f"settled={report.settled_cells} "
             f"named={report.named_tuple_cells_ran} drift-preserved="
             f"{report.preserved_drift_cells}) deduped={report.deduped} "
             f"skips={report.skips} in {report.seconds:.1f}s"

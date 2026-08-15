@@ -202,16 +202,21 @@ def test_enumeration_counts_and_reports_skips_by_reason(persistence_recording):
 
 def test_the_pending_cap_fails_loud(persistence_recording):
     """A realistic boundary, not a degenerate zero: `corpus-write`'s transactional
-    pending-set size genuinely reaches 6 at some cut (measured), so `pending_cap=5`
-    breaches on the scenario's own complexity, not on the mere presence of any
-    pending key at all."""
+    pending-set size genuinely reaches 4 at some cut, so `pending_cap=3` breaches on the
+    scenario's own complexity, not on the mere presence of any pending key at all.
+
+    The peak was 6 before design §4.1's creation-mode ruling (2026-08-15) folded every
+    creation's mode into its entry insert; re-measured at 4 afterwards, and the cap here
+    re-tuned with it -- a cap test pinned to a stale peak stops testing the boundary and
+    starts testing nothing.
+    """
     import pytest
 
     from tests.persistence_model import PendingCapExceeded, enumerate_cells
 
     stream = persistence_recording("corpus-write")
     with pytest.raises(PendingCapExceeded):
-        enumerate_cells(stream, pending_cap=5)
+        enumerate_cells(stream, pending_cap=3)
 
 
 _RECORDABLE_SCENARIOS = [
@@ -243,110 +248,92 @@ def test_the_default_cap_holds_across_every_recordable_scenario(
     assert accounting.cells > 0
 
 
-def test_survivor_subset_without_a_directory_mode_reconstructs(
+def test_a_mode_change_tears_and_the_zero_mode_path_still_reconstructs(
     persistence_recording, ext4_volume
 ):
-    """CONTROLLER RULING: a survivor subset including a directory's entry-insert
-    *without* its meta-mode unit must reconstruct -- `reconstruct`'s mkdir-0o700,
-    populate, reverse-depth-chmod ordering (design §4.4), pinned directly rather than
-    only incidentally covered by a full-sweep cell.
+    """CONTROLLER RULING (design §4.1 as amended 2026-08-15): a *creation's* mode is
+    atomic with inode creation and cannot tear, but a later mode **change** is an
+    independent durability unit that can -- leaving the object at the mode it was
+    created with.
 
-    The production `CreateDirectory` effect always makes a directory's mode durable
-    (via its own pre-publish barrier on the work-staging name) no later than the
-    directory's final entry becomes even pending -- so this exact shape is
-    structurally unreachable through it. It *is* reachable through the plain
-    `mkdir_child` capability probing every recorded transaction performs
-    (`python/tests/exerciser.py`'s admission-time probing; `src/atoms/fs/probe.py`'s
-    `src`/`dst` link-anchor probe, which also populates a child file before either
-    directory is touched again) -- so this test locates *that* shape in a recorded
-    `minimal-mkdir` stream instead of hand-picking `d`.
+    This replaces the earlier creation-tear directed test, which pinned a reconstructed
+    mode-`0` directory built by excluding a creation's paired `meta mode` unit -- a unit
+    the ruling deleted, and a world no crash can produce. The shape pinned now is the one
+    the ruling preserved, and `minimal-mkdir` produces it for real: `CreateDirectory`
+    mkdirs its work name at `0o700`, then `set_mode`s the declared `0o755` through the
+    retained descriptor (`src/atoms/coordinator/effects/create_directory.py`:
+    `mkdir_child` -> `repair_entry_mode` -> `open_child_directory` -> `set_mode` ->
+    `flush_file`), so the survivor product genuinely holds that directory at both modes.
+
+    The second half keeps design §4.4's mkdir-`0o700`/populate/reverse-depth-chmod
+    ordering covered. No recorded stream reaches a mode-`0` object any more -- that was
+    the ruling's whole point -- so the state is *derived* from a real cell with
+    `dataclasses.replace` on its `tree` alone: `reconstruct` reads only `tree` and
+    `backup_bytes`, the other four fields stay exactly as `enumerate_cells` built them,
+    and `_materialize_tree`'s mode-`0` branch stays exercised rather than becoming
+    untested code.
     """
+    import dataclasses
     import os
     import stat
 
     from tests.persistence_model import (
         Mutation,
-        Skip,
         _resolve,
-        apply_survivors,
-        durable_state,
-        pending_keys_at,
+        enumerate_cells,
         reconstruct,
     )
 
     stream = persistence_recording("minimal-mkdir")
+    changes = {
+        unit.key: unit.payload
+        for event in stream.events
+        if type(event) is Mutation
+        for unit in event.units
+        if unit.key[0] == "meta" and unit.key[2] == "mode"
+    }
+    assert changes, "minimal-mkdir must record at least one mode CHANGE unit"
 
-    def find_populated_child(mkdir_index: int, dir_token: int):
-        for index, event in enumerate(
-            stream.events[mkdir_index + 1 :], start=mkdir_index + 1
-        ):
-            if type(event) is not Mutation:
-                continue
-            entry = next(
-                (u for u in event.units if u.key[0] == "entry" and u.key[1] == dir_token),
-                None,
-            )
-            mode = next(
-                (u for u in event.units if u.key[0] == "meta" and u.key[2] == "mode"), None
-            )
-            if entry is None or mode is None or entry.change != "insert":
-                continue
-            return entry.key, mode.key, index
-        return None
+    cells, _ = enumerate_cells(stream)
+    by_path: dict[str, dict[int, int]] = {}
+    for index, cell in enumerate(cells):
+        for path, value in cell.state.tree.items():
+            if value[0] == "dir":
+                by_path.setdefault(path, {}).setdefault(value[1], index)
 
-    dir_key = dir_token = None
-    child_entry_key = child_mode_key = child_index = None
-    for index, event in enumerate(stream.events):
-        if type(event) is not Mutation or len(event.units) != 2:
-            continue
-        entry = next((u for u in event.units if u.key[0] == "entry"), None)
-        mode = next((u for u in event.units if u.key[0] == "meta" and u.key[2] == "mode"), None)
-        if entry is None or mode is None or entry.change != "insert" or entry.object_token is None:
-            continue
-        found = find_populated_child(index, entry.object_token)
-        if found is None:
-            continue
-        dir_key, dir_token = entry.key, entry.object_token
-        child_entry_key, child_mode_key, child_index = found
-        break
-    assert dir_key is not None, "no populated plain mkdir_child-shaped directory was recorded"
-    assert child_index is not None and child_mode_key is not None
-
-    child_data_key = None
-    last_index = child_index
-    for index, event in enumerate(
-        stream.events[child_index + 1 :], start=child_index + 1
-    ):
-        if type(event) is not Mutation:
-            continue
-        data = next(
-            (u for u in event.units if u.key == ("data", child_mode_key[1])), None
-        )
-        if data is not None:
-            child_data_key = data.key
-            last_index = index
-            break
-
-    cut = last_index + 1
-    survivors = frozenset(
-        {dir_key, child_entry_key, child_mode_key}
-        | ({child_data_key} if child_data_key is not None else set())
+    torn = [(path, modes) for path, modes in by_path.items() if len(modes) > 1]
+    assert torn, "no directory appears at two modes: the mode-change axis is gone"
+    path, modes = torn[0]
+    changed_mode, creation_mode = max(modes), min(modes)
+    token = next(key[1] for key, payload in changes.items() if payload == changed_mode)
+    assert stream.creation_modes[token] == creation_mode, (
+        "the mode a torn-away change leaves behind must be the object's creation mode"
     )
-    assert dir_key in pending_keys_at(stream, cut)
-    assert ("meta", dir_token, "mode") not in survivors
 
-    state = apply_survivors(durable_state(stream, cut), stream, cut, survivors)
-    assert not isinstance(state, Skip), state
+    for label, mode in (("torn", creation_mode), ("landed", changed_mode)):
+        state = cells[modes[mode]].state
+        project = ext4_volume / f"mode-{label}-p"
+        metadata = ext4_volume / f"mode-{label}-m"
+        project.mkdir()
+        metadata.mkdir()
+        reconstruct(state, project, metadata)
+        assert stat.S_IMODE(os.stat(_resolve(path, project, metadata)).st_mode) == mode
 
-    zero_mode_dirs = [
-        path for path, value in state.tree.items() if value[0] == "dir" and value[1] == 0
-    ]
-    assert zero_mode_dirs, "the excluded-mode directory must materialize at mode 0"
-    populated = [
-        path for path in state.tree
-        if any(path.startswith(f"{zero}/") for zero in zero_mode_dirs)
-    ]
-    assert populated, "the zero-mode directory must have a surviving child (populate case)"
+    # --- the mode-0 reconstruction path (design §4.4's ordering) --------------------
+    source = cells[modes[creation_mode]].state
+    populated = next(
+        (
+            directory
+            for directory, value in source.tree.items()
+            if value[0] == "dir"
+            and any(other.startswith(f"{directory}/") for other in source.tree)
+        ),
+        None,
+    )
+    assert populated is not None, "no populated directory to lock down to mode 0"
+    zero_tree = dict(source.tree)
+    zero_tree[populated] = ("dir", 0)
+    state = dataclasses.replace(source, tree=zero_tree)
 
     project = ext4_volume / "recon-zero-mode-p"
     metadata = ext4_volume / "recon-zero-mode-m"
@@ -354,27 +341,25 @@ def test_survivor_subset_without_a_directory_mode_reconstructs(
     metadata.mkdir()
     reconstruct(state, project, metadata)
 
-    # Minor 7: assert the actual on-disk post-conditions, not merely "did not raise" --
-    # the rebuilt directory's final mode really is 0 (the reverse-depth chmod pass
-    # actually landed, not merely failed to error), and the child it populated before
-    # that chmod really exists with its own recorded content and mode.
-    zero_dir = zero_mode_dirs[0]
-    on_disk_dir = _resolve(zero_dir, project, metadata)
+    on_disk_dir = _resolve(populated, project, metadata)
     assert stat.S_IMODE(os.stat(on_disk_dir).st_mode) == 0
 
-    # Mode 0 genuinely blocks even the owner from resolving a name underneath it
-    # (POSIX requires search ("x") on the containing directory to look up a child by
-    # name) -- confirmed above, before touching anything. To verify the child that
-    # `reconstruct` populated *before* locking the directory down (rather than merely
-    # trusting the in-memory `state.tree`), temporarily restore search access, purely
-    # for this assertion, then put it back.
-    child_path = next(path for path in populated if path.startswith(f"{zero_dir}/"))
-    _, content, child_mode = state.tree[child_path]
+    # Mode 0 genuinely blocks even the owner from resolving a name underneath it (POSIX
+    # requires search ("x") on the containing directory to look a child up by name) --
+    # asserted above, before anything is touched. To verify the child `reconstruct`
+    # populated *before* locking the directory down (rather than merely trusting the
+    # in-memory tree), temporarily restore search access, purely for this assertion,
+    # then put it back.
+    child_path = next(other for other in state.tree if other.startswith(f"{populated}/"))
     on_disk_child = _resolve(child_path, project, metadata)
+    child_value = state.tree[child_path]
     os.chmod(on_disk_dir, 0o700)
     try:
-        child_info = os.stat(on_disk_child)
-        assert stat.S_IMODE(child_info.st_mode) == child_mode
-        assert on_disk_child.read_bytes() == content
+        child_info = os.lstat(on_disk_child)
+        if child_value[0] == "file":
+            assert stat.S_IMODE(child_info.st_mode) == child_value[2]
+            assert on_disk_child.read_bytes() == child_value[1]
+        else:
+            assert stat.S_ISDIR(child_info.st_mode) or stat.S_ISLNK(child_info.st_mode)
     finally:
         os.chmod(on_disk_dir, 0)
