@@ -32,9 +32,10 @@ through the public commands or the existing guarded lease. Four artifacts land:
 
 One deliberate boundary refinement rides along (§7.4): `build_configuration`'s
 `durability_features` stops collapsing every ext4 feature set into `()` and gains
-a minimal superblock-feature resolver for the barrier-relevant vector
-(`fast_commit` and `orphan_file` at minimum). This refines what the verification
-boundary can distinguish; it changes no transaction semantics.
+a superblock-mask resolver that pins the volume's three feature masks verbatim.
+This refines what the verification boundary can distinguish; it changes no
+transaction semantics. It carries one operational prerequisite, recorded in
+§7.4: binding requires an explicit read grant on the volume's block device node.
 
 ## 2. Scope and non-scope
 
@@ -76,22 +77,27 @@ to the real Linux backend. Recording is **success-only**: operands are captured
 before the delegated call, resulting identities (`os.fstat`, a read) after it,
 and a failed delegated call appends nothing.
 
-Each successful mutation decomposes into **durability units** keyed by
-durability location:
+Each successful mutation decomposes into **durability units** under tagged keys:
 
-- **Directory-entry units**, keyed `(directory inode, name)`: insert, remove, or
-  replace of one entry, carrying the object inode. A rename is two units —
-  `remove(source dir, source name)` + `insert(destination dir, destination
-  name)`; `exchange` is two replaces; `link_anchor` is an insert naming an
-  existing inode; `unlink`/`rmdir` are removes.
-- **Inode-data units**, keyed by inode: pending file content. `write` calls
-  **coalesce** per inode — a later pending write extends or replaces the pending
-  data at the same key, so payload streaming never inflates the pending set.
-- **Inode-metadata units**, keyed by inode: mode (and the metadata-root marker
-  xattr, treated identically).
+- **Entry units**, keyed `(ENTRY, directory inode, name)`: insert, remove, or
+  replace of one entry. An insertion **creates or references a typed model
+  inode** — a regular file (whose byte image is empty until data units land), a
+  directory (with its mode), or a symlink (whose target is fixed at creation).
+  A rename is two units — `remove(source dir, source name)` + `insert(destination
+  dir, destination name)`; `exchange` is two replaces; `link_anchor` is an insert
+  referencing an existing inode; `unlink`/`rmdir` are removes. `create_or_open`
+  records an insertion **only when it actually creates** — the pre-call
+  observation shows the name absent.
+- **Data units**, keyed `(DATA, inode)`: the **complete current logical byte
+  image** of the inode at that pending point — never a delta or an "extends"
+  relation — so a later pending write replaces the pending image wholesale.
+- **Metadata units**, keyed `(META, inode, field)` where the field is `mode` or
+  a named xattr: field-keyed so that setting the marker xattr can never replace
+  a pending mode update, and conversely.
 
 A later pending update **replaces** the earlier pending update at the same key.
-The survivor enumeration of §4.3 therefore ranges over keys, never raw events.
+The survivor enumeration of §4.3 therefore ranges over keys, never raw events,
+and every survivor subset has exactly one reconstruction.
 
 Inode identity is captured from the real filesystem at record time, so hard-link
 relations (a move's anchor and destination; §9.5's descriptor identity) are
@@ -99,13 +105,16 @@ preserved in the model as *relations*, independent of the inode numbers any
 later reconstruction assigns.
 
 The stream is **seeded**: event 0 is the initial filesystem world (project and
-metadata trees) plus an initial SQLite backup. Store COMMITs enter the same
+metadata trees) plus an initial SQLite backup, and because event 0 already
+contains an initialized store, **bootstrap publication belongs to the seed** —
+it never appears as entry-unit enumeration. Store COMMITs enter the same
 stream through a wrapper on `Store.transaction` sharing one sequencer with the
 recording backend: each successful exit appends an atomic-durable COMMIT event
 and a fresh backup taken with the SQLite backup API. SQLite's internal atomicity
-is out of scope exactly as §13.2 rules — the database's own file I/O is opaque
-to the model, represented solely by the COMMIT snapshots, while the database
-*files'* directory entries (bootstrap creation) are ordinary entry units.
+is out of scope exactly as §13.2 rules, and the **database namespace is
+model-owned**: the four database-family names (`atoms.db`, `-wal`, `-shm`,
+`-journal`) are excluded from the seed tree and from every generic tree replay,
+so no seed-era sidecar can survive beside a newer backup.
 
 ### 4.2 Barrier coverage
 
@@ -148,7 +157,8 @@ order, with three rules:
 Each cell's surviving world is replayed into fresh `project_root` and
 `metadata_root` directories on the real filesystem: model inodes become fresh
 files, link relations are reproduced by `link`, directory modes applied, and the
-cut's database snapshot placed as the metadata store. Reconstruction is exact up
+cut's selected database backup installed as `atoms.db` **alone** — reopening
+creates fresh sidecars, and no `-wal`/`-shm`/`-journal` file is ever replayed. Reconstruction is exact up
 to inode renaming, which is safe because nothing durable stores inode numbers —
 observation identity tokens are snapshot-local and halt diagnostics are
 token-free — and the §5 comparison is already up-to-renaming for
@@ -224,15 +234,28 @@ paths; caught rollback; external drift at destructive boundaries. Scenario
 surfaces are shaped to the documented consumer shapes — corpus write,
 archive/import move — per §12.1, importing no consumer.
 
-The §13.4 matrix is **scenario × mechanism × first recovery execution**, with
-§5's second pass mandatory everywhere:
+The §13.4 matrix is **scenario × mechanism × execution placement**, with §5's
+second pass mandatory everywhere. The product is deliberately non-rectangular —
+clean commit and caught rollback reach `classify_recovery` inside the
+originating command, not through a post-reconstruction recovery — so the
+placement axis is defined **per mechanism**, and matrix sizing counts exactly
+these cells:
 
-- mechanism: `clean commit | caught rollback | SIGKILL at rehearsed barriers |
-  persistence cut`. Caught rollback injects failure at the effect-`apply` seam
-  **after `PREPARED`** — the existing conformance idiom — because a failing
-  payload occurs during capture, before a durable transaction exists, and
-  exercises refusal rather than rollback. The SIGKILL arm extends the existing
-  kill-matrix rehearsal idiom to exerciser scenarios rather than duplicating it.
+- `clean commit` and `caught rollback`: the placement axis locates the
+  **originating command** — in-process, or entire-cell in an `execute_child`
+  subprocess that returns its captured canonical projection. Caught rollback
+  injects failure at the effect-`apply` seam **after `PREPARED`** — the
+  existing conformance idiom — because a failing payload occurs during capture,
+  before a durable transaction exists, and exercises refusal rather than
+  rollback. The mandatory second pass is the subsequent fresh lease entry
+  asserting no recovery action and an unchanged projection.
+- `SIGKILL at rehearsed barriers`: the first recovery is **always** the fresh
+  subprocess (`coordinator_child`) — after a kill no in-process first recovery
+  exists, so that variant is absent from the product, not empty. The arm
+  extends the existing kill-matrix rehearsal idiom to exerciser scenarios
+  rather than duplicating it.
+- `persistence cut`: the placement axis locates the first recovery over the
+  reconstructed world — in-process or fresh subprocess — per §5.
 - **Capability-refusal scenarios sit outside this Cartesian product.** They are
   exerciser cases proving `CapabilityUnavailable` lands **before any
   transaction-record metadata or project mutation** — a refusal has no recovery
@@ -294,7 +317,12 @@ One exact `(VolumeConfiguration, StorageProfile)` pair. The tuple embedded in
 the record is **produced by `build_configuration` in-guest**, never hand-typed,
 so exact-equality matching against production holds by construction. The
 `StorageProfile` id minted here is **`flush-honoring-disk.v1`**, naming the
-tested assumption: a fixed disk that honors flush ordering. A production
+tested assumption precisely: a fixed disk honoring the FLUSH and FUA durability
+semantics the engine relies on — a completed FLUSH makes every previously
+completed write durable, and a completed FUA write is itself durable at
+completion — which is what the backend's fsync barriers and SQLite's
+`synchronous=FULL` assume, and what the harness's recorded FLUSH/FUA marks
+denote. A production
 composition root declaring that profile is making a documented trust assertion
 about its hardware; the harness proves nothing about drive firmware, and the
 record says so. A guest run does not certify this host's bare-metal NVMe tuple
@@ -307,21 +335,38 @@ rule that an entry may not name a feature whose resolver does not exist. That
 empty vector collapses every ext4 feature set into one tuple, while `fast_commit`
 changes the journal and replay path — including directory-entry operations — and
 `orphan_file` changes orphan processing. One image cannot certify every
-configuration the empty tuple would match, so A8 adds the **minimal resolver**:
+configuration the empty tuple would match, so A8 adds the resolver. The route
+was settled by a spike run before planning (2026-08-14, this host):
 
-- The resolved vector carries at least `fast_commit` and `orphan_file`, each as
-  an explicit present/absent marker, so absence is stated rather than implied.
-- The resolver is **unprivileged and two-sided**, reading the kernel's
-  mounted-volume interfaces (`/proc/fs/ext4/<device>/`, `/sys/fs/ext4/<device>/`).
-  The exact indicators are pinned at implementation by an in-guest experiment —
-  mkfs with and without each feature, then compare the kernel views — because
-  the host offers no unprivileged way to create the enabled case
-  (`/proc/fs/ext4/<device>/fc_info` exists with identical content on a
-  non-fast-commit volume, so presence alone is not the indicator).
-- A volume whose vector the interfaces cannot decide is **refused** with
-  `CapabilityUnavailable` — fail closed, like every other capability. If the
-  pinning experiment finds no two-sided unprivileged indicator for a required
-  feature, that is a design amendment to bring back here, not a silent guess.
+- **The mounted-kernel-interface route is dead.** Per-volume sysfs attributes
+  expose no superblock feature bits; the global `fast_commit` attribute means
+  kernel support, not volume enablement; and `/proc/fs/ext4/<device>/fc_info`
+  is created unconditionally — verified here with identical content on a
+  volume without the feature. No `orphan_file` indicator exists at all.
+- **The superblock-mask route is proven two-sided.** The resolver opens the
+  volume's block device node (named by the mount entry), verifies the device's
+  `st_rdev` equals the bound volume's `st_dev`, verifies the ext4 magic
+  (`0xEF53` at superblock offset `0x38`), and reads the three feature masks
+  (`compat`/`incompat`/`ro_compat` at offsets `0x5C`/`0x60`/`0x64`). The spike
+  confirmed the parse empirically against mkfs'd image pairs: `fast_commit` is
+  compat bit `0x400`, `orphan_file` compat bit `0x1000`, each present exactly
+  when formatted in. The read happens once, under the project lock; the feature
+  masks are immutable while the volume is mounted.
+- **`durability_features` carries the three masks verbatim** —
+  `("compat=0x…", "incompat=0x…", "ro_compat=0x…")` — whole-mask pinning,
+  strictly stronger than any enumerated feature list: a future barrier-relevant
+  feature changes a mask, the tuple stops matching, and binding refuses until
+  recertification, with no code change.
+- **The privilege consequence is explicit.** Device nodes are `root:disk` mode
+  `0660`, so binding — production and the test allowlist alike — requires a
+  read grant on the device node: a narrow udev-installed read-only ACL for the
+  operating user, never `disk`-group membership (which is read-write on every
+  disk). An unreadable device, a device-identity mismatch, or a magic mismatch
+  refuses with `CapabilityUnavailable` naming the exact grant needed. This
+  operational prerequisite is recorded here and in the certification record.
+- The certification harness formats the guest image with an explicit feature
+  set reproducing the target volume's masks, and refuses if its e2fsprogs
+  cannot reproduce them.
 
 This is verification-boundary refinement: binding decisions become *finer*,
 never looser, and no transaction semantics change.
@@ -330,8 +375,8 @@ never looser, and no transaction semantics change.
 
 The run emits **one canonical JSON record** to `docs/certification/` — directly
 machine-checkable, with this document supplying the prose. The record carries:
-the in-guest `VolumeConfiguration` (every field, including the resolved feature
-vector), the `StorageProfile` id, the QEMU command line and cache mode, the mkfs
+the in-guest `VolumeConfiguration` (every field, including the three resolved
+superblock masks), the `StorageProfile` id, the QEMU command line and cache mode, the mkfs
 and mount commands, the QEMU/e2fsprogs/`replay-log` versions and the replay-log
 format and pinned tool commit, the kernel identifier, the clean atoms commit,
 per-scenario mark and prefix counts, the zero-violation assertion, and the date.
@@ -377,13 +422,34 @@ their own falsification arms:
 - **Replay verification**: a directed in-guest test writes a known pattern with
   explicit flushes, cuts, replays, and compares — proving the pinned
   `replay-log` build and the clone discipline before any certification claim.
-- **Sabotage arms, one per §13.2 cross-substrate ordering**: with the
-  corresponding barrier suppressed (blob-flush before `PREPARED`; the per-effect
-  `STARTED`/mutation/`DONE` ordering; the move's destination-before-source
-  parent flush; the `CreateDirectory` live-parent-before-`work/` flush; the
-  `COMMITTED` decision), the matrix must produce at least one cell whose outcome
-  differs from the unsabotaged run — proving each ordering is load-bearing and
-  the model can see its loss.
+- **Sabotage arms, one per §13.2 cross-substrate ordering, each with a
+  designated failure** — never "any cell happens to differ." Each arm suppresses
+  its barrier in the engine under test, names one required cell, and states the
+  expected designated failure; the unsabotaged sweep must pass, and exactly that
+  designated check must fail under sabotage:
+
+  1. *Blob flush before `PREPARED`* suppressed → the cut at the `PREPARED`
+     COMMIT with pending blob units dropped → the blob-integrity assertion
+     reports a record-referenced blob absent or short in the reconstructed
+     store.
+  2. *Per-effect mutation-durable-before-`DONE`* suppressed → the cut at that
+     effect's `DONE` COMMIT with the mutation units dropped → a designated halt
+     where the unsabotaged cell converges: the `DONE` journal row meets a
+     pre-state world.
+  3. *The move's destination-parent flush* suppressed → the cut at the move's
+     `DONE` COMMIT with the insertion dropped → a designated halt: `DONE` with
+     the destination absent. Reordering §9.4's two flushes alone is
+     deliberately **not** the arm — either order yields an attributable,
+     repairable tuple; the load-bearing property is that both flushes precede
+     `DONE`.
+  4. *The `CreateDirectory` live-parent flush* suppressed → the cut at its
+     `DONE` COMMIT with the live insertion dropped and the `work/` removal
+     durable → a designated halt: `DONE` with the directory absent under both
+     names.
+  5. *The `COMMITTED` decision* suppressed (cleanup and return proceed without
+     the durable `COMMITTED` COMMIT) → the cut after committed cleanup → the
+     **returned-outcome permanence invariant** fails: a transaction whose
+     outcome was returned `COMMITTED` resolves `ROLLED_BACK` on recovery.
 - **Skip accounting**: the §4.3 by-reason skip counts and required-tuple
   generation assertions run on every sweep.
 
@@ -413,8 +479,11 @@ Landing edits, enforced by `test_docs_status.py` in the same change:
    before any metadata or project mutation.
 3. All five sabotage arms flip at least one cell; the fidelity self-check and
    skip accounting pass on every sweep.
-4. The feature resolver decides `fast_commit` and `orphan_file` two-sided and
-   unprivileged, refusing undecidable volumes.
+4. The feature resolver reads the superblock through the granted device node,
+   pins all three feature masks into `durability_features`, refuses unreadable,
+   identity-mismatched, or magic-mismatched volumes, and its parse is proven
+   two-sided by the mkfs fixture pair (`fast_commit` `0x400`, `orphan_file`
+   `0x1000`).
 5. One certification run has produced the JSON record, `CERTIFIED_ALLOWLIST`
    carries exactly the entry naming it, the four population assertions pass, and
    production binding accepts the certified volume and still refuses every
