@@ -164,6 +164,9 @@ def replay_self_verification(work: Path, data_device: Path, log_device: Path) ->
             f"0 {sectors} log-writes {data_device} {log_device}",
         ]
     )
+    _run(["dmsetup", "mknodes", name])
+    if not mapper.is_block_device():
+        raise RuntimeError(f"dmsetup did not create a block device at {mapper}")
     baseline = work / "self-test-baseline.img"
     mountpoint = work / "self-test-mount"
     mountpoint.mkdir()
