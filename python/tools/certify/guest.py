@@ -66,9 +66,8 @@ mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev
 mount -t tmpfs tmpfs /run
-touch /run/certify-mount /run/certify-umount
-mount --bind /usr/bin/mount /run/certify-mount
-mount --bind /usr/bin/umount /run/certify-umount
+cp /usr/bin/mount /run/certify-mount
+cp /usr/bin/umount /run/certify-umount
 for parameter in $(cat /proc/cmdline); do
     case "$parameter" in checkout=*) checkout=${parameter#checkout=} ;; esac
 done
