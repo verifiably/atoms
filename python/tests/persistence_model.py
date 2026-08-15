@@ -728,10 +728,16 @@ def attach_store_sequencer(
     `stale_commit` is design §9's arm 5, and it is the one sabotage that is not a
     swallowed barrier: the named label's transaction still commits for real, but the
     model's durable metadata does **not** advance to it -- the `Commit` event carries the
-    *previous* backup, so every cut at or after it reconstructs the store as it was
-    before that decision was durable. That is exactly "cleanup and return proceed without
-    the durable COMMITTED COMMIT": the run returns `COMMITTED` while nothing durable says
-    so.
+    *previous* backup. That is exactly "cleanup and return proceed without the durable
+    COMMITTED COMMIT": the run returns `COMMITTED` while nothing durable says so.
+
+    The stale window is exactly **one commit wide**: `[the stale commit, the next
+    commit)`. Only the named label's backup advance is withheld; the very next store
+    transaction (in `minimal-create`, `settlement-binding`) takes a fresh, *real* backup
+    of a database that has long since recorded the decision, so every cut at or after
+    that commit reconstructs a store which does hold it. The arm's designated cut must
+    therefore sit inside that window -- `SABOTAGE_ARMS` sites it at the stale commit
+    itself.
     """
     from atoms.store.connection import Store
 
@@ -2797,6 +2803,11 @@ def blob_integrity_failures(metadata_root: Path) -> tuple[str, ...]:
 
     The spec is decoded with production's own `from_canonical_json`, never re-parsed by
     hand, so a spec shape this test cannot read is a real decode failure.
+
+    The referenced set is asserted nonempty, for the same reason arms 2-5 assert their
+    cell reached A3: the passing answer here is "no failures", so a designated cell whose
+    record referenced no blob at all -- a cut before the record, a spec of directory-only
+    effects -- would pass by checking nothing.
     """
     from atoms.core.canonical import from_canonical_json
     from atoms.core.fingerprint import FileState
@@ -2826,6 +2837,10 @@ def blob_integrity_failures(metadata_root: Path) -> tuple[str, ...]:
         for entry in from_canonical_json(spec_json).final_surface
         if type(entry.state) is FileState
     }
+    assert referenced, (
+        "no record in the reconstructed store references a blob: the blob-integrity "
+        "check would pass without examining anything"
+    )
     blobs = metadata_root / BLOBS_DIRECTORY / SHA256_DIRECTORY
     failures: list[str] = []
     for digest in sorted(referenced):
@@ -2857,10 +2872,7 @@ def _blob_integrity_failed(designated: Designated) -> bool:
     does, which is exactly why design §9 gives the arm its own named failure rather than
     hoping some cell differs.
     """
-    failures = blob_integrity_failures(designated.metadata_root)
-    if failures:
-        print(f"\n[cut-matrix] blob-integrity: {failures}")
-    return bool(failures)
+    return bool(blob_integrity_failures(designated.metadata_root))
 
 
 def _designated_halt(designated: Designated) -> bool:
@@ -2999,6 +3011,11 @@ SABOTAGE_ARMS: tuple[Sabotage, ...] = (
         swallows=1,
         check=_designated_halt,
     ),
+    # Design §9 named this arm's cut "after committed cleanup" and was re-sited
+    # 2026-08-15 to the decision-adjacent cut: the sequencer withholds one commit's
+    # backup advance, so the stale window is `[committed, settlement-binding)` and the
+    # after-cleanup cut lies past it, on a real post-decision backup that does hold
+    # COMMITTED. The invariant is indifferent to where inside the window it is read.
     Sabotage(
         name="committed-decision",
         scenario="minimal-create",
@@ -3092,7 +3109,15 @@ class SweepReport:
     and the fault when they are not. `subprocess_cells`/`subprocess_disagreements` are
     Task 7's placement axis, and `designated_failures` names every design §9 designated
     check that failed -- empty on an unsabotaged sweep, and, on a `sabotage=` run,
-    exactly the sabotaged arm's marker."""
+    exactly the sabotaged arm's marker.
+
+    **A `sabotage=` run enumerates no cells at all** (`Sweeper._sabotaged`), so only
+    `designated_failures` and `seconds` describe it. `cells` counts the designated cells
+    that ran -- one per arm of the scenario, NOT a survivor product -- and every other
+    field is a structural zero/empty meaning "not measured here", not a measured result.
+    In particular `skips == {}` is the absence of skip accounting rather than a sweep
+    that skipped nothing, so an assertion about skips, dedupes, disagreements, or the
+    placement axis must be made on an unsabotaged sweep, where they are real."""
 
     cells: int
     deduped: int
@@ -3439,6 +3464,8 @@ class Sweeper:
         stream = self.record(scenario_name, sabotage=arm)
         designated = self.designated_failures(scenario_name, stream)
         arms = [item for item in SABOTAGE_ARMS if item.scenario == scenario_name]
+        # `cells` is the designated cells that ran; every other field is a structural
+        # zero meaning "not measured on a sabotaged run" (`SweepReport`'s docstring).
         report = SweepReport(
             cells=len(arms),
             deduped=0,
@@ -3467,8 +3494,9 @@ class Sweeper:
 
         Each check gets its arm's designated cell, reconstructed into its own fresh
         roots -- and recovered through `run_cell` first where the arm's failure is a
-        recovery outcome. The roots are always discarded: the check has already read
-        everything it needs by the time this returns.
+        recovery outcome. The roots are always discarded, and the `try` opens *before*
+        the reconstruction so a raise out of `run_cell`, `reconstruct`, or the check
+        itself leaves nothing behind on the volume every other cell shares.
         """
         failures: list[str] = []
         for arm in SABOTAGE_ARMS:
@@ -3477,29 +3505,35 @@ class Sweeper:
             cell = designated_cell(stream, arm)
             slot = f"{scenario_name}-designated-{next(self._slots)}"
             project_root, metadata_root = cell_roots(self._volume, slot)
-            result = None
-            if arm.recovers:
-                result = run_cell(
-                    cell,
-                    stream,
-                    self._volume,
-                    self._storage,
-                    self._monkeypatch,
-                    slot=slot,
-                    allowlist=self.allowlist(),
-                    retain=True,
-                )
-            else:
-                project_root.mkdir()
-                metadata_root.mkdir()
-                reconstruct(cell.state, project_root, metadata_root)
             try:
+                result = None
+                if arm.recovers:
+                    result = run_cell(
+                        cell,
+                        stream,
+                        self._volume,
+                        self._storage,
+                        self._monkeypatch,
+                        slot=slot,
+                        allowlist=self.allowlist(),
+                        retain=True,
+                    )
+                else:
+                    project_root.mkdir()
+                    metadata_root.mkdir()
+                    reconstruct(cell.state, project_root, metadata_root)
                 if arm.check(
                     Designated(stream, cell, project_root, metadata_root, result)
                 ):
                     failures.append(arm.marker)
             finally:
-                _discard_roots(project_root, metadata_root)
+                # Only the roots that exist: a raise from the first `mkdir` would
+                # otherwise have `_discard_roots` raise `FileNotFoundError` over the
+                # real failure, and teaching the shared helper to tolerate a missing
+                # root would hide a cell whose roots really did vanish.
+                _discard_roots(
+                    *(root for root in (project_root, metadata_root) if root.exists())
+                )
         return tuple(failures)
 
     def _placement_subset(

@@ -554,12 +554,14 @@ def test_sabotage_3_move_destination_flush(cut_matrix) -> None:
     # either order yields an attributable repairable tuple; the load-bearing
     # property is both flushes preceding DONE.
     report = cut_matrix("minimal-move", sabotage="move-destination-flush")
-    assert "done-meets-absent-destination-halt" in report.designated_failures
+    # `==`, not `in`: this is `minimal-move`'s only arm, so the sabotaged run evaluates
+    # exactly one designated check and equality costs nothing.
+    assert report.designated_failures == ("done-meets-absent-destination-halt",)
 
 
 def test_sabotage_4_mkdir_live_parent_flush(cut_matrix) -> None:
     report = cut_matrix("minimal-mkdir", sabotage="live-parent-flush")
-    assert "done-meets-absent-directory-halt" in report.designated_failures
+    assert report.designated_failures == ("done-meets-absent-directory-halt",)
 
 
 def test_sabotage_5_committed_decision(cut_matrix) -> None:
