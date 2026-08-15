@@ -1,5 +1,7 @@
 """Unit decomposition, coverage, replacement, and coalescing (design §4.1-§4.2)."""
 
+import pytest
+
 
 def test_recording_is_success_only_and_decomposes_renames(persistence_recording):
     stream = persistence_recording("minimal-move")
@@ -48,3 +50,93 @@ def test_each_store_commit_carries_a_backup(persistence_recording):
     commits = stream.commits()
     assert [c.backup_id for c in commits] == sorted({c.backup_id for c in commits})
     assert all(c.backup_id in stream.backups for c in commits)
+
+
+@pytest.mark.parametrize("name", ["minimal-create", "minimal-move", "minimal-mkdir"])
+def test_full_durable_reconstruction_equals_the_live_final_world(
+    name, persistence_recording, ext4_volume
+):
+    """Design §9's fidelity self-check, run per scenario.
+
+    Parametrized rather than looped over one `persistence_recording` fixture instance:
+    `ext4_project_root` (`coordinator_on`'s project root) is shared across every call
+    within one test, so a second scenario's `seed_world` collides with the first's
+    leftover tree -- each scenario needs its own fresh fixtures, which parametrize
+    gives for free.
+
+    "Every pending unit surviving" means the *maximal* survivable subset
+    (`_maximal_survivors`), not the raw `pending_keys_at` set verbatim: capability
+    probing performs un-flushed create+remove churn inside the recorded transaction
+    itself, leaving `data`/`meta` keys (and the occasional `remove`) permanently
+    orphaned once keyed replacement forgets their paired entry -- inert leftovers with
+    zero observable effect either way, never a discarded real change (design §9's
+    `apply_survivors` text: "an unreachable inode carries no observable state").
+    """
+    from tests.persistence_model import (
+        Skip,
+        _maximal_survivors,
+        apply_survivors,
+        durable_state,
+        reconstruct,
+        world_digest,
+    )
+
+    stream = persistence_recording(name)
+    end = len(stream.events)
+    state = apply_survivors(
+        durable_state(stream, end), stream, end, _maximal_survivors(stream, end)
+    )
+    assert not isinstance(state, Skip), state
+    project = ext4_volume / f"recon-{name}-p"
+    metadata = ext4_volume / f"recon-{name}-m"
+    project.mkdir()
+    metadata.mkdir()
+    reconstruct(state, project, metadata)
+    assert world_digest(project, metadata) == stream.final_world_digest
+
+
+def test_reconstruction_preserves_hard_link_relations(persistence_recording, ext4_volume):
+    """The move's anchor and destination must share one inode after reconstruction."""
+    import os
+
+    from tests.persistence_model import (
+        Skip,
+        _maximal_survivors,
+        _resolve,
+        apply_survivors,
+        durable_state,
+        reconstruct,
+    )
+
+    stream = persistence_recording("minimal-move")
+    cut = stream.index_after(change="insert", link=True)
+    state = apply_survivors(
+        durable_state(stream, cut), stream, cut, _maximal_survivors(stream, cut)
+    )
+    assert not isinstance(state, Skip), state
+
+    linked = [
+        paths
+        for paths in _group_by_link(state.tree)
+        if len(paths) > 1
+    ]
+    assert linked, "the cut after the anchor's insert must show a durable link group"
+    anchor, dest = sorted(linked[0])
+
+    project = ext4_volume / "recon-move-link-p"
+    metadata = ext4_volume / "recon-move-link-m"
+    project.mkdir()
+    metadata.mkdir()
+    reconstruct(state, project, metadata)
+
+    assert os.stat(_resolve(dest, project, metadata)).st_ino == os.stat(
+        _resolve(anchor, project, metadata)
+    ).st_ino
+
+
+def _group_by_link(tree):
+    groups: dict[tuple, list[str]] = {}
+    for path, value in tree.items():
+        if value[0] == "file" and len(value) == 4:
+            groups.setdefault(value[3], []).append(path)
+    return groups.values()
