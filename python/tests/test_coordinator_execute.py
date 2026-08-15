@@ -120,6 +120,8 @@ def test_caught_rollback_uses_one_observation_universe(
             DictPayloads({digest_of(AFTER): AFTER}),
         )
 
+    # Holds for this mkdir-free spec only: the forward mkdir path constructs its own
+    # per-publication Observation (the A8a engine fix), which would make this 2.
     assert constructed == 1
     state, registration, settlement = _record(metadata_root)
     assert state == TransactionState.ROLLED_BACK.value

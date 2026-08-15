@@ -2245,8 +2245,13 @@ def _engine_owned(rel: str) -> bool:
     # `acquire_project_lock` opens or creates (`fs/lock.py:217`). A lease entered over a
     # world that predates them creates them -- correctly -- so they are engine-owned in
     # both directions of the external-state comparison, never "spurious external state".
-    owned = (PROBE_DIRECTORY, STAGING_PARENT, WORK_PARENT, BLOBS_DIRECTORY, LOCK_LEAF)
-    if rel.startswith(tuple(f"metadata/{name}" for name in owned)):
+    # Matched by directory root or trailing-slash prefix (never a bare string prefix),
+    # so a sibling like `metadata/probeX` is not wrongly allowlisted alongside `probe`.
+    owned = (PROBE_DIRECTORY, STAGING_PARENT, WORK_PARENT, BLOBS_DIRECTORY)
+    roots = tuple(f"metadata/{name}" for name in owned)
+    if rel in roots or rel.startswith(tuple(f"{root}/" for root in roots)):
+        return True
+    if rel == f"metadata/{LOCK_LEAF}":
         return True
     return any(is_engine_reserved_leaf(part) for part in rel.split("/")[1:])
 
@@ -3358,6 +3363,35 @@ class Sweeper:
             named_labels.add(tuple_name)
             if subprocess_subset:
                 ran.append((tuple_name, cell, result))
+
+        # Design §9's reconstruction-fidelity self-check, run inside every sweep
+        # (design §10 criterion 3, amended 2026-08-15) rather than only at the three
+        # directed-test scenarios: reconstruct the end cut with every pending unit's
+        # maximal survivor subset and compare it against the live final world. Same
+        # recipe as `test_full_durable_reconstruction_equals_the_live_final_world`.
+        end = len(stream.events)
+        survivors = _maximal_survivors(stream, end)
+        fidelity_state = apply_survivors(durable_state(stream, end), stream, end, survivors)
+        assert not isinstance(fidelity_state, Skip), (
+            f"{scenario_name}: the maximal survivor subset was unrepresentable: "
+            f"{fidelity_state}"
+        )
+        fidelity_project, fidelity_metadata = cell_roots(
+            self._volume, f"{scenario_name}-fidelity-{next(self._slots)}"
+        )
+        fidelity_project.mkdir()
+        fidelity_metadata.mkdir()
+        try:
+            reconstruct(fidelity_state, fidelity_project, fidelity_metadata)
+            fidelity_digest = world_digest(fidelity_project, fidelity_metadata)
+        finally:
+            _discard_roots(fidelity_project, fidelity_metadata)
+        if fidelity_digest != stream.final_world_digest:
+            side.append(
+                f"{scenario_name}: fidelity -- end-cut maximal-survivor reconstruction "
+                f"digest {fidelity_digest!r} != live final world digest "
+                f"{stream.final_world_digest!r}"
+            )
 
         subprocess_disagreements: list[str] = []
         subprocess_cells = 0

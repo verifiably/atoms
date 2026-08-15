@@ -33,7 +33,7 @@ def _recovery_lease(
 ) -> Iterator[Lease]:
     """Design §5.1's entry order, exactly.
 
-    The one production call site that names `CERTIFIED_ALLOWLIST`. It is empty until A8
+    The one production call site that names `CERTIFIED_ALLOWLIST`. It is empty until A8b
     crash-certifies a configuration tuple, so this path refuses every real volume today.
     That is the intended fail-closed behaviour, and it is why ledger #18 is proved by an
     architecture assertion over this call rather than by an end-to-end run.
