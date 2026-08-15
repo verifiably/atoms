@@ -199,18 +199,17 @@ def replay_self_verification(work: Path, data_device: Path, log_device: Path) ->
         "first": (b"first-pattern", None),
         "second": (b"first-pattern", b"second-pattern"),
     }
-    clones: list[Path] = []
-    try:
-        for mark, wanted in expected.items():
-            target = clone(baseline)
-            clones.append(target)
+    clone_names: set[Path] = set()
+    for mark, wanted in expected.items():
+        target = clone(baseline)
+        try:
+            if target in clone_names:
+                raise RuntimeError("replay clone path was reused")
+            clone_names.add(target)
             replay_prefix(log_device, target, end_mark=mark, end_entry=None)
             if _read_replayed(target, mountpoint) != wanted:
                 raise RuntimeError(f"replay self-verification failed at mark {mark}")
-        if len({target.stat().st_ino for target in clones}) != len(clones):
-            raise RuntimeError("replay clones are not distinct files")
-    finally:
-        for target in clones:
+        finally:
             target.unlink(missing_ok=True)
 
 
