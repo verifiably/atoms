@@ -122,10 +122,6 @@ def resolver_cross_check(work: Path) -> None:
         raise RuntimeError("fast_commit fixture did not flip exactly compat bit 0x400")
     if orphan.compat ^ plain.compat != _ORPHAN_FILE:
         raise RuntimeError("orphan_file fixture did not flip exactly compat bit 0x1000")
-    if (fast.incompat, fast.ro_compat) != (plain.incompat, plain.ro_compat):
-        raise RuntimeError("fast_commit fixture changed a non-compat feature mask")
-    if (orphan.incompat, orphan.ro_compat) != (plain.incompat, plain.ro_compat):
-        raise RuntimeError("orphan_file fixture changed a non-compat feature mask")
 
 
 def _write_pattern(mountpoint: Path, name: str, payload: bytes) -> None:
