@@ -2041,6 +2041,58 @@ def _inspect(project_root: Path, metadata_root: Path, storage, allowlist) -> dic
     }
 
 
+def serialize_projection(projection: tuple | None) -> dict | None:
+    """The canonical durable projection in a JSON round-trippable shape (design §8).
+
+    The placement axis compares an in-process cell against the same cell recovered in a
+    fresh process, and a tuple of enums, `HaltDiagnostic` dataclasses and
+    `EffectJournalState`s does not survive a pipe. Every field is spelled out here --
+    nothing reflects over the dataclasses, so a field A3 grows does not silently start or
+    stop being compared across the placement boundary (ledger #12's rule, applied to the
+    test-side serialization).
+
+    The halt diagnostic goes through production's own `encode_diagnostic`, which is what
+    the store itself persists: **token-free** by construction (slots, paths, content
+    hashes, enum values -- no inode number, no txid, no absolute path), so the two
+    placements' diagnostics compare EXACTLY rather than up to renaming. The identity-
+    bearing comparisons -- approval evidence, world trees, hard-link groups -- stay
+    in-process, where `realign_durable_identities` and `_normalized_tree` alpha-rename
+    them; none of them appears here.
+
+    `state` is spelled with the enum's member NAME, matching
+    `tests/exerciser.py`'s `_durable_projection`, so one vocabulary ("COMMITTED",
+    "ROLLED_BACK") describes a projection whether it came from a child or from a fixture.
+    """
+    if projection is None:
+        return None
+    from atoms.store.records import encode_diagnostic
+
+    state, committed, rollback_result, halt_diagnostic, journals, active = projection
+    return {
+        "state": state.name,
+        "committed": committed.name,
+        "rollback_result": None if rollback_result is None else rollback_result.name,
+        "halt_diagnostic": (
+            None if halt_diagnostic is None else encode_diagnostic(halt_diagnostic)
+        ),
+        "journals": [[journal.effect_id, journal.state.name] for journal in journals],
+        "active": active,
+    }
+
+
+def durable_projection(project_root, metadata_root, storage, allowlist) -> dict | None:
+    """`_inspect`'s canonical projection, serialized -- the one reader both children use.
+
+    `tests/coordinator_child.py` (the recovery placement) and `tests/execute_child.py`
+    (the whole-cell placement) both call this rather than each growing its own
+    projection reader, so "the projection" means one thing in every process the matrix
+    runs code in.
+    """
+    return serialize_projection(
+        _inspect(Path(project_root), Path(metadata_root), storage, allowlist)["projection"]
+    )
+
+
 def _model_projection(snapshot, plan) -> tuple:
     """A3's fixed point in the durable projection's shape (design §5)."""
     from atoms.core.recovery import apply_recovery_plan
@@ -2516,6 +2568,84 @@ def run_cell(
     )
 
 
+def run_cell_in_a_fresh_process(
+    cell: Cell,
+    ext4_volume: Path,
+    *,
+    slot: str,
+    drift=None,
+) -> dict:
+    """Reconstruct one cell and run its **first** recovery in a fresh process.
+
+    Steps 1 and 2 of `run_cell` are performed identically -- reconstruct, then
+    `realign_durable_identities` before anything recovers, then the family's drift -- and
+    the lease entry that follows is `tests/coordinator_child.py`, the same child the kill
+    matrix's `_recover` spawns, rather than an in-process `root._recovery_lease`. The
+    child builds its own allowlist from its own roots, so nothing about the parent's
+    patched module state can leak into the placement being measured; that is the point of
+    the arm.
+
+    Returns the child's parsed JSON (`halted`, `projection`, `lease`, `durable`). The
+    caller compares the `projection` against the in-process cell's, serialized by the
+    same `serialize_projection`. The reconstructed roots are always discarded: the child
+    already read everything the comparison needs.
+    """
+    from tests.test_coordinator_kill_matrix import _recover
+
+    project_root, metadata_root = cell_roots(ext4_volume, slot)
+    project_root.mkdir()
+    metadata_root.mkdir()
+    reconstruct(cell.state, project_root, metadata_root)
+    realign_durable_identities(project_root, metadata_root)
+    if drift is not None:
+        # Same carve-out as `run_cell`: a cut predating the drift target's own directory
+        # simply runs undrifted.
+        with contextlib.suppress(FileNotFoundError, NotADirectoryError):
+            drift(Path(project_root))
+    try:
+        return _recover(project_root, metadata_root)
+    finally:
+        _discard_roots(project_root, metadata_root)
+
+
+def _placement_complaints(result: CellResult, child: dict) -> tuple[str, ...]:
+    """Every way the fresh-process placement of one cell disagrees with the in-process
+    one (design §8).
+
+    Three comparisons, in widening order of what they would catch:
+
+    - the **halt** verdict: both placements must either raise `TransactionHalted` at
+      lease entry or neither must;
+    - the **persisted halt diagnostic**, byte-exactly. `encode_diagnostic` is
+      token-free, so there is nothing here to alpha-rename and no reason to compare up
+      to anything -- a single differing byte is a real divergence;
+    - the whole canonical **projection**, up to `serialize_projection` -- state, commit
+      decision, rollback result, journals, and whether the record is still active.
+
+    The diagnostic is compared on its own as well as inside the projection so a failure
+    names the halt rather than dumping the whole document twice.
+    """
+    expected = serialize_projection(result.projection)
+    complaints: list[str] = []
+    if bool(child["halted"]) != result.halted:
+        complaints.append(
+            f"the child {'halted' if child['halted'] else 'resolved'} where the "
+            f"in-process placement {'halted' if result.halted else 'resolved'}"
+        )
+    left = None if expected is None else expected["halt_diagnostic"]
+    right = None if child["projection"] is None else child["projection"]["halt_diagnostic"]
+    if left != right:
+        complaints.append(
+            f"the persisted halt diagnostic differs across placements: {left!r} != {right!r}"
+        )
+    if child["projection"] != expected:
+        complaints.append(
+            f"the child's projection {child['projection']!r} disagrees with the "
+            f"in-process {expected!r}"
+        )
+    return tuple(complaints)
+
+
 @dataclass(frozen=True)
 class SweepReport:
     """One scenario's sweep. `cells`/`deduped`/`skips` come from `enumerate_cells`'
@@ -2535,6 +2665,11 @@ class SweepReport:
     subprocess_cells: int
     subprocess_disagreements: tuple[str, ...]
     designated_failures: tuple[str, ...]
+    # How many of `subprocess_cells` halted. The placement arm's sharpest assertion is
+    # that the persisted halt diagnostic compares byte-exactly across processes, and a
+    # scenario whose cells never halt asserts that vacuously -- so the count is reported
+    # and a directed test requires it to be nonzero where halts are expected.
+    subprocess_halt_cells: int = 0
     classified_cells: int = 0
     halted_cells: int = 0
     plan_halted_cells: int = 0
@@ -2647,10 +2782,41 @@ class Sweeper:
         subprocess_subset: bool = False,
         sabotage: str | None = None,
     ) -> SweepReport:
+        """Sweep one scenario: every cell of `enumerate_cells`, then §9.4's named tuples.
+
+        `subprocess_subset=True` adds design §8's **placement axis** on top: a declared
+        subset of the swept cells is reconstructed a second time and has its *first*
+        recovery run in a fresh process (`run_cell_in_a_fresh_process`), and the two
+        placements' canonical projections must agree.
+
+        THE SUBSET RULE (declared, never sampled -- design §8). A cell joins the
+        subprocess arm iff it is:
+
+        1. one of design §9.4's **named-tuple cells** -- the dual-name/anchor-only worlds,
+           where one inode carries two live names and a fresh process must resolve the
+           same one;
+        2. an **A3-halt cell** -- `classify_recovery` returned a `HaltPlan`, so the run
+           persists a halt diagnostic, and the arm's sharpest assertion (the persisted
+           token-free diagnostic compares byte-exactly across the placement boundary) has
+           something to compare;
+        3. the **first cell at or after each store-commit label** -- for every `Commit`
+           event in the recorded stream, the first enumerated cell whose cut folds that
+           commit into its durable base (`cut >= index + 1`). Store commits are where the
+           durable record moves, so this walks the record through every state it reaches
+           while spending one child per store transition rather than one per cell.
+
+        Cells whose reconstructed world refuses the engine outright (`refused`) are
+        excluded: their obligation is a deterministic *refusal*, which is asserted
+        in-process, and the child would exit nonzero rather than serialize a projection.
+
+        Everything identity-bearing stays in-process, where it is alpha-renamed:
+        `realign_durable_identities` rewrites the durable approval evidence onto the
+        reconstructed inodes and `_normalized_tree` rewrites hard-link-group keys. What
+        crosses the process boundary is `serialize_projection`'s token-free document
+        only.
+        """
         from tests.exerciser import scenario
 
-        if subprocess_subset:
-            raise NotImplementedError("the subprocess placement subset lands in Task 7")
         if sabotage is not None:
             raise NotImplementedError("the sabotage arms land in Task 9")
 
@@ -2696,11 +2862,36 @@ class Sweeper:
             totals["settled"] += result.counts["settled"]
             totals["drift"] += result.counts["drift_preserved"]
 
+        ran: list[tuple[str, Cell, CellResult]] = []
         for index, cell in enumerate(cells):
-            absorb(f"cell {index}", cell, self._run(scenario_name, cell, stream, planted))
+            result = self._run(scenario_name, cell, stream, planted)
+            absorb(f"cell {index}", cell, result)
+            ran.append((f"cell {index}", cell, result))
+        named_labels = set()
         for tuple_name, named_cell in sorted(named.items()):
             cell = complete_named_cell(named_cell, stream)
-            absorb(tuple_name, cell, self._run(scenario_name, cell, stream, planted))
+            result = self._run(scenario_name, cell, stream, planted)
+            absorb(tuple_name, cell, result)
+            ran.append((tuple_name, cell, result))
+            named_labels.add(tuple_name)
+
+        subprocess_disagreements: list[str] = []
+        subprocess_cells = 0
+        subprocess_halts = 0
+        if subprocess_subset:
+            for label, cell, result in self._placement_subset(stream, ran, named_labels):
+                subprocess_cells += 1
+                subprocess_halts += int(result.halted)
+                child = run_cell_in_a_fresh_process(
+                    cell,
+                    self._volume,
+                    slot=f"{scenario_name}-child-{next(self._slots)}",
+                    drift=planted,
+                )
+                subprocess_disagreements.extend(
+                    f"{scenario_name} {label} cut={cell.cut}: {complaint}"
+                    for complaint in _placement_complaints(result, child)
+                )
 
         # Every cell lands in exactly one outcome bucket, and the buckets must add back
         # up to the cells run. This is the assertion that keeps the sweep honest about
@@ -2735,8 +2926,9 @@ class Sweeper:
             side_assertion_failures=tuple(side),
             named_tuple_cells_ran=len(named),
             preserved_drift_cells=totals["drift"],
-            subprocess_cells=0,
-            subprocess_disagreements=(),
+            subprocess_cells=subprocess_cells,
+            subprocess_disagreements=tuple(subprocess_disagreements),
+            subprocess_halt_cells=subprocess_halts,
             designated_failures=(),
             classified_cells=totals["classified"],
             halted_cells=totals["halted"],
@@ -2754,9 +2946,40 @@ class Sweeper:
             f"settled={report.settled_cells} "
             f"named={report.named_tuple_cells_ran} drift-preserved="
             f"{report.preserved_drift_cells}) deduped={report.deduped} "
+            f"subprocess={report.subprocess_cells} "
+            f"(halted={report.subprocess_halt_cells}) "
             f"skips={report.skips} in {report.seconds:.1f}s"
         )
         return report
+
+    def _placement_subset(
+        self,
+        stream: Stream,
+        ran: list[tuple[str, Cell, CellResult]],
+        named_labels: set[str],
+    ) -> list[tuple[str, Cell, CellResult]]:
+        """The declared subprocess subset -- `__call__`'s docstring states the rule.
+
+        Insertion-ordered and deduplicated by label: several store commits routinely
+        select the same first-cell-after, and a named-tuple cell can also be an A3-halt
+        cell, but a cell is worth exactly one child.
+        """
+        selected: dict[str, tuple[str, Cell, CellResult]] = {}
+        enumerated = [item for item in ran if item[0] not in named_labels]
+        for index, event in enumerate(stream.events):
+            if type(event) is not Commit:
+                continue
+            for item in enumerated:
+                if item[1].cut >= index + 1 and not item[2].counts["refused"]:
+                    selected.setdefault(item[0], item)
+                    break
+        for item in ran:
+            label, _cell, result = item
+            if result.counts["refused"]:
+                continue
+            if label in named_labels or result.counts["plan_halted"]:
+                selected.setdefault(label, item)
+        return list(selected.values())
 
     def named_cell(self, scenario_name: str, tuple_name: str, *, caught: bool = False):
         stream = self.record(scenario_name, caught=caught)

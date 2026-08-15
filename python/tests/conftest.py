@@ -657,6 +657,163 @@ def cut_matrix(ext4_volume, test_storage_profile, monkeypatch):
 
 
 @pytest.fixture
+def exerciser_child(ext4_volume, test_storage_profile, monkeypatch):
+    """Run a whole exerciser scenario -- setup, transaction, projection -- in a child.
+
+    Design §6's whole-cell placement: `tests/execute_child.py` seeds the world, registers
+    the root through `exerciser.setup_clean`, runs the transaction (catching exactly the
+    injected failure for a `inject_failure` scenario, per erratum 1), and prints the
+    canonical durable projection. Nothing about the transaction happens in this process.
+
+    The mandatory second pass happens here, in-process, because design §5 asks only that
+    a *fresh lease* re-enter: a subsequent entry must take no recovery action at all --
+    `classify_recovery` is never reached over a settled, detached record -- and must
+    leave the projection exactly where the child left it. Returns the child's projection.
+    """
+    counter = itertools.count()
+
+    def run(name: str) -> dict:
+        from atoms.fs.linux import LinuxBackend
+        from tests.persistence_model import _enter_lease, durable_projection
+        from tests.test_coordinator_kill_matrix import _child
+
+        index = next(counter)
+        project = ext4_volume / f"whole-cell-{index}-project"
+        metadata = ext4_volume / f"whole-cell-{index}-metadata"
+        project.mkdir()
+        projection = _child(
+            project,
+            metadata,
+            {"scenario": name, "setup": True, "projection": True},
+        )["projection"]
+        assert projection is not None, f"{name}: the child recorded no durable record"
+
+        with acquire_project_lock(LinuxBackend(), str(metadata)) as lock:
+            allowlist = build_test_allowlist(lock, str(project), test_storage_profile)
+        captured: list[tuple] = []
+        kind, _ = _enter_lease(
+            project, metadata, test_storage_profile, monkeypatch, captured, allowlist
+        )
+        assert kind == "resolved", f"{name}: the second pass halted"
+        assert captured == [], (
+            f"{name}: the second pass took a recovery action over a settled record"
+        )
+        assert (
+            durable_projection(project, metadata, test_storage_profile, allowlist)
+            == projection
+        ), f"{name}: the second pass moved the projection"
+        return projection
+
+    return run
+
+
+@pytest.fixture
+def exerciser_kill_matrix(ext4_volume, test_storage_profile, monkeypatch):
+    """Drive the kill matrix's own SIGKILL contract over an exerciser scenario.
+
+    The rehearsal idiom, unchanged from `tests/test_coordinator_kill_matrix.py`: run the
+    scenario once under the recording backend with the store sequencer counting commits,
+    then, for each recorded durability event, kill a fresh child right after it and
+    require the surviving world to converge.
+
+    Three things are derived rather than hardcoded, because a multi-effect scenario has
+    no fixed barrier schedule the way the single-effect kill-matrix variants do:
+
+    - the **cut sites** are every recorded `flush_file`/`flush_directory`/`exchange`/
+      `transfer_noclobber` **at or after the first store commit** -- the calls that
+      publish something durably, in the span where every call belongs to the transaction
+      proper. The span matters: before the first commit the stream is capability
+      probing, which deliberately calls `exchange` and `transfer_noclobber` on operands
+      it expects to *fail* (that is how it learns the syscall's semantics), and a kill
+      placed after a call that raises never fires at all -- the child would survive and
+      the arm would silently assert nothing. The kill goes immediately *after* each site
+      (a negative countdown), the side that includes the barrier's own effect;
+    - **whether a cut commits** is read off the interleaved commit count. The store's
+      barrier schedule for an E-effect transaction is `prepared`,
+      `registration-binding`, `applying`, then `started`/`done` per effect, then
+      `applied`, `committed`, `settlement-binding`, `detach` -- 2E+7 commits, of which
+      the commit decision is the (2E+5)th, i.e. the third from last. The shape is
+      asserted against the recorded stream rather than trusted;
+    - the **terminal worlds** are observed, not spelled: the seeded world (before the
+      rehearsal transacts) is what an uncommitted cut must converge back to, and the
+      rehearsal's own finished world is what a committed cut must converge to.
+
+    `_assert_terminal` then applies the existing contract per cut -- recover twice,
+    require the two observations and the world to be identical, require no active
+    transaction, and require the expected world. Returns the number of cuts driven.
+    """
+
+    def drive(name: str) -> int:
+        from atoms.fs.linux import LinuxBackend
+        from tests.exerciser import scenario, setup_clean
+        from tests.test_coordinator_kill_matrix import _assert_terminal, _child, _world
+
+        entry = scenario(name)
+        effects = len(entry.build_spec().effects)
+
+        def prepared(slot: str) -> tuple[Path, Path]:
+            project = ext4_volume / f"kill-{name}-{slot}-project"
+            metadata = ext4_volume / f"kill-{name}-{slot}-metadata"
+            project.mkdir()
+            setup_clean(
+                entry,
+                (LinuxBackend(), str(project), str(metadata), test_storage_profile),
+                monkeypatch,
+            )
+            return project, metadata
+
+        rehearsal_project, rehearsal_metadata = prepared("rehearsal")
+        seeded = _world(rehearsal_project)
+        events = _child(
+            rehearsal_project,
+            rehearsal_metadata,
+            {
+                "scenario": name,
+                "record": True,
+                "store_cut": "record",
+                "countdown": 10_000,
+            },
+        )["events"]
+        finished = _world(rehearsal_project)
+
+        commits = 2 * effects + 7
+        assert events.count("commit") == commits, (
+            f"{name}: {events.count('commit')} store commits for {effects} effects, "
+            f"expected {commits} -- the barrier schedule changed"
+        )
+        methods = ("flush_file", "flush_directory", "exchange", "transfer_noclobber")
+        transaction_begins = events.index("commit")
+        targets = [
+            index
+            for index in range(transaction_begins, len(events))
+            if events[index].startswith(methods)
+        ]
+        for ordinal, target in enumerate(targets):
+            method = events[target].partition(":")[0]
+            countdown = sum(
+                event.startswith(method) for event in events[: target + 1]
+            )
+            committed = events[:target].count("commit") >= commits - 2
+            project, metadata = prepared(str(ordinal))
+            _child(
+                project,
+                metadata,
+                {"scenario": name, "method": method, "countdown": -countdown},
+                killed=True,
+            )
+            _assert_terminal(
+                project,
+                metadata,
+                name,
+                committed=committed,
+                expected=finished if committed else seeded,
+            )
+        return len(targets)
+
+    return drive
+
+
+@pytest.fixture
 def opened_store(store_on):
     """A live Store over a fresh ext4 project, closed on exit."""
     from atoms.store.connection import open_store

@@ -5,6 +5,8 @@ from __future__ import annotations
 import pytest
 
 MINIMAL = ("minimal-create", "minimal-replace", "minimal-delete", "minimal-move", "minimal-mkdir")
+COMPOUND = ("corpus-write", "archive-move", "caught-rollback", "caught-rollback-move")
+MOVE_BEARING = ("archive-move", "caught-rollback-move")
 
 
 @pytest.mark.parametrize("name", MINIMAL)
@@ -100,13 +102,73 @@ def test_an_absent_approved_directory_freezes_a_node_missing_halt(
     assert any(finding.path == "d" for finding in missing), missing
 
 
-def test_the_later_placement_modes_are_declared_but_not_yet_built(cut_matrix) -> None:
-    """The `Sweeper` accepts Task 7's and Task 9's keywords and refuses to pretend.
+@pytest.mark.parametrize("name", COMPOUND)
+def test_every_cell_of_the_compound_scenarios_agrees_with_a3(name, cut_matrix) -> None:
+    """The multi-effect and caught-rollback half of design §13.4's matrix.
 
-    A silently ignored `subprocess_subset=True` would let Task 7's placement test pass
-    against the in-process arm it exists to contrast with.
+    `corpus-write` (five effects, two nested fresh directories) and `archive-move` (a
+    move whose vacated source is re-created) are the documented consumer shapes; the two
+    caught scenarios record a *rollback* stream, whose reverse traffic is the only place
+    `JournalState.UNDO_STARTED` cuts exist at all.
+
+    Erratum 3: the named-tuple assertion is made only for the move-bearing scenarios --
+    `named_tuples` matches a transfer of a token that also carries an anchor insert, and
+    a scenario with no move has nothing to match. `corpus-write` legitimately runs zero.
     """
-    with pytest.raises(NotImplementedError):
-        cut_matrix("minimal-create", subprocess_subset=True)
+    report = cut_matrix(name, caught=name.startswith("caught"))
+    assert report.cells > 0
+    assert report.classified_cells > 0, (
+        "no cell reached classify_recovery: the sweep would assert nothing about A3"
+    )
+    assert report.disagreements == ()
+    assert report.second_pass_violations == ()
+    assert report.side_assertion_failures == ()
+    if name in MOVE_BEARING:
+        assert report.named_tuple_cells_ran > 0
+
+
+def test_drift_cells_preserve_external_blockers(cut_matrix) -> None:
+    """Design §6's drift family: an external blocker planted between reconstruction and
+    recovery survives every cell that could carry it.
+
+    `drift-blocker` plants a foreign `d/f.txt` over the `DeletePath` target. Recovery may
+    refuse to proceed, may undo, may commit -- what it may never do is silently consume
+    the blocker, and `preserved_drift_cells` counts only the classified cells where the
+    whole planted footprint came back unchanged.
+    """
+    report = cut_matrix("drift-blocker", drift=True)
+    assert report.disagreements == ()
+    assert report.second_pass_violations == ()
+    assert report.side_assertion_failures == ()
+    assert report.preserved_drift_cells > 0
+
+
+@pytest.mark.parametrize("name", ("minimal-move", "minimal-replace"))
+def test_subprocess_placement_matches_in_process(name, cut_matrix) -> None:
+    """Design §8's placement axis: the same cell, recovered in a fresh process, agrees.
+
+    The subset is declared, never sampled -- `Sweeper.__call__`'s docstring states the
+    rule and the assertion below requires it to be nonempty, so a rule that silently
+    selected nothing fails here rather than passing vacuously.
+
+    Two scenarios because the rule's three clauses are not all live in one stream:
+    `minimal-move` is the only minimal scenario carrying design §9.4's named tuples, and
+    it never halts; `minimal-replace` carries the A3 halts whose *persisted halt
+    diagnostic* is the arm's exact-comparison target. Sweeping only the first would leave
+    that comparison comparing `None` to `None` in every cell.
+    """
+    report = cut_matrix(name, subprocess_subset=True)
+    assert report.disagreements == ()
+    assert report.subprocess_cells > 0
+    assert report.subprocess_disagreements == ()
+    if name == "minimal-replace":
+        assert report.subprocess_halt_cells > 0, (
+            "no halted cell crossed the placement boundary: the exact halt-diagnostic "
+            "comparison asserted nothing"
+        )
+
+
+def test_the_sabotage_mode_is_declared_but_not_yet_built(cut_matrix) -> None:
+    """The `Sweeper` accepts Task 9's keyword and refuses to pretend."""
     with pytest.raises(NotImplementedError):
         cut_matrix("minimal-create", sabotage="drop-barrier")

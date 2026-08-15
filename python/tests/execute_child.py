@@ -10,6 +10,8 @@ import sqlite3
 import sys
 from typing import cast
 
+import pytest
+
 from atoms.coordinator import root
 from atoms.coordinator.commands import run_transaction
 from atoms.core.errors import TransactionHalted
@@ -117,6 +119,22 @@ def main(project_root: str, metadata_root: str) -> int:
                 os.umask(previous)
 
         execute.create_directory.apply = under_umask
+    # Scenario mode (design §6): the spec, the payloads, the seed world and -- when the
+    # whole cell is placed in this process -- the root registration all come from
+    # `tests.exerciser`, so the child runs the same scenario the in-process exerciser
+    # does rather than a second, drifting copy of it.
+    #
+    # Registration parity matters and is not automatic: in `variant` mode the PARENT
+    # registers the root (`test_coordinator_kill_matrix._prepare`) before spawning, and
+    # this child only transacts. `setup` is what asks the child to do the bootstrap half
+    # itself, and it does so by calling `exerciser.setup_clean` -- the same function
+    # `run_clean` and the persistence-cut recorder call -- never by re-spelling
+    # `register_root` here, which is exactly how the two setups would drift apart.
+    entry = None
+    if "scenario" in config:
+        from tests.exerciser import scenario as exerciser_scenario
+
+        entry = exerciser_scenario(config["scenario"])
     recorder = None
     if config.get("record"):
         recorder = RecordingBackend(raw, events)
@@ -130,16 +148,38 @@ def main(project_root: str, metadata_root: str) -> int:
         )
     else:
         backend = raw
+    ingredients = (backend, project_root, metadata_root, STORAGE)
+    patcher = pytest.MonkeyPatch()
+    if entry is not None and config.get("setup"):
+        from tests.exerciser import setup_clean
+
+        setup_clean(entry, ingredients, patcher)
     _configure_store_cut(config, events)
-    outcome = run_transaction(
-        backend,
-        project_root,
-        metadata_root,
-        STORAGE,
-        _spec(config["variant"]),
-        _payloads(config["variant"]),
-    )
-    print(json.dumps({"outcome": outcome.outcome.value, "events": events}))
+
+    result: dict = {"events": events}
+    if entry is not None and entry.inject_failure is not None:
+        # Erratum 1: the injected failure lands the rollback DURABLY and only then
+        # propagates. `transact_caught` catches exactly that exception and reads the
+        # canonical projection back; nothing here synthesizes a `TransactionOutcome` for
+        # a transaction that never returned one.
+        from tests.exerciser import transact_caught
+
+        transact_caught(entry, ingredients, patcher)
+        result["outcome"] = None
+    else:
+        spec = entry.build_spec() if entry is not None else _spec(config["variant"])
+        payloads = entry.payloads() if entry is not None else _payloads(config["variant"])
+        outcome = run_transaction(
+            backend, project_root, metadata_root, STORAGE, spec, payloads
+        )
+        result["outcome"] = outcome.outcome.value
+    if config.get("projection"):
+        from tests.persistence_model import durable_projection
+
+        result["projection"] = durable_projection(
+            project_root, metadata_root, STORAGE, root.CERTIFIED_ALLOWLIST
+        )
+    print(json.dumps(result))
     return 0
 
 

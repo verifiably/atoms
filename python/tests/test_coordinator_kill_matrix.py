@@ -119,14 +119,31 @@ def _world(project: Path) -> dict[str, tuple[str, bytes | None]]:
 
 
 def _assert_terminal(
-    project: Path, metadata: Path, variant: str, *, committed: bool
+    project: Path,
+    metadata: Path,
+    variant: str,
+    *,
+    committed: bool,
+    expected: dict | None = None,
 ) -> None:
+    """Recover twice and require convergence on the expected terminal world.
+
+    `expected` names that world directly, for a caller whose scenario is not one of the
+    five single-effect kill-matrix variants the table below spells out: the exerciser's
+    compound scenarios (`tests/conftest.py`'s `exerciser_kill_matrix`) observe their two
+    terminal worlds -- the seeded one and the rehearsal's finished one -- instead of
+    hardcoding a surface. Everything else about the contract is the same for both
+    callers, which is why they share this function rather than forking it.
+    """
     first = _recover(project, metadata)
     world = _world(project)
     second = _recover(project, metadata)
     assert second == first
     assert _world(project) == world
     assert first["lease"]["active"] is None
+    if expected is not None:
+        assert world == expected
+        return
     expected = {
         "create": {"d": ("directory", None), **({"d/f.txt": ("file", b"after")} if committed else {})},
         "replace": {"d": ("directory", None), "d/f.txt": ("file", b"after" if committed else b"before")},
