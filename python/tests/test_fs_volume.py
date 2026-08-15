@@ -1,4 +1,5 @@
 import dataclasses
+import errno
 import io
 import struct
 
@@ -245,6 +246,55 @@ def test_the_ioctl_resolves_masks_on_a_live_ext4_directory(ext4_probe_fd):
     masks = resolve_ext4_feature_masks(ext4_probe_fd)
     assert masks.compat >= 0
     assert masks.incompat > 0  # ext4 always sets incompat bits
+
+
+@pytest.mark.parametrize("unsupported", [errno.ENOTTY, errno.EOPNOTSUPP, errno.EINVAL])
+def test_the_ioctl_refuses_kernels_without_feature_mask_support(monkeypatch, unsupported):
+    """Catches removing one unsupported-ioctl errno from the fail-closed branch."""
+    def ioctl(*_args):
+        raise OSError(unsupported, "unsupported ioctl")
+
+    monkeypatch.setattr(volume_module.fcntl, "ioctl", ioctl)
+
+    with pytest.raises(CapabilityUnavailable, match="ext4 feature masks unresolvable") as caught:
+        resolve_ext4_feature_masks(67)
+
+    assert isinstance(caught.value.__cause__, OSError)
+    assert caught.value.__cause__.errno == unsupported
+
+
+def test_the_ioctl_propagates_an_unexpected_kernel_error(monkeypatch):
+    """Catches broad exception translation that would hide an I/O failure."""
+    def ioctl(*_args):
+        raise OSError(errno.EIO, "injected I/O failure")
+
+    monkeypatch.setattr(volume_module.fcntl, "ioctl", ioctl)
+
+    with pytest.raises(OSError, match="injected I/O failure") as caught:
+        resolve_ext4_feature_masks(67)
+
+    assert caught.value.errno == errno.EIO
+
+
+def test_the_ioctl_receives_the_bound_descriptor_request_and_mutable_buffer(monkeypatch):
+    """Catches changing the ioctl request or replacing its output buffer."""
+    calls = []
+
+    def ioctl(fd, request, buffer):
+        calls.append((fd, request, buffer))
+        struct.pack_into("<III", buffer, 64, 0x43C, 0x2C2, 0x46B)
+
+    monkeypatch.setattr(volume_module.fcntl, "ioctl", ioctl)
+
+    masks = resolve_ext4_feature_masks(67)
+
+    assert masks == FeatureMasks(compat=0x43C, incompat=0x2C2, ro_compat=0x46B)
+    assert len(calls) == 1
+    fd, request, buffer = calls[0]
+    assert fd == 67
+    assert request == (2 << 30) | (232 << 16) | (ord("f") << 8) | 45
+    assert isinstance(buffer, bytearray)
+    assert len(buffer) == 232
 
 
 def test_mask_options_are_canonical_hex():
