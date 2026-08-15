@@ -6,6 +6,15 @@ which is already RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV. No
 multi-component path is ever assembled -- passing one to a syscall would reopen the
 check/use race, because the kernel re-resolves intermediate components at the syscall.
 
+The walk is not one pass. `_build_descriptor_table` is the initial descent, and it stops
+at every planned directory -- including, by inheritance, one whose parent is itself
+planned, which it cannot even look up. Two resumption points pick the walk back up once
+such a directory gains a descriptor, both through `_register_planned_children`: recovery,
+via `_resume_descent`, and forward execution, where A7's `_apply_effect` adopts the
+descriptor a `CreateDirectory` effect retained (§9.5's descendant handoff). A planned
+directory's `WalkStop` is therefore born either in the descent or at the moment its
+parent becomes reachable, never anywhere else.
+
 The tree gives structure, not spelling: `TopologyDirectory(node_id)` carries no name, so
 the walk builds its own node-to-path table, `_directory_paths`, by climbing
 `approved.topology.parents` from each declared path up to a node it has already
@@ -301,10 +310,20 @@ def _register_planned_children(
     parent's own descriptor rather than declared free, because a freshly published
     directory is empty only until someone else writes into it.
 
+    PRECONDITION: call exactly once per `adopt`, and only for a node just adopted. It
+    appends unconditionally and checks no existing stop, so a second call would give one
+    child two stops -- `adopt` then removes only one of them, and the survivor would
+    outlive its own directory.
+
     `_unreachable` is recomputed rather than adjusted: every node without a descriptor is
     at or beneath a current stop, so the closure over `table._stops` IS the set. `adopt`
     subtracts only the adopted node, which would leave that node's descendants marked
-    unreachable after their ancestor became reachable.
+    unreachable after their ancestor became reachable. The recomputation is the last
+    statement, so that equality is a POST-CONDITION OF THE SUCCESS PATH ONLY: an
+    `observe` that raises midway leaves the table adopt-mutated with some children
+    already appended and `_unreachable` still describing the pre-adopt stops. Nothing
+    repairs it, because nothing needs to -- every caller propagates, the table is torn
+    down or handed to a rollback that re-observes every stop before reading one.
     """
     paths = _directory_paths(approved)
     planned = {

@@ -13,6 +13,7 @@ from atoms.coordinator.admission import admit
 from atoms.coordinator.capture import capture_initial_surface
 from atoms.coordinator.prepare import open_workspace, prepare_transaction
 from atoms.coordinator.recover import _registration_entry
+from atoms.core.compiler import compile_spec
 from atoms.core.recovery import JournalState, TransactionState
 from atoms.fs.audit import AuditedBackend
 from tests.capture_support import DictPayloads, digest_of
@@ -20,6 +21,7 @@ from tests.coordinator_support import (
     AFTER,
     admission_for,
     compiled_creating_a_directory,
+    deep_directory_spec,
 )
 
 
@@ -59,8 +61,8 @@ def _prepare_registered(lease) -> str:
     return approved.txid
 
 
-def _prepare_registered_directory(lease):
-    approved = admit(lease, compiled_creating_a_directory(lease))
+def _prepare_registered_directory(lease, compiled):
+    approved = admit(lease, compiled)
     with open_workspace(lease, approved) as workspace, capture_initial_surface(
         lease,
         approved,
@@ -92,7 +94,9 @@ def test_recovery_resumes_descent_through_a_created_planned_directory(
 ) -> None:
     ingredients = coordinator_on()
     with leased(ingredients) as lease:
-        approved = _prepare_registered_directory(lease)
+        approved = _prepare_registered_directory(
+            lease, compiled_creating_a_directory(lease)
+        )
         with lease._store.transaction() as txn:
             txn.set_transaction_state(approved.txid, TransactionState.APPLYING)
             txn.set_journal_state(approved.txid, "e1", JournalState.STARTED)
@@ -108,12 +112,49 @@ def test_recovery_resumes_descent_through_a_created_planned_directory(
             os.stat("d", dir_fd=lease._binding.project_root_fd)
 
 
+def test_recovery_registers_the_planned_children_of_a_resumed_directory(
+    coordinator_on, leased
+) -> None:
+    """The recovery half of `_register_planned_children`, with children to register.
+
+    `test_recovery_resumes_descent_through_a_created_planned_directory` resumes into a
+    directory that has no planned child, so it never enters the registration loop. Here
+    "a" and "a/b" both exist when the fresh lease reopens: resuming into "a" must
+    register "a/b" as a new stop, and resuming into THAT must register "a/b/c" -- the
+    same helper the forward mkdir path calls, driven from the other direction and
+    recursing past the first level.
+    """
+    ingredients = coordinator_on()
+    with leased(ingredients) as lease:
+        approved = _prepare_registered_directory(
+            lease, compile_spec(deep_directory_spec())
+        )
+        with lease._store.transaction() as txn:
+            txn.set_transaction_state(approved.txid, TransactionState.APPLYING)
+            for effect_id in ("e1", "e2"):
+                txn.set_journal_state(approved.txid, effect_id, JournalState.STARTED)
+                txn.set_journal_state(approved.txid, effect_id, JournalState.DONE)
+        root_fd = lease._binding.project_root_fd
+        os.mkdir("a", 0o755, dir_fd=root_fd)
+        os.mkdir("a/b", 0o755, dir_fd=root_fd)
+        txid = approved.txid
+
+    with leased(ingredients) as lease:
+        record = lease._store.read_record(txid)
+        assert record is not None
+        assert record.state is TransactionState.ROLLED_BACK
+        with pytest.raises(FileNotFoundError):
+            os.stat("a", dir_fd=lease._binding.project_root_fd)
+
+
 def test_foreign_file_at_a_planned_directory_reaches_recovery_classification(
     coordinator_on, leased
 ) -> None:
     ingredients = coordinator_on()
     with leased(ingredients) as lease:
-        approved = _prepare_registered_directory(lease)
+        approved = _prepare_registered_directory(
+            lease, compiled_creating_a_directory(lease)
+        )
         fd = os.open(
             "d",
             os.O_CREAT | os.O_EXCL | os.O_WRONLY,

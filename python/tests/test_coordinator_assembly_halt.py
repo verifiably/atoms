@@ -13,6 +13,7 @@ from atoms.core.errors import TransactionHalted
 from atoms.core.recovery import TransactionState
 from atoms.core.scratch import CHAIN_LEAF, scratch_leaf
 from atoms.store.errors import MetadataStoreInvalid
+from tests.coordinator_support import compiled_creating_a_directory
 from tests.test_coordinator_resolve import (
     _prepare_registered,
     _prepare_registered_directory,
@@ -65,7 +66,9 @@ def test_missing_transaction_work_slot_has_its_reserved_assembly_path(
 ) -> None:
     ingredients = coordinator_on()
     with leased(ingredients) as lease:
-        approved = _prepare_registered_directory(lease)
+        approved = _prepare_registered_directory(
+            lease, compiled_creating_a_directory(lease)
+        )
         work_parent = os.open(
             "work",
             os.O_RDONLY | os.O_DIRECTORY,

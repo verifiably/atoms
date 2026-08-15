@@ -197,6 +197,56 @@ def test_caught_rollback_after_nested_creates_restores_the_initial_surface(
     assert settled.outcome is ChainOutcome.ROLLED_BACK
 
 
+def test_caught_rollback_resumes_the_descent_into_a_published_directory(
+    coordinator_on, monkeypatch
+) -> None:
+    """`_roll_back`'s rescan, on a stop that IS occupied by a directory.
+
+    The cut lands between publication and adoption of "a/b": the directory is on disk,
+    but nothing adopted its descriptor, so its forward-registered stop survives into
+    `_roll_back`. The rescan re-observes it as a directory and resumes the descent,
+    which adopts it and registers "a/b/c" -- the same helper, reached from the rollback
+    route rather than the forward one.
+    """
+    from atoms.coordinator import execute
+
+    ingredients = coordinator_on()
+    _enable_commands(ingredients, monkeypatch)
+    backend, project_root, metadata_root, storage = ingredients
+    root = Path(project_root)
+    _register(ingredients, b"root", ())
+    apply = execute.create_directory.apply
+    applied = {"n": 0}
+
+    def apply_then_cut(backend, site, effect, *, gate):
+        fd = apply(backend, site, effect, gate=gate)
+        applied["n"] += 1
+        if applied["n"] < 2:
+            return fd
+        # Exactly the boundary the stop must survive: published, never adopted.
+        backend.close_fd(fd)
+        raise RuntimeError("cut between publication and adoption")
+
+    monkeypatch.setattr(execute.create_directory, "apply", apply_then_cut)
+    with pytest.raises(RuntimeError, match="cut between publication and adoption"):
+        run_transaction(
+            backend,
+            project_root,
+            metadata_root,
+            storage,
+            deep_directory_spec(),
+            DictPayloads({digest_of(AFTER): AFTER}),
+        )
+
+    assert applied["n"] == 2
+    assert {path.name for path in root.iterdir()} == {CHAIN_LEAF}
+    with sqlite3.connect(Path(metadata_root) / "atoms.db") as connection:
+        state = connection.execute(
+            "SELECT state FROM transaction_record ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()[0]
+    assert state == TransactionState.ROLLED_BACK.value
+
+
 def test_keyboard_interrupt_rolls_back_before_it_is_reraised(
     coordinator_on, monkeypatch
 ) -> None:
