@@ -11,6 +11,7 @@ from pathlib import Path
 _PYTHON_ROOT = Path(__file__).resolve().parents[2]
 _REPOSITORY_ROOT = _PYTHON_ROOT.parent
 _REPLAY_LOG = _PYTHON_ROOT / ".certify" / "replay-log"
+_KERNEL = Path("/boot/vmlinuz-linux")
 
 
 def _has_dm_log_writes_module() -> bool:
@@ -35,7 +36,7 @@ def check() -> list[str]:
     """Return the required host capabilities that are unavailable."""
     checks = (
         ("qemu-system-x86_64", shutil.which("qemu-system-x86_64") is not None),
-        ("/boot/vmlinuz-linux", os.access("/boot/vmlinuz-linux", os.R_OK)),
+        ("/boot/vmlinuz-linux", _KERNEL.is_file() and os.access(_KERNEL, os.R_OK)),
         ("dm-log-writes", _has_dm_log_writes_module()),
         ("mkinitcpio", shutil.which("mkinitcpio") is not None),
         ("dmsetup", shutil.which("dmsetup") is not None),

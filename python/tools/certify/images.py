@@ -91,9 +91,10 @@ def build_data_image(
     if not isinstance(mount_options, str) or "\0" in mount_options:
         raise ValueError("mount_options must be a string without NUL bytes")
     image = Path(path)
+    features = _mkfs_features(feature_masks)
     _create_raw_image(image, size_mib)
     result = subprocess.run(
-        ["mkfs.ext4", "-F", "-O", _mkfs_features(feature_masks), os.fspath(image)],
+        ["mkfs.ext4", "-F", "-O", features, os.fspath(image)],
         check=False,
         capture_output=True,
         text=True,

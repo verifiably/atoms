@@ -9,6 +9,9 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+_CHECKOUT = Path(__file__).resolve().parents[3]
+_UNSAFE_CMDLINE_CHARACTERS = frozenset("'\"\\\0")
+
 
 @dataclass(frozen=True, slots=True)
 class GuestResult:
@@ -53,15 +56,28 @@ def build_initramfs(work: Path) -> Path:
     init.write_text(
         """#!/bin/sh
 set -eu
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mount -t tmpfs tmpfs /run
+for parameter in $(cat /proc/cmdline); do
+    case "$parameter" in checkout=*) checkout=${parameter#checkout=} ;; esac
+done
+[ -n "${checkout:-}" ]
+case "$checkout" in /*) ;; *) exit 1 ;; esac
+case "$checkout" in *[!A-Za-z0-9_./-]*) exit 1 ;; esac
 for module in 9p 9pnet_virtio virtio_pci virtio_blk dm-log-writes dm-mod loop; do
     modprobe "$module"
 done
-mkdir -p /root9p /tmp /run /root9p/tmp /root9p/run
+mkdir -p /root9p
 mount -t 9p -o ro,trans=virtio,version=9p2000.L root9p /root9p
-mount -t tmpfs tmpfs /tmp
-mount --bind /tmp /root9p/tmp
-mount --bind /tmp /root9p/run
-exec chroot /root9p /bin/sh -c 'cd /python && exec python -m tools.certify.guest_init'
+mkdir -p /root9p/dev /root9p/proc /root9p/sys /root9p/run /root9p/tmp
+mount --bind /dev /root9p/dev
+mount --bind /proc /root9p/proc
+mount --bind /sys /root9p/sys
+mount --bind /run /root9p/run
+mount -t tmpfs tmpfs /root9p/tmp
+exec chroot /root9p /bin/sh -c 'cd "$1" && exec python -m tools.certify.guest_init' sh "$checkout"
 """,
         encoding="utf-8",
     )
@@ -111,6 +127,19 @@ def _qemu_path(path: Path, name: str) -> str:
     return value
 
 
+def _checkout_path(shared_root: Path) -> str:
+    root = shared_root.resolve()
+    checkout = _CHECKOUT.resolve()
+    if root != Path("/"):
+        raise ValueError("shared_root must be the host root directory")
+    if not checkout.is_relative_to(root) or not (checkout / "python").is_dir():
+        raise ValueError(f"checkout is not available beneath shared_root: {checkout}")
+    value = os.fspath(checkout)
+    if any(character.isspace() or character in _UNSAFE_CMDLINE_CHARACTERS for character in value):
+        raise ValueError(f"checkout path is unsafe for the kernel command line: {checkout}")
+    return value
+
+
 def run(
     kernel: Path,
     initramfs: Path,
@@ -129,6 +158,8 @@ def run(
     root = Path(shared_root)
     if not root.is_dir():
         raise ValueError(f"shared_root is not a directory: {root}")
+    if data_image.resolve() == log_image.resolve():
+        raise ValueError("data_image and log_image must be distinct files")
     kernel_path, initramfs_path, data_path, log_path = (
         _qemu_path(item, name)
         for item, name in zip(
@@ -138,6 +169,7 @@ def run(
         )
     )
     root_path = _qemu_path(root, "shared_root")
+    checkout = _checkout_path(root)
     command = [
         "qemu-system-x86_64",
         "-nographic",
@@ -149,7 +181,10 @@ def run(
         "-initrd",
         initramfs_path,
         "-append",
-        "console=ttyS0 rootfstype=9p root=root9p rootflags=trans=virtio,version=9p2000.L,ro data_device=/dev/vda log_device=/dev/vdb",
+        (
+            "console=ttyS0 rootfstype=9p root=root9p rootflags=trans=virtio,version=9p2000.L,ro "
+            f"data_device=/dev/vda log_device=/dev/vdb checkout={checkout}"
+        ),
         "-fsdev",
         f"local,id=root9p,path={root_path},security_model=none,readonly=on",
         "-device",
