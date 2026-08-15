@@ -33,7 +33,7 @@ import sqlite3
 import stat
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NewType
+from typing import NewType, cast
 
 DB_FAMILY = ("atoms.db", "atoms.db-wal", "atoms.db-shm", "atoms.db-journal")
 
@@ -1086,6 +1086,214 @@ def _maximal_survivors(stream: Stream, cut: int) -> frozenset[tuple]:
         if reason is None:
             accepted.add(unit.key)
     return frozenset(accepted)
+
+
+def _maximal_extra(
+    stream: Stream,
+    cut: int,
+    base: WorldState,
+    entry_survivors: frozenset[tuple],
+    other_keys: frozenset[tuple],
+) -> frozenset[tuple]:
+    """The largest subset of `other_keys` (`data`/`meta` pending units) that applies
+    cleanly once `entry_survivors` have landed on top of `base` -- `enumerate_cells`'s
+    per-cell generalization of `_maximal_survivors`'s own greedy pass (design §9's "an
+    unreachable inode carries no observable state"), fixed to one particular entry
+    subset instead of the single maximal one.
+
+    `data`/`meta` representability is *never* independently combinatorial: a unit's
+    strict reachability is a pure function of which entries are durable-or-chosen, so
+    branching `enumerate_cells`'s powerset over these keys too would multiply the walk
+    by up to `2**len(other_keys)` for zero additional observable outcomes -- exactly the
+    scale (`data`/`meta` keys orphaned by un-flushed capability-probe churn, `python/
+    tests/exerciser.py`'s admission-time probing) that makes a literal full powerset
+    over every pending key intractable. Branching stays over `entry` keys alone, which
+    is where §9.4's dual-name/anchor-only shape actually varies.
+    """
+    positioned = _pending_with_positions(stream, cut)
+    entries = dict(base.entries)
+    modes = dict(base.modes)
+    images = dict(base.images)
+    reverse = _reverse_index(entries)
+    ordered_entries = sorted(
+        (positioned[key] for key in entry_survivors), key=lambda item: item[0]
+    )
+    for _, unit in ordered_entries:
+        _apply_unit(unit, entries, modes, images, reverse, strict=True)
+    accepted: set[tuple] = set()
+    ordered_other = sorted((positioned[key] for key in other_keys), key=lambda item: item[0])
+    for _, unit in ordered_other:
+        reason = _apply_unit(unit, entries, modes, images, reverse, strict=True)
+        if reason is None:
+            accepted.add(unit.key)
+    return frozenset(accepted)
+
+
+def _tree_digest(tree: WorldTree) -> str:
+    """A deterministic dedupe key for a `WorldState.tree` (design's `(state digest,
+    backup_id)` dedupe pair) -- not a security digest, only stable ordering."""
+    digest = hashlib.sha256()
+    for path, value in sorted(tree.items()):
+        digest.update(path.encode())
+        digest.update(b"\0")
+        digest.update(repr(value).encode())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+class PendingCapExceeded(Exception):
+    """A cut's pending entry-key count exceeded `enumerate_cells`'s `pending_cap` --
+    loud, never sampled (design §4.3): "a cap breach means the model or the engine
+    changed, and the matrix must say so.\""""
+
+
+@dataclass(frozen=True)
+class Cell:
+    """One reconstructible world at a cut: the chosen pending-key subset and the
+    `WorldState` `apply_survivors` built from it."""
+
+    cut: int
+    survivors: frozenset[UnitKey]
+    state: WorldState
+
+
+@dataclass(frozen=True)
+class SweepAccounting:
+    """The sweep's bookkeeping: how many cells were kept, how many worlds deduped away
+    (identical `(tree digest, backup_id)`), and how many survivor subsets were skipped,
+    by reason."""
+
+    cells: int
+    deduped: int
+    skips: dict[str, int]
+
+
+def enumerate_cells(
+    stream: Stream, *, pending_cap: int = 12
+) -> tuple[tuple[Cell, ...], SweepAccounting]:
+    """Every reconstructible cell of `stream`, materialized (erratum 2 -- a pair, never
+    an iterator): walk every cut index (design §4.3's "an index into the recorded
+    stream"), and at each, the full powerset of that cut's pending **entry** keys --
+    `data`/`meta` keys ride along deterministically via `_maximal_extra`, since their
+    representability is never independently combinatorial (see `_maximal_extra`'s
+    docstring for why the branching dimension is entry keys alone).
+
+    `pending_cap` bounds the entry-key count a cut is allowed to carry before the walk
+    raises `PendingCapExceeded` -- loud, never sampled: the engine's barrier discipline
+    keeps the *entry* dimension small (`python/tests/exerciser.py`'s admission-time
+    capability probing never carries more than a handful of live entry names at once,
+    even though it leaves dozens of orphaned `data`/`meta` keys behind), so a breach
+    here is a real signal the model or the engine changed shape.
+
+    Identical `(tree digest, backup_id)` worlds dedupe -- expected and common, since
+    many adjacent cuts share the same durable base and the same entry powerset.
+    """
+    cells: list[Cell] = []
+    seen: set[tuple[str, int | None]] = set()
+    deduped = 0
+    skips: dict[str, int] = {}
+
+    for cut in range(len(stream.events) + 1):
+        pending = pending_keys_at(stream, cut)
+        entry_keys = tuple(sorted(key for key in pending if key[0] == "entry"))
+        other_keys = frozenset(key for key in pending if key[0] != "entry")
+        if len(entry_keys) > pending_cap:
+            raise PendingCapExceeded(
+                f"cut {cut}: {len(entry_keys)} pending entry keys exceeds "
+                f"pending_cap={pending_cap}"
+            )
+        base = durable_state(stream, cut)
+        for size in range(len(entry_keys) + 1):
+            for combo in itertools.combinations(entry_keys, size):
+                entry_survivors = frozenset(combo)
+                extra = _maximal_extra(stream, cut, base, entry_survivors, other_keys)
+                survivors = entry_survivors | extra
+                result = apply_survivors(base, stream, cut, survivors)
+                if isinstance(result, Skip):
+                    skips[result.reason] = skips.get(result.reason, 0) + 1
+                    continue
+                dedupe_key = (_tree_digest(result.tree), result.backup_id)
+                if dedupe_key in seen:
+                    deduped += 1
+                    continue
+                seen.add(dedupe_key)
+                cells.append(Cell(cut, cast("frozenset[UnitKey]", survivors), result))
+
+    return tuple(cells), SweepAccounting(cells=len(cells), deduped=deduped, skips=skips)
+
+
+def named_tuples(stream: Stream) -> dict[str, Cell]:
+    """`{"dual-name-forward", "anchor-only-forward"}` and, in a caught-rollback move
+    stream, `{"dual-name-reverse", "anchor-only-reverse"}` (design §9.4).
+
+    A move's transfer is a two-unit `remove`+`insert` `Mutation` sharing an object
+    token that also carries a `link_anchor`-shaped insert elsewhere in the stream (a
+    single-unit entry `insert` Mutation) -- rollback re-moves a landed move by emitting
+    a *second*, structurally identical transfer of the same token, so a caught-rollback
+    stream carries two matches, not one.
+
+    Direction: `TransactionState.ROLLING_BACK`'s `"rolling_back"` commit is the
+    earliest point any effect's undo can begin (`classify_recovery` always transitions
+    to `ROLLING_BACK` before any per-effect `UNDO_STARTED` step) -- a transfer at or
+    after it is the reverse (UNDO-era) traffic; before it (or when the stream never
+    rolls back at all) is forward.
+
+    For each match, the cut immediately after its `Mutation` names two single-survivor
+    cells -- `{insert}` (both names momentarily alive: dual-name) and `{remove}` (the
+    anchor is the only surviving name: anchor-only) -- design §4.3's "a remove of an
+    entry that is durably present applies" is exactly how anchor-only arises. Design
+    §4.3/§9.4 calls both **generated, never skipped**: either resolving to `Skip`
+    raises `KeyError` naming the tuple, rather than silently omitting it.
+    """
+    try:
+        boundary = stream.commit_index("rolling_back")
+    except KeyError:
+        boundary = len(stream.events)
+
+    anchor_tokens: set[int] = set()
+    for event in stream.events:
+        if type(event) is not Mutation or len(event.units) != 1:
+            continue
+        unit = event.units[0]
+        if unit.key[0] == "entry" and unit.change == "insert" and unit.object_token is not None:
+            anchor_tokens.add(unit.object_token)
+
+    result: dict[str, Cell] = {}
+    for index, event in enumerate(stream.events):
+        if type(event) is not Mutation or len(event.units) != 2:
+            continue
+        by_change = {unit.change: unit for unit in event.units}
+        if set(by_change) != {"remove", "insert"}:
+            continue
+        remove_unit, insert_unit = by_change["remove"], by_change["insert"]
+        if remove_unit.key[0] != "entry" or insert_unit.key[0] != "entry":
+            continue
+        if remove_unit.object_token != insert_unit.object_token:
+            continue
+        if remove_unit.object_token not in anchor_tokens:
+            continue
+
+        direction = "forward" if index < boundary else "reverse"
+        cut = index + 1
+        base = durable_state(stream, cut)
+
+        dual_survivors = frozenset({insert_unit.key})
+        dual = apply_survivors(base, stream, cut, dual_survivors)
+        if isinstance(dual, Skip):
+            raise KeyError(f"dual-name-{direction}")
+        result[f"dual-name-{direction}"] = Cell(
+            cut, cast("frozenset[UnitKey]", dual_survivors), dual
+        )
+
+        anchor_survivors = frozenset({remove_unit.key})
+        anchor = apply_survivors(base, stream, cut, anchor_survivors)
+        if isinstance(anchor, Skip):
+            raise KeyError(f"anchor-only-{direction}")
+        result[f"anchor-only-{direction}"] = Cell(
+            cut, cast("frozenset[UnitKey]", anchor_survivors), anchor
+        )
+
+    return result
 
 
 def _resolve(rel: str, project_root: Path, metadata_root: Path) -> Path:

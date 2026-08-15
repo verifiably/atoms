@@ -144,6 +144,42 @@ def _archive_move_spec() -> TransactionSpec:
     )
 
 
+def _seed_caught_rollback_move(project: Path) -> None:
+    directory = project / "d"
+    directory.mkdir()
+    (directory / "source.txt").write_bytes(BEFORE)
+    (project / "other.txt").write_bytes(BEFORE)
+
+
+def _caught_rollback_move_spec() -> TransactionSpec:
+    """A move that lands, then a second effect that fails -- forces rollback to
+    re-move the landed move (`JournalState.UNDO_STARTED` reverse traffic, design §9.4).
+    """
+    return build_spec(
+        consumer_tag="test",
+        intent_digest="sha256:" + "d" * 64,
+        initial_surface={
+            "d/source.txt": PRE,
+            "d/destination.txt": ABSENT,
+            "other.txt": PRE,
+        },
+        final_surface={
+            "d/source.txt": ABSENT,
+            "d/destination.txt": PRE,
+            "other.txt": POST,
+        },
+        effects=[
+            MoveNoClobber(
+                effect_id="e1",
+                source="d/source.txt",
+                destination="d/destination.txt",
+                source_pre=PRE,
+            ),
+            ReplaceFile(effect_id="e2", path="other.txt", pre=PRE, post=POST),
+        ],
+    )
+
+
 def _drift_delete_target(project: Path) -> None:
     """Occupy the DeletePath target with a foreign file, for the recovery matrix (Task 6)."""
     (project / "d" / "f.txt").write_bytes(b"drift-foreign")
@@ -167,6 +203,14 @@ SCENARIOS: tuple[Scenario, ...] = (
         replace_spec,
         _with_after,
         _seed_replace,
+        inject_failure="replace_file",
+    ),
+    Scenario(
+        "caught-rollback-move",
+        "rollback",
+        _caught_rollback_move_spec,
+        _with_after,
+        _seed_caught_rollback_move,
         inject_failure="replace_file",
     ),
     Scenario(
