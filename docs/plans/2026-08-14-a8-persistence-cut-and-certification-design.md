@@ -479,8 +479,13 @@ their own falsification arms:
      durable → a designated halt: `DONE` with the directory absent under both
      names.
   5. *The `COMMITTED` decision* suppressed (cleanup and return proceed without
-     the durable `COMMITTED` COMMIT) → the cut after committed cleanup → the
-     **returned-outcome permanence invariant** fails: a transaction whose
+     the durable `COMMITTED` COMMIT — modeled at the sequencer by withholding
+     that commit's backup advance) → the cut **at** the `COMMITTED` decision,
+     its durable metadata still `APPLIED` *(re-sited 2026-08-15, Task 9: the
+     originally named "after committed cleanup" cut lies outside the one-commit
+     stale window the sequencer model creates; the invariant is indifferent to
+     the site, and the decision-adjacent cut is the simplest world in it)* →
+     the **returned-outcome permanence invariant** fails: a transaction whose
      outcome was returned `COMMITTED` resolves `ROLLED_BACK` on recovery.
 - **Skip accounting**: the §4.3 by-reason skip counts and required-tuple
   generation assertions run on every sweep.
