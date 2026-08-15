@@ -641,6 +641,22 @@ def persistence_recording(coordinator_on, monkeypatch):
 
 
 @pytest.fixture
+def cut_matrix(ext4_volume, test_storage_profile, monkeypatch):
+    """The persistence-cut sweep (design §5): `Sweeper(...)` sweeps a whole scenario,
+    `Sweeper.named_cell(...)` runs one of §9.4's named tuples.
+
+    Deliberately NOT built on `persistence_recording`: that fixture records through
+    `coordinator_on`, whose project root is one shared directory, and every scenario's
+    `seed_world` builds the same paths -- so a test sweeping two scenarios (Task 7's
+    four compound ones, Task 8's two directions) would fail seeding the second. The
+    `Sweeper` mints a fresh project root per recording on the same ext4 volume instead.
+    """
+    from tests.persistence_model import Sweeper
+
+    return Sweeper(ext4_volume, test_storage_profile, monkeypatch)
+
+
+@pytest.fixture
 def opened_store(store_on):
     """A live Store over a fresh ext4 project, closed on exit."""
     from atoms.store.connection import open_store

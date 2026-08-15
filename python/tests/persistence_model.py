@@ -26,11 +26,14 @@ the write that happened rather than from a position).
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import itertools
+import json
 import os
 import sqlite3
 import stat
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NewType, cast
@@ -736,12 +739,48 @@ def _snapshot_seed(project_root: str, metadata_root: str, stream: Stream) -> Non
 
 
 def _walk_lstat(base: Path):
-    """Yield every (path, lstat) under `base`, recursively, never following symlinks."""
-    for child in sorted(base.iterdir()):
-        info = child.lstat()
+    """Yield every (path, lstat) under `base`, recursively, never following symlinks.
+
+    A directory whose *durable* mode denies the owner read or search permission is
+    yielded, never descended into, and never chmod'd: design §4.3's survivor product
+    branches an entry unit independently of its paired `meta mode` unit, so a
+    reconstructed world legitimately contains a mode-`0` directory (Task 5's directed
+    zero-mode test pins exactly that shape). Its contents are unobservable -- to the
+    engine as much as to this walk -- so "an unreadable directory at this mode" is the
+    whole canonical fact about it, and the mode is already part of every digest entry.
+    Restoring permission to look inside would mutate the very world the second pass is
+    about to compare.
+    """
+    try:
+        children = sorted(base.iterdir())
+    except PermissionError:
+        return
+    for child in children:
+        try:
+            info = child.lstat()
+        except PermissionError:
+            continue
         yield child, info
         if stat.S_ISDIR(info.st_mode):
             yield from _walk_lstat(child)
+
+
+_UNREADABLE = "unreadable"
+
+
+def _content_hash(path: Path) -> str:
+    """The file's content digest, or the `_UNREADABLE` marker for a mode that denies it.
+
+    Same ruling as `_walk_lstat`: a survivor subset may drop a file's `meta mode` unit
+    while keeping its entry, and design §4.4 reconstructs that faithfully as a mode-`0`
+    file. Its bytes are unobservable -- to the engine as much as to this digest -- and
+    the mode itself is already a digested field, so the marker records exactly what is
+    knowable instead of raising.
+    """
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except PermissionError:
+        return _UNREADABLE
 
 
 def world_digest(project_root: str | Path, metadata_root: str | Path) -> str:
@@ -765,7 +804,7 @@ def world_digest(project_root: str | Path, metadata_root: str | Path) -> str:
             elif stat.S_ISDIR(info.st_mode):
                 entries.append((rel, "dir", stat.S_IMODE(info.st_mode), None, None, None))
             else:
-                content_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+                content_hash = _content_hash(path)
                 inode_key = (info.st_dev, info.st_ino)
                 entries.append(
                     (rel, "file", stat.S_IMODE(info.st_mode), content_hash, None, inode_key)
@@ -1424,6 +1463,45 @@ def named_tuples(stream: Stream) -> dict[str, Cell]:
     return result
 
 
+def complete_named_cell(cell: Cell, stream: Stream) -> Cell:
+    """Complete a bare `apply_survivors`-built cell into a physically runnable one.
+
+    `named_tuples` builds its four cells through `apply_survivors` with a single chosen
+    *entry* key, so every other pending key at that cut is dropped. Design §9.4 defines
+    those tuples purely by which **names** are live -- dual-name keeps the transfer's
+    insert, anchor-only keeps its remove -- and says nothing about the modes and byte
+    images of unrelated objects. Dropping every pending `meta mode` unit does say
+    something, though: it reconstructs each affected object at mode `0`, and the engine
+    then refuses the lease on an inaccessible leaf instead of performing the repair the
+    directed test exists to observe (measured: both `minimal-move` tuples at cut 69
+    refused on a mode-`0` `metadata/work/<txid>` before this completion).
+
+    So the entry topology is left exactly as the tuple names it -- no other `entry` key
+    is ever folded in, since that is precisely what distinguishes the two tuples -- and
+    every non-`entry` pending key, plus the probe-noise keys `enumerate_cells` folds
+    anyway, is offered to the same `_fold` pass the sweep uses. Two survivor
+    vocabularies, one physical cell, one applicability engine.
+    """
+    probe_tokens, token_parents = _probe_classification(stream)
+    positioned = _pending_with_positions(stream, cell.cut)
+    optional = frozenset(
+        key
+        for key in pending_keys_at(stream, cell.cut)
+        if key not in cell.survivors
+        and (key[0] != "entry" or _is_probe_noise(key, probe_tokens, token_parents))
+    )
+    base = durable_state(stream, cell.cut)
+    mandatory = frozenset(cell.survivors)
+    reason, accepted = _fold(stream, base, positioned, mandatory, optional)
+    if reason is not None:
+        raise KeyError(f"a named cell at cut {cell.cut} is unrepresentable: {reason}")
+    survivors = mandatory | accepted
+    state = _apply_chosen(base, stream, cell.cut, positioned, survivors)
+    if isinstance(state, Skip):
+        raise KeyError(f"a named cell at cut {cell.cut} skipped: {state.reason}")
+    return Cell(cell.cut, cast("frozenset[UnitKey]", survivors), state)
+
+
 def _resolve(rel: str, project_root: Path, metadata_root: Path) -> Path:
     label, _, tail = rel.partition("/")
     return (project_root if label == "project" else metadata_root) / tail
@@ -1508,10 +1586,119 @@ def reconstruct(state: WorldState, project_root: Path, metadata_root: Path) -> N
             connection = sqlite3.connect(db_path)
             try:
                 memory.backup(connection)
+                # `_backup_db` forced the file-format-version bytes back to 1 so the
+                # image could be deserialized at all; a *reconstructed* store must be
+                # what the live one was -- WAL. `open_database` refuses a completed
+                # store in any other journal mode ("converting it would rewrite a
+                # database on a guess"), so restoring the recorded mode here is part of
+                # reconstruction fidelity, not a repair the engine is being spared.
+                mode = connection.execute("PRAGMA journal_mode=wal").fetchone()[0]
+                assert mode == "wal", f"reconstructed store would not take WAL: {mode!r}"
             finally:
                 connection.close()
         finally:
             memory.close()
+
+
+def realign_durable_identities(project_root: Path, metadata_root: Path) -> int:
+    """Rewrite every durable `approval_evidence` identity onto the reconstructed inodes.
+
+    Design §4.4 claims reconstruction is "exact up to inode renaming, ... safe because
+    nothing durable stores inode numbers". That claim is **wrong about one durable
+    document**: `transaction_record.approval_evidence`
+    (`atoms.fs.approval.encode_approval_evidence`) pins `(st_dev, st_ino)` for every
+    *existing* approved directory and for the work base. Recovery's first act on a live
+    record is `_diff_approved_topology` (`coordinator/recover.py:402`), which compares
+    those numbers against the live world and, on any difference, persists an
+    `AssemblyHalt(APPROVAL_EVIDENCE_MISMATCH)` and raises -- **before**
+    `classify_recovery` is ever reached. Reconstruction mints fresh inodes by
+    construction, so without this step every record-bearing cell halts on an artifact of
+    reconstruction and the A3 agreement matrix asserts nothing at all (measured: 42 of
+    `minimal-create`'s 103 cells, and every cell that ever reached a durable record).
+
+    So the renaming §4.4 assumes is performed here, at the one place identity is durable:
+    each identity-bearing directory's `(st_dev, st_ino)` is replaced by the reconstructed
+    object's real one. A declared directory that is *absent* from the reconstructed world
+    keeps its recorded identity -- an absent approved directory is a genuine finding the
+    matrix must keep seeing, not a renaming. Planned directories (`identity: null`) and
+    `mount_id` are untouched: the former carry no identity, and the latter is a real fact
+    about the volume, identical because reconstruction stays on it.
+
+    Returns the number of identities rewritten, so a caller can assert the step was not
+    a silent no-op.
+    """
+    db_path = Path(metadata_root) / "atoms.db"
+    if not db_path.exists():
+        return 0
+
+    def identity_of(path: Path) -> dict[str, int] | None:
+        try:
+            info = path.lstat()
+        except OSError:
+            return None
+        return {"st_dev": info.st_dev, "st_ino": info.st_ino}
+
+    # `trg_evidence_write_once` (`atoms.store.schema`) aborts any UPDATE of the column,
+    # and `classify` compares the whole catalog -- including this trigger's exact SQL
+    # text -- against `EXPECTED_CATALOG` before the store opens. So the trigger is
+    # dropped and recreated from the production statement itself, never from a
+    # hand-copied spelling that could drift from it.
+    from atoms.store.schema import SCHEMA_STATEMENTS
+
+    trigger = next(
+        statement
+        for statement in SCHEMA_STATEMENTS
+        if "trg_evidence_write_once" in statement
+    )
+
+    rewritten = 0
+    connection = sqlite3.connect(db_path)
+    try:
+        rows = connection.execute(
+            "SELECT txid, approval_evidence FROM transaction_record"
+        ).fetchall()
+        for txid, evidence in rows:
+            document = json.loads(evidence)
+            work_base = Path(metadata_root) / "work"
+            work_root = document["work_root"]
+            if work_root is not None:
+                found = identity_of(work_base)
+                if found is not None and found != work_root["identity"]:
+                    work_root["identity"] = found
+                    rewritten += 1
+            for item in document["directories"]:
+                if item["identity"] is None:
+                    continue
+                relative = item["path"]
+                target = (
+                    work_base / txid
+                    if relative is None
+                    else Path(project_root) / relative
+                    if relative
+                    else Path(project_root)
+                )
+                found = identity_of(target)
+                if found is None or found == item["identity"]:
+                    continue
+                item["identity"] = found
+                rewritten += 1
+            replacement = json.dumps(
+                document, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+            )
+            if replacement == evidence:
+                continue
+            connection.execute("DROP TRIGGER trg_evidence_write_once")
+            try:
+                connection.execute(
+                    "UPDATE transaction_record SET approval_evidence = ? WHERE txid = ?",
+                    (replacement, txid),
+                )
+            finally:
+                connection.execute(trigger)
+        connection.commit()
+    finally:
+        connection.close()
+    return rewritten
 
 
 # --- top-level recording -----------------------------------------------------------
@@ -1550,3 +1737,832 @@ def record_scenario(entry, ingredients, monkeypatch, *, caught: bool = False) ->
 
     stream.final_world_digest = world_digest(project_root, metadata_root)
     return stream
+
+
+# --- per-cell recovery, the A3 agreement, and the side assertions (design §5) -------
+
+
+@dataclass(frozen=True)
+class CellResult:
+    """One cell's verdict.
+
+    `agrees` is the A3 comparison's answer, and is `True` when the comparison did not
+    apply (no durable record, or a refusal that never reached the classifier) -- read
+    `counts["classified"]` to tell "agreed" from "not compared". `halted` is true when
+    the lease entry ended in `TransactionHalted`, which is *not* a disagreement: design
+    §5's "cells where A3 halts assert the halt agrees and is preserved".
+
+    `projection`/`model_projection` are the durable and reduced projections (design §5's
+    widened shape: state, commit decision, rollback result, halt diagnostic, journals,
+    active). `world` is the post-recovery tree in `WorldState.tree`'s shape, consumed by
+    Task 8's directed repair assertions. `counts` carries the per-cell taxonomy.
+
+    The three failure fields exist because the sweep *reports* rather than stopping at
+    the first bad cell: a single failing cell says almost nothing about whether the
+    disagreement is systematic, and the parametrized sweep test asserts the aggregated
+    tuples are empty, which is the same assertion with a far better failure message.
+    """
+
+    agrees: bool
+    halted: bool
+    projection: tuple | None
+    model_projection: tuple | None
+    world: WorldTree
+    counts: dict[str, int]
+    disagreement: str | None = None
+    second_pass_violation: str | None = None
+    side_assertion_failures: tuple[str, ...] = ()
+
+
+def world_tree(project_root: str | Path, metadata_root: str | Path) -> WorldTree:
+    """The live world in `WorldState.tree`'s shape (design §4.4/§9), for comparison
+    against a modelled tree and for Task 8's directed assertions.
+
+    Two deliberate differences from `_materialize_tree`'s modelled trees, both so a live
+    tree and a modelled one can be compared after `_normalized_tree`:
+
+    - a hard-link group is keyed by its lexicographically first member path rather than
+      by a model token, because inode numbers are exactly what reconstruction does not
+      preserve (design §4.4) while the *relation* is;
+    - a file whose durable mode denies reading carries `None` for its content, matching
+      `world_digest`'s `_UNREADABLE` marker rather than raising.
+    """
+    tree: WorldTree = {}
+    groups: dict[tuple[int, int], list[str]] = {}
+    for label, root in (("project", Path(project_root)), ("metadata", Path(metadata_root))):
+        for path, info in _walk_lstat(root):
+            if path.parent == root and path.name in DB_FAMILY:
+                continue
+            rel = f"{label}/{path.relative_to(root).as_posix()}"
+            if stat.S_ISLNK(info.st_mode):
+                tree[rel] = ("symlink", os.readlink(path))
+            elif stat.S_ISDIR(info.st_mode):
+                tree[rel] = ("dir", stat.S_IMODE(info.st_mode))
+            else:
+                try:
+                    content: bytes | None = path.read_bytes()
+                except PermissionError:
+                    content = None
+                tree[rel] = ("file", content, stat.S_IMODE(info.st_mode))
+                groups.setdefault((info.st_dev, info.st_ino), []).append(rel)
+
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        key = ("link-group", min(members))
+        for rel in members:
+            kind, content, mode = tree[rel]
+            tree[rel] = (kind, content, mode, key)
+    return tree
+
+
+def _normalized_tree(tree: WorldTree) -> WorldTree:
+    """Rewrite every hard-link-group key to the group's first member path.
+
+    `_materialize_tree` keys a group by its model token and `world_tree` by a real
+    inode pair's first member; neither number survives comparison across a
+    reconstruction, and the relation both encode -- "these paths are one inode" -- does.
+    """
+    members: dict[tuple, list[str]] = {}
+    for rel, value in tree.items():
+        if value[0] == "file" and len(value) == 4:
+            members.setdefault(value[3], []).append(rel)
+    renamed = {key: ("link-group", min(paths)) for key, paths in members.items()}
+    return {
+        rel: (value if value[0] != "file" or len(value) != 4 else (*value[:3], renamed[value[3]]))
+        for rel, value in tree.items()
+    }
+
+
+def inaccessible_paths(tree: WorldTree) -> tuple[str, ...]:
+    """Every path in `tree` whose durable mode denies the owner the access the engine
+    needs: read+search on a directory, read on a file (design §4.3's independent
+    `meta mode` axis is what puts them there)."""
+    def denied(value: tuple) -> bool:
+        if value[0] == "dir":
+            return value[1] & 0o500 != 0o500
+        return value[0] == "file" and not value[2] & 0o400
+
+    return tuple(rel for rel, value in sorted(tree.items()) if denied(value))
+
+
+def _record_txids(metadata_root: Path) -> tuple[str, ...]:
+    """Every durable `transaction_record` txid, read outside the lock.
+
+    `Store` exposes `read_record(txid)`/`read_active()` but no listing, and a cell whose
+    recovery detached the record still needs its txid to project. Read directly, exactly
+    as `tests/exerciser.py`'s `_latest_txid` does.
+    """
+    db_path = Path(metadata_root) / "atoms.db"
+    if not db_path.exists():
+        return ()
+    connection = sqlite3.connect(db_path)
+    try:
+        rows = connection.execute(
+            "SELECT txid FROM transaction_record ORDER BY rowid"
+        ).fetchall()
+    finally:
+        connection.close()
+    return tuple(row[0] for row in rows)
+
+
+def _chain_facts(backend, binding) -> dict:
+    """Validate the chain and pair its registrations with its settlements (design §5's
+    "chain registration/settlement ... asserted by separate end-to-end checks", the
+    thing A3 deliberately does not model). Reuses `atoms.chain.read.validate_chain`, so
+    a linearization, digest-name, or foreign-leaf fault raises from production code."""
+    from atoms.chain.model import RegisteredEntry, SettledEntry
+    from atoms.chain.read import validate_chain
+    from atoms.core.scratch import CHAIN_LEAF
+
+    try:
+        chain_fd = backend.open_child_directory(binding.project_root_fd, CHAIN_LEAF)
+    except FileNotFoundError:
+        return {"present": False, "failures": (), "entries": 0, "survivors": 0}
+    try:
+        validated = validate_chain(backend, chain_fd)
+    finally:
+        backend.close_fd(chain_fd)
+
+    registrations = {
+        digest: entry.txid
+        for digest, entry in validated.entries
+        if type(entry) is RegisteredEntry
+    }
+    failures: list[str] = []
+    settlements: dict[str, str] = {}
+    for digest, entry in validated.entries:
+        if type(entry) is not SettledEntry:
+            continue
+        settlements[digest] = entry.txid
+        if entry.registration not in registrations:
+            failures.append(
+                f"settlement {digest} names registration {entry.registration}, "
+                "which is not a durable chain entry"
+            )
+        elif registrations[entry.registration] != entry.txid:
+            failures.append(
+                f"settlement {digest} for txid {entry.txid} pairs with a registration "
+                f"for txid {registrations[entry.registration]}"
+            )
+    return {
+        "present": True,
+        "failures": tuple(failures),
+        "entries": len(validated.entries),
+        "survivors": len(validated.survivors),
+        "registrations": registrations,
+        "settlements": settlements,
+    }
+
+
+def _inspect(project_root: Path, metadata_root: Path, storage, allowlist) -> dict:
+    """The canonical durable projection plus the facts A3 does not model, read through
+    ONE fresh binding: `test_coordinator_conformance.py`'s `_durable_projection` idiom
+    widened with `halt_diagnostic` (design §5), the chain, the workspace slots, and the
+    unindexed blobs.
+
+    One binding, not three: the project lock is exclusive, so a chain read taken under
+    its own lock could not describe the same instant as the projection, and three lock
+    acquisitions per cell would triple the sweep's cost for no added truth.
+    """
+    from atoms.fs.audit import AuditedBackend
+    from atoms.fs.binding import bind_project_volume
+    from atoms.fs.linux import LinuxBackend
+    from atoms.fs.lock import acquire_project_lock
+    from atoms.store.connection import open_store
+
+    txids = _record_txids(metadata_root)
+    backend = AuditedBackend(
+        LinuxBackend(), project_root=str(project_root), metadata_root=str(metadata_root)
+    )
+    with acquire_project_lock(backend, str(metadata_root)) as lock, bind_project_volume(
+        str(project_root), lock, allowlist=allowlist, storage=storage
+    ) as binding, open_store(binding) as store:
+        records = {txid: store.read_record(txid) for txid in txids}
+        active = store.read_active()
+        workspaces = store.list_workspaces()
+        unindexed = store.list_unindexed_blobs()
+        chain = _chain_facts(binding.backend, binding)
+
+    record = records[txids[-1]] if txids else None
+    projection = (
+        None
+        if record is None
+        else (
+            record.state,
+            record.committed,
+            record.rollback_result,
+            record.halt_diagnostic,
+            record.journals,
+            active is not None,
+        )
+    )
+    return {
+        "txid": None if record is None else record.txid,
+        "record": record,
+        "projection": projection,
+        "active": active is not None,
+        "workspaces": workspaces,
+        "unindexed_blobs": unindexed,
+        "chain": chain,
+    }
+
+
+def _model_projection(snapshot, plan) -> tuple:
+    """A3's fixed point in the durable projection's shape (design §5)."""
+    from atoms.core.recovery import apply_recovery_plan
+
+    reduced = apply_recovery_plan(snapshot, plan)
+    return (
+        reduced.transaction_state,
+        reduced.commit_decision,
+        reduced.rollback_result,
+        reduced.halt_diagnostic,
+        reduced.journals,
+        reduced.active,
+    )
+
+
+class _Refused(Exception):
+    """A lease entry the reconstructed world's own durable modes made impossible.
+
+    Design §4.3 branches an entry unit independently of its paired `meta mode` unit, so
+    the survivor product contains worlds holding a mode-`0` workspace, chain-staging
+    file, or effect-scratch file. The engine meets those with an access refusal
+    (`PermissionError`, or a typed `ChainStateInvalid`/`MetadataStoreInvalid` naming the
+    unreadable leaf) rather than a recovery plan, and never reaches `classify_recovery`.
+    Such a cell still carries a real obligation -- the refusal must be deterministic and
+    must not mutate the world further -- which is what `run_cell` asserts for it. A
+    refusal that NO inaccessible object in the reconstructed world explains is a
+    side-assertion failure, not an accepted outcome: `run_cell` checks the explanation
+    rather than trusting the exception type.
+    """
+
+
+def _enter_lease(
+    project_root: Path, metadata_root: Path, storage, monkeypatch, captured, allowlist
+):
+    """One fresh lease entry -- the real composition root, recovery running at entry.
+
+    The spy is installed on `atoms.coordinator.recover.classify_recovery`
+    (`recover.py:59` binds the name at import from `atoms.core.recovery`, and
+    `recover.resolve` calls it once per resolution at `recover.py:712`), which is the
+    lease-entry recovery's classification point -- `commit.py`/`execute.py` hold their
+    own bindings for the originating-command routes, and patching those would capture
+    nothing here.
+
+    `CERTIFIED_ALLOWLIST` is patched here too, not left to whatever an earlier recording
+    happened to leave installed: `root.py` is the single production bind call site
+    (ledger #18) and it ships empty, so a lease entry that did not patch it would refuse
+    every volume -- and one that relied on a *leaked* patch would silently depend on the
+    recording's roots still being the same mount.
+    """
+    from atoms.chain.errors import ChainStateInvalid
+    from atoms.coordinator import recover, root
+    from atoms.core.errors import TransactionHalted
+    from atoms.fs.linux import LinuxBackend
+    from atoms.store.errors import MetadataStoreInvalid
+
+    with monkeypatch.context() as patched:
+        classify = recover.classify_recovery
+
+        def capture(snapshot):
+            plan = classify(snapshot)
+            captured.append((snapshot, plan))
+            return plan
+
+        patched.setattr(recover, "classify_recovery", capture)
+        patched.setattr(root, "CERTIFIED_ALLOWLIST", allowlist)
+        try:
+            with root._recovery_lease(
+                LinuxBackend(), str(project_root), str(metadata_root), storage
+            ):
+                pass
+        except TransactionHalted as halted:
+            return "halted", halted
+        except PermissionError as refused:
+            raise _Refused(f"{type(refused).__name__}: {refused}") from refused
+        except OSError as refused:
+            if refused.errno not in {errno.EACCES, errno.EPERM}:
+                raise
+            raise _Refused(f"{type(refused).__name__}: {refused}") from refused
+        except (ChainStateInvalid, MetadataStoreInvalid) as refused:
+            raise _Refused(f"{type(refused).__name__}: {refused}") from refused
+    return "resolved", None
+
+
+def _engine_owned(rel: str) -> bool:
+    """True for a path the engine owns and may reclaim at any lease entry: capability
+    probing's scratch, the workspace slots, the blob store (`_reclaim_orphans` removes
+    every unindexed blob at every entry), and any reserved scratch leaf. What is left is
+    the *external* world -- the state design §5 requires recovery to preserve."""
+    from atoms.core.scratch import is_engine_reserved_leaf
+
+    if rel.startswith(
+        ("metadata/probe", "metadata/staging", "metadata/work", "metadata/blobs")
+    ):
+        return True
+    return any(is_engine_reserved_leaf(part) for part in rel.split("/")[1:])
+
+
+def _scratch_survivors(tree: WorldTree) -> tuple[str, ...]:
+    """Every surviving generated scratch leaf `.#~<txid>.<effect>.<role>` (the closed
+    grammar of `atoms.core.scratch.is_scratch_leaf`) -- what a terminal state must have
+    reclaimed."""
+    from atoms.core.scratch import is_scratch_leaf
+
+    return tuple(
+        rel
+        for rel in sorted(tree)
+        if any(is_scratch_leaf(part) for part in rel.split("/")[1:])
+    )
+
+
+def _occupied_slots(tree: WorldTree) -> tuple[str, ...]:
+    """Every surviving entry *inside* a workspace slot (`metadata/staging/<txid>/...`,
+    `metadata/work/<txid>/...`).
+
+    The slot directories themselves legitimately outlive a terminal recovery: the only
+    reclamation rule is `_reclaim_orphans`' "no `transaction_record` row names this
+    txid" (`coordinator/lease.py:24`, ledger #23), and a settled transaction keeps its
+    row forever. What design §5 requires is that the slots are *empty* -- every staged
+    blob promoted or dropped, every work-slot scratch published or removed.
+    """
+    return tuple(
+        rel
+        for rel in sorted(tree)
+        if rel.startswith(("metadata/staging/", "metadata/work/"))
+        and rel.count("/") > 2
+    )
+
+
+def _preserved_external(before: WorldTree, after: WorldTree) -> tuple[str, ...]:
+    """Paths of `before`'s external (non-engine-owned) state that recovery did not
+    preserve. Used for the no-record cells, whose whole obligation is that recovery
+    reclaims engine scratch and touches nothing else."""
+    left, right = _normalized_tree(before), _normalized_tree(after)
+    return tuple(
+        rel
+        for rel, value in sorted(left.items())
+        if not _engine_owned(rel) and right.get(rel) != value
+    )
+
+
+def run_cell(
+    cell: Cell,
+    stream: Stream,
+    ext4_volume: Path,
+    storage,
+    monkeypatch,
+    *,
+    slot: str,
+    allowlist,
+    drift=None,
+) -> CellResult:
+    """Reconstruct one cell, recover it through the real composition path, and judge it
+    against A3 (design §5).
+
+    The steps, in order:
+
+    1. reconstruct the cell's world into fresh roots under `ext4_volume`, then realign
+       the durable approval-evidence identities onto it (`realign_durable_identities` --
+       without which every record-bearing cell halts on an artifact of reconstruction);
+    2. plant the scenario's external drift, if this family asked for it;
+    3. enter a fresh `root._recovery_lease` under the test allowlist with a capturing
+       spy on `atoms.coordinator.recover.classify_recovery` -- recovery runs at entry;
+    4. read the canonical durable projection, widened with `halt_diagnostic`;
+    5. compute A3's own fixed point over the captured `(snapshot, plan)` and compare;
+    6. enter a **second** fresh lease and require the canonical projection and the world
+       digest to be unchanged -- canonical projection equality, never SQLite byte
+       equality (design §5: "not identical physical SQLite bytes");
+    7. run the side assertions A3 does not model: the chain parses with its
+       registration/settlement pairing intact, no generated scratch leaf survives a
+       terminal state, the workspace slots are empty, and no unindexed blob remains.
+
+    A cell with **no durable record** (a cut before the `prepared` commit) skips the A3
+    comparison -- there is nothing to classify -- and instead asserts the store is empty,
+    every external path survives untouched, and the engine's own scratch is reclaimed.
+
+    A cell whose reconstructed world denies the engine access to one of its own leaves
+    (`_Refused`) asserts determinism only: the second pass must refuse identically and
+    leave the world byte-identical, and an unexplained refusal is a side-assertion
+    failure.
+
+    `named_tuples`' cells arrive here too, from the other survivor vocabulary
+    (`apply_survivors` on a bare chosen key, rather than `enumerate_cells`' folded set).
+    Nothing below reads `cell.survivors` -- a `Cell` is a `Cell` -- so both run
+    identically; `complete_named_cell` is what makes the bare one physically runnable.
+    """
+    from atoms.core.recovery import HaltPlan, TransactionState
+
+    project_root = ext4_volume / f"{slot}-project"
+    metadata_root = ext4_volume / f"{slot}-metadata"
+    project_root.mkdir()
+    metadata_root.mkdir()
+    reconstruct(cell.state, project_root, metadata_root)
+    counts = {
+        "realigned_identities": realign_durable_identities(project_root, metadata_root),
+        "classified": 0,
+        "halted": 0,
+        "plan_halted": 0,
+        "assembly_halted": 0,
+        "refused": 0,
+        "no_record": 0,
+        "drifted": 0,
+        "drift_preserved": 0,
+    }
+
+    reconstructed = world_tree(project_root, metadata_root)
+    if drift is not None:
+        # A cut early enough to predate the drift target's own directory cannot be
+        # drifted at all -- `_drift_delete_target` writes into `d/`, which several cells
+        # legitimately do not have. That is a property of the cell, not a failure: the
+        # drift family's obligation ("the external blocker survives recovery") is over
+        # the cells that could carry a blocker, counted in `drift_preserved`.
+        try:
+            drift(Path(project_root))
+        except OSError:
+            counts["drifted"] = 0
+        else:
+            counts["drifted"] = 1
+    before = world_tree(project_root, metadata_root)
+    drift_footprint = tuple(
+        rel for rel, value in before.items() if reconstructed.get(rel) != value
+    )
+    inaccessible = inaccessible_paths(before)
+
+    failures: list[str] = []
+    captured: list[tuple] = []
+    refusal: str | None = None
+    halted = False
+    try:
+        kind, _ = _enter_lease(
+            project_root, metadata_root, storage, monkeypatch, captured, allowlist
+        )
+        halted = kind == "halted"
+    except _Refused as refused:
+        refusal = str(refused)
+        counts["refused"] = 1
+        if not inaccessible:
+            failures.append(f"unexplained refusal with every mode accessible: {refusal}")
+    counts["halted"] = int(halted)
+    # Two different halts reach the same exception. A3's own `HaltPlan` arrives through
+    # the classifier (captured, and compared below); an *assembly* halt
+    # (`_halt_for_findings`, `coordinator/recover.py:499`) is raised from the topology
+    # diff BEFORE any classification, so it carries no plan to compare -- what it owes
+    # is that the halt was frozen durably before it was raised.
+    counts["plan_halted"] = int(halted and bool(captured))
+    counts["assembly_halted"] = int(halted and not captured)
+    counts["classified"] = len(captured)
+
+    world = world_tree(project_root, metadata_root)
+    digest = world_digest(project_root, metadata_root)
+
+    if refusal is not None:
+        second = None
+        try:
+            _enter_lease(
+                project_root, metadata_root, storage, monkeypatch, [], allowlist
+            )
+        except _Refused as again:
+            second = str(again)
+        violation = (
+            None
+            if second == refusal and world_digest(project_root, metadata_root) == digest
+            else f"first pass refused {refusal!r}; second pass gave {second!r}"
+        )
+        return CellResult(
+            agrees=True,
+            halted=False,
+            projection=None,
+            model_projection=None,
+            world=world,
+            counts=counts,
+            second_pass_violation=violation,
+            side_assertion_failures=tuple(failures),
+        )
+
+    facts = _inspect(project_root, metadata_root, storage, allowlist)
+    projection = facts["projection"]
+    model_projection = _model_projection(*captured[0]) if captured else None
+    disagreement: str | None = None
+
+    if halted and not captured:
+        record = facts["record"]
+        if record is None or (
+            record.assembly_halt is None and record.state is not TransactionState.HALTED
+        ):
+            failures.append("a halt was raised without a durable halt record")
+
+    if projection is None:
+        counts["no_record"] = 1
+        if captured:
+            failures.append("recovery classified a world holding no durable record")
+        missing = _preserved_external(before, world)
+        if missing:
+            failures.append(f"external state not preserved at {missing}")
+    elif captured:
+        if projection != model_projection:
+            disagreement = (
+                f"durable {projection!r} disagrees with A3's fixed point "
+                f"{model_projection!r}"
+            )
+        plan = captured[0][1]
+        if type(plan) is HaltPlan:
+            record = facts["record"]
+            assert record is not None
+            if record.halt_diagnostic != plan.diagnostic:
+                disagreement = (
+                    "the persisted halt diagnostic is not the plan's: "
+                    f"{record.halt_diagnostic!r} != {plan.diagnostic!r}"
+                )
+
+    if captured:
+        # Counted only where recovery actually classified the world: a refused or
+        # record-free cell preserves the blocker by never looking at it, which is not
+        # the property design §6's drift family is about.
+        for rel in drift_footprint:
+            if _normalized_tree(world).get(rel) == _normalized_tree(before).get(rel):
+                counts["drift_preserved"] = 1
+
+    # --- side assertions A3 does not model (design §5) ------------------------------
+    chain = facts["chain"]
+    failures.extend(chain["failures"])
+    record = facts["record"]
+    if chain["present"] and record is not None:
+        if record.registration_digest is not None and (
+            record.registration_digest not in chain["registrations"]
+        ):
+            failures.append(
+                f"record registration digest {record.registration_digest} is not a "
+                "durable chain entry"
+            )
+        if record.settlement_digest is not None and (
+            record.settlement_digest not in chain["settlements"]
+        ):
+            failures.append(
+                f"record settlement digest {record.settlement_digest} is not a "
+                "durable chain entry"
+            )
+    terminal = not facts["active"] and not halted
+    if terminal:
+        survivors = _scratch_survivors(world)
+        if survivors:
+            failures.append(f"scratch survived a terminal state: {survivors}")
+        occupied = _occupied_slots(world)
+        if occupied:
+            failures.append(f"workspace slots are not empty: {occupied}")
+        if chain["present"] and chain["survivors"]:
+            failures.append("a chain staging survivor outlived a terminal state")
+    if facts["unindexed_blobs"]:
+        failures.append(f"unindexed blobs survived reclamation: {facts['unindexed_blobs']}")
+
+    # --- the mandatory second pass (design §5) --------------------------------------
+    violation: str | None = None
+    try:
+        _enter_lease(project_root, metadata_root, storage, monkeypatch, [], allowlist)
+    except _Refused as refused:
+        violation = f"the second pass refused where the first resolved: {refused}"
+    if violation is None:
+        again = _inspect(project_root, metadata_root, storage, allowlist)
+        if again["projection"] != projection:
+            violation = (
+                f"the second pass moved the projection: {projection!r} -> "
+                f"{again['projection']!r}"
+            )
+        elif world_digest(project_root, metadata_root) != digest:
+            violation = "the second pass moved the world"
+
+    return CellResult(
+        agrees=disagreement is None,
+        halted=halted,
+        projection=projection,
+        model_projection=model_projection,
+        world=world,
+        counts=counts,
+        disagreement=disagreement,
+        second_pass_violation=violation,
+        side_assertion_failures=tuple(failures),
+    )
+
+
+@dataclass(frozen=True)
+class SweepReport:
+    """One scenario's sweep. `cells`/`deduped`/`skips` come from `enumerate_cells`'
+    accounting; the three failure tuples are empty on a healthy sweep and name the cell
+    and the fault when they are not. `subprocess_cells`/`subprocess_disagreements`
+    (Task 7's placement axis) and `designated_failures` (Task 9's sabotage arms) are
+    created here and filled there."""
+
+    cells: int
+    deduped: int
+    skips: dict[str, int]
+    disagreements: tuple[str, ...]
+    second_pass_violations: tuple[str, ...]
+    side_assertion_failures: tuple[str, ...]
+    named_tuple_cells_ran: int
+    preserved_drift_cells: int
+    subprocess_cells: int
+    subprocess_disagreements: tuple[str, ...]
+    designated_failures: tuple[str, ...]
+    classified_cells: int = 0
+    halted_cells: int = 0
+    plan_halted_cells: int = 0
+    refused_cells: int = 0
+    no_record_cells: int = 0
+    seconds: float = 0.0
+
+
+@dataclass(frozen=True)
+class NamedCell:
+    """One of design §9.4's named tuples, already run. Construction asserts the cell was
+    clean, so a directed test reads `result` without re-checking the sweep's invariants."""
+
+    scenario: str
+    tuple_name: str
+    cell: Cell
+    result: CellResult
+
+    def __post_init__(self) -> None:
+        assert self.result.disagreement is None, self.result.disagreement
+        assert self.result.second_pass_violation is None, self.result.second_pass_violation
+        assert not self.result.side_assertion_failures, self.result.side_assertion_failures
+
+
+class Sweeper:
+    """The `cut_matrix` fixture's object: sweep a scenario, or run one named tuple cell.
+
+    Each recording gets its own **fresh project root**, unlike `coordinator_on`'s single
+    shared one: a scenario's `seed_world` builds the same paths every time, so two
+    recordings in one test (Task 7's four compound scenarios, Task 8's two directions)
+    would collide in the shared root. The test allowlist is built once per fixture, off
+    a throwaway root on the same volume -- it names the resolved mount tuple and the
+    storage profile, never a path, so one is valid for every cell.
+    """
+
+    def __init__(self, ext4_volume: Path, storage, monkeypatch) -> None:
+        self._volume = Path(ext4_volume)
+        self._storage = storage
+        self._monkeypatch = monkeypatch
+        self._slots = itertools.count()
+        self._allowlist = None
+
+    def allowlist(self):
+        if self._allowlist is None:
+            from atoms.fs.linux import LinuxBackend
+            from atoms.fs.lock import acquire_project_lock
+            from tests.fs_support import build_test_allowlist
+
+            root = self._volume / "allowlist-project"
+            root.mkdir()
+            with acquire_project_lock(
+                LinuxBackend(), str(self._volume / "allowlist-metadata")
+            ) as lock:
+                self._allowlist = build_test_allowlist(lock, str(root), self._storage)
+        return self._allowlist
+
+    def record(self, name: str, *, caught: bool = False) -> Stream:
+        """Record one scenario, then **undo the recording's patches**.
+
+        `record_scenario` installs two of them: `_enable_commands`' allowlist, and
+        `attach_store_sequencer`'s wrapper on `Store.transaction`. Left standing, that
+        wrapper appends a `Commit` event -- and takes a full `_backup_db` of the
+        *recording's* database -- for every store transaction any later recovery in the
+        same test performs, and a second recording in one test (Task 7 sweeps four
+        scenarios) would nest a second wrapper inside the first. A private
+        `MonkeyPatch` undone here scopes both to the recording that needs them; the
+        `Stream` it produced is plain data and outlives them.
+        """
+        import pytest
+
+        from atoms.fs.linux import LinuxBackend
+        from tests.exerciser import scenario
+
+        index = next(self._slots)
+        project_root = self._volume / f"record-{index}-project"
+        project_root.mkdir()
+        ingredients = (
+            LinuxBackend(),
+            str(project_root),
+            str(self._volume / f"record-{index}-metadata"),
+            self._storage,
+        )
+        recording = pytest.MonkeyPatch()
+        try:
+            return record_scenario(
+                scenario(name), ingredients, recording, caught=caught
+            )
+        finally:
+            recording.undo()
+
+    def _run(self, name: str, cell: Cell, stream: Stream, drift) -> CellResult:
+        return run_cell(
+            cell,
+            stream,
+            self._volume,
+            self._storage,
+            self._monkeypatch,
+            slot=f"{name}-{next(self._slots)}",
+            allowlist=self.allowlist(),
+            drift=drift,
+        )
+
+    def __call__(
+        self,
+        scenario_name: str,
+        *,
+        caught: bool = False,
+        drift: bool = False,
+        subprocess_subset: bool = False,
+        sabotage: str | None = None,
+    ) -> SweepReport:
+        from tests.exerciser import scenario
+
+        if subprocess_subset:
+            raise NotImplementedError("the subprocess placement subset lands in Task 7")
+        if sabotage is not None:
+            raise NotImplementedError("the sabotage arms land in Task 9")
+
+        entry = scenario(scenario_name)
+        planted = None
+        if drift:
+            if entry.drift is None:
+                raise KeyError(f"scenario {scenario_name!r} declares no drift")
+            planted = entry.drift
+
+        started = time.monotonic()
+        stream = self.record(scenario_name, caught=caught)
+        cells, accounting = enumerate_cells(stream)
+        named = named_tuples(stream)
+
+        disagreements: list[str] = []
+        second_pass: list[str] = []
+        side: list[str] = []
+        totals = {
+            "classified": 0,
+            "halted": 0,
+            "plan_halted": 0,
+            "refused": 0,
+            "no_record": 0,
+            "drift": 0,
+        }
+
+        def absorb(label: str, cell: Cell, result: CellResult) -> None:
+            where = f"{scenario_name} {label} cut={cell.cut}"
+            if result.disagreement is not None:
+                disagreements.append(f"{where}: {result.disagreement}")
+            if result.second_pass_violation is not None:
+                second_pass.append(f"{where}: {result.second_pass_violation}")
+            side.extend(f"{where}: {item}" for item in result.side_assertion_failures)
+            totals["classified"] += min(result.counts["classified"], 1)
+            totals["halted"] += result.counts["halted"]
+            totals["plan_halted"] += result.counts["plan_halted"]
+            totals["refused"] += result.counts["refused"]
+            totals["no_record"] += result.counts["no_record"]
+            totals["drift"] += result.counts["drift_preserved"]
+
+        for index, cell in enumerate(cells):
+            absorb(f"cell {index}", cell, self._run(scenario_name, cell, stream, planted))
+        for tuple_name, named_cell in sorted(named.items()):
+            cell = complete_named_cell(named_cell, stream)
+            absorb(tuple_name, cell, self._run(scenario_name, cell, stream, planted))
+
+        report = SweepReport(
+            cells=accounting.cells + len(named),
+            deduped=accounting.deduped,
+            skips=accounting.skips,
+            disagreements=tuple(disagreements),
+            second_pass_violations=tuple(second_pass),
+            side_assertion_failures=tuple(side),
+            named_tuple_cells_ran=len(named),
+            preserved_drift_cells=totals["drift"],
+            subprocess_cells=0,
+            subprocess_disagreements=(),
+            designated_failures=(),
+            classified_cells=totals["classified"],
+            halted_cells=totals["halted"],
+            plan_halted_cells=totals["plan_halted"],
+            refused_cells=totals["refused"],
+            no_record_cells=totals["no_record"],
+            seconds=time.monotonic() - started,
+        )
+        print(
+            f"\n[cut-matrix] {scenario_name}: cells={report.cells} "
+            f"(classified={report.classified_cells} halted={report.halted_cells} "
+            f"a3-halted={report.plan_halted_cells} "
+            f"refused={report.refused_cells} no-record={report.no_record_cells} "
+            f"named={report.named_tuple_cells_ran} drift-preserved="
+            f"{report.preserved_drift_cells}) deduped={report.deduped} "
+            f"skips={report.skips} in {report.seconds:.1f}s"
+        )
+        return report
+
+    def named_cell(self, scenario_name: str, tuple_name: str, *, caught: bool = False):
+        stream = self.record(scenario_name, caught=caught)
+        cell = complete_named_cell(named_tuples(stream)[tuple_name], stream)
+        return NamedCell(
+            scenario=scenario_name,
+            tuple_name=tuple_name,
+            cell=cell,
+            result=self._run(scenario_name, cell, stream, None),
+        )
