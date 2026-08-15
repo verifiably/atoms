@@ -80,6 +80,8 @@ def replay_prefix(
         raise ValueError(f"log is not a file or block device: {log}")
     if not target.is_file() and not target.is_block_device():
         raise ValueError(f"replay target is not a file or block device: {target}")
+    if end_entry == 0:
+        return
     binary = Path(__file__).resolve().parents[2] / ".certify" / "replay-log"
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise RuntimeError(f"replay-log is not executable: {binary}")
