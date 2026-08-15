@@ -74,51 +74,41 @@ def _without_payloads() -> DictPayloads:
 
 
 def _seed_corpus_write(project: Path) -> None:
-    (project / "data").mkdir()
     (project / "index.txt").write_bytes(BEFORE)
 
 
 def _corpus_write_spec() -> TransactionSpec:
-    """An ancestor directory + two creates beneath it + a replace: the corpus-write shape (§12.1).
+    """Two nested new directories + two creates beneath them + a replace (§12.1).
 
-    Pinned by the plan as a chain of *two* freshly created `CreateDirectory` effects
-    ("data" then "data/records"). Probing that shape against this tree found a real gap:
-    `_build_descriptor_table`'s initial descent never walks past an absent directory (by
-    design -- "data" has nothing physically beneath it to observe until it exists), so it
-    never records a `WalkStop` for a declared path whose parent is *itself* created within
-    the same transaction. The recovery walk closes exactly this gap for itself
-    (`_resume_descent`, `descriptors.py`), registering a just-created planned directory's
-    planned children as new stops -- but that helper runs only from `_roll_back`, never
-    from the clean forward per-effect loop in `_run_under_lease`. So a transaction whose
-    effects create two directly-nested *new* directories fails `DescriptorTable.adopt` on
-    the second one, even on a clean run with nothing injected -- `table.adopt` refuses
-    with "is not a stopped planned directory". That is a real, previously-unexercised gap
-    in forward execution, not a defect in this exerciser; since this task is tests-only,
-    the fix belongs to a future src change, not here. `data` is instead seeded as an
-    ordinary, undeclared, already-existing ancestor directory (as `directory_spec`'s own
-    `d` is), and only `data/records` -- one level beneath a *resolvable* parent -- is a
-    `CreateDirectory` effect.
+    Regression pointer: both `CreateDirectory` effects are freshly created and directly
+    nested, the shape that forward execution could not run until
+    `_register_planned_children` was called from `_apply_effect`
+    (`fix(coordinator): register planned children as walk stops on forward mkdir
+    publication`).
     """
     return build_spec(
         consumer_tag="test",
         intent_digest="sha256:" + "8" * 64,
         initial_surface={
+            "data": ABSENT,
             "data/records": ABSENT,
             "data/records/one.txt": ABSENT,
             "data/records/two.txt": ABSENT,
             "index.txt": PRE,
         },
         final_surface={
+            "data": DIRECTORY_POST,
             "data/records": DIRECTORY_POST,
             "data/records/one.txt": POST,
             "data/records/two.txt": POST,
             "index.txt": POST,
         },
         effects=[
-            CreateDirectory(effect_id="e1", path="data/records", post=DIRECTORY_POST),
-            CreateFileNoClobber(effect_id="e2", path="data/records/one.txt", post=POST),
-            CreateFileNoClobber(effect_id="e3", path="data/records/two.txt", post=POST),
-            ReplaceFile(effect_id="e4", path="index.txt", pre=PRE, post=POST),
+            CreateDirectory(effect_id="e1", path="data", post=DIRECTORY_POST),
+            CreateDirectory(effect_id="e2", path="data/records", post=DIRECTORY_POST),
+            CreateFileNoClobber(effect_id="e3", path="data/records/one.txt", post=POST),
+            CreateFileNoClobber(effect_id="e4", path="data/records/two.txt", post=POST),
+            ReplaceFile(effect_id="e5", path="index.txt", pre=PRE, post=POST),
         ],
     )
 
