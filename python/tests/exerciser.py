@@ -194,9 +194,16 @@ def scenario(name: str) -> Scenario:
     raise KeyError(name)
 
 
-def run_clean(entry: Scenario, ingredients, monkeypatch):
-    """Register the root, seed the world, and run the transaction clean."""
-    from atoms.coordinator.commands import register_root, run_transaction
+def setup_clean(entry: Scenario, ingredients, monkeypatch) -> None:
+    """Enable commands, seed the world, and register the root -- the unrecorded bootstrap.
+
+    Split out of `run_clean` so a caller that wants to record durability units (the
+    persistence-cut model, `tests/persistence_model.py`) can seed and register with the
+    plain backend, then swap in a recording backend for the transaction alone: design
+    §4.1 makes bootstrap publication seed-owned, so it must never appear as recorded
+    entry-unit enumeration.
+    """
+    from atoms.coordinator.commands import register_root
     from tests.test_coordinator_commands import _enable_commands
 
     backend, project_root, metadata_root, storage = ingredients
@@ -210,6 +217,13 @@ def run_clean(entry: Scenario, ingredients, monkeypatch):
         genesis_payload=b"exerciser-genesis",
         registered_surface=(),
     )
+
+
+def transact(entry: Scenario, ingredients):
+    """Run just the transaction half, against already-seeded, already-registered ingredients."""
+    from atoms.coordinator.commands import run_transaction
+
+    backend, project_root, metadata_root, storage = ingredients
     return run_transaction(
         backend,
         project_root,
@@ -218,6 +232,12 @@ def run_clean(entry: Scenario, ingredients, monkeypatch):
         entry.build_spec(),
         entry.payloads(),
     )
+
+
+def run_clean(entry: Scenario, ingredients, monkeypatch):
+    """Register the root, seed the world, and run the transaction clean."""
+    setup_clean(entry, ingredients, monkeypatch)
+    return transact(entry, ingredients)
 
 
 def run_refused(entry: Scenario, ingredients, monkeypatch):
@@ -270,8 +290,8 @@ def _durable_projection(ingredients, txid: str) -> dict:
     }
 
 
-def run_caught(entry: Scenario, ingredients, monkeypatch) -> dict:
-    """Register the root, seed the world, and run a transaction whose effect fails.
+def transact_caught(entry: Scenario, ingredients, monkeypatch) -> dict:
+    """Run just the transaction half of `run_caught`, against seeded, registered ingredients.
 
     Erratum 1 (binding): the injected failure lands the rollback durably, and only
     then does the injected exception propagate to the caller -- so this catches
@@ -279,20 +299,9 @@ def run_caught(entry: Scenario, ingredients, monkeypatch) -> dict:
     synthesized `TransactionOutcome`.
     """
     from atoms.coordinator import execute
-    from atoms.coordinator.commands import register_root, run_transaction
-    from tests.test_coordinator_commands import _enable_commands
+    from atoms.coordinator.commands import run_transaction
 
     backend, project_root, metadata_root, storage = ingredients
-    _enable_commands(ingredients, monkeypatch)
-    entry.seed_world(Path(project_root))
-    register_root(
-        backend,
-        project_root,
-        metadata_root,
-        storage,
-        genesis_payload=b"exerciser-genesis",
-        registered_surface=(),
-    )
 
     assert entry.inject_failure is not None
     module = getattr(execute, entry.inject_failure)
@@ -320,3 +329,9 @@ def run_caught(entry: Scenario, ingredients, monkeypatch) -> dict:
     assert calls["n"] > 0
 
     return _durable_projection(ingredients, _latest_txid(metadata_root))
+
+
+def run_caught(entry: Scenario, ingredients, monkeypatch) -> dict:
+    """Register the root, seed the world, and run a transaction whose effect fails."""
+    setup_clean(entry, ingredients, monkeypatch)
+    return transact_caught(entry, ingredients, monkeypatch)

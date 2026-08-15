@@ -628,6 +628,19 @@ def exerciser_run(coordinator_on, monkeypatch):
 
 
 @pytest.fixture
+def persistence_recording(coordinator_on, monkeypatch):
+    """Record a named exerciser scenario through the persistence-cut model's Stream."""
+
+    def record(name: str, *, caught: bool = False):
+        from tests.exerciser import scenario
+        from tests.persistence_model import record_scenario
+
+        return record_scenario(scenario(name), coordinator_on(), monkeypatch, caught=caught)
+
+    return record
+
+
+@pytest.fixture
 def opened_store(store_on):
     """A live Store over a fresh ext4 project, closed on exit."""
     from atoms.store.connection import open_store
