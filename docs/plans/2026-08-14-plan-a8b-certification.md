@@ -37,9 +37,9 @@ stop and report — do not adapt around it silently.**
 | `EXT4_IOC_GET_TUNE_SB_PARAM = _IOR('f', 45, struct ext4_tune_sb_params)` (`/usr/include/linux/ext4.h:36`); the struct is 232 bytes with `feature_compat`/`feature_incompat`/`feature_ro_compat` at byte offsets 64/68/72 (`:113-144`: 16 bytes of u32/u16 header, three u64 at 16/24/32, four u32 at 40-52, u16×2 + u8×2 + u16 at 56-62, then the three feature words, three set masks, three clear masks, `mount_opts[64]`, `pad[68]`). | header read 2026-08-14 |
 | Invoked unprivileged on a directory fd for an ext4 volume on this host, the ioctl returns `compat=0x3c incompat=0x246 ro_compat=0x46b`; kernel handler returns the masks with no capability check; unsupported kernels fail `ENOTTY`/`EOPNOTSUPP`. | run 2026-08-14 (design §7.4) |
 | mkfs fixtures: `mkfs.ext4 -O fast_commit,^orphan_file` vs `^fast_commit,orphan_file` vs neither on 128 MiB image files (no root needed) yields compat masks differing from plain by exactly `0x400` (fast_commit) and `0x1000` (orphan_file); superblock magic `0xEF53` at offset `1024+0x38`, masks at `1024+0x5C/0x60/0x64` in the image. e2fsprogs 1.47 enables `orphan_file` by default, so every mkfs in the harness passes an explicit `-O` list. | run 2026-08-14 |
-| `VolumeConfiguration(backend_id, backend_revision, kernel_identifier, filesystem_type, barrier_options, durability_features)` at `fs/volume.py:35`; `build_configuration(entry, kernel_identifier)` at `:256` hard-codes `durability_features=()` at `:275`; callers: `fs/binding.py:190-191` (`bind_project_volume`, fd in scope from `:184`'s same-volume check) and `tests/fs_support.py:534` (`build_test_allowlist`, fd in scope). `DurabilityAllowlist.match` at `:69` is exact equality; `CERTIFIED_ALLOWLIST` empty at `:78`. | read 2026-08-14 |
+| `VolumeConfiguration(backend_id, backend_revision, kernel_identifier, filesystem_type, barrier_options, durability_features)` at `fs/volume.py:35`; `build_configuration(entry, kernel_identifier)` at `:256` hard-codes `durability_features=()` at `:275`; production and reusable test-support callers are `fs/binding.py:190-191` (`bind_project_volume`, fd in scope from `:184`'s same-volume check), `tests/fs_support.py:534` (`build_test_allowlist`, fd in scope), and the bind-mount child embedded in `tests/test_fs_resolve_conformance.py`; direct fixture calls in `test_fs_volume.py` must also adopt the keyword-only fd. `DurabilityAllowlist.match` at `:69` is exact equality; `CERTIFIED_ALLOWLIST` empty at `:78`. | corrected by implementation preflight 2026-08-15 |
 | The four emptiness assertions to flip: `test_fs_architecture.py:262` (`test_certified_allowlist_is_empty_so_population_is_deliberate`), the closing assertion of `test_fs_architecture.py:453` (`test_the_production_bind_call_passes_the_certified_allowlist`, emptiness asserted at `:470`), `test_fs_volume.py:380` (`test_certified_allowlist_ships_empty`), `test_fs_binding.py:107` (`test_certified_allowlist_is_the_empty_production_constant`). | grep 2026-08-14 |
-| Host prerequisites: `dmsetup` and the `dm-log-writes` module (`/lib/modules/7.1.8-arch1-3/kernel/drivers/md/dm-log-writes.ko.zst`) and e2fsprogs present; `qemu-system-x86_64` and `replay-log` **absent**. Host kernel image at `/boot/vmlinuz-linux`. Host ext4 mounts: `rw,noatime` (root) and `rw,noatime,data=ordered` (the ssd volume). | run 2026-08-14 |
+| Host prerequisites: `dmsetup`, `mkinitcpio`, the `dm-log-writes` module (`/lib/modules/7.1.8-arch1-3/kernel/drivers/md/dm-log-writes.ko.zst`), e2fsprogs, and (installed by the operator on 2026-08-15) `qemu-system-x86_64` present; `replay-log` **absent**. Host kernel image at `/boot/vmlinuz-linux`. Host ext4 mounts: `rw,noatime` (root) and `rw,noatime,data=ordered` (the ssd volume). | run 2026-08-14; corrected by implementation preflight 2026-08-15 |
 | `_BARRIER_OPTIONS` (ext4): `barrier`→default `barrier=1`, `data`→`data=ordered`, `journal_async_commit`→absent, `commit`→`commit=5`, `sync`→`async`, `dirsync`→absent (`fs/volume.py:89-100`). `kernel_identifier()` is `os.uname().release` (`volume.py:287`). `BACKEND_REVISION = "linux-4"` (`fs/platform.py:12`). | read 2026-08-14 |
 | dm-log-writes requires separate data and log devices; normal writes are logged around flushes in completion order; replay is prefix-based to marks/FLUSH/FUA boundaries (kernel admin-guide device-mapper/log-writes). `replay-log` lives in xfstests `src/log-writes/`, builds standalone with gcc. | kernel docs / design §7.1-§7.2 |
 | `test_docs_status.py` after A8a: `STAGES` contains `"A8a", "A8b"`, `FIRST_UNIMPLEMENTED = "A8b"`. Science's adoption ledger row 4 (artifact 4) is the science repo's, updated there after landing. | A8a plan Task 10 |
@@ -81,6 +81,7 @@ python/tools/certify/
   guest_init.py                # create: in-guest driver — identity, dm stack, workload, replay loop (Task 3)
   replay.py                    # create: pinned replay-log build + prefix replay (Task 3)
   record.py                    # create: canonical JSON record schema + writer (Task 5)
+.gitignore                     # modify: ignore the exact-pin replay-log build workspace (Task 3)
 docs/certification/            # create: the banked record lands here (Task 6)
 ```
 
@@ -144,7 +145,6 @@ def test_the_mkfs_fixture_pair_is_two_sided(tmp_path):
     def image_compat(features: str) -> int:
         image = tmp_path / f"{features.replace(',', '_').replace('^', 'no-')}.img"
         image.write_bytes(b"")
-        image.truncate = None  # not used; sized via mkfs -F with a block count
         subprocess.run(
             ["mkfs.ext4", "-q", "-F", "-O", features, str(image), "32768"],
             check=True,
@@ -259,21 +259,21 @@ git commit -m "feat(volume): pin ext4 superblock feature masks via EXT4_IOC_GET_
 **Interfaces:**
 - Produces: `python -m tools.certify check` — prints each prerequisite as `ok:`/`MISSING:` and
   exits nonzero listing exactly what is absent: `qemu-system-x86_64`, `/boot/vmlinuz-linux`
-  readable, `dm-log-writes` module for the *host* kernel release, `dmsetup`, `mkfs.ext4`,
-  `debugfs`, the pinned `replay-log` binary (built by Task 3; reported missing until then), and a
-  **clean atoms checkout** (`git status --porcelain` empty).
+  readable, `dm-log-writes` module for the *host* kernel release, `mkinitcpio`, `dmsetup`,
+  `mkfs.ext4`, `debugfs`, the pinned `replay-log` binary under `python/.certify/` (built by Task 3;
+  reported missing until then), and a **clean atoms checkout** (`git status --porcelain` empty).
 - Produces: `images.build_data_image(path, *, size_mib, feature_masks: FeatureMasks,
   mount_options: str)` — raw image mkfs'd with an **explicit `-O` list derived from the target
   masks** (translate each known bit to its e2fsprogs name; raise `UnreproducibleFeatureSet`
   naming any unknown set bit — design §7.4's refusal); `images.build_log_image(path, size_mib)`;
   `images.clone(path) -> Path` — a fresh never-mounted copy per replay prefix (design §7.1).
-- Produces: `guest.build_initramfs(work: Path) -> Path` — a cpio.gz containing a static busybox
-  (probe: `pacman -Q busybox` or fall back to copying the host's `/usr/lib/initcpio/busybox`),
-  the host kernel's `9p`, `9pnet_virtio`, `virtio_pci`, `virtio_blk`, `dm-log-writes`, `dm-mod`,
-  `loop` modules (from `/lib/modules/$(uname -r)`), and an `init` shell script that loads them,
-  mounts the 9p root read-only at `/root9p`, bind-mounts a tmpfs over its `/tmp` and `/run`, and
-  execs `chroot /root9p python -m tools.certify.guest_init` with the virtio devices passed
-  through kernel cmdline.
+- Produces: `guest.build_initramfs(work: Path) -> Path` — a cpio.gz built with the host's installed
+  `mkinitcpio` `base` hook (the measured `/usr/lib/initcpio/busybox` alone has no mount or module
+  loader applets), the host kernel's `9p`, `9pnet_virtio`, `virtio_pci`, `virtio_blk`,
+  `dm-log-writes`, `dm-mod`, and `loop` modules (from `/lib/modules/$(uname -r)`), and an `init`
+  shell script that loads them, mounts the 9p root read-only at `/root9p`, bind-mounts a tmpfs over
+  its `/tmp` and `/run`, and execs `chroot /root9p python -m tools.certify.guest_init` with
+  `data_device=/dev/vda` and `log_device=/dev/vdb` passed through the kernel cmdline.
 - Produces: `guest.run(kernel: Path, initramfs: Path, data_image: Path, log_image: Path,
   *, shared_root: Path, memory_mib: int = 2048) -> GuestResult` — invokes
   `qemu-system-x86_64 -nographic -no-reboot -m {memory} -kernel {kernel} -initrd {initramfs}
@@ -288,8 +288,8 @@ git commit -m "feat(volume): pin ext4 superblock feature masks via EXT4_IOC_GET_
 - [ ] **Step 1:** Write `prerequisites.py` with a pure `check() -> list[str]` returning missing
 items, and `__main__.py` dispatching `check`. No pytest test — the tools tree is non-collected;
 verification is running it.
-- [ ] **Step 2:** Run `uv run python -m tools.certify check` from `python/`. Expected today:
-`MISSING: qemu-system-x86_64`, `MISSING: replay-log`. Everything else `ok:`.
+- [ ] **Step 2:** Run `uv run python -m tools.certify check` from `python/`. Expected after the
+operator's 2026-08-15 QEMU installation: `MISSING: replay-log`. Everything else `ok:`.
 - [ ] **Step 3:** Implement `images.py` and `guest.py` per the interfaces. The known-bit →
 mkfs-name table covers exactly the bits observed on this host's volumes plus the fixture pair
 (`has_journal`, `ext_attr`, `resize_inode`, `dir_index`, `fast_commit`, `orphan_file`,
@@ -311,11 +311,14 @@ git commit -m "feat(certify): harness skeleton - prerequisites, images, guest bo
 
 **Files:**
 - Create: `python/tools/certify/guest_init.py`, `python/tools/certify/replay.py`
+- Modify: `.gitignore`
 
 **Interfaces:**
-- Produces (`replay.py`): `ensure_replay_log(work: Path) -> Path` — clones xfstests at the
-  pinned commit (`git clone --depth 1` + `git checkout <PINNED_XFSTESTS_COMMIT>`; the constant
-  lives at the top of `replay.py` and is recorded in the certification record), `gcc -O2 -o
+- Produces (`replay.py`): `ensure_replay_log(work: Path) -> Path` — fetches exactly xfstests commit
+  `acb6d4cb84205a8e3f19ca470cfcf7bf6d93a509` into the git-ignored `python/.certify/` workspace
+  (`git init` + `git fetch --depth 1 origin <commit>` + detached checkout, so recertification does
+  not depend on that commit remaining upstream HEAD; the constant lives at the top of `replay.py`
+  and is recorded in the certification record), `gcc -O2 -o
   replay-log src/log-writes/replay-log.c ...` (probe the actual source layout at build time —
   if it needs xfstests' headers, build via `make -C src/log-writes`), returns the binary path.
   `replay_prefix(log_device, clone_image, *, end_mark: str | None, end_entry: int | None)` —
@@ -337,7 +340,9 @@ git commit -m "feat(certify): harness skeleton - prerequisites, images, guest bo
      and the clone discipline before any certification claim.
   4. **The workload loop**, per exerciser scenario (design §7.1): create the dm-log-writes
      target over the data device (`dmsetup create certify --table "0 <sectors> log-writes
-     /dev/vdb /dev/vdc"`), mkfs with the target masks and mount with the production-equivalent
+     <data_device> <log_device>"`, resolving the kernel-command-line values `/dev/vda` and
+     `/dev/vdb` rather than assuming a root disk occupies `vda`), mkfs with the target masks and
+     mount with the production-equivalent
      options at a fresh mountpoint, run the scenario through the real composition path
      (`run_clean` — the same `tests.exerciser` entry the matrix uses) with
      `CERTIFIED_ALLOWLIST` patched by `build_test_allowlist` (the guest is certifying, not yet
