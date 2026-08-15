@@ -1005,36 +1005,37 @@ def pending_keys_at(stream: Stream, cut: int) -> frozenset[tuple]:
     return frozenset(stream.pending_before(cut))
 
 
-def apply_survivors(
-    state: WorldState, stream: Stream, cut: int, survivors: frozenset[tuple]
-) -> WorldState | Skip:
-    """Apply the chosen pending keys **in stream order** against `state`'s durable tree
-    (design §4.3). Every key must be pending at `cut` -- `pending_keys_at(stream, cut)`
-    is the closed universe callers choose subsets from; a key outside it is a caller
-    bug, not a representability question, and raises rather than skipping silently.
-
-    The *first* structurally inapplicable unit -- a `remove`/`replace` whose target
-    entry is absent, or `image`/`mode` state for a token with no durable-or-included
-    name anywhere -- makes the whole subset unrepresentable: returns `Skip(reason)`
-    immediately, without partially applying the rest.
+def _chosen_order(key: tuple) -> tuple:
+    """The `entry`-before-`data`/`meta` tie-break `apply_survivors` and every one of
+    `enumerate_cells`'s applicability passes share -- one engine, one ordering rule
+    (CRITICAL 2): within one stream position (`create_exclusive`'s insert+mode land in
+    the same event), an entry unit must apply before a data/meta unit, since a
+    data/meta unit's strict reachability check needs its own entry-insert already
+    applied when both are chosen from the same event; the unit key itself breaks any
+    remaining tie deterministically, since a `frozenset`'s iteration order is
+    hash-seed-dependent and skip accounting needs reproducible ordering across runs.
     """
-    positioned = _pending_with_positions(stream, cut)
+    return (0 if key[0] == "entry" else 1, key)
+
+
+def _apply_chosen(
+    state: WorldState,
+    stream: Stream,
+    cut: int,
+    positioned: dict[tuple, tuple[int, Unit]],
+    survivors: frozenset[tuple],
+) -> WorldState | Skip:
+    """`apply_survivors`'s engine, taking an already-computed `positioned` (Important
+    4: `enumerate_cells` computes `_pending_with_positions` once per cut and shares it
+    across every combo's applicability pass and its final `WorldState`, rather than
+    recomputing an O(events) replay per combo)."""
     chosen: list[tuple[int, Unit]] = []
     for key in survivors:
         found = positioned.get(key)
         if found is None:
             raise KeyError(f"not a pending key at cut {cut}: {key!r}")
         chosen.append(found)
-    # Stable-sort by stream position; within one Mutation event (a tied position --
-    # `create_exclusive`'s insert+mode land in the same event), entry units must apply
-    # before data/meta units, since a data/meta unit's strict reachability check needs
-    # its own entry-insert already applied when both are chosen from the same event.
-    # The unit key itself breaks any remaining tie (two entry units, or two data/meta
-    # units, from the same event) deterministically -- `survivors` is a `frozenset`, so
-    # without this, `chosen`'s relative order among same-priority ties would depend on
-    # frozenset iteration order (hash-seed-dependent), and Task 5's skip accounting
-    # needs reproducible ordering across runs.
-    chosen.sort(key=lambda item: (item[0], 0 if item[1].key[0] == "entry" else 1, item[1].key))
+    chosen.sort(key=lambda item: (item[0], _chosen_order(item[1].key)))
 
     entries = dict(state.entries)
     modes = dict(state.modes)
@@ -1048,6 +1049,22 @@ def apply_survivors(
 
     tree = _materialize_tree(stream, entries, modes, images)
     return WorldState(tree, state.backup_id, state.backup_bytes, entries, modes, images)
+
+
+def apply_survivors(
+    state: WorldState, stream: Stream, cut: int, survivors: frozenset[tuple]
+) -> WorldState | Skip:
+    """Apply the chosen pending keys **in stream order** against `state`'s durable tree
+    (design §4.3). Every key must be pending at `cut` -- `pending_keys_at(stream, cut)`
+    is the closed universe callers choose subsets from; a key outside it is a caller
+    bug, not a representability question, and raises rather than skipping silently.
+
+    The *first* structurally inapplicable unit -- a `remove`/`replace` whose target
+    entry is absent, or `image`/`mode` state for a token with no durable-or-included
+    name anywhere -- makes the whole subset unrepresentable: returns `Skip(reason)`
+    immediately, without partially applying the rest.
+    """
+    return _apply_chosen(state, stream, cut, _pending_with_positions(stream, cut), survivors)
 
 
 def _maximal_survivors(stream: Stream, cut: int) -> frozenset[tuple]:
@@ -1088,45 +1105,70 @@ def _maximal_survivors(stream: Stream, cut: int) -> frozenset[tuple]:
     return frozenset(accepted)
 
 
-def _maximal_extra(
-    stream: Stream,
-    cut: int,
-    base: WorldState,
-    entry_survivors: frozenset[tuple],
-    other_keys: frozenset[tuple],
-) -> frozenset[tuple]:
-    """The largest subset of `other_keys` (`data`/`meta` pending units) that applies
-    cleanly once `entry_survivors` have landed on top of `base` -- `enumerate_cells`'s
-    per-cell generalization of `_maximal_survivors`'s own greedy pass (design §9's "an
-    unreachable inode carries no observable state"), fixed to one particular entry
-    subset instead of the single maximal one.
+def _probe_root_token(stream: Stream) -> int | None:
+    """The token naming `metadata/probe` (`atoms.fs.bootstrap.PROBE_DIRECTORY`) --
+    created at seed-owned bootstrap (design §4.1: bootstrap publication is seed's, not
+    recorded), so it lives in `seed_entries`, never as a recorded `Mutation`."""
+    metadata_root = stream.roots.get("metadata")
+    if metadata_root is None:
+        return None
+    return stream.seed_entries.get((metadata_root, "probe"))
 
-    `data`/`meta` representability is *never* independently combinatorial: a unit's
-    strict reachability is a pure function of which entries are durable-or-chosen, so
-    branching `enumerate_cells`'s powerset over these keys too would multiply the walk
-    by up to `2**len(other_keys)` for zero additional observable outcomes -- exactly the
-    scale (`data`/`meta` keys orphaned by un-flushed capability-probe churn, `python/
-    tests/exerciser.py`'s admission-time probing) that makes a literal full powerset
-    over every pending key intractable. Branching stays over `entry` keys alone, which
-    is where §9.4's dual-name/anchor-only shape actually varies.
+
+def _probe_classification(stream: Stream) -> tuple[frozenset[int], dict[int, frozenset[int]]]:
+    """`(probe_tokens, token_parents)` for the whole stream, computed once (it is
+    cut-independent) and shared by every cut's classification:
+
+    `probe_tokens` is every token that *is* `metadata/probe`, or is transitively
+    contained by it -- `src/atoms/fs/probe.py`'s capability probing nests freely
+    (`src`/`dst` link-anchor probing creates and populates its own child
+    directories), so membership is discovered by a single forward pass: an object
+    inserted under an already-known probe parent is itself a probe token from then on
+    (a child cannot be created before its parent).
+
+    `token_parents` is, for every token that was ever named by an `entry` unit
+    (`insert`/`replace`, anywhere in the stream) or by a seed-era entry, the set of
+    every *parent* token it was ever bound under -- the CONTROLLER ruling's
+    `data`/`meta` classification ("every name its token ever held lives there") reads
+    directly off this.
     """
-    positioned = _pending_with_positions(stream, cut)
-    entries = dict(base.entries)
-    modes = dict(base.modes)
-    images = dict(base.images)
-    reverse = _reverse_index(entries)
-    ordered_entries = sorted(
-        (positioned[key] for key in entry_survivors), key=lambda item: item[0]
-    )
-    for _, unit in ordered_entries:
-        _apply_unit(unit, entries, modes, images, reverse, strict=True)
-    accepted: set[tuple] = set()
-    ordered_other = sorted((positioned[key] for key in other_keys), key=lambda item: item[0])
-    for _, unit in ordered_other:
-        reason = _apply_unit(unit, entries, modes, images, reverse, strict=True)
-        if reason is None:
-            accepted.add(unit.key)
-    return frozenset(accepted)
+    probe_root = _probe_root_token(stream)
+    probe_tokens: set[int] = {probe_root} if probe_root is not None else set()
+    token_parents: dict[int, set[int]] = {}
+    for (parent, _name), token in stream.seed_entries.items():
+        token_parents.setdefault(token, set()).add(parent)
+    for event in stream.events:
+        if type(event) is not Mutation:
+            continue
+        for unit in event.units:
+            if unit.key[0] != "entry" or unit.change not in ("insert", "replace"):
+                continue
+            if unit.object_token is None:
+                continue
+            parent = unit.key[1]
+            token_parents.setdefault(unit.object_token, set()).add(parent)
+            if parent in probe_tokens:
+                probe_tokens.add(unit.object_token)
+    return frozenset(probe_tokens), {
+        token: frozenset(parents) for token, parents in token_parents.items()
+    }
+
+
+def _is_probe_noise(
+    key: tuple,
+    probe_tokens: frozenset[int],
+    token_parents: dict[int, frozenset[int]],
+) -> bool:
+    """CONTROLLER ruling #1: an `entry` key is probe-noise iff its parent lies in the
+    `probe/` subtree; a `data`/`meta` key is probe-noise iff *every* parent its token
+    was ever bound under does -- a token with no recorded binding at all (should not
+    occur; every `data`/`meta` unit's token was named by some `entry` insert) is
+    conservatively TRANSACTIONAL, never silently folded away.
+    """
+    if key[0] == "entry":
+        return key[1] in probe_tokens
+    parents = token_parents.get(key[1])
+    return bool(parents) and parents <= probe_tokens
 
 
 def _tree_digest(tree: WorldTree) -> str:
@@ -1142,15 +1184,16 @@ def _tree_digest(tree: WorldTree) -> str:
 
 
 class PendingCapExceeded(Exception):
-    """A cut's pending entry-key count exceeded `enumerate_cells`'s `pending_cap` --
-    loud, never sampled (design §4.3): "a cap breach means the model or the engine
-    changed, and the matrix must say so.\""""
+    """A cut's pending *transactional* key count exceeded `enumerate_cells`'s
+    `pending_cap` -- loud, never sampled (design §4.3): "a cap breach means the model
+    or the engine changed, and the matrix must say so.\""""
 
 
 @dataclass(frozen=True)
 class Cell:
-    """One reconstructible world at a cut: the chosen pending-key subset and the
-    `WorldState` `apply_survivors` built from it."""
+    """One reconstructible world at a cut: the chosen pending-key subset (the
+    transactional combo plus whichever probe-noise keys folded in) and the
+    `WorldState` `apply_survivors`' own engine built from it."""
 
     cut: int
     survivors: frozenset[UnitKey]
@@ -1160,12 +1203,56 @@ class Cell:
 @dataclass(frozen=True)
 class SweepAccounting:
     """The sweep's bookkeeping: how many cells were kept, how many worlds deduped away
-    (identical `(tree digest, backup_id)`), and how many survivor subsets were skipped,
-    by reason."""
+    (identical `(tree digest, backup_id)`), how many survivor subsets were skipped by
+    reason, and `probe_folded` -- the total count of probe-noise keys folded into a
+    *kept* cell across the whole sweep (summed, not deduplicated: a probe-noise key
+    folded into ten different cells counts ten times), evidence that probe-noise
+    reclamation actually ran rather than merely being declared."""
 
     cells: int
     deduped: int
     skips: dict[str, int]
+    probe_folded: int
+
+
+def _fold(
+    stream: Stream,
+    base: WorldState,
+    positioned: dict[tuple, tuple[int, Unit]],
+    mandatory: frozenset[tuple],
+    optional: frozenset[tuple],
+) -> tuple[str | None, frozenset[tuple]]:
+    """One applicability pass, in true stream order, over `mandatory | optional` --
+    CRITICAL 2: the *same* engine (`_chosen_order`'s tie-break, `_apply_unit`'s strict
+    rules) that judges the final `Cell`, not a second, differently-ordered one. A
+    `mandatory` (chosen transactional survivor) unit that fails aborts the whole combo
+    immediately, returning its `Skip` reason and no accepted optionals -- matching
+    `apply_survivors`' own all-or-nothing contract for a chosen key. An `optional`
+    (probe-noise) unit that fails is simply excluded and the pass continues: the
+    maximal-applicable probe-noise fold (`_maximal_survivors`'s own greedy philosophy,
+    design §9's "an unreachable inode carries no observable state"), computed by
+    exactly the ordering that will later re-apply it, so a fold decision can never
+    diverge from what `apply_survivors` itself would say about the same merged set --
+    `_apply_unit` never mutates on failure, so an excluded optional key leaves no trace
+    for the units still to come.
+    """
+    ordered = sorted(
+        ((key, positioned[key]) for key in mandatory | optional),
+        key=lambda item: (item[1][0], _chosen_order(item[1][1].key)),
+    )
+    entries = dict(base.entries)
+    modes = dict(base.modes)
+    images = dict(base.images)
+    reverse = _reverse_index(entries)
+    accepted: set[tuple] = set()
+    for key, (_, unit) in ordered:
+        reason = _apply_unit(unit, entries, modes, images, reverse, strict=True)
+        if key in mandatory:
+            if reason is not None:
+                return reason, frozenset()
+        elif reason is None:
+            accepted.add(key)
+    return None, frozenset(accepted)
 
 
 def enumerate_cells(
@@ -1173,42 +1260,66 @@ def enumerate_cells(
 ) -> tuple[tuple[Cell, ...], SweepAccounting]:
     """Every reconstructible cell of `stream`, materialized (erratum 2 -- a pair, never
     an iterator): walk every cut index (design §4.3's "an index into the recorded
-    stream"), and at each, the full powerset of that cut's pending **entry** keys --
-    `data`/`meta` keys ride along deterministically via `_maximal_extra`, since their
-    representability is never independently combinatorial (see `_maximal_extra`'s
-    docstring for why the branching dimension is entry keys alone).
+    stream"), split that cut's pending keys into TRANSACTIONAL and probe-noise
+    (`_is_probe_noise`; CONTROLLER ruling #1), and take the full powerset over the
+    transactional keys **of every kind** (`entry`, `data`, `meta`) -- design §4.3's
+    full-independence adversary, restored: a scenario's own mode/content axis is
+    genuinely combinatorial (a create's entry landing without its paired mode unit is
+    §4.4's own reconstructible shape), so it is swept, not folded away.
 
-    `pending_cap` bounds the entry-key count a cut is allowed to carry before the walk
-    raises `PendingCapExceeded` -- loud, never sampled: the engine's barrier discipline
-    keeps the *entry* dimension small (`python/tests/exerciser.py`'s admission-time
-    capability probing never carries more than a handful of live entry names at once,
-    even though it leaves dozens of orphaned `data`/`meta` keys behind), so a breach
-    here is a real signal the model or the engine changed shape.
+    Every transactional combo is completed by the maximal-applicable probe-noise fold
+    (`_fold`) -- capability probing's own churn is unconditionally reclaimed at lease
+    entry (`atoms.fs.bootstrap.reclaim_probe_survivors`) regardless of which
+    transactional units happen to survive a given cut, so it contributes at most one
+    deterministic outcome per combo, never an independent branch (ruling #3).
+
+    `pending_cap` bounds the cut's transactional pending-key count (every kind, not
+    just `entry`) before the walk raises `PendingCapExceeded` -- loud, never sampled.
+    Measured across every `SCENARIOS` entry, the transactional dimension never exceeds
+    6 simultaneously pending keys (probe-noise separately reaches 24-51) -- comfortably
+    under the default cap, and matching design §4.3's "the engine's barrier discipline
+    keeps pending sets small" read as being about the engine's *own* transactional
+    surface, not capability-probing scratch.
 
     Identical `(tree digest, backup_id)` worlds dedupe -- expected and common, since
-    many adjacent cuts share the same durable base and the same entry powerset.
+    many adjacent cuts share the same durable base and the same transactional
+    powerset.
     """
+    probe_tokens, token_parents = _probe_classification(stream)
+
     cells: list[Cell] = []
     seen: set[tuple[str, int | None]] = set()
     deduped = 0
     skips: dict[str, int] = {}
+    probe_folded = 0
 
     for cut in range(len(stream.events) + 1):
         pending = pending_keys_at(stream, cut)
-        entry_keys = tuple(sorted(key for key in pending if key[0] == "entry"))
-        other_keys = frozenset(key for key in pending if key[0] != "entry")
-        if len(entry_keys) > pending_cap:
+        transactional = tuple(
+            sorted(
+                key for key in pending
+                if not _is_probe_noise(key, probe_tokens, token_parents)
+            )
+        )
+        probe_keys = frozenset(
+            key for key in pending if _is_probe_noise(key, probe_tokens, token_parents)
+        )
+        if len(transactional) > pending_cap:
             raise PendingCapExceeded(
-                f"cut {cut}: {len(entry_keys)} pending entry keys exceeds "
+                f"cut {cut}: {len(transactional)} pending transactional keys exceeds "
                 f"pending_cap={pending_cap}"
             )
         base = durable_state(stream, cut)
-        for size in range(len(entry_keys) + 1):
-            for combo in itertools.combinations(entry_keys, size):
-                entry_survivors = frozenset(combo)
-                extra = _maximal_extra(stream, cut, base, entry_survivors, other_keys)
-                survivors = entry_survivors | extra
-                result = apply_survivors(base, stream, cut, survivors)
+        positioned = _pending_with_positions(stream, cut)
+        for size in range(len(transactional) + 1):
+            for combo in itertools.combinations(transactional, size):
+                mandatory = frozenset(combo)
+                reason, accepted = _fold(stream, base, positioned, mandatory, probe_keys)
+                if reason is not None:
+                    skips[reason] = skips.get(reason, 0) + 1
+                    continue
+                survivors = mandatory | accepted
+                result = _apply_chosen(base, stream, cut, positioned, survivors)
                 if isinstance(result, Skip):
                     skips[result.reason] = skips.get(result.reason, 0) + 1
                     continue
@@ -1217,9 +1328,12 @@ def enumerate_cells(
                     deduped += 1
                     continue
                 seen.add(dedupe_key)
+                probe_folded += len(accepted)
                 cells.append(Cell(cut, cast("frozenset[UnitKey]", survivors), result))
 
-    return tuple(cells), SweepAccounting(cells=len(cells), deduped=deduped, skips=skips)
+    return tuple(cells), SweepAccounting(
+        cells=len(cells), deduped=deduped, skips=skips, probe_folded=probe_folded
+    )
 
 
 def named_tuples(stream: Stream) -> dict[str, Cell]:
@@ -1231,6 +1345,13 @@ def named_tuples(stream: Stream) -> dict[str, Cell]:
     single-unit entry `insert` Mutation) -- rollback re-moves a landed move by emitting
     a *second*, structurally identical transfer of the same token, so a caught-rollback
     stream carries two matches, not one.
+
+    Minor 8: `src/atoms/fs/probe.py`'s own hard-link capability probing performs the
+    identical shape (a rename under `src`/`dst`, and its own `link_anchor`) on
+    different tokens -- unenforced by token identity alone, since nothing stops two
+    *different* object tokens from each independently matching the shape. Candidates
+    whose remove/insert parent lies in the `probe/` subtree (`_is_probe_noise`) are
+    excluded before shape-matching, so only the scenario's own move can ever match.
 
     Direction: `TransactionState.ROLLING_BACK`'s `"rolling_back"` commit is the
     earliest point any effect's undo can begin (`classify_recovery` always transitions
@@ -1245,6 +1366,8 @@ def named_tuples(stream: Stream) -> dict[str, Cell]:
     §4.3/§9.4 calls both **generated, never skipped**: either resolving to `Skip`
     raises `KeyError` naming the tuple, rather than silently omitting it.
     """
+    probe_tokens, _ = _probe_classification(stream)
+
     try:
         boundary = stream.commit_index("rolling_back")
     except KeyError:
@@ -1255,8 +1378,11 @@ def named_tuples(stream: Stream) -> dict[str, Cell]:
         if type(event) is not Mutation or len(event.units) != 1:
             continue
         unit = event.units[0]
-        if unit.key[0] == "entry" and unit.change == "insert" and unit.object_token is not None:
-            anchor_tokens.add(unit.object_token)
+        if unit.key[0] != "entry" or unit.change != "insert" or unit.object_token is None:
+            continue
+        if unit.key[1] in probe_tokens:
+            continue
+        anchor_tokens.add(unit.object_token)
 
     result: dict[str, Cell] = {}
     for index, event in enumerate(stream.events):
@@ -1267,6 +1393,8 @@ def named_tuples(stream: Stream) -> dict[str, Cell]:
             continue
         remove_unit, insert_unit = by_change["remove"], by_change["insert"]
         if remove_unit.key[0] != "entry" or insert_unit.key[0] != "entry":
+            continue
+        if remove_unit.key[1] in probe_tokens or insert_unit.key[1] in probe_tokens:
             continue
         if remove_unit.object_token != insert_unit.object_token:
             continue

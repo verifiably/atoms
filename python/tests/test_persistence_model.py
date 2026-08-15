@@ -2,6 +2,8 @@
 
 import pytest
 
+from tests.exerciser import SCENARIOS as _SCENARIOS
+
 
 def test_recording_is_success_only_and_decomposes_renames(persistence_recording):
     stream = persistence_recording("minimal-move")
@@ -192,19 +194,53 @@ def test_enumeration_counts_and_reports_skips_by_reason(persistence_recording):
     cells, accounting = enumerate_cells(stream)
     assert accounting.cells > 0
     assert accounting.cells == len(cells)
+    assert accounting.probe_folded > 0
     assert set(accounting.skips) <= {
         "remove-without-target", "replace-without-target", "orphan-object-state",
     }
 
 
 def test_the_pending_cap_fails_loud(persistence_recording):
+    """A realistic boundary, not a degenerate zero: `corpus-write`'s transactional
+    pending-set size genuinely reaches 6 at some cut (measured), so `pending_cap=5`
+    breaches on the scenario's own complexity, not on the mere presence of any
+    pending key at all."""
     import pytest
 
     from tests.persistence_model import PendingCapExceeded, enumerate_cells
 
     stream = persistence_recording("corpus-write")
     with pytest.raises(PendingCapExceeded):
-        list(enumerate_cells(stream, pending_cap=0))
+        enumerate_cells(stream, pending_cap=5)
+
+
+_RECORDABLE_SCENARIOS = [
+    (entry.name, entry.inject_failure is not None)
+    for entry in _SCENARIOS
+    if entry.family != "refusal"
+]
+
+
+@pytest.mark.parametrize("name,caught", _RECORDABLE_SCENARIOS)
+def test_the_default_cap_holds_across_every_recordable_scenario(
+    name, caught, persistence_recording
+):
+    """The transactional dimension `pending_cap` bounds stays small on every scenario
+    `SCENARIOS` carries (probe-noise is unbounded and handled separately, `_fold`) --
+    `enumerate_cells`'s default `pending_cap=12` must never raise on a real recorded
+    stream. `"refusal-capability"` is excluded: design's own §6 text rules capability
+    refusals outside the persistence-cut product (they raise before any durable
+    transaction exists, so `persistence_recording` cannot even produce a `Stream` for
+    one). Parametrized (not one shared-fixture loop) for the same reason
+    `test_full_durable_reconstruction_equals_the_live_final_world` above is: each
+    scenario's `seed_world` needs its own fresh project root, not a second scenario's
+    leftover tree from `coordinator_on`.
+    """
+    from tests.persistence_model import enumerate_cells
+
+    stream = persistence_recording(name, caught=caught)
+    _, accounting = enumerate_cells(stream)
+    assert accounting.cells > 0
 
 
 def test_survivor_subset_without_a_directory_mode_reconstructs(
@@ -225,9 +261,13 @@ def test_survivor_subset_without_a_directory_mode_reconstructs(
     directory is touched again) -- so this test locates *that* shape in a recorded
     `minimal-mkdir` stream instead of hand-picking `d`.
     """
+    import os
+    import stat
+
     from tests.persistence_model import (
         Mutation,
         Skip,
+        _resolve,
         apply_survivors,
         durable_state,
         pending_keys_at,
@@ -313,3 +353,28 @@ def test_survivor_subset_without_a_directory_mode_reconstructs(
     project.mkdir()
     metadata.mkdir()
     reconstruct(state, project, metadata)
+
+    # Minor 7: assert the actual on-disk post-conditions, not merely "did not raise" --
+    # the rebuilt directory's final mode really is 0 (the reverse-depth chmod pass
+    # actually landed, not merely failed to error), and the child it populated before
+    # that chmod really exists with its own recorded content and mode.
+    zero_dir = zero_mode_dirs[0]
+    on_disk_dir = _resolve(zero_dir, project, metadata)
+    assert stat.S_IMODE(os.stat(on_disk_dir).st_mode) == 0
+
+    # Mode 0 genuinely blocks even the owner from resolving a name underneath it
+    # (POSIX requires search ("x") on the containing directory to look up a child by
+    # name) -- confirmed above, before touching anything. To verify the child that
+    # `reconstruct` populated *before* locking the directory down (rather than merely
+    # trusting the in-memory `state.tree`), temporarily restore search access, purely
+    # for this assertion, then put it back.
+    child_path = next(path for path in populated if path.startswith(f"{zero_dir}/"))
+    _, content, child_mode = state.tree[child_path]
+    on_disk_child = _resolve(child_path, project, metadata)
+    os.chmod(on_disk_dir, 0o700)
+    try:
+        child_info = os.stat(on_disk_child)
+        assert stat.S_IMODE(child_info.st_mode) == child_mode
+        assert on_disk_child.read_bytes() == content
+    finally:
+        os.chmod(on_disk_dir, 0)
