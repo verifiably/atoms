@@ -34,6 +34,26 @@ def _emit(document: dict[str, object]) -> None:
     print(f"CERTIFY-JSON:{json.dumps(document, ensure_ascii=True, sort_keys=True)}", flush=True)
 
 
+def _mount(source: str, target: Path) -> None:
+    result = subprocess.run(
+        ["mount", source, os.fspath(target)], check=False, capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        return
+    status = "\n".join(
+        line
+        for line in Path("/proc/self/status").read_text(encoding="ascii").splitlines()
+        if line.startswith(("Uid:", "Gid:", "Cap"))
+    )
+    kernel = subprocess.run(
+        ["dmesg", "--level=err"], check=False, capture_output=True, text=True
+    ).stdout[-2000:]
+    raise RuntimeError(
+        f"mount failed with exit {result.returncode}: {result.stderr.strip()}; "
+        f"process status: {status!r}; kernel errors: {kernel!r}"
+    )
+
+
 def _cmdline() -> dict[str, str]:
     values: dict[str, str] = {}
     for parameter in Path("/proc/cmdline").read_text(encoding="ascii").split():
@@ -98,7 +118,7 @@ def _fixture_masks(work: Path, features: str) -> FeatureMasks:
     mountpoint.mkdir()
     loop = _run(["losetup", "--find", "--show", os.fspath(image)])
     try:
-        _run(["mount", loop, os.fspath(mountpoint)])
+        _mount(loop, mountpoint)
         try:
             descriptor = os.open(mountpoint, os.O_RDONLY | os.O_DIRECTORY)
             try:
