@@ -93,7 +93,15 @@ Each successful mutation decomposes into **durability units** under tagged keys:
   relation — so a later pending write replaces the pending image wholesale.
 - **Metadata units**, keyed `(META, inode, field)` where the field is `mode` or
   a named xattr: field-keyed so that setting the marker xattr can never replace
-  a pending mode update, and conversely.
+  a pending mode update, and conversely. **Creation-time mode is atomic with
+  inode creation** *(ruled 2026-08-15, Task 6)*: the mode passed to
+  `create_exclusive`/`mkdir_child` rides with the typed model inode and is
+  durable exactly when the creating entry insert is durable — physically, a
+  create journals its inode with its entry. Only a subsequent mode **change**
+  (`set_mode`, `repair_entry_mode`, the §9.5 post-mkdir `fchmod`) emits a
+  separate metadata unit that can tear independently — which preserves the
+  load-bearing umask and staged-mode adversary while excluding the unphysical
+  world where a creation's own mode vanishes beneath its durable entry.
 
 A later pending update **replaces** the earlier pending update at the same key.
 The survivor enumeration of §4.3 therefore ranges over keys, never raw events,
@@ -159,10 +167,17 @@ Each cell's surviving world is replayed into fresh `project_root` and
 files, link relations are reproduced by `link`, directory modes applied, and the
 cut's selected database backup installed as `atoms.db` **alone** — reopening
 creates fresh sidecars, and no `-wal`/`-shm`/`-journal` file is ever replayed. Reconstruction is exact up
-to inode renaming, which is safe because nothing durable stores inode numbers —
-observation identity tokens are snapshot-local and halt diagnostics are
-token-free — and the §5 comparison is already up-to-renaming for
-identity-bearing values.
+to inode renaming. *(Corrected 2026-08-15, Task 6: the original claim that
+nothing durable stores inode numbers was wrong —
+`transaction_record.approval_evidence` pins `(st_dev, st_ino)` for every
+approved directory and the work base, and recovery's topology diff halts on a
+mismatch.)* Renaming is therefore made safe by **realigning durable identity
+evidence**: reconstruction rewrites the approval evidence's device/inode pairs
+to the reconstructed inodes for every directory that exists in the
+reconstructed world, while an **absent** directory keeps its recorded identity
+so a genuine `NODE_MISSING` assembly halt remains reachable. Observation
+identity tokens stay snapshot-local, halt diagnostics stay token-free, and the
+§5 comparison stays up-to-renaming for identity-bearing values.
 
 ### 4.5 The named intermediates, and the §9.5 ruling
 
