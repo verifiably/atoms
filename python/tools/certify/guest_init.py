@@ -75,7 +75,7 @@ def verify_identity(parameters: dict[str, str]) -> None:
         ["git", "-c", f"safe.directory={checkout}", "-C", checkout, "status", "--porcelain"]
     )
     if status:
-        actual["checkout_clean"] = False
+        actual["checkout_status"] = status
     if actual != expected:
         raise RuntimeError(
             f"guest identity mismatch: expected {expected!r}, observed {actual!r}"
