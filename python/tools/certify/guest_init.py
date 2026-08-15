@@ -64,12 +64,16 @@ def verify_identity(parameters: dict[str, str]) -> None:
     actual: dict[str, object] = {
         "backend_revision": BACKEND_REVISION,
         "checkout": checkout,
-        "commit": _run(["git", "-C", checkout, "rev-parse", "HEAD"]),
+        "commit": _run(
+            ["git", "-c", f"safe.directory={checkout}", "-C", checkout, "rev-parse", "HEAD"]
+        ),
         "kernel": platform.release(),
         "python_executable": sys.executable,
         "python_version": sys.version,
     }
-    status = _run(["git", "-C", checkout, "status", "--porcelain"])
+    status = _run(
+        ["git", "-c", f"safe.directory={checkout}", "-C", checkout, "status", "--porcelain"]
+    )
     if status:
         actual["checkout_clean"] = False
     if actual != expected:
