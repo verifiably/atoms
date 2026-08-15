@@ -8,8 +8,8 @@ crash-certification method), §13.4 (end-to-end recovery), and §14 Plan A items
 A9 (macOS) follows.
 
 A8a landed the exerciser and the record–reconstruct–recover cut model in
-`python/tests/`: five minimal scenarios sweep 48–57 cells each (~63 s total, zero A3
-disagreements); compound scenarios sweep 301 cells (~75 s); the 18-scenario drift
+`python/tests/`: five minimal scenarios sweep 47–57 cells each (~63 s total, zero A3
+disagreements); compound scenarios sweep 301 cells (~77 s); the 18-scenario drift
 corpus is preserved 18/18; subprocess-placement scenarios cover 22+ cells including
 halted ones; the SIGKILL extension covers 104 cuts (62 corpus-write + 42
 archive-move, ~81 s); and the five sabotage arms each fire exactly their designated
