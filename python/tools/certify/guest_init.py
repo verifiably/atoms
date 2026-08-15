@@ -342,6 +342,7 @@ def _resolve_configuration(mountpoint: Path) -> VolumeConfiguration:
 
 
 def _recover_cell(volume: Path) -> dict[str, object]:
+    from atoms.core.recovery import HaltPlan, TransactionState
     from atoms.fs.lock import acquire_project_lock
     from tests.fs_support import build_test_allowlist
     from tests.persistence_model import (
@@ -350,7 +351,9 @@ def _recover_cell(volume: Path) -> dict[str, object]:
         _inspect,
         _model_projection,
         _occupied_slots,
+        _Refused,
         _scratch_survivors,
+        inaccessible_paths,
         world_digest,
         world_tree,
     )
@@ -362,38 +365,116 @@ def _recover_cell(volume: Path) -> dict[str, object]:
     with acquire_project_lock(backend, str(metadata)) as lock:
         allowlist = build_test_allowlist(lock, str(project), storage)
     before = world_tree(project, metadata)
+    inaccessible = inaccessible_paths(before)
     failures: list[str] = []
     captured: list[tuple] = []
     with pytest.MonkeyPatch.context() as monkeypatch:
-        first, _ = _enter_lease(
-            project, metadata, storage, monkeypatch, captured, allowlist
-        )
-        facts = _inspect(project, metadata, storage, allowlist)
-        projection = facts["projection"]
+        refusal: str | None = None
+        halted = False
+        try:
+            kind, _ = _enter_lease(
+                project, metadata, storage, monkeypatch, captured, allowlist
+            )
+            halted = kind == "halted"
+        except _Refused as refused:
+            refusal = str(refused)
+            if not inaccessible:
+                failures.append(f"unexplained refusal with every mode accessible: {refusal}")
+
         world = world_tree(project, metadata)
         digest = world_digest(project, metadata)
-        if captured and projection != _model_projection(*captured[0]):
-            failures.append("durable projection disagrees with A3 fixed point")
+        if refusal is not None:
+            second_refusal: str | None = None
+            try:
+                _enter_lease(project, metadata, storage, monkeypatch, [], allowlist)
+            except _Refused as again:
+                second_refusal = str(again)
+            if second_refusal != refusal or world_digest(project, metadata) != digest:
+                failures.append(
+                    f"first pass refused {refusal!r}; second pass gave {second_refusal!r}"
+                )
+            return {"violations": failures, "classified": 0}
+
+        if len(captured) > 1:
+            failures.append(f"recovery classified {len(captured)} times in one entry")
+        facts = _inspect(project, metadata, storage, allowlist)
+        projection = facts["projection"]
+        record = facts["record"]
+        if halted and not captured and (
+            record is None
+            or (record.assembly_halt is None and record.state is not TransactionState.HALTED)
+        ):
+            failures.append("a halt was raised without a durable halt record")
+        if projection is not None and not captured and not halted:
+            assert record is not None
+            if facts["active"] or record.state not in {
+                TransactionState.COMMITTED,
+                TransactionState.ROLLED_BACK,
+            }:
+                failures.append(
+                    "a durable record was neither classified nor settled: "
+                    f"state={record.state.name} active={facts['active']}"
+                )
         if projection is None:
-            failures.extend(_external_differences(before, world))
-        failures.extend(facts["chain"]["failures"])
-        if not facts["active"] and first != "halted":
+            if captured:
+                failures.append("recovery classified a world holding no durable record")
+            if differences := _external_differences(before, world):
+                failures.append(f"external state not preserved: {differences}")
+        elif captured:
+            plan = captured[0][1]
+            if projection != _model_projection(*captured[0]):
+                failures.append("durable projection disagrees with A3 fixed point")
+            if type(plan) is HaltPlan:
+                assert record is not None
+                if record.halt_diagnostic != plan.diagnostic:
+                    failures.append(
+                        "the persisted halt diagnostic is not the plan's: "
+                        f"{record.halt_diagnostic!r} != {plan.diagnostic!r}"
+                    )
+
+        chain = facts["chain"]
+        failures.extend(chain["failures"])
+        if chain["present"] and record is not None:
+            if record.registration_digest is not None and (
+                record.registration_digest not in chain["registrations"]
+            ):
+                failures.append(
+                    f"record registration digest {record.registration_digest} is not a "
+                    "durable chain entry"
+                )
+            if record.settlement_digest is not None and (
+                record.settlement_digest not in chain["settlements"]
+            ):
+                failures.append(
+                    f"record settlement digest {record.settlement_digest} is not a "
+                    "durable chain entry"
+                )
+        if not facts["active"] and not halted:
             if scratch := _scratch_survivors(world):
-                failures.append(f"scratch survived terminal recovery: {scratch}")
+                failures.append(f"scratch survived a terminal state: {scratch}")
             if occupied := _occupied_slots(world):
-                failures.append(f"workspace slots survived terminal recovery: {occupied}")
+                failures.append(f"workspace slots are not empty: {occupied}")
+            if chain["present"] and chain["survivors"]:
+                failures.append("a chain staging survivor outlived a terminal state")
         if facts["unindexed_blobs"]:
-            failures.append(f"unindexed blobs survived recovery: {facts['unindexed_blobs']}")
-        second, _ = _enter_lease(
-            project, metadata, storage, monkeypatch, [], allowlist
-        )
-        again = _inspect(project, metadata, storage, allowlist)
-        if second != first:
-            failures.append(f"second pass changed lease result: {first} -> {second}")
-        if again["projection"] != projection:
-            failures.append("second pass changed durable projection")
-        if world_digest(project, metadata) != digest:
-            failures.append("second pass changed world")
+            failures.append(f"unindexed blobs survived reclamation: {facts['unindexed_blobs']}")
+
+        second_violation: str | None = None
+        try:
+            _enter_lease(project, metadata, storage, monkeypatch, [], allowlist)
+        except _Refused as refused:
+            second_violation = f"the second pass refused where the first resolved: {refused}"
+        if second_violation is None:
+            again = _inspect(project, metadata, storage, allowlist)
+            if again["projection"] != projection:
+                second_violation = (
+                    f"the second pass moved the projection: {projection!r} -> "
+                    f"{again['projection']!r}"
+                )
+            elif world_digest(project, metadata) != digest:
+                second_violation = "the second pass moved the world"
+        if second_violation is not None:
+            failures.append(second_violation)
     return {"violations": failures, "classified": len(captured)}
 
 
@@ -560,7 +641,8 @@ def main() -> int:
     if sys.argv[1:2] == ["--recover"]:
         if len(sys.argv) != 3:
             raise ValueError("--recover requires exactly one mounted volume path")
-        verify_identity(_cmdline())
+        # The verified parent execs this exact interpreter and module for each first pass.
+        # Repeating its 9p Git scan here preserves no additional crash boundary.
         print(json.dumps(_recover_cell(Path(sys.argv[2])), ensure_ascii=True, sort_keys=True))
         return 0
 
