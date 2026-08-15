@@ -158,7 +158,7 @@ def run(
     root = Path(shared_root)
     if not root.is_dir():
         raise ValueError(f"shared_root is not a directory: {root}")
-    if data_image.resolve() == log_image.resolve():
+    if os.path.samestat(data_image.stat(), log_image.stat()):
         raise ValueError("data_image and log_image must be distinct files")
     kernel_path, initramfs_path, data_path, log_path = (
         _qemu_path(item, name)
