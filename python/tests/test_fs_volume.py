@@ -1,5 +1,6 @@
 import dataclasses
 import io
+import struct
 
 import pytest
 
@@ -10,13 +11,20 @@ from atoms.fs.volume import (
     CERTIFIED_ALLOWLIST,
     AllowlistEntry,
     DurabilityAllowlist,
+    FeatureMasks,
     StorageProfile,
     VolumeConfiguration,
     build_configuration,
+    feature_mask_options,
     parse_mount_id,
     parse_mountinfo,
+    read_mountinfo,
+    resolve_ext4_feature_masks,
     resolve_mount_entry,
 )
+
+FAST_COMMIT = 0x400
+ORPHAN_FILE = 0x1000
 
 
 def _configuration() -> VolumeConfiguration:
@@ -233,10 +241,67 @@ def test_read_mountinfo_preserves_unrelated_non_utf8_mountpoints_for_matching(
     assert entry.mount_point == "/data"
 
 
-def test_build_configuration_normalizes_absent_ext4_options(mountinfo_text):
+def test_the_ioctl_resolves_masks_on_a_live_ext4_directory(ext4_probe_fd):
+    masks = resolve_ext4_feature_masks(ext4_probe_fd)
+    assert masks.compat >= 0
+    assert masks.incompat > 0  # ext4 always sets incompat bits
+
+
+def test_mask_options_are_canonical_hex():
+    masks = FeatureMasks(compat=0x43C, incompat=0x2C2, ro_compat=0x46B)
+    assert feature_mask_options(masks) == (
+        "compat=0x43c",
+        "incompat=0x2c2",
+        "ro_compat=0x46b",
+    )
+
+
+def test_the_mkfs_fixture_pair_is_two_sided(tmp_path):
+    """Design §7.4: fast_commit is compat 0x400, orphan_file compat 0x1000.
+
+    The images are built without root and parsed at the superblock offsets the
+    first spike pinned; the in-guest half re-reads them through the ioctl under
+    the certification kernel (tools/certify/guest_init.py).
+    """
+    import subprocess
+
+    def image_compat(features: str) -> int:
+        image = tmp_path / f"{features.replace(',', '_').replace('^', 'no-')}.img"
+        image.write_bytes(b"")
+        subprocess.run(
+            ["mkfs.ext4", "-q", "-F", "-O", features, str(image), "32768"],
+            check=True,
+        )
+        raw = image.read_bytes()[1024 : 1024 + 1024]
+        magic = struct.unpack_from("<H", raw, 0x38)[0]
+        assert magic == 0xEF53
+        return struct.unpack_from("<I", raw, 0x5C)[0]
+
+    plain = image_compat("^fast_commit,^orphan_file")
+    assert image_compat("fast_commit,^orphan_file") ^ plain == FAST_COMMIT
+    assert image_compat("^fast_commit,orphan_file") ^ plain == ORPHAN_FILE
+
+
+def test_build_configuration_pins_masks_for_ext4(ext4_probe_fd):
+    entry = resolve_mount_entry(ext4_probe_fd, read_mountinfo())
+
+    configuration = build_configuration(entry, "test-kernel", directory_fd=ext4_probe_fd)
+
+    assert configuration.durability_features == feature_mask_options(resolve_ext4_feature_masks(ext4_probe_fd))
+
+
+def test_a_non_ext4_entry_keeps_empty_features(mountinfo_text):
+    entry = parse_mountinfo(mountinfo_text("xfs_defaults"))[0]
+
+    configuration = build_configuration(entry, "test-kernel", directory_fd=-1)
+
+    assert configuration.durability_features == ()
+
+
+def test_build_configuration_normalizes_absent_ext4_options(mountinfo_text, ext4_probe_fd):
     entries = parse_mountinfo(mountinfo_text("ext4_defaults"))
     entry = next(item for item in entries if item.mount_point == "/data")
-    configuration = build_configuration(entry, "7.1.5-arch1-1")
+    configuration = build_configuration(entry, "7.1.5-arch1-1", directory_fd=ext4_probe_fd)
     assert configuration.barrier_options == (
         "async",
         "barrier=1",
@@ -245,20 +310,20 @@ def test_build_configuration_normalizes_absent_ext4_options(mountinfo_text):
     )
 
 
-def test_build_configuration_reads_super_only_values(mountinfo_text):
+def test_build_configuration_reads_super_only_values(mountinfo_text, ext4_probe_fd):
     # A field-6-only parser finds no data= at all and would normalize this
     # explicit data=writeback to the safe data=ordered default.
     entries = parse_mountinfo(mountinfo_text("ext4_writeback"))
     entry = next(item for item in entries if item.mount_point == "/data")
-    configuration = build_configuration(entry, "7.1.5-arch1-1")
+    configuration = build_configuration(entry, "7.1.5-arch1-1", directory_fd=ext4_probe_fd)
     assert "data=writeback" in configuration.barrier_options
     assert "data=ordered" not in configuration.barrier_options
 
 
-def test_build_configuration_reads_per_mount_only_values(mountinfo_text):
+def test_build_configuration_reads_per_mount_only_values(mountinfo_text, ext4_probe_fd):
     entries = parse_mountinfo(mountinfo_text("ext4_sync"))
     entry = next(item for item in entries if item.mount_point == "/data")
-    configuration = build_configuration(entry, "7.1.5-arch1-1")
+    configuration = build_configuration(entry, "7.1.5-arch1-1", directory_fd=ext4_probe_fd)
     assert "sync" in configuration.barrier_options
     assert "dirsync" in configuration.barrier_options
 
@@ -269,7 +334,7 @@ def test_build_configuration_normalizes_absent_xfs_options(mountinfo_text):
     # changes which allowlist entry a real volume matches.
     entries = parse_mountinfo(mountinfo_text("xfs_defaults"))
     entry = next(item for item in entries if item.mount_point == "/data")
-    configuration = build_configuration(entry, "7.1.5-arch1-1")
+    configuration = build_configuration(entry, "7.1.5-arch1-1", directory_fd=-1)
     assert configuration.barrier_options == ("async", "barrier=1")
 
 
@@ -277,14 +342,14 @@ def test_build_configuration_reads_xfs_super_only_values(mountinfo_text):
     # wsync appears only in field 11, so a field-6-only parser reports the default.
     entries = parse_mountinfo(mountinfo_text("xfs_wsync"))
     entry = next(item for item in entries if item.mount_point == "/data")
-    configuration = build_configuration(entry, "7.1.5-arch1-1")
+    configuration = build_configuration(entry, "7.1.5-arch1-1", directory_fd=-1)
     assert configuration.barrier_options == ("async", "barrier=1", "wsync")
 
 
 def test_build_configuration_normalizes_absent_btrfs_options(mountinfo_text):
     entries = parse_mountinfo(mountinfo_text("btrfs_defaults"))
     entry = next(item for item in entries if item.mount_point == "/data")
-    configuration = build_configuration(entry, "7.1.5-arch1-1")
+    configuration = build_configuration(entry, "7.1.5-arch1-1", directory_fd=-1)
     assert configuration.barrier_options == ("barrier=1", "commit=30", "noflushoncommit")
 
 
@@ -293,11 +358,11 @@ def test_build_configuration_reads_btrfs_super_only_values(mountinfo_text):
     # normalizing either to its default would silently widen the certified claim.
     entries = parse_mountinfo(mountinfo_text("btrfs_flushoncommit"))
     entry = next(item for item in entries if item.mount_point == "/data")
-    configuration = build_configuration(entry, "7.1.5-arch1-1")
+    configuration = build_configuration(entry, "7.1.5-arch1-1", directory_fd=-1)
     assert configuration.barrier_options == ("barrier=1", "commit=15", "flushoncommit")
 
 
-def test_every_supported_filesystem_has_normalization_coverage(mountinfo_text):
+def test_every_supported_filesystem_has_normalization_coverage(mountinfo_text, ext4_probe_fd):
     # The production table is the source of truth. A hard-coded loop over the three
     # current filesystems would keep passing when a fourth table entry was added.
     super_only_cases = {
@@ -309,12 +374,13 @@ def test_every_supported_filesystem_has_normalization_coverage(mountinfo_text):
     for filesystem in _BARRIER_OPTIONS:
         defaults = parse_mountinfo(mountinfo_text(f"{filesystem}_defaults"))
         default_entry = next(item for item in defaults if item.mount_point == "/data")
-        default_configuration = build_configuration(default_entry, "7.1.5-arch1-1")
+        directory_fd = ext4_probe_fd if filesystem == "ext4" else -1
+        default_configuration = build_configuration(default_entry, "7.1.5-arch1-1", directory_fd=directory_fd)
         assert default_configuration.filesystem_type == filesystem
 
         super_only = parse_mountinfo(mountinfo_text(super_only_cases[filesystem]))
         super_entry = next(item for item in super_only if item.mount_point == "/data")
-        super_configuration = build_configuration(super_entry, "7.1.5-arch1-1")
+        super_configuration = build_configuration(super_entry, "7.1.5-arch1-1", directory_fd=directory_fd)
         assert super_configuration.filesystem_type == filesystem
         # The coverage fixture must actually isolate a non-default value in field 11.
         # Mapping a filesystem to its defaults fixture would otherwise satisfy the
@@ -324,7 +390,7 @@ def test_every_supported_filesystem_has_normalization_coverage(mountinfo_text):
         assert super_configuration.barrier_options != default_configuration.barrier_options
 
 
-def test_every_barrier_option_ignores_a_wrong_field_decoy(mountinfo_text):
+def test_every_barrier_option_ignores_a_wrong_field_decoy(mountinfo_text, ext4_probe_fd):
     wrong_field_cases = {
         "ext4": (
             "ext4_wrong_field_decoys",
@@ -351,14 +417,19 @@ def test_every_barrier_option_ignores_a_wrong_field_decoy(mountinfo_text):
                 for option in wrong_options
             ), f"{filesystem} fixture lacks wrong-field decoy for {name}"
         assert (
-            build_configuration(entry, "7.1.5-arch1-1").barrier_options == expected
+            build_configuration(
+                entry,
+                "7.1.5-arch1-1",
+                directory_fd=ext4_probe_fd if filesystem == "ext4" else -1,
+            ).barrier_options
+            == expected
         )
 
 
-def test_build_configuration_carries_the_exact_kernel_and_backend_revision(mountinfo_text):
+def test_build_configuration_carries_the_exact_kernel_and_backend_revision(mountinfo_text, ext4_probe_fd):
     entries = parse_mountinfo(mountinfo_text("ext4_defaults"))
     entry = next(item for item in entries if item.mount_point == "/data")
-    configuration = build_configuration(entry, "7.1.5-arch1-1")
+    configuration = build_configuration(entry, "7.1.5-arch1-1", directory_fd=ext4_probe_fd)
     # Not a major.minor truncation: one crash test must not certify a whole kernel line.
     assert configuration.kernel_identifier == "7.1.5-arch1-1"
     assert configuration.backend_revision == "linux-4"
@@ -368,13 +439,13 @@ def test_build_configuration_refuses_an_unlisted_filesystem(mountinfo_text):
     entries = parse_mountinfo(mountinfo_text("tmpfs"))
     entry = next(item for item in entries if item.mount_point == "/tmp")
     with pytest.raises(CapabilityUnavailable, match="tmpfs"):
-        build_configuration(entry, "7.1.5-arch1-1")
+        build_configuration(entry, "7.1.5-arch1-1", directory_fd=-1)
 
 
-def test_durability_features_are_empty_until_a_resolver_exists(mountinfo_text):
+def test_durability_features_are_pinned_by_the_ext4_resolver(mountinfo_text, ext4_probe_fd):
     entries = parse_mountinfo(mountinfo_text("ext4_defaults"))
     entry = next(item for item in entries if item.mount_point == "/data")
-    assert build_configuration(entry, "7.1.5-arch1-1").durability_features == ()
+    assert build_configuration(entry, "7.1.5-arch1-1", directory_fd=ext4_probe_fd).durability_features
 
 
 def test_certified_allowlist_ships_empty():

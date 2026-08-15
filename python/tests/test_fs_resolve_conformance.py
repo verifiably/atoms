@@ -58,13 +58,16 @@ def resolver_for(lock):
     fd = backend.open_root(project)
     try:
         entry = resolve_mount_entry(fd, read_mountinfo())
+        configuration = build_configuration(
+            entry, kernel_identifier(), directory_fd=fd
+        )
     finally:
         os.close(fd)
     allowlist = DurabilityAllowlist(
         entries=frozenset(
             {
                 AllowlistEntry(
-                    configuration=build_configuration(entry, kernel_identifier()),
+                    configuration=configuration,
                     storage=storage,
                     certification_ref="test-injected-not-crash-certified",
                 )

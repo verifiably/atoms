@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import errno
+import fcntl
 import os
 import re
+import struct
 from dataclasses import dataclass, field
 
 from atoms.core.errors import CapabilityUnavailable
@@ -19,6 +22,15 @@ _KERNEL_ESCAPE_VALUES = {
     r"\012": "\n",
     r"\134": "\\",
 }
+
+_EXT4_TUNE_SB_PARAMS_SIZE = 232
+_EXT4_IOC_GET_TUNE_SB_PARAM = (
+    (2 << 30)  # _IOC_READ
+    | (_EXT4_TUNE_SB_PARAMS_SIZE << 16)
+    | (ord("f") << 8)
+    | 45
+)
+_FEATURE_OFFSETS = (64, 68, 72)  # feature_compat, feature_incompat, feature_ro_compat
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +51,13 @@ class VolumeConfiguration:
     filesystem_type: str
     barrier_options: tuple[str, ...]
     durability_features: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class FeatureMasks:
+    compat: int
+    incompat: int
+    ro_compat: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,7 +272,35 @@ def _select(name: str, source: str, absent: str, entry: MountEntry) -> str:
     return absent
 
 
-def build_configuration(entry: MountEntry, kernel_identifier: str) -> VolumeConfiguration:
+def resolve_ext4_feature_masks(directory_fd: int) -> FeatureMasks:
+    """Read all ext4 superblock feature masks (design §7.4)."""
+    buffer = bytearray(_EXT4_TUNE_SB_PARAMS_SIZE)
+    try:
+        fcntl.ioctl(directory_fd, _EXT4_IOC_GET_TUNE_SB_PARAM, buffer)
+    except OSError as error:
+        if error.errno in (errno.ENOTTY, errno.EOPNOTSUPP, errno.EINVAL):
+            raise CapabilityUnavailable(
+                "ext4 feature masks unresolvable: the kernel does not support "
+                "EXT4_IOC_GET_TUNE_SB_PARAM"
+            ) from error
+        raise
+    compat, incompat, ro_compat = (
+        struct.unpack_from("<I", buffer, offset)[0] for offset in _FEATURE_OFFSETS
+    )
+    return FeatureMasks(compat=compat, incompat=incompat, ro_compat=ro_compat)
+
+
+def feature_mask_options(masks: FeatureMasks) -> tuple[str, str, str]:
+    return (
+        f"compat={masks.compat:#x}",
+        f"incompat={masks.incompat:#x}",
+        f"ro_compat={masks.ro_compat:#x}",
+    )
+
+
+def build_configuration(
+    entry: MountEntry, kernel_identifier: str, *, directory_fd: int
+) -> VolumeConfiguration:
     table = _BARRIER_OPTIONS.get(entry.filesystem_type)
     if table is None:
         raise CapabilityUnavailable(
@@ -268,10 +315,13 @@ def build_configuration(entry: MountEntry, kernel_identifier: str) -> VolumeConf
         kernel_identifier=kernel_identifier,
         filesystem_type=entry.filesystem_type,
         barrier_options=tuple(sorted(values)),
-        # No certified entry references a superblock feature yet, and an entry may
-        # not reference a feature whose resolver does not exist. Empty means
-        # "nothing claimed", not "unresolved".
-        durability_features=(),
+        # ext4 claims the masks from its already-held directory; xfs and btrfs
+        # currently claim no feature masks.
+        durability_features=(
+            feature_mask_options(resolve_ext4_feature_masks(directory_fd))
+            if entry.filesystem_type == "ext4"
+            else ()
+        ),
     )
 
 

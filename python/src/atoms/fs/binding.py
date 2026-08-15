@@ -188,7 +188,9 @@ def bind_project_volume(
             )
 
         entry = resolve_mount_entry(metadata_root_fd, read_mountinfo())
-        configuration = build_configuration(entry, kernel_identifier())
+        configuration = build_configuration(
+            entry, kernel_identifier(), directory_fd=metadata_root_fd
+        )
 
         reclaim_probe_survivors(lock)
 

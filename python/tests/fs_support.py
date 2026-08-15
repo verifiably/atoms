@@ -542,9 +542,11 @@ def build_test_allowlist(lock, project_root, storage):
     fd = backend.open_root(str(project_root))
     try:
         entry = resolve_mount_entry(fd, read_mountinfo())
+        configuration = build_configuration(
+            entry, kernel_identifier(), directory_fd=fd
+        )
     finally:
         os.close(fd)
-    configuration = build_configuration(entry, kernel_identifier())
     return DurabilityAllowlist(
         entries=frozenset(
             {
