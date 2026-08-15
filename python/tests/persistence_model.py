@@ -31,7 +31,7 @@ import itertools
 import os
 import sqlite3
 import stat
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import NewType
 
@@ -164,16 +164,16 @@ class Stream:
                     state.pop(key, None)
         return state
 
-    def index_after(self, *, change: str, link: bool) -> int:
+    def index_after(self, *, change: str) -> int:
         """The index right after the *last* Mutation whose `change`-typed entry unit
-        leaves its object token with more than one live name (`link=True`) or exactly
-        one (`link=False`).
+        leaves its object token with more than one live name.
 
         A cut-locating helper: `minimal-move`'s `link_anchor` gives its token a second
         live name (the anchor), and the later `transfer_noclobber` gives it a second
         live name again (the destination, replacing the source) -- both are
-        `change="insert", link=True` events, so the *last* one is the cut where the
-        destination and the still-durable anchor share one inode (design §9.4).
+        `change="insert"` events leaving the token linked, so the *last* one is the cut
+        where the destination and the still-durable anchor share one inode (design
+        §9.4).
         """
         entries: dict[tuple[int, str], int] = {}
         reverse: dict[int, set[tuple[int, str]]] = {}
@@ -199,12 +199,14 @@ class Stream:
                         reverse[old].discard(entry_key)
                 touched.append(unit)
             for unit in touched:
-                if unit.change == change and unit.object_token is not None:
-                    is_linked = len(reverse.get(unit.object_token, ())) > 1
-                    if is_linked == link:
-                        match = index + 1
+                if (
+                    unit.change == change
+                    and unit.object_token is not None
+                    and len(reverse.get(unit.object_token, ())) > 1
+                ):
+                    match = index + 1
         if match is None:
-            raise KeyError((change, link))
+            raise KeyError(change)
         return match
 
 
@@ -567,6 +569,10 @@ def _backup_db(db_path: Path) -> bytes:
         try:
             source.backup(dest)
             data = bytearray(dest.serialize())
+            assert len(data) >= 20 and data[18] in (1, 2) and data[19] in (1, 2), (
+                "not a SQLite file image at the expected file-format-version offsets "
+                f"(len={len(data)}, [18]={data[18:19]!r}, [19]={data[19:20]!r})"
+            )
             data[18] = 1
             data[19] = 1
             return bytes(data)
@@ -695,6 +701,7 @@ def _snapshot_seed(project_root: str, metadata_root: str, stream: Stream) -> Non
             return token
         token = next(stream.tokens)
         stream.identity[identity_key] = token
+        stream.identity_reverse[token] = identity_key
         if stat.S_ISDIR(info.st_mode):
             kind = "directory"
         elif stat.S_ISLNK(info.st_mode):
@@ -779,7 +786,9 @@ def world_digest(project_root: str | Path, metadata_root: str | Path) -> str:
         digest.update(b"\0")
         if kind == "file":
             assert inode_key is not None
-            digest.update(",".join(sorted(groups[inode_key])).encode())
+            for member in sorted(groups[inode_key]):
+                digest.update(member.encode())
+                digest.update(b"\0")
         digest.update(b"\0")
     return digest.hexdigest()
 
@@ -787,22 +796,31 @@ def world_digest(project_root: str | Path, metadata_root: str | Path) -> str:
 # --- durable state, survivor application, reconstruction (design §4.3-4.4, §9) -----
 
 
-@dataclass
+@dataclass(frozen=True)
 class WorldState:
-    """The surviving world at a cut: `tree` (design §4's public shape) plus the token
-    model (`entries`/`modes`/`images`) `apply_survivors` extends and `reconstruct`
-    consumes for hard-link grouping, and the resolved backup bytes `reconstruct`
-    installs -- `durable_state`'s brief names only `tree`/`backup_id`; the rest is
-    plumbing `reconstruct` needs that a bare stream-independent `WorldState` must carry
-    itself, since `reconstruct`'s signature takes no `Stream`.
+    """The surviving world at a cut. `reconstruct` reads exactly two fields: `tree`
+    (design §4's public shape) and `backup_bytes` (the resolved backup content -- a
+    bare, stream-independent `WorldState` must carry the bytes itself, since
+    `reconstruct`'s signature takes no `Stream` to resolve `backup_id` through).
+    `backup_id` is carried for identity/debugging only. `entries`/`modes`/`images` are
+    the token-keyed working model `durable_state` folds into and `apply_survivors`
+    extends before re-deriving `tree` -- `reconstruct` never reads them; they exist so
+    `apply_survivors` can build on `durable_state`'s output without re-deriving it from
+    `tree` (which has already lost per-token identity for non-linked files).
+
+    All six fields are required and the dataclass is frozen: every constructor is
+    `durable_state`/`apply_survivors` themselves (never a bare literal elsewhere), and
+    an unfilled field silently defaulting to `{}` was exactly what let a stale,
+    caller-mismatched `WorldState` slip past *without* the caller ever supplying the
+    working model apply_survivors needed.
     """
 
     tree: WorldTree
     backup_id: int | None
-    backup_bytes: bytes | None = None
-    entries: dict[tuple[int, str], int] = field(default_factory=dict)
-    modes: dict[int, int] = field(default_factory=dict)
-    images: dict[int, bytes] = field(default_factory=dict)
+    backup_bytes: bytes | None
+    entries: dict[tuple[int, str], int]
+    modes: dict[int, int]
+    images: dict[int, bytes]
 
 
 @dataclass(frozen=True)
@@ -941,7 +959,7 @@ def durable_state(stream: Stream, cut: int) -> WorldState:
     with a chosen survivor subset of them.
     """
     if cut <= 0:
-        return WorldState({}, None, None)
+        return WorldState({}, None, None, {}, {}, {})
 
     entries = dict(stream.seed_entries)
     modes = dict(stream.seed_modes)
@@ -1011,7 +1029,12 @@ def apply_survivors(
     # `create_exclusive`'s insert+mode land in the same event), entry units must apply
     # before data/meta units, since a data/meta unit's strict reachability check needs
     # its own entry-insert already applied when both are chosen from the same event.
-    chosen.sort(key=lambda item: (item[0], 0 if item[1].key[0] == "entry" else 1))
+    # The unit key itself breaks any remaining tie (two entry units, or two data/meta
+    # units, from the same event) deterministically -- `survivors` is a `frozenset`, so
+    # without this, `chosen`'s relative order among same-priority ties would depend on
+    # frozenset iteration order (hash-seed-dependent), and Task 5's skip accounting
+    # needs reproducible ordering across runs.
+    chosen.sort(key=lambda item: (item[0], 0 if item[1].key[0] == "entry" else 1, item[1].key))
 
     entries = dict(state.entries)
     modes = dict(state.modes)
@@ -1076,9 +1099,21 @@ def reconstruct(state: WorldState, project_root: Path, metadata_root: Path) -> N
     (files only), directory modes applied, symlink targets exact, and the cut's backup
     installed as `atoms.db` **alone** -- never any other `DB_FAMILY` name.
 
-    Modes are applied explicitly with `os.chmod` after every create, never left to
-    `mkdir`'s/`open`'s mode argument alone -- the umask would otherwise drift the
-    reconstructed mode away from the durable one the fidelity digest checks for.
+    Modes are applied explicitly with `os.chmod`, never left to `mkdir`'s/`open`'s mode
+    argument alone -- the umask would otherwise drift the reconstructed mode away from
+    the durable one the fidelity digest checks for.
+
+    Directories are created at a permissive `0o700` first and only chmod'd to their
+    *durable* mode in a final, deepest-first pass -- a survivor subset can legitimately
+    include an entry `insert` without its paired `meta mode` unit (design §4.2's
+    independently-barrier-covered keys), so `_materialize_tree` can hand back a `0`
+    (no permission bits at all) directory mode. Applying that mode immediately, before
+    the directory is populated or a descendant is even created, would make every path
+    through it unresolvable (`os.mkdir`/`os.chmod`/`os.link`/`os.symlink` all need `x`
+    on every ancestor). Populating everything first, then locking modes down from the
+    leaves toward the roots, means every write that needs to resolve through a
+    directory has already happened before that directory's real (possibly `0`) mode is
+    ever applied.
     """
     project_root = Path(project_root)
     metadata_root = Path(metadata_root)
@@ -1090,7 +1125,7 @@ def reconstruct(state: WorldState, project_root: Path, metadata_root: Path) -> N
     for rel in directories:
         target = _resolve(rel, project_root, metadata_root)
         target.mkdir()
-        os.chmod(target, state.tree[rel][1])
+        os.chmod(target, 0o700)
 
     groups: dict[tuple, list[str]] = {}
     singles: list[str] = []
@@ -1121,6 +1156,13 @@ def reconstruct(state: WorldState, project_root: Path, metadata_root: Path) -> N
         if value[0] != "symlink":
             continue
         os.symlink(value[1], _resolve(rel, project_root, metadata_root))
+
+    # Deepest-first: every path that still needs to resolve *through* a directory
+    # (every mkdir/write/link/symlink above) has already happened, so locking a
+    # directory down to its real -- possibly `0` -- durable mode here can never block
+    # a not-yet-done write.
+    for rel in sorted(directories, key=lambda path: path.count("/"), reverse=True):
+        os.chmod(_resolve(rel, project_root, metadata_root), state.tree[rel][1])
 
     if state.backup_bytes is not None:
         memory = sqlite3.connect(":memory:")

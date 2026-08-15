@@ -70,22 +70,37 @@ def test_full_durable_reconstruction_equals_the_live_final_world(
     itself, leaving `data`/`meta` keys (and the occasional `remove`) permanently
     orphaned once keyed replacement forgets their paired entry -- inert leftovers with
     zero observable effect either way, never a discarded real change (design §9's
-    `apply_survivors` text: "an unreachable inode carries no observable state").
+    `apply_survivors` text: "an unreachable inode carries no observable state"). The
+    dropped set is asserted, not merely trusted: every dropped key must be a `data`/
+    `meta` unit (nameless-token churn) or an entry `remove` (a no-op with no durable
+    target) -- an entry `replace` is the one shape whose drop *would* be observable
+    (silently un-recording a real `exchange`), so dropping one is a hard failure here,
+    not a quiet coverage gap.
     """
     from tests.persistence_model import (
         Skip,
         _maximal_survivors,
         apply_survivors,
         durable_state,
+        pending_keys_at,
         reconstruct,
         world_digest,
     )
 
     stream = persistence_recording(name)
     end = len(stream.events)
-    state = apply_survivors(
-        durable_state(stream, end), stream, end, _maximal_survivors(stream, end)
-    )
+    survivors = _maximal_survivors(stream, end)
+    pending = stream.pending_before(end)
+    dropped = pending_keys_at(stream, end) - survivors
+    for key in dropped:
+        if key[0] == "entry":
+            assert pending[key].change == "remove", (
+                f"dropped entry key must be a remove, never insert/replace: "
+                f"{key!r} change={pending[key].change!r}"
+            )
+        else:
+            assert key[0] in ("data", "meta"), f"unexpected dropped key kind: {key!r}"
+    state = apply_survivors(durable_state(stream, end), stream, end, survivors)
     assert not isinstance(state, Skip), state
     project = ext4_volume / f"recon-{name}-p"
     metadata = ext4_volume / f"recon-{name}-m"
@@ -109,7 +124,7 @@ def test_reconstruction_preserves_hard_link_relations(persistence_recording, ext
     )
 
     stream = persistence_recording("minimal-move")
-    cut = stream.index_after(change="insert", link=True)
+    cut = stream.index_after(change="insert")
     state = apply_survivors(
         durable_state(stream, cut), stream, cut, _maximal_survivors(stream, cut)
     )
