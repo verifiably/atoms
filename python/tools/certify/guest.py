@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import platform
+import shlex
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -53,6 +56,9 @@ def build_initramfs(work: Path) -> Path:
     elif not base.is_symlink() or base.readlink() != Path("/usr/lib/initcpio/install/base"):
         raise ValueError(f"unexpected base hook at {base}")
     init = workspace / "certify-init"
+    python = Path(sys.executable)
+    if not python.is_absolute() or not python.is_file():
+        raise ValueError(f"Python executable is not an absolute regular file: {python}")
     init.write_text(
         """#!/bin/sh
 set -eu
@@ -77,8 +83,9 @@ mount --bind /proc /root9p/proc
 mount --bind /sys /root9p/sys
 mount --bind /run /root9p/run
 mount -t tmpfs tmpfs /root9p/tmp
-exec chroot /root9p /bin/sh -c 'cd "$1" && exec python -m tools.certify.guest_init' sh "$checkout"
-""",
+exec chroot /root9p /bin/sh -c 'cd "$1/python" && exec "$2" -m tools.certify.guest_init' sh "$checkout" """
+        + shlex.quote(os.fspath(python))
+        + "\n",
         encoding="utf-8",
     )
     init.chmod(0o755)
@@ -148,6 +155,7 @@ def run(
     *,
     shared_root: Path,
     memory_mib: int = 2048,
+    guest_arguments: tuple[str, ...] = (),
 ) -> GuestResult:
     """Boot one certification guest and parse its machine-readable serial records."""
     if not isinstance(memory_mib, int) or isinstance(memory_mib, bool) or memory_mib <= 0:
@@ -170,6 +178,26 @@ def run(
     )
     root_path = _qemu_path(root, "shared_root")
     checkout = _checkout_path(root)
+    status = _run(["git", "status", "--porcelain"]).stdout
+    if status:
+        raise GuestRunError("atoms checkout must be clean before guest boot")
+    commit = _run(["git", "rev-parse", "HEAD"]).stdout.strip()
+    from atoms.fs.platform import BACKEND_REVISION
+
+    identity = {
+        "backend_revision": BACKEND_REVISION,
+        "checkout": checkout,
+        "commit": commit,
+        "kernel": platform.release(),
+        "python_executable": sys.executable,
+        "python_version": sys.version,
+    }
+    encoded_identity = base64.urlsafe_b64encode(
+        json.dumps(identity, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode()
+    ).decode()
+    encoded_arguments = base64.urlsafe_b64encode(
+        json.dumps(guest_arguments, ensure_ascii=True, separators=(",", ":")).encode()
+    ).decode()
     command = [
         "qemu-system-x86_64",
         "-nographic",
@@ -183,7 +211,9 @@ def run(
         "-append",
         (
             "console=ttyS0 rootfstype=9p root=root9p rootflags=trans=virtio,version=9p2000.L,ro "
-            f"data_device=/dev/vda log_device=/dev/vdb checkout={checkout}"
+            "panic=-1 data_device=/dev/vda log_device=/dev/vdb "
+            f"checkout={checkout} certify_identity={encoded_identity} "
+            f"certify_arguments={encoded_arguments}"
         ),
         "-fsdev",
         f"local,id=root9p,path={root_path},security_model=none,readonly=on",
