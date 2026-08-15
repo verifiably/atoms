@@ -150,8 +150,23 @@ def _read_replayed(clone_image: Path, mountpoint: Path) -> tuple[bytes | None, b
         _run([_UMOUNT, os.fspath(mountpoint)])
 
 
-def replay_self_verification(work: Path, data_device: Path, log_device: Path) -> None:
+def replay_self_verification(work: Path) -> None:
     """Prove mark-bounded replay and fresh-clone isolation with known payloads."""
+    scratch_data = work / "self-test-data.img"
+    scratch_log = work / "self-test-log.img"
+    for image, size_mib in ((scratch_data, 64), (scratch_log, 128)):
+        with image.open("wb") as stream:
+            stream.truncate(size_mib * 1024 * 1024)
+    data_device = Path(_run(["losetup", "--find", "--show", os.fspath(scratch_data)]))
+    log_device = Path(_run(["losetup", "--find", "--show", os.fspath(scratch_log)]))
+    try:
+        _replay_self_verification(work, data_device, log_device)
+    finally:
+        _run(["losetup", "--detach", os.fspath(log_device)])
+        _run(["losetup", "--detach", os.fspath(data_device)])
+
+
+def _replay_self_verification(work: Path, data_device: Path, log_device: Path) -> None:
     sectors = _run(["blockdev", "--getsz", os.fspath(data_device)])
     name = "certify-self-test"
     mapper = Path("/dev/mapper") / name
@@ -245,11 +260,9 @@ def main() -> int:
         with tempfile.TemporaryDirectory(prefix="atoms-certify-") as temporary:
             work = Path(temporary)
             resolver_cross_check(work)
-            replay_self_verification(
-                work,
-                _device(parameters, "data_device"),
-                _device(parameters, "log_device"),
-            )
+            _device(parameters, "data_device")
+            _device(parameters, "log_device")
+            replay_self_verification(work)
         if not args.self_test:
             raise NotImplementedError("scenario workload is not implemented")
     except Exception as caught:  # noqa: BLE001 - the serial fatal record is the boundary.
