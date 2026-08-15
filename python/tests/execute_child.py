@@ -10,8 +10,6 @@ import sqlite3
 import sys
 from typing import cast
 
-import pytest
-
 from atoms.coordinator import root
 from atoms.coordinator.commands import run_transaction
 from atoms.core.errors import TransactionHalted
@@ -46,6 +44,20 @@ def _payloads(name: str) -> DictPayloads:
     return DictPayloads(
         {digest_of(AFTER): AFTER} if name in {"create", "replace", "mkdir"} else {}
     )
+
+
+def _patcher():
+    """A `MonkeyPatch` for the scenario-mode halves that need one (`setup_clean`'s
+    allowlist, `transact_caught`'s failure injection).
+
+    Imported and constructed only where used: importing `pytest` costs ~0.1 s, and every
+    kill-matrix child pays it once per spawn -- across the kill matrix that is minutes of
+    process startup for an object those children never build. Nothing undoes the patch;
+    the process exits.
+    """
+    import pytest
+
+    return pytest.MonkeyPatch()
 
 
 def _configure_store_cut(config: dict, events: list[str]) -> None:
@@ -149,11 +161,10 @@ def main(project_root: str, metadata_root: str) -> int:
     else:
         backend = raw
     ingredients = (backend, project_root, metadata_root, STORAGE)
-    patcher = pytest.MonkeyPatch()
     if entry is not None and config.get("setup"):
         from tests.exerciser import setup_clean
 
-        setup_clean(entry, ingredients, patcher)
+        setup_clean(entry, ingredients, _patcher())
     _configure_store_cut(config, events)
 
     result: dict = {"events": events}
@@ -161,11 +172,15 @@ def main(project_root: str, metadata_root: str) -> int:
         # Erratum 1: the injected failure lands the rollback DURABLY and only then
         # propagates. `transact_caught` catches exactly that exception and reads the
         # canonical projection back; nothing here synthesizes a `TransactionOutcome` for
-        # a transaction that never returned one.
+        # a transaction that never returned one. Its return value IS the projection --
+        # already read through a fresh binding -- so the `projection` config key is
+        # honoured from it rather than by opening the store a second time.
         from tests.exerciser import transact_caught
 
-        transact_caught(entry, ingredients, patcher)
+        projection = transact_caught(entry, ingredients, _patcher())
         result["outcome"] = None
+        if config.get("projection"):
+            result["projection"] = projection
     else:
         spec = entry.build_spec() if entry is not None else _spec(config["variant"])
         payloads = entry.payloads() if entry is not None else _payloads(config["variant"])
@@ -173,12 +188,12 @@ def main(project_root: str, metadata_root: str) -> int:
             backend, project_root, metadata_root, STORAGE, spec, payloads
         )
         result["outcome"] = outcome.outcome.value
-    if config.get("projection"):
-        from tests.persistence_model import durable_projection
+        if config.get("projection"):
+            from tests.persistence_model import durable_projection
 
-        result["projection"] = durable_projection(
-            project_root, metadata_root, STORAGE, root.CERTIFIED_ALLOWLIST
-        )
+            result["projection"] = durable_projection(
+                project_root, metadata_root, STORAGE, root.CERTIFIED_ALLOWLIST
+            )
     print(json.dumps(result))
     return 0
 

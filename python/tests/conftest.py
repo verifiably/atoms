@@ -720,14 +720,19 @@ def exerciser_kill_matrix(ext4_volume, test_storage_profile, monkeypatch):
     no fixed barrier schedule the way the single-effect kill-matrix variants do:
 
     - the **cut sites** are every recorded `flush_file`/`flush_directory`/`exchange`/
-      `transfer_noclobber` **at or after the first store commit** -- the calls that
-      publish something durably, in the span where every call belongs to the transaction
-      proper. The span matters: before the first commit the stream is capability
-      probing, which deliberately calls `exchange` and `transfer_noclobber` on operands
-      it expects to *fail* (that is how it learns the syscall's semantics), and a kill
-      placed after a call that raises never fires at all -- the child would survive and
-      the arm would silently assert nothing. The kill goes immediately *after* each site
-      (a negative countdown), the side that includes the barrier's own effect;
+      `transfer_noclobber` in the whole stream -- the calls that publish something
+      durably -- and **no site is excluded**. Each is cut on the **before** side (a
+      positive countdown), and additionally on the **after** side from the first store
+      commit onward. The asymmetry is forced, not chosen: an after-side kill fires only
+      once the delegated call *returns*, and capability probing deliberately calls
+      `transfer_noclobber`/`exchange` on operands it expects to *fail* (that is how it
+      learns the syscall's semantics), so an after-side kill there never fires at all --
+      the child survives and the cut asserts nothing. The before side fires regardless,
+      which makes it the one placement that is total over the stream; the after side is
+      added exactly where every call provably returns. Everything between the end of
+      probing and the first commit -- workspace creation under `staging/` and `work/`,
+      blob payload flushes, promotion into `blobs/sha256`, staging reclamation -- is
+      swept by both;
     - **whether a cut commits** is read off the interleaved commit count. The store's
       barrier schedule for an E-effect transaction is `prepared`,
       `registration-binding`, `applying`, then `started`/`done` per effect, then
@@ -782,23 +787,27 @@ def exerciser_kill_matrix(ext4_volume, test_storage_profile, monkeypatch):
             f"expected {commits} -- the barrier schedule changed"
         )
         methods = ("flush_file", "flush_directory", "exchange", "transfer_noclobber")
-        transaction_begins = events.index("commit")
-        targets = [
-            index
-            for index in range(transaction_begins, len(events))
-            if events[index].startswith(methods)
+        sites = [
+            index for index, event in enumerate(events) if event.startswith(methods)
         ]
-        for ordinal, target in enumerate(targets):
+        first_commit = events.index("commit")
+        cuts = [(site, "before") for site in sites]
+        cuts += [(site, "after") for site in sites if site >= first_commit]
+        for ordinal, (target, side) in enumerate(cuts):
             method = events[target].partition(":")[0]
             countdown = sum(
                 event.startswith(method) for event in events[: target + 1]
             )
             committed = events[:target].count("commit") >= commits - 2
-            project, metadata = prepared(str(ordinal))
+            project, metadata = prepared(f"{ordinal}-{side}")
             _child(
                 project,
                 metadata,
-                {"scenario": name, "method": method, "countdown": -countdown},
+                {
+                    "scenario": name,
+                    "method": method,
+                    "countdown": countdown if side == "before" else -countdown,
+                },
                 killed=True,
             )
             _assert_terminal(
@@ -808,7 +817,7 @@ def exerciser_kill_matrix(ext4_volume, test_storage_profile, monkeypatch):
                 committed=committed,
                 expected=finished if committed else seeded,
             )
-        return len(targets)
+        return len(cuts)
 
     return drive
 

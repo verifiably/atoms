@@ -44,7 +44,22 @@ def _lease_phase(backend, project_root: str, metadata_root: str) -> dict:
         }
 
 
-def _durable_phase(backend, project_root: str, metadata_root: str) -> dict:
+def _durable_phase(
+    backend, project_root: str, metadata_root: str, *, torn_blobs: bool = False
+) -> dict:
+    """Read the active record back through a fresh binding.
+
+    `torn_blobs` is OFF by default, and deliberately: on every pre-existing caller (the
+    kill matrix, `test_coordinator_process`, `test_coordinator_commands`) a durable
+    `blob` row whose file is missing is a real durability defect, and a child that died
+    on it was free loudness worth keeping -- `_assert_terminal` now asserts the absence
+    of a torn blob explicitly as well.
+
+    Only the persistence-cut placement arm turns it on. That arm recovers *reconstructed*
+    worlds, where a cut can legitimately leave a durable `blob` row whose bytes were
+    still pending -- and a halted record keeps the transaction active for this phase to
+    read. There the missing file is a fact about the cut, reported as `null`.
+    """
     with acquire_project_lock(backend, metadata_root) as lock:
         allowlist = build_test_allowlist(lock, project_root, STORAGE)
         with bind_project_volume(
@@ -55,17 +70,14 @@ def _durable_phase(backend, project_root: str, metadata_root: str) -> dict:
                 return {"active": None, "state": None, "spec": None, "blobs": {}}
             blobs = {}
             for digest, byte_len in referenced_digests(active.spec):
-                # A record can outlive its blob file: the persistence-cut matrix
-                # (`tests/persistence_model.py`) recovers *reconstructed* worlds where a
-                # durable `blob` row's bytes were still pending at the cut, and a halted
-                # record leaves the transaction active for this phase to read. The
-                # missing file is a fact about the world, reported as `null`, not a
-                # reason for the observation child to die with a traceback.
-                try:
+                if torn_blobs:
+                    try:
+                        fd = store.open_blob(digest)
+                    except FileNotFoundError:
+                        blobs[digest] = None
+                        continue
+                else:
                     fd = store.open_blob(digest)
-                except FileNotFoundError:
-                    blobs[digest] = None
-                    continue
                 try:
                     blobs[digest] = len(os.read(fd, byte_len + 1))
                 finally:
@@ -81,21 +93,29 @@ def _durable_phase(backend, project_root: str, metadata_root: str) -> dict:
 def main(project_root: str, metadata_root: str) -> int:
     """Recover in a fresh process, then report what the recovery left durable.
 
-    Three phases, and every one of them is an observation the *parent* cannot make
-    without leaving its own process: the lease phase runs recovery at entry, the durable
-    phase reads the store back through a fresh binding, and the projection phase reads
-    the canonical durable projection through the persistence-cut model's own reader
-    (`tests/persistence_model.durable_projection`), so the fresh-process placement of a
-    cut-matrix cell compares against exactly the document the in-process placement built.
+    The lease phase runs recovery at entry and the durable phase reads the store back
+    through a fresh binding -- both observations the *parent* cannot make without leaving
+    its own process.
 
-    A lease that halts (`TransactionHalted`) is an outcome, not a crash: the A3-halt
-    cells of design §8's placement subset are precisely the ones whose halt diagnostic
-    the parent wants to compare, so the halt is caught, reported as `halted`, and the
-    remaining phases still run over the world the halt froze.
+    `ATOMS_COORDINATOR_CONFIG` (JSON, empty by default) adds what only the
+    persistence-cut placement arm needs, so the pre-existing callers pay nothing for it:
+
+    - `projection` -- also read the canonical durable projection, through the
+      persistence-cut model's own reader (`persistence_model.durable_projection`), so the
+      fresh-process placement of a cut-matrix cell compares against exactly the document
+      the in-process placement built. It costs a second lock acquisition, binding, store
+      open and chain validation, which the kill matrix's own `_recover` has no use for;
+    - `torn_blobs` -- tolerate a durable `blob` row whose file is missing (see
+      `_durable_phase`).
+
+    A lease that halts (`TransactionHalted`) is an outcome, not a crash, and that is NOT
+    gated: the A3-halt cells of design §8's placement subset are precisely the ones whose
+    halt diagnostic the parent wants to compare, and for every other caller a halt still
+    surfaces loudly -- `lease` is `null`, so anything reading `lease["active"]` fails.
     """
     from atoms.core.errors import TransactionHalted
-    from tests.persistence_model import durable_projection
 
+    config = json.loads(os.environ.get("ATOMS_COORDINATOR_CONFIG", "{}"))
     backend = LinuxBackend()
     with acquire_project_lock(backend, metadata_root) as probe:
         allowlist = build_test_allowlist(probe, project_root, STORAGE)
@@ -106,18 +126,23 @@ def main(project_root: str, metadata_root: str) -> int:
     except TransactionHalted:
         lease = None
         halted = True
-    print(
-        json.dumps(
-            {
-                "lease": lease,
-                "halted": halted,
-                "durable": _durable_phase(backend, project_root, metadata_root),
-                "projection": durable_projection(
-                    project_root, metadata_root, STORAGE, allowlist
-                ),
-            }
+    observed = {
+        "lease": lease,
+        "halted": halted,
+        "durable": _durable_phase(
+            backend,
+            project_root,
+            metadata_root,
+            torn_blobs=bool(config.get("torn_blobs")),
+        ),
+    }
+    if config.get("projection"):
+        from tests.persistence_model import durable_projection
+
+        observed["projection"] = durable_projection(
+            project_root, metadata_root, STORAGE, allowlist
         )
-    )
+    print(json.dumps(observed))
     return 0
 
 

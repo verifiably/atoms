@@ -84,7 +84,13 @@ def _child(project: Path, metadata: Path, config: dict, *, killed=False):
     return json.loads(completed.stdout)
 
 
-def _recover(project: Path, metadata: Path) -> dict:
+def _recover(project: Path, metadata: Path, config: dict | None = None) -> dict:
+    """One recovery in a fresh process. `config` reaches the child as
+    `ATOMS_COORDINATOR_CONFIG`; the kill matrix passes none, and the persistence-cut
+    placement arm passes the keys it needs (`projection`, `torn_blobs`)."""
+    environment = os.environ.copy()
+    if config is not None:
+        environment["ATOMS_COORDINATOR_CONFIG"] = json.dumps(config)
     completed = subprocess.run(
         [
             sys.executable,
@@ -94,6 +100,7 @@ def _recover(project: Path, metadata: Path) -> dict:
             str(metadata),
         ],
         cwd=ROOT,
+        env=environment,
         capture_output=True,
         text=True,
         timeout=120,
@@ -133,7 +140,14 @@ def _assert_terminal(
     compound scenarios (`tests/conftest.py`'s `exerciser_kill_matrix`) observe their two
     terminal worlds -- the seeded one and the rehearsal's finished one -- instead of
     hardcoding a surface. Everything else about the contract is the same for both
-    callers, which is why they share this function rather than forking it.
+    callers, which is why they share this function rather than forking it. (`variant` is
+    then used only to look the world up, so it goes unread on the `expected` path.)
+
+    The torn-blob assertion is explicit rather than inherited from a child crash: a
+    durable `blob` row whose file is missing used to kill `coordinator_child`, and the
+    persistence-cut placement arm needs that tolerated for *reconstructed* worlds. It is
+    now gated off by default there, and asserted here, so the loudness stays exactly
+    where it was earned.
     """
     first = _recover(project, metadata)
     world = _world(project)
@@ -141,6 +155,7 @@ def _assert_terminal(
     assert second == first
     assert _world(project) == world
     assert first["lease"]["active"] is None
+    assert None not in first["durable"]["blobs"].values(), first["durable"]["blobs"]
     if expected is not None:
         assert world == expected
         return

@@ -303,12 +303,55 @@ def _latest_txid(metadata_root: str) -> str:
         ).fetchone()[0]
 
 
+def serialize_projection(projection: tuple | None) -> dict | None:
+    """The canonical durable projection in a JSON round-trippable shape.
+
+    The projection tuple is `(state, committed, rollback_result, halt_diagnostic,
+    journals, active)` -- `tests/persistence_model.py`'s `_inspect` and
+    `_model_projection` both build it, and so does `_durable_projection` below. A tuple
+    of enums, `HaltDiagnostic` dataclasses and `EffectJournalState`s does not survive a
+    pipe, and design §8's placement axis compares an in-process cell against the same
+    cell recovered in a **fresh process**, so this is the one shape that crosses.
+
+    Every field is spelled out; nothing reflects over the dataclasses, so a field A3
+    grows does not silently start or stop being compared across the placement boundary
+    (ledger #12's rule, applied to the test-side serialization).
+
+    The halt diagnostic goes through production's own `encode_diagnostic`, which is what
+    the store itself persists: **token-free** by construction (slots, paths, content
+    hashes, enum values -- no inode number, no txid, no absolute path), so two
+    placements' diagnostics compare EXACTLY rather than up to renaming. Every
+    identity-bearing comparison -- approval evidence, world trees, hard-link groups --
+    stays in-process, where `realign_durable_identities` and `_normalized_tree`
+    alpha-rename it; none of them appears here.
+
+    `state` keeps the enum's member NAME ("COMMITTED", "ROLLED_BACK"), the spelling
+    `_durable_projection` has always returned.
+    """
+    if projection is None:
+        return None
+    from atoms.store.records import encode_diagnostic
+
+    state, committed, rollback_result, halt_diagnostic, journals, active = projection
+    return {
+        "state": state.name,
+        "committed": committed.name,
+        "rollback_result": None if rollback_result is None else rollback_result.name,
+        "halt_diagnostic": (
+            None if halt_diagnostic is None else encode_diagnostic(halt_diagnostic)
+        ),
+        "journals": [[journal.effect_id, journal.state.name] for journal in journals],
+        "active": active,
+    }
+
+
 def _durable_projection(ingredients, txid: str) -> dict:
     """The canonical durable projection of one transaction record, through a fresh binding.
 
     Mirrors `test_coordinator_conformance.py`'s `_durable_projection` idiom, but returns
-    a dict (with `halt_diagnostic` and the enum's member-name string for `state`) so a
-    caller outside that module can compare against it without importing the model types.
+    `serialize_projection`'s dict so a caller outside that module can compare against it
+    without importing the model types -- and so a caller in another *process* can print
+    it.
     """
     from atoms.fs.binding import bind_project_volume
     from atoms.fs.lock import acquire_project_lock
@@ -324,14 +367,18 @@ def _durable_projection(ingredients, txid: str) -> dict:
             record = store.read_record(txid)
             active = store.read_active()
     assert record is not None
-    return {
-        "state": record.state.name,
-        "committed": record.committed,
-        "rollback_result": record.rollback_result,
-        "halt_diagnostic": record.halt_diagnostic,
-        "journals": record.journals,
-        "active": active is not None,
-    }
+    document = serialize_projection(
+        (
+            record.state,
+            record.committed,
+            record.rollback_result,
+            record.halt_diagnostic,
+            record.journals,
+            active is not None,
+        )
+    )
+    assert document is not None
+    return document
 
 
 def transact_caught(entry: Scenario, ingredients, monkeypatch) -> dict:

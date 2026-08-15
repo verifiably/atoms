@@ -135,12 +135,20 @@ def test_drift_cells_preserve_external_blockers(cut_matrix) -> None:
     refuse to proceed, may undo, may commit -- what it may never do is silently consume
     the blocker, and `preserved_drift_cells` counts only the classified cells where the
     whole planted footprint came back unchanged.
+
+    The count is required to equal `classified_cells`, not merely to be positive: a cell
+    that *consumed* the blocker does not raise, it simply fails to increment, so a `> 0`
+    assertion would stay green while most of the sweep ate the drift. Equality also pins
+    the other half -- every classified cell of this scenario is late enough to carry the
+    blocker at all (measured: 18 of 18). A future drift whose target predates some
+    classified cut would have to make that carve-out explicit here.
     """
     report = cut_matrix("drift-blocker", drift=True)
     assert report.disagreements == ()
     assert report.second_pass_violations == ()
     assert report.side_assertion_failures == ()
-    assert report.preserved_drift_cells > 0
+    assert report.classified_cells > 0
+    assert report.preserved_drift_cells == report.classified_cells
 
 
 @pytest.mark.parametrize("name", ("minimal-move", "minimal-replace"))
@@ -148,8 +156,9 @@ def test_subprocess_placement_matches_in_process(name, cut_matrix) -> None:
     """Design §8's placement axis: the same cell, recovered in a fresh process, agrees.
 
     The subset is declared, never sampled -- `Sweeper.__call__`'s docstring states the
-    rule and the assertion below requires it to be nonempty, so a rule that silently
-    selected nothing fails here rather than passing vacuously.
+    rule, and the arm itself asserts the rule selected something, so a rule that silently
+    selected nothing fails inside the sweep rather than leaving every caller to remember
+    an emptiness check.
 
     Two scenarios because the rule's three clauses are not all live in one stream:
     `minimal-move` is the only minimal scenario carrying design §9.4's named tuples, and
@@ -159,7 +168,6 @@ def test_subprocess_placement_matches_in_process(name, cut_matrix) -> None:
     """
     report = cut_matrix(name, subprocess_subset=True)
     assert report.disagreements == ()
-    assert report.subprocess_cells > 0
     assert report.subprocess_disagreements == ()
     if name == "minimal-replace":
         assert report.subprocess_halt_cells > 0, (
