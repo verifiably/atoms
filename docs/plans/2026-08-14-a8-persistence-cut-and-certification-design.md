@@ -420,7 +420,12 @@ was settled by a spike run before planning (2026-08-14, this host):
   bits under the identical kernel the certification run uses.
 - The certification harness formats the guest image with an explicit feature
   set reproducing the target volume's masks, and refuses if its e2fsprogs
-  cannot reproduce them.
+  cannot reproduce them. The sole lifecycle exception is ext4's incompat
+  `needs_recovery` bit (`0x4`): it is present on the bound read-write mount but
+  is not a valid `mkfs.ext4 -O` feature. The raw image must reproduce the target
+  masks with only that bit cleared; after mounting, the ioctl must add it and
+  resolve the target masks exactly. The certification record always carries
+  that mounted tuple.
 
 This is verification-boundary refinement: binding decisions become *finer*,
 never looser, and no transaction semantics change.

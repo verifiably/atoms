@@ -37,6 +37,7 @@ stop and report — do not adapt around it silently.**
 | `EXT4_IOC_GET_TUNE_SB_PARAM = _IOR('f', 45, struct ext4_tune_sb_params)` (`/usr/include/linux/ext4.h:36`); the struct is 232 bytes with `feature_compat`/`feature_incompat`/`feature_ro_compat` at byte offsets 64/68/72 (`:113-144`: 16 bytes of u32/u16 header, three u64 at 16/24/32, four u32 at 40-52, u16×2 + u8×2 + u16 at 56-62, then the three feature words, three set masks, three clear masks, `mount_opts[64]`, `pad[68]`). | header read 2026-08-14 |
 | Invoked unprivileged on a directory fd for an ext4 volume on this host, the ioctl returns `compat=0x3c incompat=0x246 ro_compat=0x46b`; kernel handler returns the masks with no capability check; unsupported kernels fail `ENOTTY`/`EOPNOTSUPP`. | run 2026-08-14 (design §7.4) |
 | mkfs fixtures: `mkfs.ext4 -O fast_commit,^orphan_file` vs `^fast_commit,orphan_file` vs neither on 128 MiB image files (no root needed) yields compat masks differing from plain by exactly `0x400` (fast_commit) and `0x1000` (orphan_file); superblock magic `0xEF53` at offset `1024+0x38`, masks at `1024+0x5C/0x60/0x64` in the image. e2fsprogs 1.47 enables `orphan_file` by default, so every mkfs in the harness passes an explicit `-O` list. | run 2026-08-14 |
+| The live target's incompat mask `0x246` includes ext4's runtime `needs_recovery` bit `0x4`; `mkfs.ext4 -O needs_recovery` is invalid. The builder reproduces the raw target with only `needs_recovery` cleared (`0x242` here), and the mounted in-guest ioctl must then equal the target `0x246` exactly. | corrected by implementation preflight 2026-08-15 |
 | `VolumeConfiguration(backend_id, backend_revision, kernel_identifier, filesystem_type, barrier_options, durability_features)` at `fs/volume.py:35`; `build_configuration(entry, kernel_identifier)` at `:256` hard-codes `durability_features=()` at `:275`; production and reusable test-support callers are `fs/binding.py:190-191` (`bind_project_volume`, fd in scope from `:184`'s same-volume check), `tests/fs_support.py:534` (`build_test_allowlist`, fd in scope), and the bind-mount child embedded in `tests/test_fs_resolve_conformance.py`; direct fixture calls in `test_fs_volume.py` must also adopt the keyword-only fd. `DurabilityAllowlist.match` at `:69` is exact equality; `CERTIFIED_ALLOWLIST` empty at `:78`. | corrected by implementation preflight 2026-08-15 |
 | The four emptiness assertions to flip: `test_fs_architecture.py:262` (`test_certified_allowlist_is_empty_so_population_is_deliberate`), the closing assertion of `test_fs_architecture.py:453` (`test_the_production_bind_call_passes_the_certified_allowlist`, emptiness asserted at `:470`), `test_fs_volume.py:380` (`test_certified_allowlist_ships_empty`), `test_fs_binding.py:107` (`test_certified_allowlist_is_the_empty_production_constant`). | grep 2026-08-14 |
 | Host prerequisites: `dmsetup`, `mkinitcpio`, the `dm-log-writes` module (`/lib/modules/7.1.8-arch1-3/kernel/drivers/md/dm-log-writes.ko.zst`), e2fsprogs, and (installed by the operator on 2026-08-15) `qemu-system-x86_64` present; `replay-log` **absent**. Host kernel image at `/boot/vmlinuz-linux`. Host ext4 mounts: `rw,noatime` (root) and `rw,noatime,data=ordered` (the ssd volume). | run 2026-08-14; corrected by implementation preflight 2026-08-15 |
@@ -265,8 +266,12 @@ git commit -m "feat(volume): pin ext4 superblock feature masks via EXT4_IOC_GET_
 - Produces: `images.build_data_image(path, *, size_mib, feature_masks: FeatureMasks,
   mount_options: str)` — raw image mkfs'd with an **explicit `-O` list derived from the target
   masks** (translate each known bit to its e2fsprogs name; raise `UnreproducibleFeatureSet`
-  naming any unknown set bit — design §7.4's refusal); `images.build_log_image(path, size_mib)`;
-  `images.clone(path) -> Path` — a fresh never-mounted copy per replay prefix (design §7.1).
+  naming any unknown set bit — design §7.4's refusal). Ext4 incompat `needs_recovery` (`0x4`) is
+  the sole lifecycle bit: require it in the mounted target, omit it from `mkfs.ext4 -O`, require
+  the raw image to equal the requested masks with only that bit cleared, and require the mounted
+  in-guest ioctl to equal the requested masks exactly. Produces
+  `images.build_log_image(path, size_mib)`; `images.clone(path) -> Path` — a fresh never-mounted
+  copy per replay prefix (design §7.1).
 - Produces: `guest.build_initramfs(work: Path) -> Path` — a cpio.gz built with the host's installed
   `mkinitcpio` `base` hook (the measured `/usr/lib/initcpio/busybox` alone has no mount or module
   loader applets), the host kernel's `9p`, `9pnet_virtio`, `virtio_pci`, `virtio_blk`,
@@ -293,13 +298,15 @@ operator's 2026-08-15 QEMU installation: `MISSING: replay-log`. Everything else 
 - [ ] **Step 3:** Implement `images.py` and `guest.py` per the interfaces. The known-bit →
 mkfs-name table covers exactly the bits observed on this host's volumes plus the fixture pair
 (`has_journal`, `ext_attr`, `resize_inode`, `dir_index`, `fast_commit`, `orphan_file`,
-`filetype`, `extent`, `64bit`, `flex_bg`, `metadata_csum_seed`, `sparse_super`, `large_file`,
+`filetype`, the runtime-only `needs_recovery`, `extent`, `64bit`, `flex_bg`,
+`metadata_csum_seed`, `sparse_super`, `large_file`,
 `huge_file`, `dir_nlink`, `extra_isize`, `metadata_csum` — from the spike's dumpe2fs output);
 any other set bit raises `UnreproducibleFeatureSet` with the bit position.
 - [ ] **Step 4:** Smoke-run image building: `uv run python -c "from tools.certify.images import
 build_data_image; ..."` building a 64 MiB image from this host's live masks and verifying the
-superblock masks in the image equal the requested masks (read at `1024+0x5C..` as in Task 1's
-fixture test).
+superblock masks in the raw image equal the requested masks with only incompat
+`needs_recovery` cleared (read at `1024+0x5C..` as in Task 1's fixture test); Task 3's in-guest
+mount verifies the live ioctl restores exact equality.
 - [ ] **Step 5: Commit**
 
 ```bash
