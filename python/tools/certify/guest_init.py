@@ -96,15 +96,19 @@ def _fixture_masks(work: Path, features: str) -> FeatureMasks:
     _run(["mkfs.ext4", "-q", "-F", "-O", features, os.fspath(image)])
     mountpoint = work / f"mount-{image.stem}"
     mountpoint.mkdir()
-    _run(["mount", "-o", "loop", os.fspath(image), os.fspath(mountpoint)])
+    loop = _run(["losetup", "--find", "--show", os.fspath(image)])
     try:
-        descriptor = os.open(mountpoint, os.O_RDONLY | os.O_DIRECTORY)
+        _run(["mount", loop, os.fspath(mountpoint)])
         try:
-            return resolve_ext4_feature_masks(descriptor)
+            descriptor = os.open(mountpoint, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                return resolve_ext4_feature_masks(descriptor)
+            finally:
+                os.close(descriptor)
         finally:
-            os.close(descriptor)
+            _run(["umount", os.fspath(mountpoint)])
     finally:
-        _run(["umount", os.fspath(mountpoint)])
+        _run(["losetup", "--detach", loop])
 
 
 def resolver_cross_check(work: Path) -> None:
