@@ -20,6 +20,8 @@ from .replay import replay_prefix
 
 _FAST_COMMIT = 0x400
 _ORPHAN_FILE = 0x1000
+_MOUNT = "/run/certify-mount"
+_UMOUNT = "/run/certify-umount"
 
 
 def _run(command: list[str]) -> str:
@@ -32,26 +34,6 @@ def _run(command: list[str]) -> str:
 
 def _emit(document: dict[str, object]) -> None:
     print(f"CERTIFY-JSON:{json.dumps(document, ensure_ascii=True, sort_keys=True)}", flush=True)
-
-
-def _mount(source: str, target: Path) -> None:
-    result = subprocess.run(
-        ["mount", source, os.fspath(target)], check=False, capture_output=True, text=True
-    )
-    if result.returncode == 0:
-        return
-    status = "\n".join(
-        line
-        for line in Path("/proc/self/status").read_text(encoding="ascii").splitlines()
-        if line.startswith(("Uid:", "Gid:", "Cap"))
-    )
-    kernel = subprocess.run(
-        ["dmesg", "--level=err"], check=False, capture_output=True, text=True
-    ).stdout[-2000:]
-    raise RuntimeError(
-        f"mount failed with exit {result.returncode}: {result.stderr.strip()}; "
-        f"process status: {status!r}; kernel errors: {kernel!r}"
-    )
 
 
 def _cmdline() -> dict[str, str]:
@@ -118,7 +100,7 @@ def _fixture_masks(work: Path, features: str) -> FeatureMasks:
     mountpoint.mkdir()
     loop = _run(["losetup", "--find", "--show", os.fspath(image)])
     try:
-        _mount(loop, mountpoint)
+        _run([_MOUNT, loop, os.fspath(mountpoint)])
         try:
             descriptor = os.open(mountpoint, os.O_RDONLY | os.O_DIRECTORY)
             try:
@@ -126,7 +108,7 @@ def _fixture_masks(work: Path, features: str) -> FeatureMasks:
             finally:
                 os.close(descriptor)
         finally:
-            _run(["umount", os.fspath(mountpoint)])
+            _run([_UMOUNT, os.fspath(mountpoint)])
     finally:
         _run(["losetup", "--detach", loop])
 
@@ -160,7 +142,7 @@ def _write_pattern(mountpoint: Path, name: str, payload: bytes) -> None:
 
 
 def _read_replayed(clone_image: Path, mountpoint: Path) -> tuple[bytes | None, bytes | None]:
-    _run(["mount", "-o", "loop", os.fspath(clone_image), os.fspath(mountpoint)])
+    _run([_MOUNT, "-o", "loop", os.fspath(clone_image), os.fspath(mountpoint)])
     try:
         first = mountpoint / "first"
         second = mountpoint / "second"
@@ -169,7 +151,7 @@ def _read_replayed(clone_image: Path, mountpoint: Path) -> tuple[bytes | None, b
             second.read_bytes() if second.exists() else None,
         )
     finally:
-        _run(["umount", os.fspath(mountpoint)])
+        _run([_UMOUNT, os.fspath(mountpoint)])
 
 
 def replay_self_verification(work: Path, data_device: Path, log_device: Path) -> None:
@@ -202,15 +184,15 @@ def replay_self_verification(work: Path, data_device: Path, log_device: Path) ->
                 "status=none",
             ]
         )
-        _run(["mount", os.fspath(mapper), os.fspath(mountpoint)])
+        _run([_MOUNT, os.fspath(mapper), os.fspath(mountpoint)])
         _write_pattern(mountpoint, "first", b"first-pattern")
         _run(["dmsetup", "message", name, "0", "mark", "first"])
         _write_pattern(mountpoint, "second", b"second-pattern")
         _run(["dmsetup", "message", name, "0", "mark", "second"])
-        _run(["umount", os.fspath(mountpoint)])
+        _run([_UMOUNT, os.fspath(mountpoint)])
     finally:
         if mapper.exists():
-            subprocess.run(["umount", os.fspath(mountpoint)], check=False, capture_output=True)
+            subprocess.run([_UMOUNT, os.fspath(mountpoint)], check=False, capture_output=True)
             subprocess.run(["dmsetup", "remove", name], check=False, capture_output=True)
 
     expected = {
