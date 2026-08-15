@@ -22,6 +22,12 @@ hardcode nine names because every kill-matrix variant is single-effect; the exer
 `corpus-write` and `archive-move` scenarios are not, so this file derives the label from
 the write that happened rather than from a position).
 
+Design §9's falsification arms live here too, as data (`SABOTAGE_ARMS`): each one either
+makes the recorder *swallow* one named `Barrier` -- the real `fsync` still happens, the
+covered units simply stay pending in the recorded view, which is what the survivor
+product is taken over -- or has the sequencer withhold one `Commit`'s backup advance, and
+each names the cut its designated check runs at.
+
 Two known bounds of the Task-6 runner in this module, both deliberate and both cheap to
 lift if a later task needs them:
 
@@ -46,9 +52,16 @@ import shutil
 import sqlite3
 import stat
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NewType, cast
+from typing import TYPE_CHECKING, NewType, cast
+
+if TYPE_CHECKING:
+    # Type-only: every *runtime* production import in this module is inside the function
+    # that needs it (the model is imported by tests that must be able to patch
+    # production first), and this block executes in no interpreter.
+    from atoms.chain.model import ChainOutcome
 
 DB_FAMILY = ("atoms.db", "atoms.db-wal", "atoms.db-shm", "atoms.db-journal")
 LOCK_LEAF = "lock"  # `acquire_project_lock`'s metadata_root child (`fs/lock.py:217`)
@@ -166,6 +179,21 @@ class Stream:
         # digest (`world_digest`) of the real, live final world -- the fidelity
         # self-check's target (design §9).
         self.final_world_digest: str | None = None
+
+        # Design §9's sabotage arms (`SABOTAGE_ARMS`). `suppress` is the barrier
+        # predicate one arm installs for the length of one recording: the recorder
+        # consults it before appending a `Barrier`, and a match is *swallowed* -- the
+        # real filesystem still flushed, but the covered units stay pending in the
+        # model's view, and the model is what decides survivor worlds. `suppressed`
+        # counts the swallows (every arm declares how many it owes, and the recording
+        # asserts it got exactly that many); `stale_commits` counts the `Commit`s whose
+        # backup advance the sequencer dropped (arm 5's return-before-durable); and
+        # `returned_outcome` is the `ChainOutcome` the recorded transaction handed its
+        # caller, which arm 5's permanence invariant is a statement about.
+        self.suppress: Callable[[Stream, str, frozenset], bool] | None = None
+        self.suppressed = 0
+        self.stale_commits = 0
+        self.returned_outcome: ChainOutcome | None = None
 
     # --- accessors (mechanical) --------------------------------------------------
     def mutations(self) -> list[Mutation]:
@@ -342,8 +370,17 @@ class RecordingCutBackend:
     def _pending_keys(self) -> frozenset:
         return frozenset(self._stream.pending)
 
-    def _emit_barrier(self, covered: frozenset) -> None:
+    def _emit_barrier(self, covered: frozenset, *, kind: str) -> None:
+        """Append the `Barrier` this flush publishes -- unless a design §9 sabotage arm
+        swallows it (`Stream.suppress`), in which case the covered units stay pending
+        and no event is appended at all: the arm's whole content is that the model's
+        recorded view no longer holds a durability barrier the engine really performed.
+        `kind` is `"file"`/`"directory"`, the two flush shapes an arm distinguishes.
+        """
         stream = self._stream
+        if stream.suppress is not None and stream.suppress(stream, kind, covered):
+            stream.suppressed += 1
+            return
         for key in covered:
             stream.pending.pop(key, None)
         stream.events.append(Barrier(covered))
@@ -556,7 +593,7 @@ class RecordingCutBackend:
             if token is not None
             else frozenset()
         )
-        self._emit_barrier(covered)
+        self._emit_barrier(covered, kind="file")
 
     def flush_directory(self, fd: int) -> None:
         self._inner.flush_directory(fd)
@@ -571,7 +608,7 @@ class RecordingCutBackend:
             if directory is not None
             else frozenset()
         )
-        self._emit_barrier(covered)
+        self._emit_barrier(covered, kind="directory")
 
 
 # --- the store commit sequencer ------------------------------------------------
@@ -678,13 +715,23 @@ class _LabelingTransaction:
         return result
 
 
-def attach_store_sequencer(stream: Stream, monkeypatch, metadata_root: str) -> None:
+def attach_store_sequencer(
+    stream: Stream, monkeypatch, metadata_root: str, *, stale_commit: str | None = None
+) -> None:
     """Wrap `Store.transaction` so each successful exit appends a labelled `Commit`.
 
     Follows the wrapper shape `tests/execute_child.py:48-66`'s `_configure_store_cut`
     uses for its "after" cut -- run the original contextmanager to completion -- except
     on success it also backs up `atoms.db` and appends the event, rather than counting
     towards a kill countdown.
+
+    `stale_commit` is design §9's arm 5, and it is the one sabotage that is not a
+    swallowed barrier: the named label's transaction still commits for real, but the
+    model's durable metadata does **not** advance to it -- the `Commit` event carries the
+    *previous* backup, so every cut at or after it reconstructs the store as it was
+    before that decision was durable. That is exactly "cleanup and return proceed without
+    the durable COMMITTED COMMIT": the run returns `COMMITTED` while nothing durable says
+    so.
     """
     from atoms.store.connection import Store
 
@@ -701,8 +748,12 @@ def attach_store_sequencer(stream: Stream, monkeypatch, metadata_root: str) -> N
             raise AssertionError(
                 "a store transaction committed without a recognized mutating call"
             )
-        backup_id = len(stream.backups)
-        stream.backups[backup_id] = _backup_db(db_path)
+        if label == stale_commit:
+            stream.stale_commits += 1
+            backup_id = max(stream.backups)
+        else:
+            backup_id = len(stream.backups)
+            stream.backups[backup_id] = _backup_db(db_path)
         stream.events.append(Commit(label, backup_id))
 
     monkeypatch.setattr(Store, "transaction", sequenced)
@@ -1777,7 +1828,14 @@ def realign_durable_identities(project_root: Path, metadata_root: Path) -> int:
 # --- top-level recording -----------------------------------------------------------
 
 
-def record_scenario(entry, ingredients, monkeypatch, *, caught: bool = False) -> Stream:
+def record_scenario(
+    entry,
+    ingredients,
+    monkeypatch,
+    *,
+    caught: bool = False,
+    sabotage: Sabotage | None = None,
+) -> Stream:
     """Seed, snapshot event 0, and record only the transaction (controller ruling).
 
     Bootstrap (`setup_clean`: seed the world, register the root) is seed-owned per
@@ -1787,6 +1845,12 @@ def record_scenario(entry, ingredients, monkeypatch, *, caught: bool = False) ->
     never enumerates it as entry-unit mutation. Only afterwards is the backend wrapped
     and the transaction alone run through it. `final_world_digest` is computed last, so
     the fidelity self-check (design §9) has a live-world target to compare against.
+
+    `sabotage` is one design §9 `Sabotage` arm, installed for this recording only and
+    audited on the way out: an arm that swallowed a different number of barriers than it
+    declared has silently stopped suppressing the thing it names -- an engine refactor
+    moving a flush, a scenario growing a second one -- and must fail here rather than
+    hand back a stream whose designated check would then quietly pass.
     """
     from tests.exerciser import setup_clean, transact, transact_caught
 
@@ -1794,6 +1858,8 @@ def record_scenario(entry, ingredients, monkeypatch, *, caught: bool = False) ->
     setup_clean(entry, ingredients, monkeypatch)
 
     stream = Stream()
+    if sabotage is not None:
+        install_sabotage(stream, sabotage)
     _snapshot_seed(project_root, metadata_root, stream)
     db_path = Path(metadata_root) / "atoms.db"
     stream.backups[0] = _backup_db(db_path) if db_path.exists() else None
@@ -1801,14 +1867,21 @@ def record_scenario(entry, ingredients, monkeypatch, *, caught: bool = False) ->
 
     recorder = RecordingCutBackend(backend, stream)
     recorded_ingredients = (recorder, project_root, metadata_root, storage)
-    attach_store_sequencer(stream, monkeypatch, metadata_root)
+    attach_store_sequencer(
+        stream,
+        monkeypatch,
+        metadata_root,
+        stale_commit=None if sabotage is None else sabotage.stale_commit,
+    )
 
     if caught:
         transact_caught(entry, recorded_ingredients, monkeypatch)
     else:
-        transact(entry, recorded_ingredients)
+        stream.returned_outcome = transact(entry, recorded_ingredients).outcome
 
     stream.final_world_digest = world_digest(project_root, metadata_root)
+    if sabotage is not None:
+        audit_sabotage(stream, sabotage)
     return stream
 
 
@@ -2619,13 +2692,407 @@ def _placement_complaints(result: CellResult, child: dict) -> tuple[str, ...]:
     return tuple(complaints)
 
 
+# --- design §9's sabotage arms and their designated checks --------------------------
+
+
+def _window_label(stream: Stream) -> str | None:
+    """The label of the most recent store `Commit` -- the recording-time window an arm
+    suppresses inside. `"e1-started"` is open from the moment the first effect's journal
+    row is durably STARTED until its `DONE` row commits, which is exactly the interval
+    design §9's arms 2-4 say a mutation must become durable in."""
+    for event in reversed(stream.events):
+        if type(event) is Commit:
+            return event.label
+    return None
+
+
+def _published_insert(stream: Stream, kind: str, covered: frozenset) -> Unit | None:
+    """The publication rename's `insert` unit, when this flush is the barrier that
+    publishes it, and `None` otherwise.
+
+    Every effect in the matrix publishes by renaming a verified scratch object over its
+    live name -- a two-unit `remove`+`insert` `Mutation` -- and then flushing the
+    directory that must hold the new name before the effect's `DONE` row commits. So
+    "the flush that covers the most recent transfer's insert, inside the `e1-started`
+    window" identifies that barrier without the recorder having to know any path: it is
+    found from the recorded stream's own shape, the same way `named_tuples` and
+    `_mkdir_publication_cut` find theirs.
+    """
+    if kind != "directory" or _window_label(stream) != "e1-started":
+        return None
+    last = next(
+        (event for event in reversed(stream.events) if type(event) is Mutation), None
+    )
+    if last is None or len(last.units) != 2:
+        return None
+    by_change = {unit.change: unit for unit in last.units}
+    if set(by_change) != {"remove", "insert"}:
+        return None
+    insert = by_change["insert"]
+    return insert if insert.key in covered else None
+
+
+def _blobs_directory_flush(stream: Stream, kind: str, covered: frozenset) -> bool:
+    """Arm 1: `promote_staging`'s `flush_directory` over `blobs/sha256`, matched by that
+    directory's own token (a seed-era object -- `ensure_metadata_layout` builds the blob
+    store before any recording starts, so it is in `seed_entries`, never a `Mutation`)."""
+    from atoms.store.blobs import BLOBS_DIRECTORY, SHA256_DIRECTORY
+
+    if kind != "directory":
+        return False
+    blobs = stream.seed_entries[(stream.roots["metadata"], BLOBS_DIRECTORY)]
+    sha256 = stream.seed_entries[(blobs, SHA256_DIRECTORY)]
+    return any(key[0] == "entry" and key[1] == sha256 for key in covered)
+
+
+def _publication_flush(stream: Stream, kind: str, covered: frozenset) -> bool:
+    """Arms 2 and 3: the flush that makes an effect's publication rename durable.
+
+    Arm 2 (`minimal-create`) owes one swallow -- `create_file.py`'s single
+    `flush_directory(site.parent_fd)` between the transfer and `DONE`.
+
+    Arm 3 (`minimal-move`) owes **two**, and that is a measured property of the
+    scenario rather than a wider net: `minimal-move` moves `d/source.txt` to
+    `d/destination.txt`, so `move.py`'s destination-parent flush and the source-parent
+    flush that follows it are the *same directory*, and each would separately publish
+    the transfer's insert. Suppressing only the first would leave the second covering
+    it, and the arm would silently suppress nothing at all. "The move's destination-parent
+    flush" is therefore every post-transfer flush of that parent, and the arm's declared
+    swallow count is what pins it: a scenario whose source and destination parents
+    differ would owe exactly one.
+    """
+    return _published_insert(stream, kind, covered) is not None
+
+
+def _live_parent_flush(stream: Stream, kind: str, covered: frozenset) -> bool:
+    """Arm 4: `create_directory.py`'s live-parent flush, the *first* of §9.5's two
+    cross-directory publication flushes -- distinguished from the `work/` flush that
+    follows it by the published name's parent being the project root."""
+    insert = _published_insert(stream, kind, covered)
+    return insert is not None and insert.key[1] == stream.roots["project"]
+
+
+@dataclass(frozen=True)
+class Designated:
+    """What a designated check gets to look at: the sabotaged-or-healthy stream, the
+    designated cell, its reconstructed roots, and -- for the arms whose failure is a
+    recovery outcome -- the `CellResult` of recovering it."""
+
+    stream: Stream
+    cell: Cell
+    project_root: Path
+    metadata_root: Path
+    result: CellResult | None
+
+
+def blob_integrity_failures(metadata_root: Path) -> tuple[str, ...]:
+    """Every way the reconstructed store fails to resolve a blob its record references
+    (design §9 arm 1's "a record-referenced blob absent or short").
+
+    "Referenced" is the record's **final surface**: the content the transaction promised
+    to materialize, which is what the payload capture stages and `promote_staging`
+    publishes. A `pre` fingerprint's digest is deliberately not included -- it describes
+    a file already on disk and no scenario stages a blob for it, so demanding a leaf for
+    it would fail every healthy store.
+
+    The spec is decoded with production's own `from_canonical_json`, never re-parsed by
+    hand, so a spec shape this test cannot read is a real decode failure.
+    """
+    from atoms.core.canonical import from_canonical_json
+    from atoms.core.fingerprint import FileState
+    from atoms.store.blobs import BLOBS_DIRECTORY, SHA256_DIRECTORY, digest_to_leaf
+
+    metadata_root = Path(metadata_root)
+    db_path = metadata_root / "atoms.db"
+    if not db_path.exists():
+        return ("the reconstructed world holds no store",)
+    connection = sqlite3.connect(db_path)
+    try:
+        indexed = {
+            digest: byte_len
+            for digest, byte_len in connection.execute(
+                "SELECT digest, byte_len FROM blob"
+            )
+        }
+        specs = [
+            row[0] for row in connection.execute("SELECT spec_json FROM transaction_record")
+        ]
+    finally:
+        connection.close()
+
+    referenced = {
+        entry.state.content_hash
+        for spec_json in specs
+        for entry in from_canonical_json(spec_json).final_surface
+        if type(entry.state) is FileState
+    }
+    blobs = metadata_root / BLOBS_DIRECTORY / SHA256_DIRECTORY
+    failures: list[str] = []
+    for digest in sorted(referenced):
+        if digest not in indexed:
+            failures.append(f"{digest} is referenced by the record but not indexed")
+            continue
+        leaf = blobs / digest_to_leaf(digest)
+        if not leaf.exists():
+            failures.append(f"{digest} is indexed but its leaf is absent")
+            continue
+        content = leaf.read_bytes()
+        if len(content) != indexed[digest]:
+            failures.append(
+                f"{digest} is {len(content)} bytes, the index says {indexed[digest]}"
+            )
+        elif "sha256:" + hashlib.sha256(content).hexdigest() != digest:
+            failures.append(f"the leaf named {digest} hashes to something else")
+    return tuple(failures)
+
+
+def _blob_integrity_failed(designated: Designated) -> bool:
+    """Arm 1, judged on the reconstructed store before recovery touches it.
+
+    Measured (Task 9): recovery over the sabotaged world resolves *cleanly* -- the
+    record is still `PREPARED`, so the plan undoes nothing, and nothing else ever opens
+    the missing blob. `list_unindexed_blobs` walks the leaves that are present and so
+    cannot see an indexed digest with no leaf either, which is why not one of the
+    sweep's own assertions notices. This designated check is the only instrument that
+    does, which is exactly why design §9 gives the arm its own named failure rather than
+    hoping some cell differs.
+    """
+    failures = blob_integrity_failures(designated.metadata_root)
+    if failures:
+        print(f"\n[cut-matrix] blob-integrity: {failures}")
+    return bool(failures)
+
+
+def _designated_halt(designated: Designated) -> bool:
+    """Arms 2-4: recovery halted, over a `DONE` journal row, where the unsabotaged cell
+    converges.
+
+    The designated cell is the same cell in both runs -- the cut at the effect's `DONE`
+    commit with nothing pending surviving. Unsabotaged, the effect's mutation is already
+    durable there (that is precisely what the suppressed flush does), so the cell is the
+    published world and recovery resolves it; sabotaged, the mutation is still pending
+    and is dropped, so a `DONE` journal row meets a world the effect never reached.
+
+    Two guards keep this from passing vacuously on the unsabotaged half, where "did not
+    halt" is the passing answer: the cell must have carried a durable record and reached
+    `classify_recovery` at all. And the halt itself must be A3's own (`plan_halted`,
+    never a topology assembly halt) *and* carry a `DONE` journal row in its persisted
+    diagnostic -- which is the designated failure's own sentence, not merely "something
+    went wrong here". Measured, all three arms halt `EFFECT_TUPLE_UNATTRIBUTABLE` naming
+    the effect and the paths the missing barrier left behind.
+    """
+    from atoms.core.recovery import JournalState
+
+    result = designated.result
+    assert result is not None, "arms 2-4 judge a recovered cell"
+    assert result.projection is not None, (
+        "the designated cell carries no durable record: it cannot show a DONE row"
+    )
+    assert result.counts["classified"] == 1, (
+        f"the designated cell never reached A3 (counts={result.counts})"
+    )
+    if not result.counts["plan_halted"]:
+        return False
+    diagnostic = result.projection[3]
+    return diagnostic is not None and any(
+        row.state is JournalState.DONE for row in diagnostic.journals
+    )
+
+
+def _returned_outcome_reversed(designated: Designated) -> bool:
+    """Arm 5: the returned-outcome permanence invariant.
+
+    A transaction that returned `COMMITTED` to its caller must never resolve
+    `ROLLED_BACK` on recovery. The recorded run's own returned outcome is read from the
+    stream rather than assumed -- an arm bound to a scenario that did not commit would
+    be asserting nothing, and fails loudly here instead.
+    """
+    from atoms.chain.model import ChainOutcome
+    from atoms.core.recovery import TransactionState
+
+    result = designated.result
+    assert result is not None, "arm 5 judges a recovered cell"
+    assert designated.stream.returned_outcome is ChainOutcome.COMMITTED, (
+        "the returned-outcome permanence arm needs a recorded run that returned "
+        f"COMMITTED, got {designated.stream.returned_outcome!r}"
+    )
+    assert result.projection is not None, "the designated cell carries no durable record"
+    assert result.counts["classified"] == 1, (
+        f"the designated cell never reached A3 (counts={result.counts})"
+    )
+    return result.projection[0] is TransactionState.ROLLED_BACK
+
+
+@dataclass(frozen=True)
+class Sabotage:
+    """One design §9 falsification arm.
+
+    An arm is a *recording-time suppression* plus a *designated cell* plus a *designated
+    check*, and the three are one object so a sweep cannot run the check without the
+    suppression, or point it at some other cut.
+
+    - `barrier`/`swallows`: the `Barrier` predicate the recorder consults, and exactly
+      how many barriers it owes. Suppression is in the model's recorded view: the real
+      `fsync` still happened, the covered units simply stay pending, which is what lets
+      the designated cut drop them. (Patching the engine's own `flush_*` would suppress
+      the real fsync while the model went on recording a barrier -- the exact opposite
+      of what the survivor product needs to see.)
+    - `stale_commit`: arm 5's alternative, in the store sequencer rather than the
+      barrier stream (`attach_store_sequencer`).
+    - `cut_label`: the store commit the designated cut sits **at** -- `durable_state`
+      folds that commit in, and no pending unit survives. On an unsabotaged recording
+      nothing *is* pending at any of these cuts (measured: the transactional pending set
+      is empty at every one), so the designated cell is the clean durable world and the
+      check passes silently; the suppressed barrier is the only reason a unit is pending
+      there, and dropping it is what materializes the designated failure.
+    - `recovers`: whether the cell is recovered before the check. Arm 1's assertion is
+      about the *reconstructed store*, before recovery has had a chance to reclaim or
+      halt on anything; arms 2-5's failures are recovery outcomes.
+    """
+
+    name: str
+    scenario: str
+    marker: str
+    cut_label: str
+    check: Callable[[Designated], bool]
+    barrier: Callable[[Stream, str, frozenset], bool] | None = None
+    swallows: int = 0
+    stale_commit: str | None = None
+    recovers: bool = True
+
+
+SABOTAGE_ARMS: tuple[Sabotage, ...] = (
+    Sabotage(
+        name="blob-flush",
+        scenario="minimal-create",
+        marker="blob-integrity",
+        cut_label="prepared",
+        barrier=_blobs_directory_flush,
+        swallows=1,
+        recovers=False,
+        check=_blob_integrity_failed,
+    ),
+    Sabotage(
+        name="pre-done-flush",
+        scenario="minimal-create",
+        marker="done-meets-pre-state-halt",
+        cut_label="e1-done",
+        barrier=_publication_flush,
+        swallows=1,
+        check=_designated_halt,
+    ),
+    Sabotage(
+        name="move-destination-flush",
+        scenario="minimal-move",
+        marker="done-meets-absent-destination-halt",
+        cut_label="e1-done",
+        barrier=_publication_flush,
+        swallows=2,
+        check=_designated_halt,
+    ),
+    Sabotage(
+        name="live-parent-flush",
+        scenario="minimal-mkdir",
+        marker="done-meets-absent-directory-halt",
+        cut_label="e1-done",
+        barrier=_live_parent_flush,
+        swallows=1,
+        check=_designated_halt,
+    ),
+    Sabotage(
+        name="committed-decision",
+        scenario="minimal-create",
+        marker="returned-outcome-permanence",
+        cut_label="committed",
+        stale_commit="committed",
+        check=_returned_outcome_reversed,
+    ),
+)
+
+
+def sabotage_arm(name: str, scenario: str) -> Sabotage:
+    """The arm named `name`, which must be the one declared for `scenario` -- an arm run
+    against another scenario would suppress nothing and check nothing."""
+    for arm in SABOTAGE_ARMS:
+        if arm.name != name:
+            continue
+        if arm.scenario != scenario:
+            raise KeyError(
+                f"sabotage arm {name!r} is declared for scenario {arm.scenario!r}, "
+                f"not {scenario!r}"
+            )
+        return arm
+    raise KeyError(f"no sabotage arm named {name!r}")
+
+
+def install_sabotage(stream: Stream, arm: Sabotage) -> None:
+    """Install `arm`'s barrier predicate on `stream`, bounded by its declared count.
+
+    The budget lives here rather than inside each predicate: an arm names *which*
+    barrier it suppresses and *how many* of that shape it owes, and both halves are then
+    enforced in one place -- `audit_sabotage` reads the same number back out.
+    """
+    predicate = arm.barrier
+    if predicate is None:
+        return
+
+    def suppress(recorded: Stream, kind: str, covered: frozenset) -> bool:
+        return recorded.suppressed < arm.swallows and predicate(recorded, kind, covered)
+
+    stream.suppress = suppress
+
+
+def audit_sabotage(stream: Stream, arm: Sabotage) -> None:
+    """Require the recording to have sabotaged exactly what the arm declares."""
+    assert stream.suppressed == arm.swallows, (
+        f"sabotage arm {arm.name!r} swallowed {stream.suppressed} barriers, "
+        f"not the {arm.swallows} it declares"
+    )
+    assert stream.stale_commits == (0 if arm.stale_commit is None else 1), (
+        f"sabotage arm {arm.name!r} dropped {stream.stale_commits} commit backups"
+    )
+
+
+def designated_cell(stream: Stream, arm: Sabotage) -> Cell:
+    """`arm`'s designated cell: the cut **at** its store commit, with no pending unit
+    surviving. Completed by the same `_fold` pass the sweep uses (`complete_named_cell`),
+    so the non-`entry` and probe-noise keys are folded exactly as they are for every
+    other cell -- the entry topology alone is what the arm designates.
+
+    On an *unsabotaged* recording the cut is asserted to have no transactional unit
+    pending at all. That is the claim the whole arm design rests on -- it is why one
+    definition of the designated cell serves both halves, the healthy world and the torn
+    one -- and it is a real property of the engine's barrier discipline (every mutation
+    a commit depends on is flushed before that commit), so a change that left something
+    pending at a store commit must fail here rather than quietly turn the healthy
+    designated cell into a torn one.
+    """
+    cut = stream.commit_index(arm.cut_label) + 1
+    if stream.suppressed == 0:
+        probe_tokens, token_parents = _probe_classification(stream)
+        leftover = sorted(
+            key
+            for key in pending_keys_at(stream, cut)
+            if not _is_probe_noise(key, probe_tokens, token_parents)
+        )
+        assert not leftover, (
+            f"{arm.name}: the unsabotaged {arm.cut_label!r} commit left {leftover} "
+            "pending; the designated cell is no longer the clean durable world"
+        )
+    bare = apply_survivors(durable_state(stream, cut), stream, cut, frozenset())
+    if isinstance(bare, Skip):
+        raise KeyError(f"{arm.name}: the designated cell is unrepresentable: {bare.reason}")
+    return complete_named_cell(Cell(cut, frozenset(), bare), stream)
+
+
 @dataclass(frozen=True)
 class SweepReport:
     """One scenario's sweep. `cells`/`deduped`/`skips` come from `enumerate_cells`'
     accounting; the three failure tuples are empty on a healthy sweep and name the cell
-    and the fault when they are not. `subprocess_cells`/`subprocess_disagreements`
-    (Task 7's placement axis) and `designated_failures` (Task 9's sabotage arms) are
-    created here and filled there."""
+    and the fault when they are not. `subprocess_cells`/`subprocess_disagreements` are
+    Task 7's placement axis, and `designated_failures` names every design §9 designated
+    check that failed -- empty on an unsabotaged sweep, and, on a `sabotage=` run,
+    exactly the sabotaged arm's marker."""
 
     cells: int
     deduped: int
@@ -2700,7 +3167,9 @@ class Sweeper:
                 self._allowlist = build_test_allowlist(lock, str(root), self._storage)
         return self._allowlist
 
-    def record(self, name: str, *, caught: bool = False) -> Stream:
+    def record(
+        self, name: str, *, caught: bool = False, sabotage: Sabotage | None = None
+    ) -> Stream:
         """Record one scenario, then **undo the recording's patches**.
 
         `record_scenario` installs two of them: `_enable_commands`' allowlist, and
@@ -2729,7 +3198,7 @@ class Sweeper:
         recording = pytest.MonkeyPatch()
         try:
             return record_scenario(
-                scenario(name), ingredients, recording, caught=caught
+                scenario(name), ingredients, recording, caught=caught, sabotage=sabotage
             )
         finally:
             recording.undo()
@@ -2792,11 +3261,16 @@ class Sweeper:
         reconstructed inodes and `_normalized_tree` rewrites hard-link-group keys. What
         crosses the process boundary is `serialize_projection`'s token-free document
         only.
+
+        `sabotage="<arm>"` runs design §9's falsification instead of the sweep -- see
+        `_sabotaged`. Every *unsabotaged* sweep additionally runs the designated checks
+        of whichever arms name its scenario, which is where `designated_failures == ()`
+        comes from: the arms' other half, that an unsabotaged run passes them.
         """
         from tests.exerciser import scenario
 
         if sabotage is not None:
-            raise NotImplementedError("the sabotage arms land in Task 9")
+            return self._sabotaged(scenario_name, sabotage_arm(sabotage, scenario_name))
 
         entry = scenario(scenario_name)
         planted = None
@@ -2887,6 +3361,8 @@ class Sweeper:
                 f"named={len(named)})"
             )
 
+        designated = self.designated_failures(scenario_name, stream)
+
         # Every cell lands in exactly one outcome bucket, and the buckets must add back
         # up to the cells run. This is the assertion that keeps the sweep honest about
         # what it actually exercised: a regression that stopped classifying (as the
@@ -2923,7 +3399,7 @@ class Sweeper:
             subprocess_cells=subprocess_cells,
             subprocess_disagreements=tuple(subprocess_disagreements),
             subprocess_halt_cells=subprocess_halts,
-            designated_failures=(),
+            designated_failures=designated,
             classified_cells=totals["classified"],
             halted_cells=totals["halted"],
             plan_halted_cells=totals["plan_halted"],
@@ -2942,9 +3418,89 @@ class Sweeper:
             f"{report.preserved_drift_cells}) deduped={report.deduped} "
             f"subprocess={report.subprocess_cells} "
             f"(halted={report.subprocess_halt_cells}) "
+            f"designated={report.designated_failures} "
             f"skips={report.skips} in {report.seconds:.1f}s"
         )
         return report
+
+    def _sabotaged(self, scenario_name: str, arm: Sabotage) -> SweepReport:
+        """One design §9 falsification arm: record `scenario_name` with `arm` installed,
+        then run **every** designated check that names this scenario.
+
+        Not a sweep. Design §9 requires an arm to "name one required cell, and state the
+        expected designated failure -- never 'any cell happens to differ'", so a
+        sabotaged run's verdict comes from the designated checks alone; re-enumerating
+        the whole survivor product over a stream that is missing a barrier would spend a
+        sweep's worth of cells to assert nothing the arm is about. Every check of the
+        scenario runs, not just the sabotaged arm's own, so a run can assert that
+        exactly one of them fired (`minimal-create` carries three).
+        """
+        started = time.monotonic()
+        stream = self.record(scenario_name, sabotage=arm)
+        designated = self.designated_failures(scenario_name, stream)
+        arms = [item for item in SABOTAGE_ARMS if item.scenario == scenario_name]
+        report = SweepReport(
+            cells=len(arms),
+            deduped=0,
+            skips={},
+            disagreements=(),
+            second_pass_violations=(),
+            side_assertion_failures=(),
+            named_tuple_cells_ran=0,
+            preserved_drift_cells=0,
+            subprocess_cells=0,
+            subprocess_disagreements=(),
+            designated_failures=designated,
+            seconds=time.monotonic() - started,
+        )
+        print(
+            f"\n[cut-matrix] {scenario_name} sabotage={arm.name}: "
+            f"swallowed={stream.suppressed} stale-commits={stream.stale_commits} "
+            f"designated-cells={report.cells} failures={designated} "
+            f"in {report.seconds:.1f}s"
+        )
+        return report
+
+    def designated_failures(self, scenario_name: str, stream: Stream) -> tuple[str, ...]:
+        """Run every design §9 designated check declared for `scenario_name` against
+        `stream`, returning the markers of those that failed.
+
+        Each check gets its arm's designated cell, reconstructed into its own fresh
+        roots -- and recovered through `run_cell` first where the arm's failure is a
+        recovery outcome. The roots are always discarded: the check has already read
+        everything it needs by the time this returns.
+        """
+        failures: list[str] = []
+        for arm in SABOTAGE_ARMS:
+            if arm.scenario != scenario_name:
+                continue
+            cell = designated_cell(stream, arm)
+            slot = f"{scenario_name}-designated-{next(self._slots)}"
+            project_root, metadata_root = cell_roots(self._volume, slot)
+            result = None
+            if arm.recovers:
+                result = run_cell(
+                    cell,
+                    stream,
+                    self._volume,
+                    self._storage,
+                    self._monkeypatch,
+                    slot=slot,
+                    allowlist=self.allowlist(),
+                    retain=True,
+                )
+            else:
+                project_root.mkdir()
+                metadata_root.mkdir()
+                reconstruct(cell.state, project_root, metadata_root)
+            try:
+                if arm.check(
+                    Designated(stream, cell, project_root, metadata_root, result)
+                ):
+                    failures.append(arm.marker)
+            finally:
+                _discard_roots(project_root, metadata_root)
+        return tuple(failures)
 
     def _placement_subset(
         self,

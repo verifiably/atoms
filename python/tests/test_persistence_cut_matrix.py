@@ -19,6 +19,9 @@ def test_every_cell_of_the_minimal_scenarios_agrees_with_a3(name, cut_matrix) ->
     assert report.disagreements == ()
     assert report.second_pass_violations == ()
     assert report.side_assertion_failures == ()
+    assert report.designated_failures == (), (
+        "an unsabotaged sweep must raise no design §9 designated failure"
+    )
 
 
 def test_an_absent_approved_directory_freezes_a_node_missing_halt(
@@ -512,7 +515,101 @@ def test_same_inode_work_survivor_is_landed_not_blocker(
     )
 
 
-def test_the_sabotage_mode_is_declared_but_not_yet_built(cut_matrix) -> None:
-    """The `Sweeper` accepts Task 9's keyword and refuses to pretend."""
-    with pytest.raises(NotImplementedError):
+# --- design §9's five sabotage arms ------------------------------------------------
+#
+# Each arm suppresses ONE barrier in the model's recorded view (the real filesystem
+# still flushed; the model is what decides survivor worlds) or drops one store COMMIT's
+# durable advance, and then runs its scenario's designated cells -- the cut AT a named
+# store commit with no pending unit surviving. On an unsabotaged recording nothing is
+# pending there, so every designated cell is the clean durable world and every check
+# passes silently; the suppressed barrier is exactly what leaves the designated units
+# pending, and dropping them is what materializes the designated failure.
+#
+# The arms are data (`tests.persistence_model.SABOTAGE_ARMS`) rather than per-test
+# monkeypatching: the plan's sketch patched a `flush_*` function in a module, which
+# would suppress the *real* fsync and leave the model still recording a Barrier -- the
+# opposite of what design §9's arms need, since the model's recorded view is what the
+# survivor product is taken over.
+#
+# A sabotaged run judges its arm by its own designated check ONLY -- design §9's "never
+# 'any cell happens to differ'" -- so it does not re-enumerate the whole sweep.
+
+
+def test_sabotage_1_blob_flush_before_prepared(cut_matrix) -> None:
+    """Suppressed blob-directory flush -> the PREPARED-cut cell reports a
+    record-referenced blob missing from the reconstructed store."""
+    report = cut_matrix("minimal-create", sabotage="blob-flush")
+    assert report.designated_failures == ("blob-integrity",)
+
+
+def test_sabotage_2_mutation_durable_before_done(cut_matrix) -> None:
+    """Suppressed publication flush -> the effect's `DONE` journal row meets a
+    pre-state world, and recovery halts where the unsabotaged cell converges."""
+    report = cut_matrix("minimal-create", sabotage="pre-done-flush")
+    assert "done-meets-pre-state-halt" in report.designated_failures
+
+
+def test_sabotage_3_move_destination_flush(cut_matrix) -> None:
+    # Reordering the two 9.4 flushes is deliberately NOT the arm (design §9):
+    # either order yields an attributable repairable tuple; the load-bearing
+    # property is both flushes preceding DONE.
+    report = cut_matrix("minimal-move", sabotage="move-destination-flush")
+    assert "done-meets-absent-destination-halt" in report.designated_failures
+
+
+def test_sabotage_4_mkdir_live_parent_flush(cut_matrix) -> None:
+    report = cut_matrix("minimal-mkdir", sabotage="live-parent-flush")
+    assert "done-meets-absent-directory-halt" in report.designated_failures
+
+
+def test_sabotage_5_committed_decision(cut_matrix) -> None:
+    """Returned-outcome permanence: a COMMITTED return must never resolve
+    ROLLED_BACK on recovery."""
+    report = cut_matrix("minimal-create", sabotage="committed-decision")
+    assert "returned-outcome-permanence" in report.designated_failures
+
+
+def test_each_sabotaged_run_fails_only_its_own_designated_check(cut_matrix) -> None:
+    """Design §9's sharpest sentence: *exactly* the designated check fails.
+
+    `minimal-create` carries three of the five arms, so a sabotaged run of it evaluates
+    all three designated checks and must name only the sabotaged one -- the blob arm
+    must not also break the returned-outcome invariant, and the committed-decision arm
+    must not also lose a blob. A single-arm scenario can only ever name its own marker,
+    so the three-arm scenario is the only place this says anything.
+    """
+    for arm, marker in (
+        ("blob-flush", "blob-integrity"),
+        ("pre-done-flush", "done-meets-pre-state-halt"),
+        ("committed-decision", "returned-outcome-permanence"),
+    ):
+        report = cut_matrix("minimal-create", sabotage=arm)
+        assert report.designated_failures == (marker,), arm
+
+
+def test_unsabotaged_sweeps_raise_no_designated_failure(cut_matrix) -> None:
+    """The other half of every arm: unsabotaged, every designated check passes.
+
+    Deliberately over *recordings* rather than over three more full sweeps. The
+    designated checks already run inside every sweep -- `test_every_cell_of_the_minimal_
+    scenarios_agrees_with_a3` asserts `designated_failures == ()` for all five minimal
+    scenarios -- so re-sweeping the same three here would spend a minute of cells to
+    re-assert what this names directly: on an unsabotaged recording, the same designated
+    cells the arms fail on are clean.
+    """
+    for name in ("minimal-create", "minimal-move", "minimal-mkdir"):
+        stream = cut_matrix.record(name)
+        assert cut_matrix.designated_failures(name, stream) == (), name
+
+
+def test_an_unknown_sabotage_arm_is_refused(cut_matrix) -> None:
+    """The `Sweeper` names its arms and refuses to pretend about any other."""
+    with pytest.raises(KeyError):
         cut_matrix("minimal-create", sabotage="drop-barrier")
+
+
+def test_a_sabotage_arm_refuses_a_scenario_it_was_not_designed_for(cut_matrix) -> None:
+    """Each arm declares the scenario whose stream carries its barrier; sweeping it
+    against another scenario would suppress nothing and check nothing."""
+    with pytest.raises(KeyError):
+        cut_matrix("minimal-move", sabotage="blob-flush")
