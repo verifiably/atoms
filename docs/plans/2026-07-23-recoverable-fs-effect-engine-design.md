@@ -1220,8 +1220,11 @@ directory's means the rename published our inode but its `work/` old-name remova
 and treats the effect as landed, subject to the transaction's forward/rollback decision. A surviving
 `work/` staging directory together with a live directory that is a **different** (foreign) inode proves
 publication did not land: the engine preserves the live blocker, removes its own `work/` staging, and
-finishes rollback with a refused outcome. The persistence-cut model generates the same-inode
-intermediate and asserts recovery does not misread it as a blocker.
+finishes rollback with a refused outcome. The persistence-cut model covers the same-inode
+intermediate by identity injection at recovery's two observation seams — the
+state is not host-reconstructible and ext4's journaled rename never splits it,
+so no replay generates it physically (A8 design §4.5) — and asserts recovery
+does not misread it as a blocker.
 
 Missing ancestors compile as explicit outer-to-inner effects. Rollback removes them inner-to-outer by
 atomically quarantining each directory, validating its exact mode and emptiness, and then using `rmdir`

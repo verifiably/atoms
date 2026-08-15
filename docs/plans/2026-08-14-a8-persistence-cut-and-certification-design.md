@@ -155,8 +155,18 @@ a hand-written expectation of what "should" survive.
 A **cut** is an index into the recorded stream. At each cut the surviving world
 is the durable state (all units covered by barriers before the cut, plus all
 COMMIT snapshots up to the cut) extended by a **survivor subset** of the pending
-units. Enumeration is the full powerset over pending keys, applied in stream
-order, with three rules:
+units. Pending keys are first classified **probe-noise or transactional**
+*(ruled 2026-08-15, Task 5: capability probing inside every lease entry leaves
+24–51 perpetually-pending keys in the engine-reserved probe namespace, making a
+literal all-keys powerset unenumerable, while the transactional remainder peaks
+at 6 keys — under the cap with a 2× margin)*: a key is probe-noise iff its
+entry's parent lies in the metadata probe subtree, or — for data/metadata — every
+name its token ever held lives there. Probe-noise keys receive **one
+deterministic treatment** (the maximal applicable fold, counted in the sweep's
+accounting), justified because probe survivors are unconditionally reclaimed at
+lease entry before recovery classifies anything. Enumeration is then the full
+powerset over the **transactional** pending keys of every kind, applied in
+stream order, with three rules:
 
 - **Structural applicability.** A unit is applicable iff its target exists in
   the durable base or through a preceding included unit — a remove of an entry
@@ -167,9 +177,10 @@ order, with three rules:
   named required tuple — §9.4's dual-name and anchor-only, forward and reverse —
   was *generated*, not skipped. The §9.5 same-inode tuple is asserted at its
   named injected test instead (§4.5).
-- **The pending-set size is capped with a loud failure**, not sampling. The
-  engine's barrier discipline keeps pending sets small; a cap breach means the
-  model or the engine changed, and the matrix must say so.
+- **The transactional pending-set size is capped with a loud failure**, not
+  sampling. The engine's barrier discipline keeps transactional pending sets
+  small; a cap breach means the model or the engine changed, and the matrix
+  must say so.
 
 ### 4.4 Reconstruction
 
@@ -518,15 +529,17 @@ Landing edits, enforced by `test_docs_status.py` in the same change:
 
 **Acceptance criteria.** A8 is complete when:
 
-1. The persistence-cut sweep runs every host-reconstructible survivor of every
-   exerciser scenario through real-filesystem recovery with A3 agreement, the
-   four named §9.4 tuples generated and repaired, and the §9.5 injected test
-   passing.
+1. The persistence-cut sweep runs every host-reconstructible **transactional**
+   survivor of every exerciser scenario (probe-noise keys folded per §4.3's
+   ruling) through real-filesystem recovery with A3 agreement, the four named
+   §9.4 tuples generated and repaired, and the §9.5 injected test passing.
 2. The §13.4 matrix covers scenario × mechanism × first-execution with mandatory
    second-pass verification, and capability refusals proven outside the product,
    before any metadata or project mutation.
-3. All five sabotage arms flip at least one cell; the fidelity self-check and
-   skip accounting pass on every sweep.
+3. All five sabotage arms flip at least one cell; skip accounting passes on
+   every sweep, and the reconstruction-fidelity self-check — the end-cut,
+   all-pending-survivors world equals the live final world — runs **inside
+   every sweep**, not only as a directed test over three scenarios.
 4. The feature resolver reads the three masks through
    `EXT4_IOC_GET_TUNE_SB_PARAM` on the bound directory descriptor, pins them
    verbatim into `durability_features`, refuses `ENOTTY`/`EOPNOTSUPP` kernels
