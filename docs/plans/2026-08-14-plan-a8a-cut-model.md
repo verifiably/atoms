@@ -1087,8 +1087,11 @@ def test_same_inode_work_survivor_is_landed_not_blocker(ext4_volume, coordinator
     # hard-link directories). Then patch the observation seam so both report the
     # same identity token, and run recovery.
     ...
-    # Assertions: recovery converges (no halt); live "d" survives with its declared
-    # mode; the work slot is empty; the second pass is NO_RECOVERY-clean.
+    # Assertions (corrected 2026-08-15 at implementation — "live d survives" was
+    # the false-blocker outcome): recovery converges (no halt); the effect is
+    # read as LANDED and the uncommitted transaction's rollback undoes it —
+    # RollbackResult.RESTORED, "d" removed, work slot empty; the second pass is
+    # NO_RECOVERY-clean; both injection seams' fired counters > 0.
 ```
 
 - [ ] **Step 2: Run to verify failure.**

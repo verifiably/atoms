@@ -203,10 +203,23 @@ records why stronger is unavailable**:
    that the certified filesystem cannot generate would be vacuous.
 
 Coverage is therefore a **named identity-injected executor test at the
-observation seam**: the physical world holds a live published directory and a
-`work/` survivor as distinct inodes, and the injected observation reports the
-identical identity §9.5 describes; the test asserts recovery removes the stale
-`work/` name and treats the effect as landed, never misreading it as a blocker.
+observation seams** (both recovery observation routes — classification and
+per-step authorization — injected, each with a fired counter): the physical
+world holds a live published directory and a `work/` survivor as distinct
+inodes, and the injected observations report the identical identity §9.5
+describes; the test asserts recovery treats the effect as **landed** — never
+misreading it as a blocker — and then applies the transaction's decision, which
+for this pre-`DONE` tuple is rollback: the stale `work/` name is removed, the
+landed directory undone, `RollbackResult.RESTORED`. *(Corrected 2026-08-15,
+Task 8: "the live directory survives" was the false-blocker outcome — a
+blocker misreading preserves `d` as external drift, so the discriminating
+assertion is the rollback's removal.)* Two model notes recorded with the test:
+the work-slot **name** is never separately flushed, and §4.1's keyed
+replacement collapses a same-key insert-then-remove to the remove — so the
+survivor world is unrepresentable in the sweep and the directed test
+**splices** the work-slot entry into the reconstructed tree, asserting the
+splice remains necessary so an engine that later flushes the work parent fails
+the test loudly.
 One supporting fact makes the injected shape faithful: the tuple can only
 coexist with an **empty** published directory — the `work/` flush is durable
 before `DONE`, and no descendant reaches `STARTED` before its parent's `DONE` —
