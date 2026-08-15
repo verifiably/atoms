@@ -314,6 +314,17 @@ def _remove_mapper(name: str) -> None:
     _run(["dmsetup", "mknodes"])
 
 
+def _zero_device(device: Path, size: int) -> None:
+    zero = b"\0" * (1024 * 1024)
+    with device.open("wb", buffering=0) as stream:
+        remaining = size
+        while remaining:
+            block = zero[: min(len(zero), remaining)]
+            stream.write(block)
+            remaining -= len(block)
+        os.fsync(stream.fileno())
+
+
 def _mount_device(device: Path, mountpoint: Path, options: str) -> None:
     command = [_MOUNT]
     if options:
@@ -421,18 +432,20 @@ def run_scenario(
         raise ValueError(f"Task 3 requires a clean-commit scenario, got {entry.family}")
     data_bytes = int(_run(["blockdev", "--getsize64", os.fspath(data_device)]))
     log_bytes = int(_run(["blockdev", "--getsize64", os.fspath(log_device)]))
-    zero = b"\0" * (1024 * 1024)
-    with log_device.open("wb", buffering=0) as stream:
-        for _ in range(log_bytes // len(zero)):
-            stream.write(zero)
-        if log_bytes % len(zero):
-            stream.write(zero[: log_bytes % len(zero)])
-        os.fsync(stream.fileno())
+    _zero_device(log_device, log_bytes)
     _run(["mkfs.ext4", "-q", "-F", "-O", _mkfs_features(masks), os.fspath(data_device)])
 
     volume = work / "volume"
     volume.mkdir()
-    _mount_device(data_device, volume, mount_options)
+    sectors = _run(["blockdev", "--getsz", os.fspath(data_device)])
+    mapper_name = "certify"
+    mapper = _create_mapper(
+        mapper_name,
+        f"0 {sectors} log-writes {data_device} {log_device}",
+    )
+    device_number = mapper.stat().st_rdev
+    major, minor = os.major(device_number), os.minor(device_number)
+    _mount_device(mapper, volume, mount_options)
     project = volume / "project"
     project.mkdir()
     metadata = volume / "metadata"
@@ -443,6 +456,9 @@ def run_scenario(
         setup_clean(entry, ingredients, monkeypatch)
     finally:
         _run([_UMOUNT, os.fspath(volume)])
+        _remove_mapper(mapper_name)
+
+    _zero_device(log_device, log_bytes)
 
     baseline = work / "baseline.img"
     with data_device.open("rb", buffering=0) as source, baseline.open("wb", buffering=0) as sink:
@@ -456,14 +472,12 @@ def run_scenario(
         sink.flush()
         os.fsync(sink.fileno())
 
-    sectors = _run(["blockdev", "--getsz", os.fspath(data_device)])
-    mapper_name = "certify"
     mapper = _create_mapper(
         mapper_name,
         f"0 {sectors} log-writes {data_device} {log_device}",
+        major=major,
+        minor=minor,
     )
-    device_number = mapper.stat().st_rdev
-    major, minor = os.major(device_number), os.minor(device_number)
     workload_mounted = False
     try:
         _mount_device(mapper, volume, mount_options)
