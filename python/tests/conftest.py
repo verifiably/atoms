@@ -614,6 +614,20 @@ def leased(coordinator_on, monkeypatch):
 
 
 @pytest.fixture
+def exerciser_run(coordinator_on, monkeypatch):
+    """Run a named exerciser scenario clean; returns (ingredients, outcome)."""
+
+    def run(name: str):
+        from tests.exerciser import run_clean, scenario
+
+        ingredients = coordinator_on()
+        outcome = run_clean(scenario(name), ingredients, monkeypatch)
+        return ingredients, outcome
+
+    return run
+
+
+@pytest.fixture
 def opened_store(store_on):
     """A live Store over a fresh ext4 project, closed on exit."""
     from atoms.store.connection import open_store
