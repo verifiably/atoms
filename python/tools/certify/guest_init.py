@@ -61,19 +61,26 @@ def verify_identity(parameters: dict[str, str]) -> None:
     checkout = expected.get("checkout")
     if not isinstance(checkout, str) or not checkout.startswith("/"):
         raise ValueError("identity checkout must be an absolute path")
+    excludes_file = expected.get("git_excludes_file")
+    if excludes_file is not None and (
+        not isinstance(excludes_file, str)
+        or not Path(excludes_file).is_absolute()
+        or not Path(excludes_file).is_file()
+    ):
+        raise ValueError("identity git excludes file must be an absolute regular file")
+    git = ["git", "-c", f"safe.directory={checkout}"]
+    if excludes_file is not None:
+        git += ["-c", f"core.excludesFile={excludes_file}"]
     actual: dict[str, object] = {
         "backend_revision": BACKEND_REVISION,
         "checkout": checkout,
-        "commit": _run(
-            ["git", "-c", f"safe.directory={checkout}", "-C", checkout, "rev-parse", "HEAD"]
-        ),
+        "commit": _run([*git, "-C", checkout, "rev-parse", "HEAD"]),
+        "git_excludes_file": excludes_file,
         "kernel": platform.release(),
         "python_executable": sys.executable,
         "python_version": sys.version,
     }
-    status = _run(
-        ["git", "-c", f"safe.directory={checkout}", "-C", checkout, "status", "--porcelain"]
-    )
+    status = _run([*git, "-C", checkout, "status", "--porcelain"])
     if status:
         actual["checkout_status"] = status
     if actual != expected:

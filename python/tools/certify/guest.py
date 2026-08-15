@@ -182,12 +182,22 @@ def run(
     if status:
         raise GuestRunError("atoms checkout must be clean before guest boot")
     commit = _run(["git", "rev-parse", "HEAD"]).stdout.strip()
+    excludes_result = subprocess.run(
+        ["git", "config", "--path", "--get", "core.excludesfile"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if excludes_result.returncode not in {0, 1}:
+        raise GuestRunError(f"git config failed: {excludes_result.stderr.strip()}")
+    excludes_file = excludes_result.stdout.strip() or None
     from atoms.fs.platform import BACKEND_REVISION
 
     identity = {
         "backend_revision": BACKEND_REVISION,
         "checkout": checkout,
         "commit": commit,
+        "git_excludes_file": excludes_file,
         "kernel": platform.release(),
         "python_executable": sys.executable,
         "python_version": sys.version,
