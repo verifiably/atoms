@@ -34,8 +34,8 @@ One deliberate boundary refinement rides along (§7.4): `build_configuration`'s
 `durability_features` stops collapsing every ext4 feature set into `()` and gains
 a superblock-mask resolver that pins the volume's three feature masks verbatim.
 This refines what the verification boundary can distinguish; it changes no
-transaction semantics. It carries one operational prerequisite, recorded in
-§7.4: binding requires an explicit read grant on the volume's block device node.
+transaction semantics and requires no privilege: the masks are read through an
+ext4 ioctl on the already-bound directory descriptor (§7.4).
 
 ## 2. Scope and non-scope
 
@@ -343,27 +343,31 @@ was settled by a spike run before planning (2026-08-14, this host):
   kernel support, not volume enablement; and `/proc/fs/ext4/<device>/fc_info`
   is created unconditionally — verified here with identical content on a
   volume without the feature. No `orphan_file` indicator exists at all.
-- **The superblock-mask route is proven two-sided.** The resolver opens the
-  volume's block device node (named by the mount entry), verifies the device's
-  `st_rdev` equals the bound volume's `st_dev`, verifies the ext4 magic
-  (`0xEF53` at superblock offset `0x38`), and reads the three feature masks
-  (`compat`/`incompat`/`ro_compat` at offsets `0x5C`/`0x60`/`0x64`). The spike
-  confirmed the parse empirically against mkfs'd image pairs: `fast_commit` is
-  compat bit `0x400`, `orphan_file` compat bit `0x1000`, each present exactly
-  when formatted in. The read happens once, under the project lock; the feature
-  masks are immutable while the volume is mounted.
+- **The resolver is the `EXT4_IOC_GET_TUNE_SB_PARAM` ioctl**, invoked on the
+  **already-bound directory descriptor**. The kernel handler returns all three
+  feature masks (`compat`/`incompat`/`ro_compat`) from the coherent mounted
+  superblock without a capability check — verified unprivileged on this host
+  (this volume resolves `compat=0x3c incompat=0x246 ro_compat=0x46b`).
+  Filesystem identity is intrinsic to the descriptor, so there is no device
+  name to resolve, no raw block access, and no privilege to grant. The call
+  happens once, under the project lock; the masks are immutable while the
+  volume is mounted. A kernel without the ioctl fails closed —
+  `ENOTTY`/`EOPNOTSUPP` refuses with `CapabilityUnavailable`.
+- **A device-node superblock parser was considered and rejected on hardening
+  review**: even read-only raw block access exposes the entire filesystem
+  beneath pathname permissions and would have demanded a per-device ACL grant.
+  The first spike proved that route's parse two-sided before the ioctl
+  superseded it; the mkfs fixtures it produced are retained below.
 - **`durability_features` carries the three masks verbatim** —
   `("compat=0x…", "incompat=0x…", "ro_compat=0x…")` — whole-mask pinning,
   strictly stronger than any enumerated feature list: a future barrier-relevant
   feature changes a mask, the tuple stops matching, and binding refuses until
   recertification, with no code change.
-- **The privilege consequence is explicit.** Device nodes are `root:disk` mode
-  `0660`, so binding — production and the test allowlist alike — requires a
-  read grant on the device node: a narrow udev-installed read-only ACL for the
-  operating user, never `disk`-group membership (which is read-write on every
-  disk). An unreadable device, a device-identity mismatch, or a magic mismatch
-  refuses with `CapabilityUnavailable` naming the exact grant needed. This
-  operational prerequisite is recorded here and in the certification record.
+- **Two-sidedness is proven by the mkfs fixture pair.** Formatting with and
+  without each feature pins the bit values (`fast_commit` compat `0x400`,
+  `orphan_file` compat `0x1000`, confirmed empirically); the in-guest check
+  mounts each fixture image and compares the ioctl's masks against those known
+  bits under the identical kernel the certification run uses.
 - The certification harness formats the guest image with an explicit feature
   set reproducing the target volume's masks, and refuses if its e2fsprogs
   cannot reproduce them.
@@ -479,11 +483,12 @@ Landing edits, enforced by `test_docs_status.py` in the same change:
    before any metadata or project mutation.
 3. All five sabotage arms flip at least one cell; the fidelity self-check and
    skip accounting pass on every sweep.
-4. The feature resolver reads the superblock through the granted device node,
-   pins all three feature masks into `durability_features`, refuses unreadable,
-   identity-mismatched, or magic-mismatched volumes, and its parse is proven
-   two-sided by the mkfs fixture pair (`fast_commit` `0x400`, `orphan_file`
-   `0x1000`).
+4. The feature resolver reads the three masks through
+   `EXT4_IOC_GET_TUNE_SB_PARAM` on the bound directory descriptor, pins them
+   verbatim into `durability_features`, refuses `ENOTTY`/`EOPNOTSUPP` kernels
+   with `CapabilityUnavailable`, and is proven two-sided by the mkfs fixture
+   pair (`fast_commit` `0x400`, `orphan_file` `0x1000`) mounted and re-read
+   through the same ioctl in-guest.
 5. One certification run has produced the JSON record, `CERTIFIED_ALLOWLIST`
    carries exactly the entry naming it, the four population assertions pass, and
    production binding accepts the certified volume and still refuses every
