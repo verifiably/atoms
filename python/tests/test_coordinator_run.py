@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import stat
 from dataclasses import replace
 from pathlib import Path
 
@@ -11,14 +12,17 @@ import pytest
 from atoms.chain.model import ChainOutcome, RegisteredEntry, SettledEntry, decode_entry
 from atoms.coordinator.commands import TransactionOutcome, run_transaction
 from atoms.core.recovery import CommitDecision, TransactionState
+from atoms.core.scratch import CHAIN_LEAF
 from tests.capture_support import DictPayloads, digest_of
 from tests.coordinator_support import (
     AFTER,
     BEFORE,
     create_file_spec,
+    deep_directory_spec,
     delete_spec,
     directory_spec,
     move_spec,
+    nested_directory_spec,
     replace_spec,
 )
 from tests.test_coordinator_commands import _durable_entries, _enable_commands, _register
@@ -79,6 +83,118 @@ def test_run_transaction_executes_a_created_directory_before_its_child(
 
     assert outcome.outcome is ChainOutcome.COMMITTED
     assert (Path(project_root) / "d/f.txt").read_bytes() == AFTER
+
+
+def test_run_transaction_creates_directly_nested_planned_directories(
+    coordinator_on, monkeypatch
+) -> None:
+    """Authority §9.5: a fresh directory's descriptor is handed to its descendants.
+
+    Both directories are absent at capture, so `_build_descriptor_table` can only stop
+    at "data"; "data/records" becomes reachable exactly when the forward
+    `CreateDirectory` for "data" publishes and hands its retained descriptor down.
+    """
+    ingredients = coordinator_on()
+    _enable_commands(ingredients, monkeypatch)
+    backend, project_root, metadata_root, storage = ingredients
+    root = Path(project_root)
+    (root / "index.txt").write_bytes(BEFORE)
+    _register(ingredients, b"root", ())
+
+    outcome = run_transaction(
+        backend,
+        project_root,
+        metadata_root,
+        storage,
+        nested_directory_spec(),
+        DictPayloads({digest_of(AFTER): AFTER}),
+    )
+
+    assert outcome.outcome is ChainOutcome.COMMITTED
+    assert stat.S_IMODE((root / "data").stat().st_mode) == 0o755
+    assert stat.S_IMODE((root / "data" / "records").stat().st_mode) == 0o755
+    assert (root / "data" / "records" / "one.txt").read_bytes() == AFTER
+    assert (root / "data" / "records" / "two.txt").read_bytes() == AFTER
+    assert (root / "index.txt").read_bytes() == AFTER
+
+
+def test_run_transaction_creates_a_three_level_planned_directory_chain(
+    coordinator_on, monkeypatch
+) -> None:
+    """Depth beyond two: the handoff is a general mechanism, not a one-shot."""
+    ingredients = coordinator_on()
+    _enable_commands(ingredients, monkeypatch)
+    backend, project_root, metadata_root, storage = ingredients
+    root = Path(project_root)
+    _register(ingredients, b"root", ())
+
+    outcome = run_transaction(
+        backend,
+        project_root,
+        metadata_root,
+        storage,
+        deep_directory_spec(),
+        DictPayloads({digest_of(AFTER): AFTER}),
+    )
+
+    assert outcome.outcome is ChainOutcome.COMMITTED
+    for relative in ("a", "a/b", "a/b/c"):
+        assert stat.S_IMODE((root / relative).stat().st_mode) == 0o755
+    assert (root / "a" / "b" / "c" / "f.txt").read_bytes() == AFTER
+
+
+def test_caught_rollback_after_nested_creates_restores_the_initial_surface(
+    coordinator_on, monkeypatch
+) -> None:
+    """The confirmed cascade: rollback must reach both nested directories.
+
+    "data" is adopted and leaves `table.stops`, so `_roll_back`'s rescan never revisits
+    it; only the forward registration of "data/records" keeps the inner directory in the
+    table at all.
+    """
+    from atoms.coordinator import execute
+
+    ingredients = coordinator_on()
+    _enable_commands(ingredients, monkeypatch)
+    backend, project_root, metadata_root, storage = ingredients
+    root = Path(project_root)
+    (root / "index.txt").write_bytes(BEFORE)
+    _register(ingredients, b"root", ())
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("cut after the nested creates")
+
+    monkeypatch.setattr(execute.replace_file, "apply", fail)
+    with pytest.raises(RuntimeError, match="cut after the nested creates"):
+        run_transaction(
+            backend,
+            project_root,
+            metadata_root,
+            storage,
+            nested_directory_spec(),
+            DictPayloads({digest_of(AFTER): AFTER}),
+        )
+
+    assert not (root / "data").exists()
+    assert (root / "index.txt").read_bytes() == BEFORE
+    # The whole project surface, not just the declared paths: the only survivor beside
+    # the restored file is the chain the engine owns. No staging or tombstone leaf, and
+    # no half-created directory, is left anywhere under the root.
+    assert {path.name for path in root.iterdir()} == {CHAIN_LEAF, "index.txt"}
+    # The slot itself outlives the rollback by design -- the orphan sweep reclaims it
+    # once the record is gone -- but nothing the mkdirs built may still be inside it.
+    work = Path(metadata_root) / "work"
+    assert [entry.name for entry in work.iterdir()] != []
+    assert list(work.rglob("*/*")) == []
+    with sqlite3.connect(Path(metadata_root) / "atoms.db") as connection:
+        state = connection.execute(
+            "SELECT state FROM transaction_record ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()[0]
+        assert connection.execute("SELECT COUNT(*) FROM active").fetchone()[0] == 0
+    assert state == TransactionState.ROLLED_BACK.value
+    decoded = [decode_entry(value)[1] for value in _durable_entries(project_root).values()]
+    settled = next(item for item in decoded if type(item) is SettledEntry)
+    assert settled.outcome is ChainOutcome.ROLLED_BACK
 
 
 def test_keyboard_interrupt_rolls_back_before_it_is_reraised(

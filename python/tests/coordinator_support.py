@@ -107,6 +107,68 @@ def directory_spec() -> TransactionSpec:
     )
 
 
+def nested_directory_spec() -> TransactionSpec:
+    """Two DIRECTLY NESTED planned directories, then files beneath the inner one.
+
+    The corpus-write shape of authority design §9.5: "data" and "data/records" are both
+    absent when the transaction opens, so the initial descent can stop only at "data" --
+    "data/records" has no parent descriptor to be looked up from until "data" exists.
+    Its `WalkStop` can therefore only be born from the forward `CreateDirectory` that
+    publishes "data", which is what §9.5's descendant-descriptor handoff requires.
+    """
+    return build_spec(
+        consumer_tag="test",
+        intent_digest="sha256:" + "b" * 64,
+        initial_surface={
+            "data": ABSENT,
+            "data/records": ABSENT,
+            "data/records/one.txt": ABSENT,
+            "data/records/two.txt": ABSENT,
+            "index.txt": PRE,
+        },
+        final_surface={
+            "data": DIRECTORY_POST,
+            "data/records": DIRECTORY_POST,
+            "data/records/one.txt": POST,
+            "data/records/two.txt": POST,
+            "index.txt": POST,
+        },
+        effects=[
+            CreateDirectory(effect_id="e1", path="data", post=DIRECTORY_POST),
+            CreateDirectory(effect_id="e2", path="data/records", post=DIRECTORY_POST),
+            CreateFileNoClobber(effect_id="e3", path="data/records/one.txt", post=POST),
+            CreateFileNoClobber(effect_id="e4", path="data/records/two.txt", post=POST),
+            ReplaceFile(effect_id="e5", path="index.txt", pre=PRE, post=POST),
+        ],
+    )
+
+
+def deep_directory_spec() -> TransactionSpec:
+    """Three planned directories in one chain: depth beyond two, so the handoff is general."""
+    return build_spec(
+        consumer_tag="test",
+        intent_digest="sha256:" + "c" * 64,
+        initial_surface={
+            "a": ABSENT,
+            "a/b": ABSENT,
+            "a/b/c": ABSENT,
+            "a/b/c/f.txt": ABSENT,
+        },
+        final_surface={
+            "a": DIRECTORY_POST,
+            "a/b": DIRECTORY_POST,
+            "a/b/c": DIRECTORY_POST,
+            "a/b/c/f.txt": POST,
+        },
+        effects=[
+            CreateDirectory(effect_id="e1", path="a", post=DIRECTORY_POST),
+            CreateDirectory(effect_id="e2", path="a/b", post=DIRECTORY_POST),
+            CreateDirectory(effect_id="e3", path="a/b/c", post=DIRECTORY_POST),
+            CreateFileNoClobber(effect_id="e4", path="a/b/c/f.txt", post=POST),
+        ],
+    )
+
+
 def replace_spec() -> TransactionSpec:
     return build_spec(
         consumer_tag="test",

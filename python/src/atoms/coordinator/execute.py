@@ -16,6 +16,7 @@ from atoms.coordinator.descriptors import (
     WalkStop,
     _directory_paths,
     _modeled_children,
+    _register_planned_children,
     _resume_descent,
 )
 from atoms.coordinator.effects import create_directory, create_file, delete_path, move, replace_file
@@ -84,11 +85,19 @@ def _apply_effect(
             effect,
             gate=lambda: _require_admitted(lease, approved),
         )
+        node = PersistentNode(effect.path)
         try:
-            table.adopt(PersistentNode(effect.path), fd)
+            table.adopt(node, fd)
         except BaseException:
             backend.close_fd(fd)
             raise
+        # §9.5's descendant handoff, forward. `adopt` owns `fd` from here, so a failure
+        # below must NOT close it -- the table does. Until this runs, a planned directory
+        # nested directly inside this one has no stop and its own CreateDirectory cannot
+        # adopt; the children are looked up through the descriptor this effect retained
+        # and rebound, so no multi-component path is ever assembled.
+        with Observation(backend) as observation:
+            _register_planned_children(table, observation, approved, node)
     else:
         raise ProtocolError("effect and descriptor site variants disagree")
 

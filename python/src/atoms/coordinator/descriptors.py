@@ -280,6 +280,56 @@ def _build_descriptor_table(
     )
 
 
+def _register_planned_children(
+    table: DescriptorTable,
+    observation: Observation,
+    approved: ProjectApprovedSpec,
+    node: TopologyNode,
+) -> tuple[TopologyNode, ...]:
+    """Record every planned child of a NOW-ADOPTED directory as a fresh walk stop.
+
+    The initial descent cannot do this. A planned directory whose parent is itself
+    planned has no parent descriptor to be looked up from -- `_build_descriptor_table`
+    marks it stopped-by-inheritance and moves on -- so nothing ever recorded a `WalkStop`
+    for it, and `DescriptorTable.adopt` refuses any node that is not a stop. The stop can
+    therefore only be born the moment its parent gains a descriptor, which is exactly
+    what §9.5's "handed to any descendant effect as that descendant's parent descriptor"
+    describes. Both directions use this: recovery, through `_resume_descent`, and forward
+    execution, right after `CreateDirectory` publishes and its descriptor is adopted.
+
+    Looked up, not assumed, on both routes -- the child's name is observed through the
+    parent's own descriptor rather than declared free, because a freshly published
+    directory is empty only until someone else writes into it.
+
+    `_unreachable` is recomputed rather than adjusted: every node without a descriptor is
+    at or beneath a current stop, so the closure over `table._stops` IS the set. `adopt`
+    subtracts only the adopted node, which would leave that node's descendants marked
+    unreachable after their ancestor became reachable.
+    """
+    paths = _directory_paths(approved)
+    planned = {
+        entry.node
+        for entry in approved.directories
+        if type(entry) is ApprovedPlannedDirectory
+    }
+    parent_fd = table.fd_for(node)
+    registered: list[TopologyNode] = []
+    for child in _walk_order(approved, paths):
+        if child not in planned or _parent_of(approved, child) != node:
+            continue
+        component = _component(paths, node, child)
+        observed = observation.observe(
+            parent_fd, component, modeled=_modeled_children(paths, child)
+        )
+        table._stops = (
+            *table._stops,
+            WalkStop(child, paths[child], parent_fd, component, observed),
+        )
+        registered.append(child)
+    table._unreachable = _closure(approved, {stop.node for stop in table._stops})
+    return tuple(registered)
+
+
 def _resume_descent(
     table: DescriptorTable,
     backend,
@@ -289,12 +339,6 @@ def _resume_descent(
 ) -> None:
     """Resume a recovery walk through planned directories already created."""
 
-    paths = _directory_paths(approved)
-    planned = {
-        entry.node
-        for entry in approved.directories
-        if type(entry) is ApprovedPlannedDirectory
-    }
     pending = [node]
     while pending:
         current = pending.pop(0)
@@ -314,24 +358,9 @@ def _resume_descent(
         except BaseException:
             backend.close_fd(fd)
             raise
-
-        for child in _walk_order(approved, paths):
-            if child not in planned or _parent_of(approved, child) != current:
-                continue
-            component = _component(paths, current, child)
-            observed = observation.observe(
-                table.fd_for(current),
-                component,
-                modeled=_modeled_children(paths, child),
-            )
-            table._stops = (
-                *table._stops,
-                WalkStop(child, paths[child], table.fd_for(current), component, observed),
-            )
-            pending.append(child)
-    table._unreachable = _closure(
-        approved, {stop.node for stop in table._stops}
-    )
+        pending.extend(
+            _register_planned_children(table, observation, approved, current)
+        )
 
 
 def _modeled_children(paths: dict[TopologyNode, str], node: TopologyNode) -> frozenset[str]:
