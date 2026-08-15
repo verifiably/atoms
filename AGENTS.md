@@ -20,13 +20,14 @@ Plan B is written only after Plan A's interfaces settle.
 - **A3 — executable recovery reference model: implemented.** The pure production authority exposes
   `build_recovery_snapshot`, `classify_recovery`, `authorize_recovery_step`,
   `reduce_recovery_plan_prefix`, and `apply_recovery_plan` with the closed recovery model, fresh-step
-  authorization, and abstract reducer. A5, A6, and A7 are implemented; A8–A9 remain unimplemented.
+  authorization, and abstract reducer. A5, A6, A7, and A8a are implemented; A8b–A9 remain
+  unimplemented.
 - **A4a — capability backend and project volume binding: implemented on 2026-07-30.**
   `python/src/atoms/fs/`
   holds the `Backend` protocol and its Linux implementation, `ctypes` bindings for `openat2` and
   `renameat2`, mount-identity and durability-configuration resolution, the §5.5 bootstrap under an
   explicit `HeldProjectLock`, the empirical capability probe, and `bind_project_volume`.
-  `CERTIFIED_ALLOWLIST` ships empty, so production binding refuses every volume until A8
+  `CERTIFIED_ALLOWLIST` ships empty, so production binding refuses every volume until A8b
   crash-certifies a configuration tuple.
 - **A4b — rooted project approval: implemented on 2026-07-31.** A4b-1 owns
   the resolution mechanism in `atoms/fs/resolve.py` and `atoms/fs/lookup.py` — `PathResolver`,
@@ -35,7 +36,7 @@ Plan B is written only after Plan A's interfaces settle.
   A4b-2 owns the judgment in `atoms/fs/approval.py`, `atoms/fs/judgment.py`, and
   `atoms/fs/topology.py`: `approve_for_project`, `ProjectApprovedSpec`, and ledger entries #2,
   #3 (its part), #4, #5, #6, #10, #11, #16, and #20 are discharged. The factory half of #9
-  is complete; A5–A7's entry points enforce it and A8's remains open.
+  is complete; A5–A7's entry points enforce it and A8b's remains open.
   It admits #21, the txid binding, owned by A5.
   A4b-1 approves only non-casefold ext4; XFS, Btrfs, and casefold directories fail closed.
 - **A5 — durable metadata store and recovery lease: A5a implemented on 2026-08-01, A5b implemented on
@@ -62,11 +63,21 @@ Plan B is written only after Plan A's interfaces settle.
 - **A7b — effect and recovery executor: implemented on 2026-08-14.** The coordinator now owns
   the five forward effects, A3-authorized recovery mutations, registration/settlement reconciliation,
   pinned recovery resolution, `run_transaction`, and the fresh-process SIGKILL matrix.
+- **A8a — synthetic exerciser and persistence-cut model: implemented on 2026-08-15.** Its design is
+  [`docs/plans/2026-08-14-a8-persistence-cut-and-certification-design.md`](docs/plans/2026-08-14-a8-persistence-cut-and-certification-design.md);
+  its plan is
+  [`docs/plans/2026-08-14-plan-a8a-cut-model.md`](docs/plans/2026-08-14-plan-a8a-cut-model.md).
+  Test-only, all in `python/tests/`: the data-declared scenario library, the record–reconstruct–recover
+  cut model, the A3 agreement matrix over in-process and subprocess placements with the SIGKILL
+  extension, the directed §9.4 tuple and §9.5 identity-injected tests, and the five sabotage arms.
+  `CERTIFIED_ALLOWLIST` still ships empty; A8b owns the feature resolver and the real
+  crash-certification record that populates it.
 
 Work lives under `python/` (`uv run pytest`, `uv run ruff check`, `uv run pyright`, all from
 `python/`).
 A4a, A5a, and A6 write only to engine-owned paths under `metadata_root`; A7a also writes engine
 bookkeeping at the reserved `.#~chain/` leaf, and A7b executes approved effects against project paths.
+A8a adds no new writer; it drives the existing public commands and guarded lease.
 
 ## Authority order
 

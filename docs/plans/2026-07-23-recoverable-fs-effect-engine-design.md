@@ -1,11 +1,12 @@
 # Recoverable filesystem effect engine — design
 
 **Date:** 2026-07-23
-**Status:** Approved — authority design for `atoms`. Plan A implementation underway; A1–A7b are
+**Status:** Approved — authority design for `atoms`. Plan A implementation underway; A1–A8a are
 implemented (pure model and compilation, recovery reference model, capability backend, path resolution
 and project approval, SQLite-WAL metadata store, recovery-resolve lease, coherent capture and the
 observation mechanism; A7 adds the audited facade, chain, effect/recovery executor, and public
-transaction command); A8–A9 (synthetic exerciser, macOS backend) remain.
+transaction command; A8a adds the synthetic exerciser and the persistence-cut model); A8b–A9
+(durability certification, macOS backend) remain.
 **Repository:** `atoms` (`~/d/atoms`) — Python-first physical durability substrate below `nodes`
 **Supersedes:** the science-framed [`2026-07-20-recoverable-fs-effect-engine-design.md`](2026-07-20-recoverable-fs-effect-engine-design.md), retained as the historical, review-hardened record.
 

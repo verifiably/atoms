@@ -1,6 +1,6 @@
 # A7 — effect execution, recovery execution, and the tamper-evident chain
 
-**Status:** Implemented on 2026-08-14. A8–A9 remain unimplemented. §15 acceptance is met:
+**Status:** Implemented on 2026-08-14. A8b–A9 remain unimplemented. §15 acceptance is met:
 (1) per-variant effect tests plus `test_coordinator_kill_matrix.py`; (2) resolver and assembly-halt
 tests; (3) chain, run, and kill-matrix tests; (4) filesystem/coordinator architecture guards;
 (5) the named suites in the deferred-obligation ledger; and (6) `test_docs_status.py` plus the full

@@ -3,7 +3,7 @@
 **Date:** 2026-07-28
 **Status:** Implemented on 2026-07-29 according to
 [`2026-07-28-plan-a3-recovery-reference-model.md`](2026-07-28-plan-a3-recovery-reference-model.md).
-A8 remains unimplemented; A7 executes effects and recovery against project paths.
+A8b remains unimplemented; A7 executes effects and recovery against project paths.
 **Depends on:** A1 core model and A2 compilation validation (implemented)
 **Authority:** [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md)
 §8.4 and §13.1

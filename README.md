@@ -64,7 +64,13 @@ approved effects against project paths.
 - **A7b — effect and recovery executor (implemented):**
   [`docs/plans/2026-08-13-plan-a7b-executor.md`](docs/plans/2026-08-13-plan-a7b-executor.md)
   — five forward effects, A3-authorized recovery, chain reconciliation, `run_transaction`, and
-  fresh-process crash convergence. A8–A9 remain unimplemented.
+  fresh-process crash convergence.
+- **A8a — synthetic exerciser and persistence-cut model (implemented):**
+  [`docs/plans/2026-08-14-a8-persistence-cut-and-certification-design.md`](docs/plans/2026-08-14-a8-persistence-cut-and-certification-design.md),
+  [`docs/plans/2026-08-14-plan-a8a-cut-model.md`](docs/plans/2026-08-14-plan-a8a-cut-model.md)
+  — the data-declared scenario library, the record–reconstruct–recover cut model, the A3 agreement
+  matrix over in-process and subprocess placements with the SIGKILL extension, and the five sabotage
+  arms, all in `python/tests/`. A8b–A9 remain unimplemented.
 - Historical (superseded): the science-framed [`2026-07-20-*`](docs/plans/2026-07-20-recoverable-fs-effect-engine-design.md)
   design + roadmap, retained as the record of the review that hardened the effect/recovery contracts.
 

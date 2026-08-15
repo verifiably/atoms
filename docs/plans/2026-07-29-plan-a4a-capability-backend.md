@@ -24,7 +24,7 @@ embedding a resource.
 refines [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md)
 §§5.4, 5.5, 6, 7, and 13.2. Where they disagree, the authority design wins.
 
-**Status:** Implemented on 2026-07-30. A8 remains unimplemented;
+**Status:** Implemented on 2026-07-30. A8b remains unimplemented;
 A4a mutates only engine-owned `metadata_root`, never project paths.
 
 ## Global Constraints

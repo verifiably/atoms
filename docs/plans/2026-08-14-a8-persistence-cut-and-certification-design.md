@@ -1,10 +1,21 @@
 # A8 — persistence-cut model, synthetic exerciser, and durability certification
 
-**Status:** Designed 2026-08-14; unimplemented. Owner of deferred-obligation ledger
-entry #15 and of the empty-`CERTIFIED_ALLOWLIST` refusal. Implements authority
+**Status:** Designed 2026-08-14. **A8a — exerciser, cut model, matrices — implemented
+2026-08-15; A8b unimplemented.** Owner of deferred-obligation ledger entry #15 and of
+the empty-`CERTIFIED_ALLOWLIST` refusal (both remain open to A8b). Implements authority
 §12.1 (the synthetic exerciser), §13.2 (the persistence-cut model and the
 crash-certification method), §13.4 (end-to-end recovery), and §14 Plan A items 6–7.
 A9 (macOS) follows.
+
+A8a landed the exerciser and the record–reconstruct–recover cut model in
+`python/tests/`: five minimal scenarios sweep 48–57 cells each (~63 s total, zero A3
+disagreements); compound scenarios sweep 301 cells (~75 s); the 18-scenario drift
+corpus is preserved 18/18; subprocess-placement scenarios cover 22+ cells including
+halted ones; the SIGKILL extension covers 104 cuts (62 corpus-write + 42
+archive-move, ~81 s); and the five sabotage arms each fire exactly their designated
+marker. The full suite runs ~6050 passed / 7 skipped in ~7 minutes, exit 0. A8b —
+the feature resolver, `tools/certify`, the real certification record, and the
+`CERTIFIED_ALLOWLIST` landing — is unimplemented.
 
 ## 1. Decision
 

@@ -28,10 +28,10 @@ ROOT = Path(__file__).parents[2]
 PLANS = ROOT / "docs" / "plans"
 
 #: Every sub-plan of authority §14's Plan A roadmap, in delivery order.
-STAGES = ("A1", "A2", "A3", "A4a", "A4b", "A5a", "A5b", "A6", "A7a", "A7b", "A8", "A9")
+STAGES = ("A1", "A2", "A3", "A4a", "A4b", "A5a", "A5b", "A6", "A7a", "A7b", "A8a", "A8b", "A9")
 
 #: The one fact this file exists to hold. Landing a sub-plan moves this boundary.
-FIRST_UNIMPLEMENTED = "A8"
+FIRST_UNIMPLEMENTED = "A8b"
 
 IMPLEMENTED = STAGES[: STAGES.index(FIRST_UNIMPLEMENTED)]
 UNIMPLEMENTED = STAGES[STAGES.index(FIRST_UNIMPLEMENTED) :]
@@ -241,11 +241,12 @@ def test_the_claim_parser_attaches_a_claim_to_the_span_that_owns_it():
     assert unimplemented_claims("A5 and A6 are implemented; A7–A8 remain unimplemented.") == {
         "A7a",
         "A7b",
-        "A8",
+        "A8a",
+        "A8b",
     }
     assert unimplemented_claims(
         "A7–A8 (effect/recovery execution, synthetic exerciser) remain."
-    ) == {"A7a", "A7b", "A8"}
+    ) == {"A7a", "A7b", "A8a", "A8b"}
     assert unimplemented_claims("A4b-2 and A5–A8 remain unimplemented.") == {
         "A4b",
         "A5a",
@@ -253,7 +254,8 @@ def test_the_claim_parser_attaches_a_claim_to_the_span_that_owns_it():
         "A6",
         "A7a",
         "A7b",
-        "A8",
+        "A8a",
+        "A8b",
     }
     # A requirement about a stage is not a claim that the stage is unimplemented.
     assert unimplemented_claims("A4b must produce the proof before A5–A8.") == set()
