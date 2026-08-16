@@ -35,6 +35,21 @@ import sys
 from atoms.fs.volume import VolumeConfiguration
 from tools.certify.record import write
 
+names = (
+    "minimal-create",
+    "minimal-replace",
+    "minimal-delete",
+    "minimal-move",
+    "minimal-mkdir",
+    "corpus-write",
+    "archive-move",
+    "caught-rollback",
+    "caught-rollback-move",
+)
+if sys.argv[4] == "empty":
+    names = ()
+elif sys.argv[4] == "subset":
+    names = names[:1]
 write(
     Path(sys.argv[1]),
     configuration=VolumeConfiguration(
@@ -55,15 +70,16 @@ write(
     log_format="1",
     kernel="7.1.8-arch1-3",
     atoms_commit="0123456789abcdef",
-    scenarios=() if sys.argv[4] == "empty" else (
+    scenarios=tuple(
         {
-            "scenario": "minimal-create",
+            "scenario": name,
             "marks": json.loads(sys.argv[2]),
             "prefixes": 310,
-            "violations": json.loads(sys.argv[3]),
+            "violations": json.loads(sys.argv[3]) if index == 0 else 0,
             "violation_details": [],
             "declared_cap": None,
-        },
+        }
+        for index, name in enumerate(names)
     ),
     date="2026-08-16",
 )
@@ -102,12 +118,13 @@ def _expected_record() -> dict[str, object]:
         "atoms_commit": "0123456789abcdef",
         "scenarios": [
             {
-                "name": "minimal-create",
+                "name": name,
                 "marks": 90,
                 "prefixes": 310,
                 "violations": 0,
                 "declared_cap": None,
             }
+            for name in CERTIFICATION_SCENARIOS
         ],
         "zero_violations": True,
     }
@@ -222,7 +239,7 @@ def _assert_record_schema(document: object) -> None:
         cap = row["declared_cap"]
         assert cap is None or (type(cap) is int and cap > 0)
     assert len(names) == len(set(names))
-    assert set(names) == set(CERTIFICATION_SCENARIOS)
+    assert tuple(names) == CERTIFICATION_SCENARIOS
 
 
 def _run_writer(
@@ -262,6 +279,7 @@ def test_writer_refuses_floats(tmp_path: Path) -> None:
     ("violations", "shape", "message"),
     [
         pytest.param("0", "empty", "at least one scenario", id="empty"),
+        pytest.param("0", "subset", "exact certification scenarios", id="subset"),
         pytest.param("false", "row", "violations must be an integer", id="boolean-false"),
     ],
 )
@@ -289,9 +307,6 @@ def test_collected_check_rejects_evidence_that_cannot_prove_zero_violations(
     mutation: str,
 ) -> None:
     document = _expected_record()
-    rows = document["scenarios"]
-    assert isinstance(rows, list) and isinstance(rows[0], dict)
-    document["scenarios"] = [rows[0] | {"name": name} for name in CERTIFICATION_SCENARIOS]
     _assert_record_schema(document)
 
     if mutation == "empty":

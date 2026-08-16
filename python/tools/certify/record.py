@@ -17,6 +17,17 @@ _STORAGE_CONTRACT = (
 _ROW_KEYS = frozenset(
     {"scenario", "marks", "prefixes", "violations", "violation_details", "declared_cap"}
 )
+_CERTIFICATION_SCENARIOS = (
+    "minimal-create",
+    "minimal-replace",
+    "minimal-delete",
+    "minimal-move",
+    "minimal-mkdir",
+    "corpus-write",
+    "archive-move",
+    "caught-rollback",
+    "caught-rollback-move",
+)
 
 
 def _string(value: object, label: str) -> str:
@@ -109,14 +120,14 @@ def write(
     if not scenarios:
         raise ValueError("certification requires at least one scenario")
     rows: list[dict[str, object]] = []
-    names: set[str] = set()
+    names: list[str] = []
     for row in scenarios:
         if set(row) != _ROW_KEYS:
             raise ValueError("scenario row has the wrong fields")
         name = _string(row["scenario"], "scenario name")
         if name in names:
             raise ValueError(f"duplicate scenario name: {name}")
-        names.add(name)
+        names.append(name)
         cap = row["declared_cap"]
         if cap is not None and (
             not isinstance(cap, int) or isinstance(cap, bool) or cap <= 0
@@ -135,6 +146,8 @@ def write(
                 "declared_cap": cap,
             }
         )
+    if tuple(names) != _CERTIFICATION_SCENARIOS:
+        raise ValueError("record requires the exact certification scenarios in order")
     document = {
         "record_version": 1,
         "date": date,
