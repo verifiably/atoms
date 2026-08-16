@@ -13,6 +13,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import traceback
 from dataclasses import asdict
 from pathlib import Path
 
@@ -813,8 +814,13 @@ def main() -> int:
                     "declared_cap": args.declare_cap,
                 }
             )
-    except Exception as caught:  # noqa: BLE001 - the serial fatal record is the boundary.
-        _emit({"fatal": "self-test" if args.self_test else "workload", "detail": str(caught)})
+    except Exception:  # noqa: BLE001 - the serial fatal record is the boundary.
+        _emit(
+            {
+                "fatal": "self-test" if args.self_test else "workload",
+                "detail": traceback.format_exc(),
+            }
+        )
         return 1
     return 0
 
