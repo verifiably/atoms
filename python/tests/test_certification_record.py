@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from datetime import date as Date
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,21 @@ from atoms.fs.volume import CERTIFIED_ALLOWLIST, VolumeConfiguration
 
 ROOT = Path(__file__).parents[2]
 CERTIFICATION = ROOT / "docs" / "certification"
+CERTIFICATION_SCENARIOS = (
+    "minimal-create",
+    "minimal-replace",
+    "minimal-delete",
+    "minimal-move",
+    "minimal-mkdir",
+    "corpus-write",
+    "archive-move",
+    "caught-rollback",
+    "caught-rollback-move",
+)
+STORAGE_CONTRACT = (
+    "completed FLUSH makes all previously completed writes durable; "
+    "a completed FUA write is durable at completion"
+)
 _WRITER_PROGRAM = r'''
 import json
 from pathlib import Path
@@ -39,12 +55,13 @@ write(
     log_format="1",
     kernel="7.1.8-arch1-3",
     atoms_commit="0123456789abcdef",
-    scenarios=(
+    scenarios=() if sys.argv[4] == "empty" else (
         {
             "scenario": "minimal-create",
             "marks": json.loads(sys.argv[2]),
             "prefixes": 310,
-            "violations": 0,
+            "violations": json.loads(sys.argv[3]),
+            "violation_details": [],
             "declared_cap": None,
         },
     ),
@@ -53,18 +70,8 @@ write(
 '''
 
 
-def test_writer_emits_the_exact_canonical_record(tmp_path: Path) -> None:
-    output = tmp_path / "record.json"
-    result = subprocess.run(
-        [sys.executable, "-c", _WRITER_PROGRAM, str(output), "90"],
-        check=False,
-        cwd=ROOT / "python",
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr
-
-    expected = {
+def _expected_record() -> dict[str, object]:
+    return {
         "record_version": 1,
         "date": "2026-08-16",
         "configuration": {
@@ -77,10 +84,7 @@ def test_writer_emits_the_exact_canonical_record(tmp_path: Path) -> None:
         },
         "storage": {
             "profile_id": "flush-honoring-disk.v1",
-            "contract": (
-                "completed FLUSH makes all previously completed writes durable; "
-                "a completed FUA write is durable at completion"
-            ),
+            "contract": STORAGE_CONTRACT,
         },
         "harness": {
             "qemu_command": ["qemu-system-x86_64", "-accel", "kvm"],
@@ -107,6 +111,138 @@ def test_writer_emits_the_exact_canonical_record(tmp_path: Path) -> None:
         ],
         "zero_violations": True,
     }
+
+
+def _object(value: object, fields: set[str]) -> dict[str, object]:
+    assert isinstance(value, dict)
+    assert set(value) == fields
+    return value
+
+
+def _string(value: object) -> None:
+    assert isinstance(value, str) and value
+
+
+def _string_list(value: object, *, nonempty: bool = True) -> None:
+    assert isinstance(value, list)
+    assert not nonempty or value
+    assert all(isinstance(item, str) and item for item in value)
+
+
+def _assert_no_floats(value: object) -> None:
+    assert not isinstance(value, float)
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _assert_no_floats(key)
+            _assert_no_floats(item)
+    elif isinstance(value, list):
+        for item in value:
+            _assert_no_floats(item)
+
+
+def _assert_record_schema(document: object) -> None:
+    _assert_no_floats(document)
+    record = _object(
+        document,
+        {
+            "record_version",
+            "date",
+            "configuration",
+            "storage",
+            "harness",
+            "atoms_commit",
+            "scenarios",
+            "zero_violations",
+        },
+    )
+    assert type(record["record_version"]) is int and record["record_version"] == 1
+    date = record["date"]
+    _string(date)
+    assert isinstance(date, str) and Date.fromisoformat(date).isoformat() == date
+    _string(record["atoms_commit"])
+    assert record["zero_violations"] is True
+
+    configuration = _object(
+        record["configuration"],
+        {
+            "backend_id",
+            "backend_revision",
+            "kernel_identifier",
+            "filesystem_type",
+            "barrier_options",
+            "durability_features",
+        },
+    )
+    for field in ("backend_id", "backend_revision", "kernel_identifier", "filesystem_type"):
+        _string(configuration[field])
+    _string_list(configuration["barrier_options"])
+    _string_list(configuration["durability_features"])
+
+    storage = _object(record["storage"], {"profile_id", "contract"})
+    _string(storage["profile_id"])
+    assert storage["contract"] == STORAGE_CONTRACT
+
+    harness = _object(
+        record["harness"],
+        {
+            "qemu_command",
+            "cache_mode",
+            "mkfs_command",
+            "mount_command",
+            "versions",
+            "replay_log_commit",
+            "log_format_version",
+        },
+    )
+    for field in ("qemu_command", "mkfs_command", "mount_command"):
+        _string_list(harness[field])
+    assert harness["cache_mode"] == "writeback"
+    _string(harness["replay_log_commit"])
+    _string(harness["log_format_version"])
+    versions = _object(harness["versions"], {"qemu", "e2fsprogs", "kernel"})
+    for version in versions.values():
+        _string(version)
+
+    scenarios = record["scenarios"]
+    assert isinstance(scenarios, list) and scenarios
+    names: list[str] = []
+    for value in scenarios:
+        row = _object(
+            value,
+            {"name", "marks", "prefixes", "violations", "declared_cap"},
+        )
+        name = row["name"]
+        _string(name)
+        assert isinstance(name, str)
+        names.append(name)
+        for field in ("marks", "prefixes"):
+            count = row[field]
+            assert isinstance(count, int) and not isinstance(count, bool) and count >= 0
+        assert type(row["violations"]) is int and row["violations"] == 0
+        cap = row["declared_cap"]
+        assert cap is None or (type(cap) is int and cap > 0)
+    assert len(names) == len(set(names))
+    assert set(names) == set(CERTIFICATION_SCENARIOS)
+
+
+def _run_writer(
+    output: Path, *, marks: str = "90", violations: str = "0", shape: str = "row"
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-c", _WRITER_PROGRAM, str(output), marks, violations, shape],
+        check=False,
+        cwd=ROOT / "python",
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_writer_emits_the_exact_canonical_record(tmp_path: Path) -> None:
+    output = tmp_path / "record.json"
+    result = _run_writer(output)
+    assert result.returncode == 0, result.stderr
+
+    expected = _expected_record()
     encoded = output.read_text(encoding="utf-8")
     assert json.loads(encoded) == expected
     assert encoded == json.dumps(
@@ -116,16 +252,56 @@ def test_writer_emits_the_exact_canonical_record(tmp_path: Path) -> None:
 
 def test_writer_refuses_floats(tmp_path: Path) -> None:
     output = tmp_path / "record.json"
-    result = subprocess.run(
-        [sys.executable, "-c", _WRITER_PROGRAM, str(output), "1.5"],
-        check=False,
-        cwd=ROOT / "python",
-        capture_output=True,
-        text=True,
-    )
+    result = _run_writer(output, marks="1.5")
     assert result.returncode != 0
     assert "certification records must not contain floats" in result.stderr
     assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("violations", "shape", "message"),
+    [
+        pytest.param("0", "empty", "at least one scenario", id="empty"),
+        pytest.param("false", "row", "violations must be an integer", id="boolean-false"),
+    ],
+)
+def test_writer_refuses_evidence_that_cannot_prove_zero_violations(
+    tmp_path: Path, violations: str, shape: str, message: str
+) -> None:
+    output = tmp_path / "record.json"
+    result = _run_writer(output, violations=violations, shape=shape)
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert not output.exists()
+
+
+def test_writer_records_positive_violations_as_failed_certification(tmp_path: Path) -> None:
+    output = tmp_path / "record.json"
+    result = _run_writer(output, violations="1")
+    assert result.returncode == 0, result.stderr
+    document = json.loads(output.read_text(encoding="utf-8"))
+    assert document["zero_violations"] is False
+    assert document["scenarios"][0]["violations"] == 1
+
+
+@pytest.mark.parametrize("mutation", ["empty", "boolean-false"])
+def test_collected_check_rejects_evidence_that_cannot_prove_zero_violations(
+    mutation: str,
+) -> None:
+    document = _expected_record()
+    rows = document["scenarios"]
+    assert isinstance(rows, list) and isinstance(rows[0], dict)
+    document["scenarios"] = [rows[0] | {"name": name} for name in CERTIFICATION_SCENARIOS]
+    _assert_record_schema(document)
+
+    if mutation == "empty":
+        document["scenarios"] = []
+    else:
+        scenarios = document["scenarios"]
+        assert isinstance(scenarios, list) and isinstance(scenarios[0], dict)
+        scenarios[0]["violations"] = False
+    with pytest.raises(AssertionError):
+        _assert_record_schema(document)
 
 
 def test_certification_record_matches_the_production_allowlist() -> None:
@@ -143,18 +319,9 @@ def test_certification_record_matches_the_production_allowlist() -> None:
     assert encoded == json.dumps(
         document, ensure_ascii=True, separators=(",", ":"), sort_keys=True
     ) + "\n"
-    assert document["zero_violations"] is True
-    assert all(row["violations"] == 0 for row in document["scenarios"])
+    _assert_record_schema(document)
 
     configuration = document["configuration"]
-    assert set(configuration) == {
-        "backend_id",
-        "backend_revision",
-        "kernel_identifier",
-        "filesystem_type",
-        "barrier_options",
-        "durability_features",
-    }
     assert entry.configuration == VolumeConfiguration(
         backend_id=configuration["backend_id"],
         backend_revision=configuration["backend_revision"],
