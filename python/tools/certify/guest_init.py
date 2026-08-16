@@ -220,10 +220,12 @@ def _replay_self_verification(work: Path, data_device: Path, log_device: Path) -
         _run([_UMOUNT, os.fspath(mountpoint)])
         mounted = False
     finally:
-        if mounted:
-            _run([_UMOUNT, os.fspath(mountpoint)])
-        if mapper_created:
-            _remove_mapper(name)
+        try:
+            if mounted:
+                _run([_UMOUNT, os.fspath(mountpoint)])
+        finally:
+            if mapper_created:
+                _remove_mapper(name)
 
     expected = {
         "baseline": (None, None),
@@ -541,10 +543,12 @@ def run_scenario(
         ingredients = (LinuxBackend(), str(project), str(metadata), storage)
         setup_clean(entry, ingredients, monkeypatch)
     finally:
-        if mounted:
-            _run([_UMOUNT, os.fspath(volume)])
-        if mapper_created:
-            _remove_mapper(mapper_name)
+        try:
+            if mounted:
+                _run([_UMOUNT, os.fspath(volume)])
+        finally:
+            if mapper_created:
+                _remove_mapper(mapper_name)
 
     _zero_device(log_device, log_bytes)
 
@@ -586,10 +590,12 @@ def run_scenario(
         _run(["dmsetup", "message", mapper_name, "0", "mark", "scenario-end"])
     finally:
         monkeypatch.undo()
-        if workload_mounted:
-            _run([_UMOUNT, os.fspath(volume)])
-        if mapper_created:
-            _remove_mapper(mapper_name)
+        try:
+            if workload_mounted:
+                _run([_UMOUNT, os.fspath(volume)])
+        finally:
+            if mapper_created:
+                _remove_mapper(mapper_name)
 
     flags = _log_entries(log_device)
     violations: list[str] = []
@@ -625,14 +631,23 @@ def run_scenario(
                 raise TypeError("recovery subprocess returned malformed classified count")
             classified += cell_classified
         finally:
-            if replay_mounted:
-                _run([_UMOUNT, os.fspath(volume)])
-            if replay_mapper_created:
-                _remove_mapper(mapper_name)
-            if loop is not None:
-                _run(["blockdev", "--flushbufs", os.fspath(loop)])
-                _run(["losetup", "--detach", os.fspath(loop)])
-            target.unlink(missing_ok=True)
+            try:
+                if replay_mounted:
+                    _run([_UMOUNT, os.fspath(volume)])
+            finally:
+                try:
+                    if replay_mapper_created:
+                        _remove_mapper(mapper_name)
+                finally:
+                    try:
+                        if loop is not None:
+                            _run(["blockdev", "--flushbufs", os.fspath(loop)])
+                    finally:
+                        try:
+                            if loop is not None:
+                                _run(["losetup", "--detach", os.fspath(loop)])
+                        finally:
+                            target.unlink(missing_ok=True)
     if classified == 0:
         violations.append("no replay prefix reached A3 classification")
     return (
