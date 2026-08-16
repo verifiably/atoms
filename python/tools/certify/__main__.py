@@ -248,53 +248,55 @@ def _run_scenarios(
         final_result: guest.GuestResult | None = None
         harness: tuple[tuple[str, ...], tuple[str, ...], str] | None = None
         for scenario in scenarios:
-            scenario_work = work / scenario
-            scenario_work.mkdir()
-            data = build_log_image(scenario_work / "data.img", 128)
-            log = build_log_image(scenario_work / "log.img", 512)
-            arguments = [
-                "--scenario",
-                scenario,
-                "--trials",
-                str(trials),
-                "--compat",
-                str(masks.compat),
-                "--incompat",
-                str(masks.incompat),
-                "--ro-compat",
-                str(masks.ro_compat),
-                "--mount-options",
-                _mount_options(configuration),
-            ]
-            if declared_cap is not None:
-                arguments += ["--declare-cap", str(declared_cap)]
-            result = guest.run(
-                Path("/boot/vmlinuz-linux"),
-                initramfs,
-                data,
-                log,
-                shared_root=Path("/"),
-                guest_arguments=tuple(arguments),
-                acceleration=acceleration,
-            )
-            if fatal := next((row for row in result.records if "fatal" in row), None):
-                raise guest.GuestRunError(f"guest reported a fatal certification error: {fatal}")
-            row = next(
-                (
-                    record
-                    for record in result.records
-                    if record.get("scenario") == scenario and "violations" in record
-                ),
-                None,
-            )
-            if row is None:
-                raise guest.GuestRunError("guest omitted the scenario result")
-            _validate_scenario_row(row, scenario, declared_cap)
-            if not result.records:
-                raise guest.GuestRunError("guest omitted its final summary")
-            harness = _guest_harness_evidence(result.records[-1], configuration)
-            rows.append(row)
-            final_result = result
+            with tempfile.TemporaryDirectory(prefix=f"{scenario}-", dir=work) as temporary:
+                scenario_work = Path(temporary)
+                data = build_log_image(scenario_work / "data.img", 128)
+                log = build_log_image(scenario_work / "log.img", 512)
+                arguments = [
+                    "--scenario",
+                    scenario,
+                    "--trials",
+                    str(trials),
+                    "--compat",
+                    str(masks.compat),
+                    "--incompat",
+                    str(masks.incompat),
+                    "--ro-compat",
+                    str(masks.ro_compat),
+                    "--mount-options",
+                    _mount_options(configuration),
+                ]
+                if declared_cap is not None:
+                    arguments += ["--declare-cap", str(declared_cap)]
+                result = guest.run(
+                    Path("/boot/vmlinuz-linux"),
+                    initramfs,
+                    data,
+                    log,
+                    shared_root=Path("/"),
+                    guest_arguments=tuple(arguments),
+                    acceleration=acceleration,
+                )
+                if fatal := next((row for row in result.records if "fatal" in row), None):
+                    raise guest.GuestRunError(
+                        f"guest reported a fatal certification error: {fatal}"
+                    )
+                row = next(
+                    (
+                        record
+                        for record in result.records
+                        if record.get("scenario") == scenario and "violations" in record
+                    ),
+                    None,
+                )
+                if row is None:
+                    raise guest.GuestRunError("guest omitted the scenario result")
+                _validate_scenario_row(row, scenario, declared_cap)
+                if not result.records:
+                    raise guest.GuestRunError("guest omitted its final summary")
+                harness = _guest_harness_evidence(result.records[-1], configuration)
+                rows.append(row)
+                final_result = result
         total_marks = sum(_row_count(row, "marks") for row in rows)
         total_prefixes = sum(_row_count(row, "prefixes") for row in rows)
         if output is not None:

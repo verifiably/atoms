@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -266,27 +267,28 @@ def _check_record_lands_only_after_the_complete_matrix() -> None:
         durability_features=("compat=0x1", "incompat=0x4", "ro_compat=0x2"),
     )
     encoded_configuration = json.loads(json.dumps(cli.asdict(configuration)))
-    qemu_command = (
-        "qemu-system-x86_64",
-        "-drive",
-        "file=data,cache=writeback",
-        "-drive",
-        "file=log,cache=writeback",
-    )
-
     def image(path: Path, _size: int) -> Path:
         path.touch()
         return path
 
     for corrupt_final in (False, True):
         calls: list[str] = []
+        workspaces: list[Path] = []
 
         def run_guest(
             *_args: object,
             _calls: list[str] = calls,
             _corrupt_final: bool = corrupt_final,
+            _workspaces: list[Path] = workspaces,
             **kwargs: object,
         ) -> guest.GuestResult:
+            data, log = _args[2:4]
+            assert isinstance(data, Path) and isinstance(log, Path)
+            if any(workspace.exists() for workspace in _workspaces):
+                raise AssertionError("a previous scenario workspace survived into the next guest")
+            scenario_work = data.parent
+            assert log.parent == scenario_work
+            _workspaces.append(scenario_work)
             arguments = kwargs["guest_arguments"]
             assert isinstance(arguments, tuple)
             scenario = arguments[arguments.index("--scenario") + 1]
@@ -310,15 +312,31 @@ def _check_record_lands_only_after_the_complete_matrix() -> None:
                 "mount_command": ["mount", "/dev/mapper/certify", "/volume"],
                 "log_format_version": "1",
             }
+            qemu_command = (
+                "qemu-system-x86_64",
+                "-drive",
+                f"file={data},cache=writeback",
+                "-drive",
+                f"file={log},cache=writeback",
+            )
             return guest.GuestResult(qemu_command, "", (row, final))
 
         def write_record(
-            _path: Path, *, _calls: list[str] = calls, **evidence: object
+            _path: Path,
+            *,
+            _calls: list[str] = calls,
+            _workspaces: list[Path] = workspaces,
+            **evidence: object,
         ) -> None:
             _calls.append("write")
             scenarios = evidence["scenarios"]
             if not isinstance(scenarios, list) or len(scenarios) != 9:
                 raise AssertionError("record writer did not receive all nine rows")
+            if any(workspace.exists() for workspace in _workspaces):
+                raise AssertionError("a scenario workspace survived until record writing")
+            command = evidence["qemu_command"]
+            if not isinstance(command, tuple) or os.fspath(_workspaces[-1]) not in command[2]:
+                raise AssertionError("final QEMU evidence did not survive workspace cleanup")
 
         with tempfile.TemporaryDirectory() as temporary:
             destination = Path(temporary) / "certification"
