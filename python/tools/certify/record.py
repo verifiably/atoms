@@ -17,7 +17,7 @@ _STORAGE_CONTRACT = (
 _ROW_KEYS = frozenset(
     {"scenario", "marks", "prefixes", "violations", "violation_details", "declared_cap"}
 )
-_CERTIFICATION_SCENARIOS = (
+CERTIFICATION_SCENARIOS = (
     "minimal-create",
     "minimal-replace",
     "minimal-delete",
@@ -146,7 +146,7 @@ def write(
                 "declared_cap": cap,
             }
         )
-    if tuple(names) != _CERTIFICATION_SCENARIOS:
+    if tuple(names) != CERTIFICATION_SCENARIOS:
         raise ValueError("record requires the exact certification scenarios in order")
     document = {
         "record_version": 1,
@@ -167,7 +167,7 @@ def write(
         "zero_violations": all(row["violations"] == 0 for row in rows),
     }
     _reject_floats(document)
-    Path(path).write_text(
-        json.dumps(document, ensure_ascii=True, separators=(",", ":"), sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    with Path(path).open("x", encoding="utf-8") as stream:
+        stream.write(
+            json.dumps(document, ensure_ascii=True, separators=(",", ":"), sort_keys=True) + "\n"
+        )

@@ -228,6 +228,14 @@ def _run_streaming(command: list[str], stream: TextIO) -> str:
     return serial
 
 
+def checkout_commit() -> str:
+    """Return the clean atoms checkout commit used by every guest boot."""
+    status = _run(["git", "status", "--porcelain"]).stdout
+    if status:
+        raise GuestRunError("atoms checkout must be clean before guest boot")
+    return _run(["git", "rev-parse", "HEAD"]).stdout.strip()
+
+
 def run(
     kernel: Path,
     initramfs: Path,
@@ -261,10 +269,7 @@ def run(
     )
     root_path = _qemu_path(root, "shared_root")
     checkout = _checkout_path(root)
-    status = _run(["git", "status", "--porcelain"]).stdout
-    if status:
-        raise GuestRunError("atoms checkout must be clean before guest boot")
-    commit = _run(["git", "rev-parse", "HEAD"]).stdout.strip()
+    commit = checkout_commit()
     excludes_result = subprocess.run(
         ["git", "config", "--path", "--get", "core.excludesfile"],
         check=False,

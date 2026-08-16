@@ -379,11 +379,13 @@ def _zero_device(device: Path, size: int) -> None:
         os.fsync(stream.fileno())
 
 
-def _mount_device(device: Path, mountpoint: Path, options: str) -> None:
+def _mount_device(device: Path, mountpoint: Path, options: str) -> list[str]:
     command = [_MOUNT]
     if options:
         command += ["-o", options]
-    _run([*command, os.fspath(device), os.fspath(mountpoint)])
+    command += [os.fspath(device), os.fspath(mountpoint)]
+    _run(command)
+    return command
 
 
 def _resolve_configuration(mountpoint: Path) -> VolumeConfiguration:
@@ -559,7 +561,7 @@ def run_scenario(
     masks: FeatureMasks,
     mount_options: str,
     declared_cap: int | None,
-) -> tuple[dict[str, object], VolumeConfiguration]:
+) -> tuple[dict[str, object], VolumeConfiguration, dict[str, object]]:
     """Record and exhaustively replay one scenario's completion-ordered trace."""
     from tests.exerciser import scenario, setup_clean, transact, transact_caught
 
@@ -569,7 +571,15 @@ def run_scenario(
     data_bytes = int(_run(["blockdev", "--getsize64", os.fspath(data_device)]))
     log_bytes = int(_run(["blockdev", "--getsize64", os.fspath(log_device)]))
     _zero_device(log_device, log_bytes)
-    _run(["mkfs.ext4", "-q", "-F", "-O", _mkfs_features(masks), os.fspath(data_device)])
+    mkfs_command = [
+        "mkfs.ext4",
+        "-q",
+        "-F",
+        "-O",
+        _mkfs_features(masks),
+        os.fspath(data_device),
+    ]
+    _run(mkfs_command)
 
     volume = work / "volume"
     volume.mkdir()
@@ -626,7 +636,7 @@ def run_scenario(
             minor=minor,
         )
         mapper_created = True
-        _mount_device(mapper, volume, mount_options)
+        mount_command = _mount_device(mapper, volume, mount_options)
         workload_mounted = True
         configuration = _resolve_configuration(volume)
         if configuration.durability_features != (
@@ -732,6 +742,11 @@ def run_scenario(
             "declared_cap": declared_cap,
         },
         configuration,
+        {
+            "mkfs_command": mkfs_command,
+            "mount_command": mount_command,
+            "log_format_version": str(_LOG_VERSION),
+        },
     )
 
 
@@ -791,7 +806,7 @@ def main() -> int:
             assert args.incompat is not None
             assert args.ro_compat is not None
             assert args.mount_options is not None
-            report, configuration = run_scenario(
+            report, configuration, harness = run_scenario(
                 work,
                 data_device,
                 log_device,
@@ -811,6 +826,7 @@ def main() -> int:
                     "marks": report["marks"],
                     "prefixes": report["prefixes"],
                     "declared_cap": args.declare_cap,
+                    **harness,
                 }
             )
     except Exception as caught:  # noqa: BLE001 - the serial fatal record is the boundary.

@@ -184,6 +184,178 @@ def _check_scenario_row_types_and_bonus() -> None:
         raise AssertionError("different directory inodes were tagged as §9.5")
 
 
+def _check_record_boundaries_and_guest_evidence() -> None:
+    from atoms.fs.volume import VolumeConfiguration
+
+    from . import __main__ as cli
+
+    configuration = VolumeConfiguration(
+        backend_id="linux",
+        backend_revision="linux-4",
+        kernel_identifier="test-kernel",
+        filesystem_type="ext4",
+        barrier_options=("async", "barrier=1", "data=ordered"),
+        durability_features=("compat=0x1", "incompat=0x4", "ro_compat=0x2"),
+    )
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        destination = root / "certification"
+        if cli._record_directory(destination, True, 1) != destination:
+            raise AssertionError("a new record directory was not preserved")
+        for all_scenarios, trials in ((False, 1), (True, 2)):
+            try:
+                cli._record_directory(destination, all_scenarios, trials)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("partial certification accepted --record")
+        malformed = root / "file"
+        malformed.write_text("not a directory", encoding="utf-8")
+        try:
+            cli._record_directory(malformed, True, 1)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("a record file was accepted as a destination directory")
+        output = cli._record_path(destination, configuration, "2026-08-16")
+        if output != destination / "2026-08-16-ext4-linux-test-kernel.json":
+            raise AssertionError(f"unexpected certification filename: {output}")
+        destination.mkdir()
+        output.touch()
+        try:
+            cli._record_path(destination, configuration, "2026-08-16")
+        except FileExistsError:
+            pass
+        else:
+            raise AssertionError("an existing certification record was accepted")
+
+    final = {
+        "configuration": json.loads(json.dumps(cli.asdict(configuration))),
+        "storage": "flush-honoring-disk.v1",
+        "mkfs_command": ["mkfs.ext4", "-F", "/dev/vda"],
+        "mount_command": ["/run/certify-mount", "/dev/mapper/certify", "/volume"],
+        "log_format_version": "1",
+    }
+    mkfs, mount, log_format = cli._guest_harness_evidence(final, configuration)
+    if mkfs != tuple(final["mkfs_command"]) or mount != tuple(final["mount_command"]):
+        raise AssertionError("guest commands were reconstructed instead of retained")
+    if log_format != "1":
+        raise AssertionError("guest log format changed")
+    qemu = (
+        "qemu-system-x86_64",
+        "-drive",
+        "file=data,format=raw,if=virtio,cache=writeback",
+        "-drive",
+        "file=log,format=raw,if=virtio,cache=writeback",
+    )
+    if cli._qemu_cache_mode(qemu) != "writeback":
+        raise AssertionError("QEMU cache mode was not derived from the retained command")
+
+
+def _check_record_lands_only_after_the_complete_matrix() -> None:
+    from atoms.fs.volume import VolumeConfiguration
+
+    from . import __main__ as cli
+
+    configuration = VolumeConfiguration(
+        backend_id="linux",
+        backend_revision="linux-4",
+        kernel_identifier="test-kernel",
+        filesystem_type="ext4",
+        barrier_options=("async", "barrier=1", "data=ordered"),
+        durability_features=("compat=0x1", "incompat=0x4", "ro_compat=0x2"),
+    )
+    encoded_configuration = json.loads(json.dumps(cli.asdict(configuration)))
+    qemu_command = (
+        "qemu-system-x86_64",
+        "-drive",
+        "file=data,cache=writeback",
+        "-drive",
+        "file=log,cache=writeback",
+    )
+
+    def image(path: Path, _size: int) -> Path:
+        path.touch()
+        return path
+
+    for corrupt_final in (False, True):
+        calls: list[str] = []
+
+        def run_guest(
+            *_args: object,
+            _calls: list[str] = calls,
+            _corrupt_final: bool = corrupt_final,
+            **kwargs: object,
+        ) -> guest.GuestResult:
+            arguments = kwargs["guest_arguments"]
+            assert isinstance(arguments, tuple)
+            scenario = arguments[arguments.index("--scenario") + 1]
+            assert isinstance(scenario, str)
+            _calls.append(scenario)
+            row: dict[str, object] = {
+                "scenario": scenario,
+                "marks": 1,
+                "prefixes": 2,
+                "violations": 0,
+                "violation_details": [],
+                "declared_cap": None,
+            }
+            final_configuration = encoded_configuration
+            if _corrupt_final and scenario == cli.CERTIFICATION_SCENARIOS[-1]:
+                final_configuration = encoded_configuration | {"kernel_identifier": "wrong"}
+            final = {
+                "configuration": final_configuration,
+                "storage": "flush-honoring-disk.v1",
+                "mkfs_command": ["mkfs.ext4", "-F", "/dev/vda"],
+                "mount_command": ["mount", "/dev/mapper/certify", "/volume"],
+                "log_format_version": "1",
+            }
+            return guest.GuestResult(qemu_command, "", (row, final))
+
+        def write_record(
+            _path: Path, *, _calls: list[str] = calls, **evidence: object
+        ) -> None:
+            _calls.append("write")
+            scenarios = evidence["scenarios"]
+            if not isinstance(scenarios, list) or len(scenarios) != 9:
+                raise AssertionError("record writer did not receive all nine rows")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "certification"
+            with (
+                patch.object(cli, "_target_configuration", return_value=configuration),
+                patch.object(cli.prerequisites, "check", return_value=[]),
+                patch.object(cli, "_build_guest_initramfs", return_value=Path("/initramfs")),
+                patch.object(cli, "build_log_image", side_effect=image),
+                patch.object(cli.guest, "run", side_effect=run_guest),
+                patch.object(cli.guest, "checkout_commit", return_value="clean-commit"),
+                patch.object(cli.record, "write", side_effect=write_record),
+                patch.object(cli, "_version", return_value="version"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                try:
+                    cli._run_scenarios(
+                        cli.CERTIFICATION_SCENARIOS,
+                        1,
+                        Path("/target"),
+                        None,
+                        "kvm",
+                        destination,
+                    )
+                except guest.GuestRunError:
+                    if not corrupt_final:
+                        raise
+                else:
+                    if corrupt_final:
+                        raise AssertionError("a wrong final guest configuration was accepted")
+            expected = list(cli.CERTIFICATION_SCENARIOS)
+            if corrupt_final:
+                if calls != expected or destination.exists():
+                    raise AssertionError("failed evidence created a record destination")
+            elif calls != [*expected, "write"] or not destination.is_dir():
+                raise AssertionError(f"record was not written last: {calls}")
+
+
 def _check_qemu_failure_ownership() -> None:
     class Process:
         def __init__(self, returncode: int) -> None:
@@ -246,6 +418,8 @@ def run() -> int:
         ("scenario selection and declared prefix cap", _check_scenario_selection_and_cap),
         ("acceleration argv and serial parsing", _check_acceleration_and_serial_parsing),
         ("scenario row types and §9.5 bonus detection", _check_scenario_row_types_and_bonus),
+        ("record boundaries and exact guest evidence", _check_record_boundaries_and_guest_evidence),
+        ("record lands only after the complete matrix", _check_record_lands_only_after_the_complete_matrix),
         ("QEMU failure terminates and reaps", _check_qemu_failure_ownership),
     )
     for name, check in checks:

@@ -267,6 +267,43 @@ def test_writer_emits_the_exact_canonical_record(tmp_path: Path) -> None:
     ) + "\n"
 
 
+def test_writer_refuses_to_replace_an_existing_record(tmp_path: Path) -> None:
+    output = tmp_path / "record.json"
+    assert _run_writer(output).returncode == 0
+    original = output.read_bytes()
+
+    result = _run_writer(output)
+    assert result.returncode != 0
+    assert "FileExistsError" in result.stderr
+    assert output.read_bytes() == original
+
+
+def test_record_cli_refuses_non_matrix_and_non_directory_destinations(tmp_path: Path) -> None:
+    file = tmp_path / "not-a-directory"
+    file.write_text("sentinel", encoding="utf-8")
+    commands = (
+        (
+            "run",
+            "--scenario",
+            "minimal-create",
+            "--record",
+            str(tmp_path),
+        ),
+        ("run", "--all", "--record", str(file)),
+        ("check", "--record", str(tmp_path)),
+    )
+    for command in commands:
+        result = subprocess.run(
+            [sys.executable, "-m", "tools.certify", *command],
+            check=False,
+            cwd=ROOT / "python",
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode != 0
+        assert "--record" in result.stderr
+
+
 def test_writer_refuses_floats(tmp_path: Path) -> None:
     output = tmp_path / "record.json"
     result = _run_writer(output, marks="1.5")

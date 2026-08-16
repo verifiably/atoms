@@ -8,6 +8,7 @@ import json
 import os
 import tempfile
 from dataclasses import asdict
+from datetime import datetime as DateTime
 from pathlib import Path
 
 from atoms.fs.volume import (
@@ -19,23 +20,14 @@ from atoms.fs.volume import (
     resolve_mount_entry,
 )
 
-from . import guest, prerequisites
+from . import guest, prerequisites, record
 from .images import build_log_image
-from .replay import ensure_replay_log
+from .record import CERTIFICATION_SCENARIOS
+from .replay import XFS_TESTS_COMMIT, ensure_replay_log
 
 _PYTHON_ROOT = Path(__file__).resolve().parents[2]
 _REPOSITORY_ROOT = _PYTHON_ROOT.parent
-CERTIFICATION_SCENARIOS = (
-    "minimal-create",
-    "minimal-replace",
-    "minimal-delete",
-    "minimal-move",
-    "minimal-mkdir",
-    "corpus-write",
-    "archive-move",
-    "caught-rollback",
-    "caught-rollback-move",
-)
+_STORAGE_ID = "flush-honoring-disk.v1"
 
 
 def _digest(path: Path) -> str:
@@ -51,6 +43,80 @@ def _target_configuration(path: Path) -> VolumeConfiguration:
         return build_configuration(entry, kernel_identifier(), directory_fd=descriptor)
     finally:
         os.close(descriptor)
+
+
+def _record_directory(destination: Path, all_scenarios: bool, trials: int) -> Path:
+    if not all_scenarios or trials != 1:
+        raise ValueError("--record requires run --all with exactly one trial")
+    path = destination if destination.is_absolute() else _REPOSITORY_ROOT / destination
+    path = path.resolve()
+    if path.exists():
+        if not path.is_dir():
+            raise ValueError(f"--record destination is not a directory: {path}")
+    elif not path.parent.is_dir():
+        raise ValueError(f"--record destination parent is not a directory: {path.parent}")
+    return path
+
+
+def _record_path(
+    directory: Path, configuration: VolumeConfiguration, certification_date: str
+) -> Path:
+    if configuration.filesystem_type != "ext4" or configuration.backend_id != "linux":
+        raise ValueError("certification records require the ext4 Linux backend")
+    kernel = configuration.kernel_identifier
+    if not kernel or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._+-" for character in kernel):
+        raise ValueError(f"kernel identifier is unsafe for a record filename: {kernel!r}")
+    output = directory / f"{certification_date}-ext4-linux-{kernel}.json"
+    if output.exists():
+        raise FileExistsError(f"certification record already exists: {output}")
+    return output
+
+
+def _string_vector(value: object, label: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or not value or not all(isinstance(item, str) and item for item in value):
+        raise guest.GuestRunError(f"guest reported invalid {label}")
+    return tuple(value)
+
+
+def _guest_harness_evidence(
+    final: dict[str, object], configuration: VolumeConfiguration
+) -> tuple[tuple[str, ...], tuple[str, ...], str]:
+    expected = json.loads(json.dumps(asdict(configuration)))
+    if final.get("configuration") != expected:
+        raise guest.GuestRunError("guest configuration does not equal the selected target")
+    if final.get("storage") != _STORAGE_ID:
+        raise guest.GuestRunError("guest storage profile does not equal the certification profile")
+    log_format = final.get("log_format_version")
+    if log_format != "1":
+        raise guest.GuestRunError(f"guest reported invalid log format: {log_format!r}")
+    assert isinstance(log_format, str)
+    return (
+        _string_vector(final.get("mkfs_command"), "mkfs command"),
+        _string_vector(final.get("mount_command"), "mount command"),
+        log_format,
+    )
+
+
+def _qemu_cache_mode(command: tuple[str, ...]) -> str:
+    drives = [command[index + 1] for index, value in enumerate(command[:-1]) if value == "-drive"]
+    if len(drives) != 2:
+        raise guest.GuestRunError("retained QEMU command does not contain exactly two drives")
+    modes = {
+        field.removeprefix("cache=")
+        for drive in drives
+        for field in drive.split(",")
+        if field.startswith("cache=")
+    }
+    if len(modes) != 1 or any("cache=" not in drive for drive in drives):
+        raise guest.GuestRunError("retained QEMU drives do not share one explicit cache mode")
+    return modes.pop()
+
+
+def _version(command: list[str]) -> str:
+    lines = guest._run(command).stdout.splitlines()
+    if not lines or not lines[0]:
+        raise RuntimeError(f"{command[0]} returned no version")
+    return lines[0]
 
 
 def _feature_masks(configuration: VolumeConfiguration) -> FeatureMasks:
@@ -153,6 +219,7 @@ def _run_scenarios(
     target: Path,
     declared_cap: int | None,
     acceleration: str,
+    record_directory: Path | None = None,
 ) -> int:
     if trials != 1:
         raise ValueError("certification supports exactly one trial")
@@ -160,17 +227,26 @@ def _run_scenarios(
         not isinstance(declared_cap, int) or isinstance(declared_cap, bool) or declared_cap <= 0
     ):
         raise ValueError("--declare-cap must be a positive integer")
-    missing = prerequisites.check()
-    if missing:
-        raise RuntimeError(f"missing certification prerequisites: {', '.join(missing)}")
     configuration = _target_configuration(target)
     if configuration.filesystem_type != "ext4":
         raise RuntimeError(f"certification target is not ext4: {configuration.filesystem_type}")
+    certification_date = DateTime.now().astimezone().date().isoformat()
+    output = (
+        _record_path(record_directory, configuration, certification_date)
+        if record_directory is not None
+        else None
+    )
+    atoms_commit = guest.checkout_commit() if output is not None else None
+    missing = prerequisites.check()
+    if missing:
+        raise RuntimeError(f"missing certification prerequisites: {', '.join(missing)}")
     masks = _feature_masks(configuration)
     with tempfile.TemporaryDirectory(prefix="atoms-certify-host-") as temporary:
         work = Path(temporary)
         initramfs = _build_guest_initramfs(work)
         rows: list[dict[str, object]] = []
+        final_result: guest.GuestResult | None = None
+        harness: tuple[tuple[str, ...], tuple[str, ...], str] | None = None
         for scenario in scenarios:
             scenario_work = work / scenario
             scenario_work.mkdir()
@@ -214,21 +290,59 @@ def _run_scenarios(
             if row is None:
                 raise guest.GuestRunError("guest omitted the scenario result")
             _validate_scenario_row(row, scenario, declared_cap)
-            expected = json.loads(json.dumps(asdict(configuration)))
-            if not result.records or result.records[-1].get("configuration") != expected:
-                raise guest.GuestRunError("guest configuration does not equal the selected target")
+            if not result.records:
+                raise guest.GuestRunError("guest omitted its final summary")
+            harness = _guest_harness_evidence(result.records[-1], configuration)
             rows.append(row)
+            final_result = result
         total_marks = sum(_row_count(row, "marks") for row in rows)
         total_prefixes = sum(_row_count(row, "prefixes") for row in rows)
+        if output is not None:
+            if scenarios != CERTIFICATION_SCENARIOS or len(rows) != len(CERTIFICATION_SCENARIOS):
+                raise guest.GuestRunError("recording requires the exact certification matrix")
+            assert (
+                record_directory is not None
+                and final_result is not None
+                and harness is not None
+                and atoms_commit is not None
+            )
+            if guest.checkout_commit() != atoms_commit:
+                raise guest.GuestRunError("atoms checkout changed during certification")
+            if not record_directory.exists():
+                record_directory.mkdir()
+            if not record_directory.is_dir():
+                raise ValueError(f"--record destination is not a directory: {record_directory}")
+            _record_path(record_directory, configuration, certification_date)
+            mkfs_command, mount_command, log_format = harness
+            record.write(
+                output,
+                configuration=configuration,
+                storage_id=_STORAGE_ID,
+                qemu_command=final_result.command,
+                cache_mode=_qemu_cache_mode(final_result.command),
+                mkfs_command=mkfs_command,
+                mount_command=mount_command,
+                versions={
+                    "qemu": _version(["qemu-system-x86_64", "--version"]),
+                    "e2fsprogs": _version(["mkfs.ext4", "-V"]),
+                },
+                replay_log_commit=XFS_TESTS_COMMIT,
+                log_format=log_format,
+                kernel=configuration.kernel_identifier,
+                atoms_commit=atoms_commit,
+                scenarios=rows,
+                date=certification_date,
+            )
         print(
             "CERTIFY-JSON:"
             + json.dumps(
                 {
                     "configuration": json.loads(json.dumps(asdict(configuration))),
-                    "storage": "flush-honoring-disk.v1",
+                    "storage": _STORAGE_ID,
                     "scenarios": rows,
                     "total_marks": total_marks,
                     "total_prefixes": total_prefixes,
+                    **({"record": os.fspath(output)} if output is not None else {}),
                 },
                 ensure_ascii=True,
                 sort_keys=True,
@@ -241,15 +355,26 @@ def _run_scenarios(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "command", choices=("check", "build-replay", "self-check", "self-test", "run")
+        "command", choices=("check", "build-replay", "self-check", "self-test", "target", "run")
     )
+    parser.add_argument("path", nargs="?", type=Path)
     parser.add_argument("--scenario")
     parser.add_argument("--all", action="store_true", dest="all_scenarios")
     parser.add_argument("--trials", type=int, default=1)
     parser.add_argument("--target", type=Path, default=_REPOSITORY_ROOT)
+    parser.add_argument("--record", type=Path)
     parser.add_argument("--declare-cap", type=int)
     parser.add_argument("--accel", choices=("tcg", "kvm"), default="tcg")
     args = parser.parse_args()
+    if args.record is not None and args.command != "run":
+        parser.error("--record is accepted only by run")
+    if args.command == "target":
+        if args.path is None:
+            parser.error("target requires a path")
+        print(json.dumps(asdict(_target_configuration(args.path)), ensure_ascii=True, sort_keys=True))
+        return 0
+    if args.path is not None:
+        parser.error(f"{args.command} does not accept a positional path")
     if args.command == "build-replay":
         print(ensure_replay_log(Path(__file__).resolve().parents[2] / ".certify"))
         return 0
@@ -260,12 +385,18 @@ def main() -> int:
     if args.command == "self-test":
         return _self_test(args.accel)
     if args.command == "run":
+        record_directory = (
+            _record_directory(args.record, args.all_scenarios, args.trials)
+            if args.record is not None
+            else None
+        )
         return _run_scenarios(
             _selected_scenarios(args.scenario, args.all_scenarios),
             args.trials,
             args.target,
             args.declare_cap,
             args.accel,
+            record_directory,
         )
 
     missing = prerequisites.check()
