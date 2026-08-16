@@ -41,25 +41,8 @@ def _run(command: list[str], *, env: dict[str, str] | None = None) -> subprocess
     return result
 
 
-def build_initramfs(work: Path) -> Path:
-    """Build the base-hook initramfs that starts the shared-root guest driver."""
-    workspace = Path(work)
-    if workspace.exists() and not workspace.is_dir():
-        raise ValueError(f"work path is not a directory: {workspace}")
-    workspace.mkdir(parents=True, exist_ok=True)
-    hookdir = workspace / "initcpio"
-    install = hookdir / "install"
-    install.mkdir(parents=True, exist_ok=True)
-    base = install / "base"
-    if not base.exists():
-        base.symlink_to("/usr/lib/initcpio/install/base")
-    elif not base.is_symlink() or base.readlink() != Path("/usr/lib/initcpio/install/base"):
-        raise ValueError(f"unexpected base hook at {base}")
-    init = workspace / "certify-init"
-    python = Path(sys.executable)
-    if not python.is_absolute() or not python.is_file():
-        raise ValueError(f"Python executable is not an absolute regular file: {python}")
-    init.write_text(
+def _init_script(python: Path) -> str:
+    return (
         """#!/bin/sh
 set -eu
 mount -t proc proc /proc
@@ -87,9 +70,45 @@ mount --bind /run /root9p/run
 mount -t tmpfs tmpfs /root9p/tmp
 exec chroot /root9p /bin/sh -c 'cd "$1/python" && exec "$2" -m tools.certify.guest_init' sh "$checkout" """
         + shlex.quote(os.fspath(python))
-        + "\n",
-        encoding="utf-8",
+        + "\n"
     )
+
+
+def _check_init_contract(script: str) -> None:
+    mount = "cp /usr/bin/mount /run/certify-mount"
+    umount = "cp /usr/bin/umount /run/certify-umount"
+    try:
+        run_index = script.index("mount -t tmpfs tmpfs /run")
+        mount_index = script.index(mount)
+        umount_index = script.index(umount)
+        bind_index = script.index("mount --bind /run /root9p/run")
+    except ValueError as caught:
+        raise GuestRunError("generated init omits the privileged mount-tool contract") from caught
+    if not run_index < mount_index < umount_index < bind_index:
+        raise GuestRunError("generated init orders the privileged mount-tool contract incorrectly")
+
+
+def build_initramfs(work: Path) -> Path:
+    """Build the base-hook initramfs that starts the shared-root guest driver."""
+    workspace = Path(work)
+    if workspace.exists() and not workspace.is_dir():
+        raise ValueError(f"work path is not a directory: {workspace}")
+    workspace.mkdir(parents=True, exist_ok=True)
+    hookdir = workspace / "initcpio"
+    install = hookdir / "install"
+    install.mkdir(parents=True, exist_ok=True)
+    base = install / "base"
+    if not base.exists():
+        base.symlink_to("/usr/lib/initcpio/install/base")
+    elif not base.is_symlink() or base.readlink() != Path("/usr/lib/initcpio/install/base"):
+        raise ValueError(f"unexpected base hook at {base}")
+    init = workspace / "certify-init"
+    python = Path(sys.executable)
+    if not python.is_absolute() or not python.is_file():
+        raise ValueError(f"Python executable is not an absolute regular file: {python}")
+    script = _init_script(python)
+    _check_init_contract(script)
+    init.write_text(script, encoding="utf-8")
     init.chmod(0o755)
     (install / "certify").write_text(
         """build() {

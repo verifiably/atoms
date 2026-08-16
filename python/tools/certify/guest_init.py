@@ -188,23 +188,17 @@ def replay_self_verification(work: Path) -> None:
 def _replay_self_verification(work: Path, data_device: Path, log_device: Path) -> None:
     sectors = _run(["blockdev", "--getsz", os.fspath(data_device)])
     name = "certify-self-test"
-    mapper = Path("/dev/mapper") / name
-    _run(
-        [
-            "dmsetup",
-            "create",
-            name,
-            "--table",
-            f"0 {sectors} log-writes {data_device} {log_device}",
-        ]
-    )
-    _run(["dmsetup", "mknodes", name])
-    if not mapper.is_block_device():
-        raise RuntimeError(f"dmsetup did not create a block device at {mapper}")
     baseline = work / "self-test-baseline.img"
     mountpoint = work / "self-test-mount"
     mountpoint.mkdir()
+    mapper_created = False
+    mounted = False
     try:
+        mapper = _create_mapper(
+            name,
+            f"0 {sectors} log-writes {data_device} {log_device}",
+        )
+        mapper_created = True
         _run(["mkfs.ext4", "-q", "-F", "-O", "^fast_commit,^orphan_file", os.fspath(mapper)])
         _run(["dmsetup", "message", name, "0", "mark", "baseline"])
         _run(["blockdev", "--flushbufs", os.fspath(mapper)])
@@ -218,15 +212,18 @@ def _replay_self_verification(work: Path, data_device: Path, log_device: Path) -
             ]
         )
         _run([_MOUNT, os.fspath(mapper), os.fspath(mountpoint)])
+        mounted = True
         _write_pattern(mountpoint, "first", b"first-pattern")
         _run(["dmsetup", "message", name, "0", "mark", "first"])
         _write_pattern(mountpoint, "second", b"second-pattern")
         _run(["dmsetup", "message", name, "0", "mark", "second"])
         _run([_UMOUNT, os.fspath(mountpoint)])
+        mounted = False
     finally:
-        if mapper.exists():
-            subprocess.run([_UMOUNT, os.fspath(mountpoint)], check=False, capture_output=True)
-            subprocess.run(["dmsetup", "remove", name], check=False, capture_output=True)
+        if mounted:
+            _run([_UMOUNT, os.fspath(mountpoint)])
+        if mapper_created:
+            _remove_mapper(name)
 
     expected = {
         "baseline": (None, None),
@@ -302,11 +299,15 @@ def _create_mapper(
     elif major is not None or minor is not None:
         raise ValueError("mapper major and minor must be specified together")
     _run(command)
-    _run(["dmsetup", "mknodes", name])
-    mapper = Path("/dev/mapper") / name
-    if not mapper.is_block_device():
-        raise RuntimeError(f"dmsetup did not create a block device at {mapper}")
-    return mapper
+    try:
+        _run(["dmsetup", "mknodes", name])
+        mapper = Path("/dev/mapper") / name
+        if not mapper.is_block_device():
+            raise RuntimeError(f"dmsetup did not create a block device at {mapper}")
+        return mapper
+    except Exception:
+        _remove_mapper(name)
+        raise
 
 
 def _remove_mapper(name: str) -> None:
@@ -520,24 +521,30 @@ def run_scenario(
     volume.mkdir()
     sectors = _run(["blockdev", "--getsz", os.fspath(data_device)])
     mapper_name = "certify"
-    mapper = _create_mapper(
-        mapper_name,
-        f"0 {sectors} log-writes {data_device} {log_device}",
-    )
-    device_number = mapper.stat().st_rdev
-    major, minor = os.major(device_number), os.minor(device_number)
-    _mount_device(mapper, volume, mount_options)
-    project = volume / "project"
-    project.mkdir()
-    metadata = volume / "metadata"
-    storage = StorageProfile(profile_id="flush-honoring-disk.v1")
-    ingredients = (LinuxBackend(), str(project), str(metadata), storage)
     monkeypatch = pytest.MonkeyPatch()
+    mapper_created = False
+    mounted = False
     try:
+        mapper = _create_mapper(
+            mapper_name,
+            f"0 {sectors} log-writes {data_device} {log_device}",
+        )
+        mapper_created = True
+        device_number = mapper.stat().st_rdev
+        major, minor = os.major(device_number), os.minor(device_number)
+        _mount_device(mapper, volume, mount_options)
+        mounted = True
+        project = volume / "project"
+        project.mkdir()
+        metadata = volume / "metadata"
+        storage = StorageProfile(profile_id="flush-honoring-disk.v1")
+        ingredients = (LinuxBackend(), str(project), str(metadata), storage)
         setup_clean(entry, ingredients, monkeypatch)
     finally:
-        _run([_UMOUNT, os.fspath(volume)])
-        _remove_mapper(mapper_name)
+        if mounted:
+            _run([_UMOUNT, os.fspath(volume)])
+        if mapper_created:
+            _remove_mapper(mapper_name)
 
     _zero_device(log_device, log_bytes)
 
@@ -553,14 +560,16 @@ def run_scenario(
         sink.flush()
         os.fsync(sink.fileno())
 
-    mapper = _create_mapper(
-        mapper_name,
-        f"0 {sectors} log-writes {data_device} {log_device}",
-        major=major,
-        minor=minor,
-    )
+    mapper_created = False
     workload_mounted = False
     try:
+        mapper = _create_mapper(
+            mapper_name,
+            f"0 {sectors} log-writes {data_device} {log_device}",
+            major=major,
+            minor=minor,
+        )
+        mapper_created = True
         _mount_device(mapper, volume, mount_options)
         workload_mounted = True
         configuration = _resolve_configuration(volume)
@@ -579,7 +588,8 @@ def run_scenario(
         monkeypatch.undo()
         if workload_mounted:
             _run([_UMOUNT, os.fspath(volume)])
-        _remove_mapper(mapper_name)
+        if mapper_created:
+            _remove_mapper(mapper_name)
 
     flags = _log_entries(log_device)
     violations: list[str] = []

@@ -68,13 +68,18 @@ def _mount_options(configuration: VolumeConfiguration) -> str:
     return ",".join(options)
 
 
+def _build_guest_initramfs(work: Path) -> Path:
+    ensure_replay_log(_PYTHON_ROOT / ".certify")
+    return guest.build_initramfs(work / "init")
+
+
 def _self_test() -> int:
     missing = prerequisites.check()
     if missing:
         raise RuntimeError(f"missing certification prerequisites: {', '.join(missing)}")
     with tempfile.TemporaryDirectory(prefix="atoms-certify-host-") as temporary:
         work = Path(temporary)
-        initramfs = guest.build_initramfs(work / "init")
+        initramfs = _build_guest_initramfs(work)
         data = build_log_image(work / "data.img", 8)
         log = build_log_image(work / "log.img", 8)
         before = (_digest(data), _digest(log))
@@ -108,7 +113,7 @@ def _run_scenario(scenario: str, trials: int, target: Path) -> int:
     masks = _feature_masks(configuration)
     with tempfile.TemporaryDirectory(prefix="atoms-certify-host-") as temporary:
         work = Path(temporary)
-        initramfs = guest.build_initramfs(work / "init")
+        initramfs = _build_guest_initramfs(work)
         data = build_log_image(work / "data.img", 128)
         log = build_log_image(work / "log.img", 512)
         result = guest.run(
@@ -143,7 +148,9 @@ def _run_scenario(scenario: str, trials: int, target: Path) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("check", "build-replay", "self-test", "run"))
+    parser.add_argument(
+        "command", choices=("check", "build-replay", "self-check", "self-test", "run")
+    )
     parser.add_argument("--scenario")
     parser.add_argument("--trials", type=int, default=1)
     parser.add_argument("--target", type=Path, default=_REPOSITORY_ROOT)
@@ -151,6 +158,10 @@ def main() -> int:
     if args.command == "build-replay":
         print(ensure_replay_log(Path(__file__).resolve().parents[2] / ".certify"))
         return 0
+    if args.command == "self-check":
+        from .self_check import run
+
+        return run()
     if args.command == "self-test":
         return _self_test()
     if args.command == "run":

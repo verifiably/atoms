@@ -39,6 +39,9 @@ def ensure_replay_log(work: Path) -> Path:
     actual = _run(["git", "rev-parse", "HEAD"], cwd=source)
     if actual != XFS_TESTS_COMMIT:
         raise RuntimeError(f"xfstests checkout is {actual}, expected {XFS_TESTS_COMMIT}")
+    status = _run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=source)
+    if status:
+        raise RuntimeError(f"xfstests checkout has tracked modifications:\n{status}")
 
     output = workspace / "replay-log"
     temporary = workspace / "replay-log.tmp"
