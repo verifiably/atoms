@@ -177,11 +177,13 @@ def replay_self_verification(work: Path) -> None:
         with image.open("wb") as stream:
             stream.truncate(size_mib * 1024 * 1024)
     data_device = Path(_run(["losetup", "--find", "--show", os.fspath(scratch_data)]))
-    log_device = Path(_run(["losetup", "--find", "--show", os.fspath(scratch_log)]))
     try:
-        _replay_self_verification(work, data_device, log_device)
+        log_device = Path(_run(["losetup", "--find", "--show", os.fspath(scratch_log)]))
+        try:
+            _replay_self_verification(work, data_device, log_device)
+        finally:
+            _run(["losetup", "--detach", os.fspath(log_device)])
     finally:
-        _run(["losetup", "--detach", os.fspath(log_device)])
         _run(["losetup", "--detach", os.fspath(data_device)])
 
 
@@ -589,13 +591,15 @@ def run_scenario(
             raise RuntimeError(f"clean scenario returned {outcome.outcome.name}")
         _run(["dmsetup", "message", mapper_name, "0", "mark", "scenario-end"])
     finally:
-        monkeypatch.undo()
         try:
-            if workload_mounted:
-                _run([_UMOUNT, os.fspath(volume)])
+            monkeypatch.undo()
         finally:
-            if mapper_created:
-                _remove_mapper(mapper_name)
+            try:
+                if workload_mounted:
+                    _run([_UMOUNT, os.fspath(volume)])
+            finally:
+                if mapper_created:
+                    _remove_mapper(mapper_name)
 
     flags = _log_entries(log_device)
     violations: list[str] = []
