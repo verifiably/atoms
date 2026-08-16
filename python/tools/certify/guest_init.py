@@ -59,6 +59,20 @@ def _emit(document: dict[str, object]) -> None:
     print(f"CERTIFY-JSON:{json.dumps(document, ensure_ascii=True, sort_keys=True)}", flush=True)
 
 
+def _debug_volume_references(volume: Path) -> None:
+    prefix = os.fspath(volume)
+    references: dict[str, str] = {}
+    for descriptor in Path("/proc/self/fd").iterdir():
+        try:
+            target = os.readlink(descriptor)
+        except FileNotFoundError:
+            continue
+        if target.startswith(prefix):
+            references[descriptor.name] = target
+    mounts = [line for line in read_mountinfo().splitlines() if prefix in line]
+    _emit({"debug_volume": {"cwd": os.getcwd(), "fds": references, "mounts": mounts}})
+
+
 def _cmdline() -> dict[str, str]:
     values: dict[str, str] = {}
     for parameter in Path("/proc/cmdline").read_text(encoding="ascii").split():
@@ -652,6 +666,8 @@ def run_scenario(
         finally:
             try:
                 if workload_mounted:
+                    if entry.family == "rollback":
+                        _debug_volume_references(volume)
                     _run([_UMOUNT, os.fspath(volume)])
             finally:
                 if mapper_created:
