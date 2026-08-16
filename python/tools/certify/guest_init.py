@@ -13,7 +13,6 @@ import struct
 import subprocess
 import sys
 import tempfile
-import traceback
 from dataclasses import asdict
 from pathlib import Path
 
@@ -57,20 +56,6 @@ def _run(command: list[str]) -> str:
 
 def _emit(document: dict[str, object]) -> None:
     print(f"CERTIFY-JSON:{json.dumps(document, ensure_ascii=True, sort_keys=True)}", flush=True)
-
-
-def _debug_volume_references(volume: Path) -> None:
-    prefix = os.fspath(volume)
-    references: dict[str, str] = {}
-    for descriptor in Path("/proc/self/fd").iterdir():
-        try:
-            target = os.readlink(descriptor)
-        except FileNotFoundError:
-            continue
-        if target.startswith(prefix):
-            references[descriptor.name] = target
-    mounts = [line for line in read_mountinfo().splitlines() if prefix in line]
-    _emit({"debug_volume": {"cwd": os.getcwd(), "fds": references, "mounts": mounts}})
 
 
 def _cmdline() -> dict[str, str]:
@@ -666,8 +651,6 @@ def run_scenario(
         finally:
             try:
                 if workload_mounted:
-                    if entry.family == "rollback":
-                        _debug_volume_references(volume)
                     _run([_UMOUNT, os.fspath(volume)])
             finally:
                 if mapper_created:
@@ -830,13 +813,8 @@ def main() -> int:
                     "declared_cap": args.declare_cap,
                 }
             )
-    except Exception:  # noqa: BLE001 - the serial fatal record is the boundary.
-        _emit(
-            {
-                "fatal": "self-test" if args.self_test else "workload",
-                "detail": traceback.format_exc(),
-            }
-        )
+    except Exception as caught:  # noqa: BLE001 - the serial fatal record is the boundary.
+        _emit({"fatal": "self-test" if args.self_test else "workload", "detail": str(caught)})
         return 1
     return 0
 

@@ -35,6 +35,32 @@ def test_caught_rollback_completes_durably_then_propagates(coordinator_on, monke
     assert projection["active"] is False
 
 
+def test_latest_txid_closes_its_sqlite_connection(tmp_path):
+    import os
+    import sqlite3
+    from pathlib import Path
+
+    from tests.exerciser import _latest_txid
+
+    database = tmp_path / "atoms.db"
+    connection = sqlite3.connect(database)
+    connection.execute("CREATE TABLE transaction_record (txid TEXT)")
+    connection.execute("INSERT INTO transaction_record VALUES ('tx')")
+    connection.commit()
+    connection.close()
+
+    assert _latest_txid(str(tmp_path)) == "tx"
+    references = []
+    for descriptor in Path("/proc/self/fd").iterdir():
+        try:
+            target = os.readlink(descriptor)
+        except FileNotFoundError:
+            continue
+        if target.startswith(str(tmp_path)):
+            references.append(target)
+    assert references == []
+
+
 def test_clean_and_caught_whole_cell_subprocess_placement(exerciser_child):
     """Design §6's whole-cell placement: setup, transaction, and projection in a child.
 

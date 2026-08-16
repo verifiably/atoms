@@ -296,8 +296,9 @@ def run_refused(entry: Scenario, ingredients, monkeypatch):
 
 def _latest_txid(metadata_root: str) -> str:
     import sqlite3
+    from contextlib import closing
 
-    with sqlite3.connect(Path(metadata_root) / "atoms.db") as connection:
+    with closing(sqlite3.connect(Path(metadata_root) / "atoms.db")) as connection:
         return connection.execute(
             "SELECT txid FROM transaction_record ORDER BY rowid DESC LIMIT 1"
         ).fetchone()[0]
