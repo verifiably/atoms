@@ -25,6 +25,17 @@ from .replay import ensure_replay_log
 
 _PYTHON_ROOT = Path(__file__).resolve().parents[2]
 _REPOSITORY_ROOT = _PYTHON_ROOT.parent
+CERTIFICATION_SCENARIOS = (
+    "minimal-create",
+    "minimal-replace",
+    "minimal-delete",
+    "minimal-move",
+    "minimal-mkdir",
+    "corpus-write",
+    "archive-move",
+    "caught-rollback",
+    "caught-rollback-move",
+)
 
 
 def _digest(path: Path) -> str:
@@ -73,7 +84,7 @@ def _build_guest_initramfs(work: Path) -> Path:
     return guest.build_initramfs(work / "init")
 
 
-def _self_test() -> int:
+def _self_test(acceleration: str) -> int:
     missing = prerequisites.check()
     if missing:
         raise RuntimeError(f"missing certification prerequisites: {', '.join(missing)}")
@@ -90,8 +101,8 @@ def _self_test() -> int:
             log,
             shared_root=Path("/"),
             guest_arguments=("--self-test",),
+            acceleration=acceleration,
         )
-        print(result.serial, end="")
         if not result.records or result.records[-1] != {"self_test": "ok"}:
             raise guest.GuestRunError("guest did not report a successful self-test")
         if (_digest(data), _digest(log)) != before:
@@ -99,11 +110,35 @@ def _self_test() -> int:
     return 0
 
 
-def _run_scenario(scenario: str, trials: int, target: Path) -> int:
-    if not scenario:
-        raise ValueError("--scenario is required")
+def _selected_scenarios(scenario: str | None, all_scenarios: bool) -> tuple[str, ...]:
+    if (scenario is None) == (not all_scenarios):
+        raise ValueError("run requires exactly one of --scenario or --all")
+    if all_scenarios:
+        return CERTIFICATION_SCENARIOS
+    assert scenario is not None
+    if scenario not in CERTIFICATION_SCENARIOS:
+        raise ValueError(f"scenario is not certifiable: {scenario}")
+    return (scenario,)
+
+
+def _row_count(row: dict[str, object], field: str) -> int:
+    value = row.get(field)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise guest.GuestRunError(f"scenario reported invalid {field}: {value!r}")
+    return value
+
+
+def _run_scenarios(
+    scenarios: tuple[str, ...],
+    trials: int,
+    target: Path,
+    declared_cap: int | None,
+    acceleration: str,
+) -> int:
     if trials != 1:
-        raise ValueError("Task 3 supports exactly one trial")
+        raise ValueError("certification supports exactly one trial")
+    if declared_cap is not None and declared_cap <= 0:
+        raise ValueError("--declare-cap must be a positive integer")
     missing = prerequisites.check()
     if missing:
         raise RuntimeError(f"missing certification prerequisites: {', '.join(missing)}")
@@ -114,15 +149,13 @@ def _run_scenario(scenario: str, trials: int, target: Path) -> int:
     with tempfile.TemporaryDirectory(prefix="atoms-certify-host-") as temporary:
         work = Path(temporary)
         initramfs = _build_guest_initramfs(work)
-        data = build_log_image(work / "data.img", 128)
-        log = build_log_image(work / "log.img", 512)
-        result = guest.run(
-            Path("/boot/vmlinuz-linux"),
-            initramfs,
-            data,
-            log,
-            shared_root=Path("/"),
-            guest_arguments=(
+        rows: list[dict[str, object]] = []
+        for scenario in scenarios:
+            scenario_work = work / scenario
+            scenario_work.mkdir()
+            data = build_log_image(scenario_work / "data.img", 128)
+            log = build_log_image(scenario_work / "log.img", 512)
+            arguments = [
                 "--scenario",
                 scenario,
                 "--trials",
@@ -135,14 +168,53 @@ def _run_scenario(scenario: str, trials: int, target: Path) -> int:
                 str(masks.ro_compat),
                 "--mount-options",
                 _mount_options(configuration),
+            ]
+            if declared_cap is not None:
+                arguments += ["--declare-cap", str(declared_cap)]
+            result = guest.run(
+                Path("/boot/vmlinuz-linux"),
+                initramfs,
+                data,
+                log,
+                shared_root=Path("/"),
+                guest_arguments=tuple(arguments),
+                acceleration=acceleration,
+            )
+            if fatal := next((row for row in result.records if "fatal" in row), None):
+                raise guest.GuestRunError(f"guest reported a fatal certification error: {fatal}")
+            row = next(
+                (
+                    record
+                    for record in result.records
+                    if record.get("scenario") == scenario and "violations" in record
+                ),
+                None,
+            )
+            if row is None or row.get("violations") != 0:
+                raise guest.GuestRunError(f"scenario did not report zero violations: {row}")
+            if row.get("declared_cap") != declared_cap:
+                raise guest.GuestRunError("guest did not preserve the declared prefix cap")
+            expected = json.loads(json.dumps(asdict(configuration)))
+            if not result.records or result.records[-1].get("configuration") != expected:
+                raise guest.GuestRunError("guest configuration does not equal the selected target")
+            rows.append(row)
+        total_marks = sum(_row_count(row, "marks") for row in rows)
+        total_prefixes = sum(_row_count(row, "prefixes") for row in rows)
+        print(
+            "CERTIFY-JSON:"
+            + json.dumps(
+                {
+                    "configuration": json.loads(json.dumps(asdict(configuration))),
+                    "storage": "flush-honoring-disk.v1",
+                    "scenarios": rows,
+                    "total_marks": total_marks,
+                    "total_prefixes": total_prefixes,
+                },
+                ensure_ascii=True,
+                sort_keys=True,
             ),
+            flush=True,
         )
-        print(result.serial, end="")
-        if any("fatal" in record for record in result.records):
-            raise guest.GuestRunError("guest reported a fatal certification error")
-        expected = json.loads(json.dumps(asdict(configuration)))
-        if not result.records or result.records[-1].get("configuration") != expected:
-            raise guest.GuestRunError("guest configuration does not equal the selected target")
     return 0
 
 
@@ -152,8 +224,11 @@ def main() -> int:
         "command", choices=("check", "build-replay", "self-check", "self-test", "run")
     )
     parser.add_argument("--scenario")
+    parser.add_argument("--all", action="store_true", dest="all_scenarios")
     parser.add_argument("--trials", type=int, default=1)
     parser.add_argument("--target", type=Path, default=_REPOSITORY_ROOT)
+    parser.add_argument("--declare-cap", type=int)
+    parser.add_argument("--accel", choices=("tcg", "kvm"), default="tcg")
     args = parser.parse_args()
     if args.command == "build-replay":
         print(ensure_replay_log(Path(__file__).resolve().parents[2] / ".certify"))
@@ -163,9 +238,15 @@ def main() -> int:
 
         return run()
     if args.command == "self-test":
-        return _self_test()
+        return _self_test(args.accel)
     if args.command == "run":
-        return _run_scenario(args.scenario, args.trials, args.target)
+        return _run_scenarios(
+            _selected_scenarios(args.scenario, args.all_scenarios),
+            args.trials,
+            args.target,
+            args.declare_cap,
+            args.accel,
+        )
 
     missing = prerequisites.check()
     missing_set = set(missing)

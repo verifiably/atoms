@@ -92,6 +92,59 @@ def _check_mapper_rollback() -> None:
         raise AssertionError(f"mapper was not rolled back: {calls}")
 
 
+def _check_scenario_selection_and_cap() -> None:
+    from . import __main__ as cli
+
+    if cli._selected_scenarios("minimal-create", False) != ("minimal-create",):
+        raise AssertionError("single-scenario selection changed")
+    if cli._selected_scenarios(None, True) != cli.CERTIFICATION_SCENARIOS:
+        raise AssertionError("full-matrix selection changed")
+    if "drift-blocker" in cli.CERTIFICATION_SCENARIOS or "refusal-capability" in (
+        cli.CERTIFICATION_SCENARIOS
+    ):
+        raise AssertionError("a refusal-only scenario entered certification")
+    for prefixes, cap in ((2001, None), (10, 9)):
+        try:
+            guest_init._check_prefix_budget(prefixes, cap)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"prefix budget {prefixes=} {cap=} was accepted")
+    guest_init._check_prefix_budget(2000, None)
+    guest_init._check_prefix_budget(10, 10)
+
+
+def _check_acceleration_and_serial_parsing() -> None:
+    if guest._acceleration_arguments("tcg") != ("-accel", "tcg"):
+        raise AssertionError("TCG acceleration argv changed")
+    if guest._acceleration_arguments("kvm") != ("-accel", "kvm"):
+        raise AssertionError("KVM acceleration argv changed")
+    try:
+        guest._acceleration_arguments("auto")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("silent acceleration selection was accepted")
+    serial = 'boot\nCERTIFY-JSON:{"scenario":"minimal-create","violations":0}\n'
+
+    class Process:
+        stdout = io.StringIO(serial)
+
+        @staticmethod
+        def wait() -> int:
+            return 0
+
+    streamed = io.StringIO()
+    with patch.object(guest.subprocess, "Popen", return_value=Process()):
+        retained = guest._run_streaming(["qemu-system-x86_64"], streamed)
+    if retained != serial or streamed.getvalue() != serial:
+        raise AssertionError("streamed serial was not retained exactly")
+    if guest._parse_records(retained) != (
+        {"scenario": "minimal-create", "violations": 0},
+    ):
+        raise AssertionError("streamed serial record parsing changed")
+
+
 def run() -> int:
     """Run checks that deliberately remain outside the collected pytest suite."""
     checks = (
@@ -99,6 +152,8 @@ def run() -> int:
         ("verified replay-log rebuild precedes guest build", _check_boot_rebuild),
         ("recovery child trusts its identity-verified parent", _check_recovery_child),
         ("mapper creation rolls back after node failure", _check_mapper_rollback),
+        ("scenario selection and declared prefix cap", _check_scenario_selection_and_cap),
+        ("acceleration argv and serial parsing", _check_acceleration_and_serial_parsing),
     )
     for name, check in checks:
         check()

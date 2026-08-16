@@ -41,6 +41,7 @@ _LOG_MAGIC = 0x6A736677736872
 _LOG_VERSION = 1
 _LOG_FLUSH_OR_FUA = 0x3
 _LOG_DISCARD = 0x4
+_UNDECLARED_PREFIX_LIMIT = 2000
 
 
 def _run(command: list[str]) -> str:
@@ -290,6 +291,19 @@ def _log_entries(log_device: Path) -> tuple[int, ...]:
     return tuple(flags_seen)
 
 
+def _check_prefix_budget(prefixes: int, declared_cap: int | None) -> None:
+    if declared_cap is not None and declared_cap <= 0:
+        raise ValueError("declared prefix cap must be a positive integer")
+    if declared_cap is None and prefixes > _UNDECLARED_PREFIX_LIMIT:
+        raise ValueError(
+            f"observed {prefixes} prefixes exceeds 2000; rerun with --declare-cap N"
+        )
+    if declared_cap is not None and prefixes > declared_cap:
+        raise ValueError(
+            f"observed {prefixes} prefixes exceeds declared maximum {declared_cap}"
+        )
+
+
 def _create_mapper(
     name: str,
     table: str,
@@ -509,13 +523,14 @@ def run_scenario(
     name: str,
     masks: FeatureMasks,
     mount_options: str,
+    declared_cap: int | None,
 ) -> tuple[dict[str, object], VolumeConfiguration]:
     """Record and exhaustively replay one scenario's completion-ordered trace."""
-    from tests.exerciser import scenario, setup_clean, transact
+    from tests.exerciser import scenario, setup_clean, transact, transact_caught
 
     entry = scenario(name)
-    if entry.family != "commit":
-        raise ValueError(f"Task 3 requires a clean-commit scenario, got {entry.family}")
+    if entry.family not in {"commit", "rollback"} or entry.drift is not None:
+        raise ValueError(f"scenario is not certifiable: {name}")
     data_bytes = int(_run(["blockdev", "--getsize64", os.fspath(data_device)]))
     log_bytes = int(_run(["blockdev", "--getsize64", os.fspath(log_device)]))
     _zero_device(log_device, log_bytes)
@@ -586,9 +601,14 @@ def run_scenario(
         ):
             raise RuntimeError("mounted workload feature masks do not equal the selected target")
         _run(["dmsetup", "message", mapper_name, "0", "mark", "scenario-start"])
-        outcome = transact(entry, ingredients)
-        if outcome.outcome.name != "COMMITTED":
-            raise RuntimeError(f"clean scenario returned {outcome.outcome.name}")
+        if entry.family == "commit":
+            outcome = transact(entry, ingredients)
+            if outcome.outcome.name != "COMMITTED":
+                raise RuntimeError(f"clean scenario returned {outcome.outcome.name}")
+        else:
+            projection = transact_caught(entry, ingredients, monkeypatch)
+            if projection["state"] != "ROLLED_BACK":
+                raise RuntimeError(f"caught scenario returned {projection['state']}")
         _run(["dmsetup", "message", mapper_name, "0", "mark", "scenario-end"])
     finally:
         try:
@@ -602,6 +622,8 @@ def run_scenario(
                     _remove_mapper(mapper_name)
 
     flags = _log_entries(log_device)
+    prefixes = len(flags) + 1
+    _check_prefix_budget(prefixes, declared_cap)
     violations: list[str] = []
     classified = 0
     clone_names: set[Path] = set()
@@ -634,6 +656,15 @@ def run_scenario(
             if not isinstance(cell_classified, int):
                 raise TypeError("recovery subprocess returned malformed classified count")
             classified += cell_classified
+            _emit(
+                {
+                    "progress": {
+                        "scenario": name,
+                        "prefix": prefix,
+                        "prefixes": prefixes,
+                    }
+                }
+            )
         finally:
             try:
                 if replay_mounted:
@@ -658,9 +689,10 @@ def run_scenario(
         {
             "scenario": name,
             "marks": sum(bool(flags_value & _LOG_FLUSH_OR_FUA) for flags_value in flags),
-            "prefixes": len(flags) + 1,
+            "prefixes": prefixes,
             "violations": len(violations),
             "violation_details": violations,
+            "declared_cap": declared_cap,
         },
         configuration,
     )
@@ -697,6 +729,7 @@ def main() -> int:
     parser.add_argument("--incompat", type=int)
     parser.add_argument("--ro-compat", type=int)
     parser.add_argument("--mount-options")
+    parser.add_argument("--declare-cap", type=int)
     args = parser.parse_args(arguments)
     try:
         with tempfile.TemporaryDirectory(prefix="atoms-certify-") as temporary:
@@ -728,6 +761,7 @@ def main() -> int:
                 name=args.scenario,
                 masks=FeatureMasks(args.compat, args.incompat, args.ro_compat),
                 mount_options=args.mount_options,
+                declared_cap=args.declare_cap,
             )
             _emit(report)
             if report["violations"]:
@@ -739,6 +773,7 @@ def main() -> int:
                     "scenario": args.scenario,
                     "marks": report["marks"],
                     "prefixes": report["prefixes"],
+                    "declared_cap": args.declare_cap,
                 }
             )
     except Exception as caught:  # noqa: BLE001 - the serial fatal record is the boundary.

@@ -11,6 +11,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TextIO
 
 _CHECKOUT = Path(__file__).resolve().parents[3]
 _UNSAFE_CMDLINE_CHARACTERS = frozenset("'\"\\\0")
@@ -168,6 +169,47 @@ def _checkout_path(shared_root: Path) -> str:
     return value
 
 
+def _acceleration_arguments(acceleration: str) -> tuple[str, str]:
+    if acceleration not in {"tcg", "kvm"}:
+        raise ValueError("acceleration must be exactly 'tcg' or 'kvm'")
+    return "-accel", acceleration
+
+
+def _parse_records(serial: str) -> tuple[dict[str, object], ...]:
+    records: list[dict[str, object]] = []
+    for line in serial.splitlines():
+        if not line.startswith("CERTIFY-JSON:"):
+            continue
+        try:
+            record = json.loads(line.removeprefix("CERTIFY-JSON:"))
+        except json.JSONDecodeError as caught:
+            raise GuestRunError(f"invalid guest JSON: {line}") from caught
+        if not isinstance(record, dict):
+            raise GuestRunError("guest JSON record must be an object")
+        records.append(record)
+    return tuple(records)
+
+
+def _run_streaming(command: list[str], stream: TextIO) -> str:
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    assert process.stdout is not None
+    lines: list[str] = []
+    for line in process.stdout:
+        lines.append(line)
+        stream.write(line)
+        stream.flush()
+    returncode = process.wait()
+    serial = "".join(lines)
+    if returncode != 0:
+        raise GuestRunError(f"{command[0]} failed with exit {returncode}: {serial}")
+    return serial
+
+
 def run(
     kernel: Path,
     initramfs: Path,
@@ -177,6 +219,8 @@ def run(
     shared_root: Path,
     memory_mib: int = 2048,
     guest_arguments: tuple[str, ...] = (),
+    acceleration: str = "tcg",
+    stream: TextIO | None = None,
 ) -> GuestResult:
     """Boot one certification guest and parse its machine-readable serial records."""
     if not isinstance(memory_mib, int) or isinstance(memory_mib, bool) or memory_mib <= 0:
@@ -231,6 +275,7 @@ def run(
     ).decode()
     command = [
         "qemu-system-x86_64",
+        *_acceleration_arguments(acceleration),
         "-nographic",
         "-no-reboot",
         "-m",
@@ -257,16 +302,5 @@ def run(
         "-serial",
         "mon:stdio",
     ]
-    result = _run(command)
-    records: list[dict[str, object]] = []
-    for line in result.stdout.splitlines():
-        if not line.startswith("CERTIFY-JSON:"):
-            continue
-        try:
-            record = json.loads(line.removeprefix("CERTIFY-JSON:"))
-        except json.JSONDecodeError as caught:
-            raise GuestRunError(f"invalid guest JSON: {line}") from caught
-        if not isinstance(record, dict):
-            raise GuestRunError("guest JSON record must be an object")
-        records.append(record)
-    return GuestResult(tuple(command), result.stdout, tuple(records))
+    serial = _run_streaming(command, sys.stdout if stream is None else stream)
+    return GuestResult(tuple(command), serial, _parse_records(serial))
