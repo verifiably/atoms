@@ -190,6 +190,18 @@ def _parse_records(serial: str) -> tuple[dict[str, object], ...]:
     return tuple(records)
 
 
+def _terminate_and_reap(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        process.wait()
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
 def _run_streaming(command: list[str], stream: TextIO) -> str:
     process = subprocess.Popen(
         command,
@@ -199,14 +211,20 @@ def _run_streaming(command: list[str], stream: TextIO) -> str:
     )
     assert process.stdout is not None
     lines: list[str] = []
-    for line in process.stdout:
-        lines.append(line)
-        stream.write(line)
-        stream.flush()
+    try:
+        for line in process.stdout:
+            lines.append(line)
+            stream.write(line)
+            stream.flush()
+    except BaseException:
+        _terminate_and_reap(process)
+        raise
+    finally:
+        process.stdout.close()
     returncode = process.wait()
     serial = "".join(lines)
     if returncode != 0:
-        raise GuestRunError(f"{command[0]} failed with exit {returncode}: {serial}")
+        raise GuestRunError(f"{command[0]} failed with exit {returncode}")
     return serial
 
 

@@ -8,6 +8,7 @@ import json
 import os
 import platform
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -17,6 +18,7 @@ from pathlib import Path
 
 import pytest
 
+from atoms.core.scratch import is_scratch_leaf
 from atoms.fs.linux import LinuxBackend
 from atoms.fs.platform import BACKEND_REVISION
 from atoms.fs.volume import (
@@ -302,6 +304,39 @@ def _check_prefix_budget(prefixes: int, declared_cap: int | None) -> None:
         raise ValueError(
             f"observed {prefixes} prefixes exceeds declared maximum {declared_cap}"
         )
+
+
+def _same_inode_95(
+    live_directories: set[tuple[int, int]], work_directories: set[tuple[int, int]]
+) -> bool:
+    return not live_directories.isdisjoint(work_directories)
+
+
+def _directory_identity(path: Path) -> tuple[int, int] | None:
+    info = path.stat(follow_symlinks=False)
+    if not stat.S_ISDIR(info.st_mode):
+        return None
+    return info.st_dev, info.st_ino
+
+
+def _has_same_inode_95(volume: Path) -> bool:
+    project = volume / "project"
+    work = volume / "metadata" / "work"
+    live = {
+        identity
+        for path in project.rglob("*")
+        if (identity := _directory_identity(path)) is not None
+    }
+    scratch = {
+        identity
+        for txid in work.iterdir()
+        if _directory_identity(txid) is not None
+        for path in txid.iterdir()
+        if is_scratch_leaf(path.name)
+        and path.name.endswith(".work")
+        and (identity := _directory_identity(path)) is not None
+    }
+    return _same_inode_95(live, scratch)
 
 
 def _create_mapper(
@@ -647,6 +682,8 @@ def run_scenario(
             replay_mapper_created = True
             _mount_device(replay_mapper, volume, mount_options)
             replay_mounted = True
+            if _has_same_inode_95(volume):
+                _emit({"bonus": "same-inode-9.5"})
             result = _recover_subprocess(volume)
             found = result.get("violations")
             if not isinstance(found, list) or not all(isinstance(item, str) for item in found):

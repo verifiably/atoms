@@ -128,6 +128,25 @@ def _row_count(row: dict[str, object], field: str) -> int:
     return value
 
 
+def _validate_scenario_row(
+    row: dict[str, object], scenario: str, declared_cap: int | None
+) -> dict[str, object]:
+    if row.get("scenario") != scenario:
+        raise guest.GuestRunError("guest reported the wrong scenario")
+    for field in ("marks", "prefixes"):
+        _row_count(row, field)
+    if _row_count(row, "violations") != 0:
+        raise guest.GuestRunError(f"scenario did not report zero violations: {row}")
+    if "declared_cap" not in row:
+        raise guest.GuestRunError("guest omitted the declared prefix cap")
+    if declared_cap is None:
+        if row["declared_cap"] is not None:
+            raise guest.GuestRunError("guest changed the undeclared prefix cap")
+    elif _row_count(row, "declared_cap") != declared_cap:
+        raise guest.GuestRunError("guest did not preserve the declared prefix cap")
+    return row
+
+
 def _run_scenarios(
     scenarios: tuple[str, ...],
     trials: int,
@@ -137,7 +156,9 @@ def _run_scenarios(
 ) -> int:
     if trials != 1:
         raise ValueError("certification supports exactly one trial")
-    if declared_cap is not None and declared_cap <= 0:
+    if declared_cap is not None and (
+        not isinstance(declared_cap, int) or isinstance(declared_cap, bool) or declared_cap <= 0
+    ):
         raise ValueError("--declare-cap must be a positive integer")
     missing = prerequisites.check()
     if missing:
@@ -190,10 +211,9 @@ def _run_scenarios(
                 ),
                 None,
             )
-            if row is None or row.get("violations") != 0:
-                raise guest.GuestRunError(f"scenario did not report zero violations: {row}")
-            if row.get("declared_cap") != declared_cap:
-                raise guest.GuestRunError("guest did not preserve the declared prefix cap")
+            if row is None:
+                raise guest.GuestRunError("guest omitted the scenario result")
+            _validate_scenario_row(row, scenario, declared_cap)
             expected = json.loads(json.dumps(asdict(configuration)))
             if not result.records or result.records[-1].get("configuration") != expected:
                 raise guest.GuestRunError("guest configuration does not equal the selected target")

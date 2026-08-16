@@ -158,6 +158,84 @@ def _check_acceleration_and_serial_parsing() -> None:
         raise AssertionError("streamed serial record parsing changed")
 
 
+def _check_scenario_row_types_and_bonus() -> None:
+    from . import __main__ as cli
+
+    valid: dict[str, object] = {
+        "scenario": "minimal-create",
+        "marks": 1,
+        "prefixes": 2,
+        "violations": 0,
+        "declared_cap": 10,
+    }
+    if cli._validate_scenario_row(valid, "minimal-create", 10) is not valid:
+        raise AssertionError("a valid scenario row was not preserved")
+    for field in ("marks", "prefixes", "violations", "declared_cap"):
+        mutated = valid | {field: False}
+        try:
+            cli._validate_scenario_row(mutated, "minimal-create", 10)
+        except guest.GuestRunError:
+            pass
+        else:
+            raise AssertionError(f"boolean {field} was accepted")
+    if not guest_init._same_inode_95({(1, 2)}, {(1, 2)}):
+        raise AssertionError("the §9.5 same-inode tuple was missed")
+    if guest_init._same_inode_95({(1, 2)}, {(1, 3)}):
+        raise AssertionError("different directory inodes were tagged as §9.5")
+
+
+def _check_qemu_failure_ownership() -> None:
+    class Process:
+        def __init__(self, returncode: int) -> None:
+            self.returncode = returncode
+            self.stdout = io.StringIO("already-streamed\n")
+            self.calls: list[object] = []
+
+        def poll(self) -> int | None:
+            self.calls.append("poll")
+            return None
+
+        def terminate(self) -> None:
+            self.calls.append("terminate")
+
+        def kill(self) -> None:
+            self.calls.append("kill")
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.calls.append(("wait", timeout))
+            if timeout is not None:
+                raise guest.subprocess.TimeoutExpired("qemu-system-x86_64", timeout)
+            return self.returncode
+
+    process = Process(1)
+
+    class BrokenStream(io.StringIO):
+        def write(self, value: str) -> int:
+            raise OSError("injected stream failure")
+
+    with patch.object(guest.subprocess, "Popen", return_value=process):
+        try:
+            guest._run_streaming(["qemu-system-x86_64"], BrokenStream())
+        except OSError as caught:
+            if str(caught) != "injected stream failure":
+                raise
+        else:
+            raise AssertionError("stream failure did not propagate")
+    if process.calls != ["poll", "terminate", ("wait", 5.0), "kill", ("wait", None)]:
+        raise AssertionError(f"QEMU was not terminated and reaped: {process.calls}")
+
+    exited = Process(7)
+    exited.poll = lambda: 7  # type: ignore[method-assign]
+    with patch.object(guest.subprocess, "Popen", return_value=exited):
+        try:
+            guest._run_streaming(["qemu-system-x86_64"], io.StringIO())
+        except guest.GuestRunError as caught:
+            if str(caught) != "qemu-system-x86_64 failed with exit 7":
+                raise AssertionError(f"non-concise QEMU diagnostic: {caught}") from caught
+        else:
+            raise AssertionError("nonzero QEMU exit was accepted")
+
+
 def run() -> int:
     """Run checks that deliberately remain outside the collected pytest suite."""
     checks = (
@@ -167,6 +245,8 @@ def run() -> int:
         ("mapper creation rolls back after node failure", _check_mapper_rollback),
         ("scenario selection and declared prefix cap", _check_scenario_selection_and_cap),
         ("acceleration argv and serial parsing", _check_acceleration_and_serial_parsing),
+        ("scenario row types and §9.5 bonus detection", _check_scenario_row_types_and_bonus),
+        ("QEMU failure terminates and reaps", _check_qemu_failure_ownership),
     )
     for name, check in checks:
         check()
