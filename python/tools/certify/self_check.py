@@ -95,6 +95,19 @@ def _check_mapper_rollback() -> None:
 def _check_scenario_selection_and_cap() -> None:
     from . import __main__ as cli
 
+    expected = (
+        "minimal-create",
+        "minimal-replace",
+        "minimal-delete",
+        "minimal-move",
+        "minimal-mkdir",
+        "corpus-write",
+        "archive-move",
+        "caught-rollback",
+        "caught-rollback-move",
+    )
+    if cli.CERTIFICATION_SCENARIOS != expected:
+        raise AssertionError(f"certification scenarios changed: {cli.CERTIFICATION_SCENARIOS}")
     if cli._selected_scenarios("minimal-create", False) != ("minimal-create",):
         raise AssertionError("single-scenario selection changed")
     if cli._selected_scenarios(None, True) != cli.CERTIFICATION_SCENARIOS:
