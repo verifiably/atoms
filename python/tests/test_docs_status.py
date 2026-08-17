@@ -31,7 +31,7 @@ PLANS = ROOT / "docs" / "plans"
 STAGES = ("A1", "A2", "A3", "A4a", "A4b", "A5a", "A5b", "A6", "A7a", "A7b", "A8a", "A8b", "A9")
 
 #: The one fact this file exists to hold. Landing a sub-plan moves this boundary.
-FIRST_UNIMPLEMENTED = "A8b"
+FIRST_UNIMPLEMENTED = "A9"
 
 IMPLEMENTED = STAGES[: STAGES.index(FIRST_UNIMPLEMENTED)]
 UNIMPLEMENTED = STAGES[STAGES.index(FIRST_UNIMPLEMENTED) :]

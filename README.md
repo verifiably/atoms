@@ -70,7 +70,12 @@ approved effects against project paths.
   [`docs/plans/2026-08-14-plan-a8a-cut-model.md`](docs/plans/2026-08-14-plan-a8a-cut-model.md)
   — the data-declared scenario library, the record–reconstruct–recover cut model, the A3 agreement
   matrix over in-process and subprocess placements with the SIGKILL extension, and the five sabotage
-  arms, all in `python/tests/`. A8b–A9 remain unimplemented.
+  arms, all in `python/tests/`.
+- **A8b — durability certification (implemented):**
+  [`docs/plans/2026-08-14-plan-a8b-certification.md`](docs/plans/2026-08-14-plan-a8b-certification.md)
+  — the ext4 feature-mask resolver, QEMU + dm-log-writes certification harness, canonical
+  certification record, and singleton `CERTIFIED_ALLOWLIST`; it matches the certified
+  configuration/storage tuple exactly and every other tuple fails closed. A9 remains unimplemented.
 - Historical (superseded): the science-framed [`2026-07-20-*`](docs/plans/2026-07-20-recoverable-fs-effect-engine-design.md)
   design + roadmap, retained as the record of the review that hardened the effect/recovery contracts.
 
@@ -107,10 +112,6 @@ approved effects against project paths.
   needs no custom VFS — the stock VFS honors `PRAGMA fullfsync`. The stdlib baseline
   trusts cooperating processes not to relocate `metadata_root` mid-lease; the custom VFS
   is what closes that gap.
-- **Durability allowlist:** the crash-tested allowlist `metadata_root` is restricted to,
-  keyed on a *configuration tuple* (fs implementation + barrier-relevant mount options),
-  not `statfs` `f_type` — which is too coarse (ext2/3/4 share one type; `nobarrier` is
-  invisible to it). Functional probing proves *availability*, not power-loss *correctness*.
 - **Data-VCS composition (downstream):** DVC / lakeFS / dolt version data *content* —
   orthogonal, but `atoms` could underlie safe checkout materialization. Not a driver now.
 

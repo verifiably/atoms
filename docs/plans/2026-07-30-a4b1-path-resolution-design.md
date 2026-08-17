@@ -1,7 +1,7 @@
 # A4b-1 — rooted path resolution
 
 **Status:** Implemented 2026-07-30; final-review fixes applied 2026-07-31.
-A8b remains unimplemented. A4b-1 reads project space and never writes to it.
+A9 remains unimplemented. A4b-1 reads project space and never writes to it.
 
 **Authority:** [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md).
 Where this document and the authority design disagree, the authority wins.

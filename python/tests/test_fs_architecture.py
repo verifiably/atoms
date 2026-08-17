@@ -1235,24 +1235,26 @@ def test_chain_commands_keep_the_lease_and_approval_proofs_private():
     assert lease_acceptors == set()
 
 
-def test_ledger_entry_nine_stays_open_against_the_stages_that_owe_it():
-    """#9's enforcement is A5-A8's, and AGENTS.md must keep naming the two halves.
+def test_ledger_entry_nine_is_discharged_after_a8_added_no_entry_point():
+    """#9 closes only after every A5-A8 production entry point has landed.
 
     Status wording lives in `test_docs_status.py`; what this asserts is the ledger's own
-    shape -- entry #9 open, owned by A5, scoped to A5-A8 -- which no status guard covers.
+    shape -- entry #9 discharged by A8b, still scoped to A5-A8 -- which no status guard
+    covers.
     """
     root = Path(__file__).parents[2]
     agents = (root / "AGENTS.md").read_text(encoding="utf-8")
     assert "It admits #21, the txid binding, owned by A5." in agents
     assert "factory half of #9" in agents
+    assert "A8 added no production entry point." in agents
 
     ledger = (root / "docs" / "deferred-obligation-ledger.md").read_text(
         encoding="utf-8"
     )
     open_obligations, discharged = ledger.split("## Discharged obligations", 1)
-    row = next(
-        line for line in open_obligations.splitlines() if line.startswith("| 9 |")
-    )
+    assert not any(line.startswith("| 9 |") for line in open_obligations.splitlines())
+    row = next(line for line in discharged.splitlines() if line.startswith("| 9 |"))
     assert "| A5 |" in row
     assert "A5–A8" in row
-    assert not any(line.startswith("| 9 |") for line in discharged.splitlines())
+    assert "A8 added no production transaction entry point" in row
+    assert "| A8b | 2026-08-17 |" in row

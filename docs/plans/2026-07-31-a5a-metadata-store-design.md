@@ -1,6 +1,6 @@
 # A5a — the durable metadata store
 
-**Status:** Implemented on 2026-08-01. A8b remains unimplemented.
+**Status:** Implemented on 2026-08-01. A9 remains unimplemented.
 **Authority:** [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md)
 authority §7, §7.2, §11. Where this design and the authority disagreed, the authority was amended in the same
 commit; §3.3 lists every amendment.

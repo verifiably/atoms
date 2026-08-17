@@ -1,6 +1,6 @@
 # A7 — effect execution, recovery execution, and the tamper-evident chain
 
-**Status:** Implemented on 2026-08-14. A8b–A9 remain unimplemented. §15 acceptance is met:
+**Status:** Implemented on 2026-08-14. A9 remains unimplemented. §15 acceptance is met:
 (1) per-variant effect tests plus `test_coordinator_kill_matrix.py`; (2) resolver and assembly-halt
 tests; (3) chain, run, and kill-matrix tests; (4) filesystem/coordinator architecture guards;
 (5) the named suites in the deferred-obligation ledger; and (6) `test_docs_status.py` plus the full
@@ -749,21 +749,15 @@ A7 lands with its own suites; the ledger halves it discharges name them.
 6. `FIRST_UNIMPLEMENTED` moves to `"A8"`; `uv run pytest`, `ruff check`, and
    `pyright` are green.
 
-## 16. Known gaps carried to A8 and A9
+## 16. Known gaps after A8
 
-1. **The persistence-cut model** (A8) — A7's fault injection cuts at modeled
-   barriers in-process; only A8's deterministic reordering backend tests the
-   cross-substrate orderings under dropped/reordered writes.
-2. **The synthetic exerciser and end-to-end matrix** (A8).
-3. **Allowlist certification** (A8) — until then, production binding refuses
-   every volume and A7 is exercised under the test allowlist only.
-4. **macOS** (A9) — the facade and primitives are designed
+1. **macOS** (A9) — the facade and primitives are designed
    platform-portably; nothing is probed or implemented for macOS here.
-5. **Terminal-record GC** — the structural gate exists (§10.5, §11); the
+2. **Terminal-record GC** — the structural gate exists (§10.5, §11); the
    command does not.
-6. **The L-row tests** — science-side, unexercisable until Plan B adoption
+3. **The L-row tests** — science-side, unexercisable until Plan B adoption
    gives science an atoms-backed boundary.
-7. **Chain compaction and size** — one file per entry is unbounded;
+4. **Chain compaction and size** — one file per entry is unbounded;
    compaction, if ever, is a future design under the log design's anchor
    rules, not an A8 item.
 

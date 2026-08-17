@@ -1,6 +1,6 @@
 # A4a — platform capability backend and project volume binding
 
-**Status:** Implemented on 2026-07-30. A8b remains unimplemented;
+**Status:** Implemented on 2026-07-30. A9 remains unimplemented;
 A4a mutates only engine-owned `metadata_root`, never project paths.
 
 **Authority:** [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md).
