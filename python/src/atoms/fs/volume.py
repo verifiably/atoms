@@ -94,8 +94,32 @@ class DurabilityAllowlist:
         return None
 
 
-CERTIFIED_ALLOWLIST = DurabilityAllowlist(entries=frozenset())
-"""Empty until A8 crash-certifies a configuration tuple. Production binding fails closed."""
+CERTIFIED_ALLOWLIST = DurabilityAllowlist(
+    entries=frozenset(
+        {
+            AllowlistEntry(
+                configuration=VolumeConfiguration(
+                    backend_id="linux",
+                    backend_revision="linux-4",
+                    kernel_identifier="7.1.8-arch1-3",
+                    filesystem_type="ext4",
+                    barrier_options=("async", "barrier=1", "commit=5", "data=ordered"),
+                    durability_features=(
+                        "compat=0x3c",
+                        "incompat=0x246",
+                        "ro_compat=0x46b",
+                    ),
+                ),
+                storage=StorageProfile(profile_id="flush-honoring-disk.v1"),
+                certification_ref=(
+                    "docs/certification/2026-08-16-ext4-linux-7.1.8-arch1-3.json"
+                ),
+            )
+        }
+    )
+)
+"""Populated by the A8 certification run; see the named record. Recertification
+after a kernel or backend-revision change: python -m tools.certify run --all."""
 
 
 # Per-filesystem barrier-relevant options: the exact mountinfo field each is read

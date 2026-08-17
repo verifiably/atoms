@@ -104,8 +104,20 @@ def test_empty_allowlist_refuses(project_root, held_lock, metadata_root, test_st
         )
 
 
-def test_certified_allowlist_is_the_empty_production_constant():
-    assert CERTIFIED_ALLOWLIST == DurabilityAllowlist(entries=frozenset())
+def test_certified_allowlist_is_the_production_singleton():
+    assert len(CERTIFIED_ALLOWLIST.entries) == 1
+
+
+def test_certified_allowlist_refuses_mismatched_feature_masks():
+    entry = next(iter(CERTIFIED_ALLOWLIST.entries))
+    mismatched = dataclasses.replace(
+        entry.configuration,
+        durability_features=(
+            "compat=0x3d",
+            *entry.configuration.durability_features[1:],
+        ),
+    )
+    assert CERTIFIED_ALLOWLIST.match(mismatched, entry.storage) is None
 
 
 def test_refusal_reclaims_existing_debris_but_writes_nothing_new(

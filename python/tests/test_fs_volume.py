@@ -498,9 +498,8 @@ def test_durability_features_are_pinned_by_the_ext4_resolver(mountinfo_text, ext
     assert build_configuration(entry, "7.1.5-arch1-1", directory_fd=ext4_probe_fd).durability_features
 
 
-def test_certified_allowlist_ships_empty():
-    # Fail closed: production binding refuses every volume until A8 certifies one.
-    assert CERTIFIED_ALLOWLIST.entries == frozenset()
+def test_certified_allowlist_ships_the_certified_singleton():
+    assert len(CERTIFIED_ALLOWLIST.entries) == 1
 
 
 def test_allowlist_matches_equal_but_distinct_configuration_and_profile(

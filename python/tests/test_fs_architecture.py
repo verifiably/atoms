@@ -12,7 +12,7 @@ import pytest
 import atoms.fs
 from atoms.core.errors import CapabilityUnavailable
 from atoms.fs import platform as fs_platform
-from atoms.fs.volume import CERTIFIED_ALLOWLIST, DurabilityAllowlist
+from atoms.fs.volume import CERTIFIED_ALLOWLIST
 from tests.architecture_support import (
     fixture_names,
     oserror_handler_discriminates,
@@ -259,8 +259,8 @@ def test_bind_requires_a_keyword_only_allowlist_with_no_default():
     assert storage.default is inspect.Parameter.empty
 
 
-def test_certified_allowlist_is_empty_so_population_is_deliberate():
-    assert CERTIFIED_ALLOWLIST == DurabilityAllowlist(entries=frozenset())
+def test_certified_allowlist_population_is_deliberate():
+    assert len(CERTIFIED_ALLOWLIST.entries) == 1
 
 
 _BIND_PROJECT_VOLUME_TARGETS = {
@@ -467,7 +467,7 @@ def test_the_production_bind_call_passes_the_certified_allowlist():
     assert "atoms.fs.volume.CERTIFIED_ALLOWLIST" in _resolved_imports(
         tree, package="atoms.coordinator"
     )
-    assert CERTIFIED_ALLOWLIST == DurabilityAllowlist(entries=frozenset())
+    assert len(CERTIFIED_ALLOWLIST.entries) == 1
 
 
 def test_verified_child_path_is_not_exported():
