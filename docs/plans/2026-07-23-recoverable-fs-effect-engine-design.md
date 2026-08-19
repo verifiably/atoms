@@ -1354,6 +1354,12 @@ execution seam exists (a serialized spec plus out-of-process executor is the pla
 No consumer adoption may redefine the engine protocol, add a feature flag, or introduce a runtime
 transaction-dialect choice.
 
+*(amended 2026-08-19: Science's Plan B item 2 is recast under the clean start in Science's
+`2026-08-19-family-adapters-design.md`: the family list is supersede, retraction, and explicit import;
+the planner/Gate-B lapse with the save/apply boundary that no longer exists; dialect deletion is
+discharged by the clean start; archive/cohort require their own designs; the hard cut's surviving
+claim is "every Science corpus mutation flows through the certified engine".)*
+
 ## 13. Verification strategy
 
 ### 13.1 Executable reference model
@@ -1656,6 +1662,12 @@ The README platform-support statement lands with the first real consumer's hard 
 actually gates that consumer's mutating commands — not before, so the README never documents behavior
 that has not shipped. There is no feature flag, compatibility executor, or runtime transaction-dialect
 choice.
+
+*(amended 2026-08-19: Science's Plan B item 2 is recast under the clean start in Science's
+`2026-08-19-family-adapters-design.md`: the family list is supersede, retraction, and explicit import;
+the planner/Gate-B lapse with the save/apply boundary that no longer exists; dialect deletion is
+discharged by the clean start; archive/cohort require their own designs; the hard cut's surviving
+claim is "every Science corpus mutation flows through the certified engine".)*
 
 ## 15. Out of scope and future extension
 
