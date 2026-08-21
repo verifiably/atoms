@@ -1,6 +1,6 @@
 # `read_chain` — the public read-only chain projection
 
-**Status:** Designed on 2026-08-20; not yet implemented. A9 remains unimplemented.
+**Status:** Designed on 2026-08-20; implemented on 2026-08-21. A9 remains unimplemented.
 
 **Authority:** [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md)
 §4.1, §4.3, §7.1, §11, §12.2, §13.5.
@@ -246,7 +246,10 @@ true of `append_intent`: `_recovery_lease` calls `resolve(binding, store)` befor
 `_derive_reconciliation(record, validated)` returns `Reconciliation(None, None)` for `record is None`
 (`recover.py:148-154`), and `_perform_reconciliation` still calls `apply_survivors`, discharging the
 classified `.#~stage` survivor per A7 design §10.2's closed rule (`recover.py:263`, inside
-`_perform_reconciliation`, reached unconditionally from `resolve` at `recover.py:640`). With no
+`_perform_reconciliation`, which `resolve` calls at `recover.py:640` without gating that call on
+`actions` — line 263 then runs on every call that reaches 640. It is *reaching* 640 that is
+conditional: `resolve` returns early at `recover.py:613-614` when the chain is absent and no record
+is live, and raises at `:634`/`:639` on a halted record). With no
 active record there is no planned envelope, so the survivor is *removed*; only an active record's
 derived append can *finish* one.
 
@@ -278,6 +281,12 @@ It does **not** claim, and must not be read as claiming:
   filesystem.
 - **Payload semantics.** `GenesisEntry.payload` and `IntentEntry.payload` are opaque consumer bytes,
   embedded unchanged (A7 design §10.3, §10.4). atoms validates none of it.
+- **That a mutation on the same root would be admitted.** A successful `read_chain` proves the lease
+  was enterable, not that the volume can publish a chain entry. `read_chain` skips
+  `_require_chain_publication` (§6), so on a volume whose evidence lacks `noclobber_transfer` it
+  returns a view while `run_transaction`, `append_intent`, and `register_root` all still refuse with
+  `CapabilityUnavailable` (`root.py:21-24`, `fs/approval.py:362-367`). A read is not a dry run of a
+  write.
 - **Genesis or mirror audit, fork construction, or explicit anchoring.** The consumer contract
   restricts this command to four boundaries (per-corpus capture, build-start world head, an
   `open_epoch` recovery barrier whose view is discarded, and a `current_epoch`/`delete_epoch`
@@ -314,9 +323,12 @@ New tests in `python/tests/test_coordinator_commands.py`, alongside the existing
    after the lease released — the view holds no engine resource (§6).
 
 **Existing guards this command changes.** `test_fs_architecture.py:1177`
-(`test_chain_commands_keep_the_lease_and_approval_proofs_private`) pins
+(`test_chain_commands_keep_the_lease_and_approval_proofs_private`) pinned
 `commands.__all__` to the exact four-name tuple and the public function set to the exact three names.
-Landing `read_chain` **must** extend both to the values in §4 in the same commit; the test's other
+Landing `read_chain` **must** extend both in the same commit: `__all__` becomes §4's seven names, and
+the public-function set becomes the **four** names `{"register_root", "append_intent",
+"run_transaction", "read_chain"}` — it is built from module-level `ast.FunctionDef`s, so the
+`ChainView` class and the imported `Entry` union do not join it. The test's other
 two assertions — every public command enters `_recovery_lease` through a `with`, and no public
 command's annotations mention `Lease` or `ProjectApprovedSpec` — are satisfied by §6's choreography
 unchanged, and `read_chain` must remain covered by them rather than exempted.
@@ -351,9 +363,13 @@ than assumed:
 **When the implementation lands (the next commit, not this one),** two claims about the exact
 `__all__` tuple go stale together and must move with it:
 
-- `python/tests/test_fs_architecture.py:1193-1199`, the assertion itself (§10).
+- `python/tests/test_fs_architecture.py:1193-1199`, the assertion itself (§10). It is rewritten to
+  the new values, because it is a live machine claim about the current surface.
 - [`2026-08-13-plan-a7b-executor.md`](2026-08-13-plan-a7b-executor.md) step 10.2, which quotes that
-  tuple as the guard A7b added.
+  tuple as the guard A7b added. That step is a historical record of what A7b's guard added, so the
+  tuple is **not** rewritten there; it takes a dated amendment parenthetical instead, the idiom
+  [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md)
+  §13.5 and §14 already use (`*(amended 2026-08-13, …)*`). Rewriting the tuple would falsify history.
 
 Both are records of what the code is, not status claims about a roadmap, so neither is stale today.
 

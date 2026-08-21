@@ -2176,7 +2176,10 @@ commit arm.
   pins the fixed points only.
 - [ ] **Step 10.2: Architecture.** Add to the existing guard files:
   - `commands.__all__` is exactly `("TransactionOutcome", "append_intent",
-    "register_root", "run_transaction")`, every public command's signature
+    "register_root", "run_transaction")` *(amended 2026-08-21, the `read_chain`
+    design: the guard now pins the seven-name tuple that adds `ChainView`,
+    `Entry`, and `read_chain`, and the public-function set it also pins is four
+    names, not three)*, every public command's signature
     accepts neither `Lease` nor `ProjectApprovedSpec` (source scan of
     `commands.py`), and each acquires `_recovery_lease` in its body.
   - `set_assembly_halt` is called from exactly one production site,

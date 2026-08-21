@@ -8,7 +8,13 @@ from typing import cast as _cast
 
 from atoms.chain.append import append_entry as _append_entry
 from atoms.chain.append import bootstrap_chain as _bootstrap_chain
-from atoms.chain.model import ChainOutcome, GenesisEntry, IntentEntry, state_to_json
+from atoms.chain.model import (
+    ChainOutcome,
+    Entry,
+    GenesisEntry,
+    IntentEntry,
+    state_to_json,
+)
 from atoms.chain.read import validate_chain as _validate_chain
 from atoms.coordinator.capture import PayloadSource
 from atoms.coordinator.execute import _run_under_lease
@@ -32,8 +38,11 @@ from atoms.fs.observe import Observation
 from atoms.fs.volume import StorageProfile
 
 __all__ = (
+    "ChainView",
+    "Entry",
     "TransactionOutcome",
     "append_intent",
+    "read_chain",
     "register_root",
     "run_transaction",
 )
@@ -45,6 +54,20 @@ class TransactionOutcome:
     outcome: ChainOutcome
     registration: str
     settlement: str
+
+
+@dataclass(frozen=True)
+class ChainView:
+    """One validated chain, projected for a consumer, holding no engine resource.
+
+    `entries` is `_linearize`'s order: genesis first, one successor per entry, tip
+    last. `genesis_digest` is `entries[0][0]` and `tip` is the validator's own tip,
+    not a re-derivation of `entries[-1][0]`.
+    """
+
+    genesis_digest: str
+    entries: tuple[tuple[str, Entry], ...]
+    tip: str
 
 
 def _capture_baseline(
@@ -197,3 +220,30 @@ def run_transaction(
         registration=result.registration,
         settlement=result.settlement,
     )
+
+
+def read_chain(
+    backend: Backend,
+    project_root: str,
+    metadata_root: str,
+    storage: StorageProfile,
+) -> ChainView:
+    """Project the validated chain `_registered_root` already computed.
+
+    The lease is what makes the answer true: it holds the project lock and resolves
+    recovery before yielding, so this reads no survivor as chain state and races no
+    cooperating writer. `_require_chain_publication` is deliberately absent -- the
+    three mutators call it to refuse before their own append, and this command has
+    none.
+    """
+    with (
+        _recovery_lease(backend, project_root, metadata_root, storage) as lease,
+        _registered_root(lease) as (_chain_fd, validated),
+    ):
+        if validated.tip is None:
+            raise ProtocolError("a registered chain has no tip")
+        return ChainView(
+            genesis_digest=validated.entries[0][0],
+            entries=validated.entries,
+            tip=validated.tip,
+        )

@@ -1191,12 +1191,20 @@ def test_chain_commands_keep_the_lease_and_approval_proofs_private():
         if not name.startswith("_")
     }
     assert commands.__all__ == (
+        "ChainView",
+        "Entry",
         "TransactionOutcome",
         "append_intent",
+        "read_chain",
         "register_root",
         "run_transaction",
     )
-    assert set(public) == {"register_root", "append_intent", "run_transaction"}
+    assert set(public) == {
+        "register_root",
+        "append_intent",
+        "run_transaction",
+        "read_chain",
+    }
 
     for name, function in public.items():
         assert any(

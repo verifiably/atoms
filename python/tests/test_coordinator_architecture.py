@@ -217,3 +217,62 @@ def test_only_the_recovery_loop_forwards_authorized_mutations_to_settle():
     assert _named_callers("apply_remove_scratch") == {
         "recover.py::_execute_mutating"
     }
+
+
+def test_read_chain_uses_the_lease_and_registered_root_seam_and_exposes_neither():
+    """The read command is the mutators' seam projected, and nothing more.
+
+    `test_fs_architecture.py` already pins that every public command enters
+    `_recovery_lease`; what is specific to `read_chain` is that it enters
+    `_registered_root` *inside* that lease -- the `append_intent`/`run_transaction`
+    shape -- and that the value it hands back carries no descriptor, lease, store, or
+    binding.
+    """
+    tree = ast.parse(
+        (SOURCE_ROOT / "coordinator" / "commands.py").read_text(encoding="utf-8")
+    )
+    read_chain = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "read_chain"
+    )
+    lease = next(
+        node
+        for node in ast.walk(read_chain)
+        if isinstance(node, ast.With)
+        and ast.unparse(node.items[0].context_expr).startswith("_recovery_lease(")
+    )
+    # `_registered_root` is entered under the lease either as a later context of the
+    # same `with` -- which is nesting -- or as a `with` in its body. Both spellings
+    # produce this one ordered list, and a third context manager would break it.
+    entered = [ast.unparse(item.context_expr) for item in lease.items]
+    entered += [
+        ast.unparse(item.context_expr)
+        for node in lease.body
+        if isinstance(node, ast.With)
+        for item in node.items
+    ]
+    assert [name.partition("(")[0] for name in entered] == [
+        "_recovery_lease",
+        "_registered_root",
+    ]
+    assert read_chain.returns is not None
+    assert ast.unparse(read_chain.returns) == "ChainView"
+
+    view = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "ChainView"
+    )
+    assert [ast.unparse(decorator) for decorator in view.decorator_list] == [
+        "dataclass(frozen=True)"
+    ]
+    assert [
+        (ast.unparse(node.target), ast.unparse(node.annotation))
+        for node in view.body
+        if isinstance(node, ast.AnnAssign)
+    ] == [
+        ("genesis_digest", "str"),
+        ("entries", "tuple[tuple[str, Entry], ...]"),
+        ("tip", "str"),
+    ]

@@ -497,3 +497,251 @@ def test_append_refuses_missing_noclobber_without_changing_chain_bytes_or_tip(
 
     assert _durable_entries(project_root) == before
     assert _fresh_process(project_root, metadata_root)["lease"]["chain"]["tip"] == genesis
+
+
+def _read(ingredients):
+    from atoms.coordinator.commands import read_chain
+
+    backend, project_root, metadata_root, storage = ingredients
+    return read_chain(backend, project_root, metadata_root, storage)
+
+
+def _project_lock_is_free(backend, metadata_root: str) -> bool:
+    """True when nothing in this process still holds the advisory project lock.
+
+    flock is per open-file-description, so a fresh descriptor contends with a lease
+    that has not unwound. Closing the descriptor releases what this probe took.
+    """
+    fd = os.open(str(Path(metadata_root) / "lock"), os.O_RDWR)
+    try:
+        return backend.try_lock_exclusive(fd)
+    finally:
+        os.close(fd)
+
+
+def test_read_chain_projects_a_freshly_registered_genesis(coordinator_on, monkeypatch):
+    from atoms.chain.model import GenesisEntry
+
+    ingredients = coordinator_on()
+    _enable_commands(ingredients, monkeypatch)
+    backend, project_root, metadata_root, _ = ingredients
+    tracked = Path(project_root) / "tracked"
+    tracked.write_bytes(b"registration-time state")
+    tracked.chmod(0o640)
+    genesis = _register(ingredients, b"opaque genesis", ("tracked",))
+
+    view = _read(ingredients)
+
+    assert view.genesis_digest == genesis
+    assert view.tip == genesis
+    assert view.entries[0][0] == view.genesis_digest
+    assert view.entries[-1][0] == view.tip
+    assert view.entries == (
+        (
+            genesis,
+            GenesisEntry(
+                payload=b"opaque genesis",
+                baseline=(
+                    (
+                        "tracked",
+                        (
+                            ("kind", "file"),
+                            (
+                                "content_hash",
+                                hashlib.sha256(b"registration-time state").hexdigest(),
+                            ),
+                            ("mode", "0o640"),
+                            ("byte_len", str(len(b"registration-time state"))),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    assert _project_lock_is_free(backend, metadata_root)
+
+
+def test_read_chain_projects_the_whole_appended_chain_in_order(
+    coordinator_on, monkeypatch
+):
+    from atoms.chain.model import GenesisEntry, IntentEntry
+
+    ingredients = coordinator_on()
+    _enable_commands(ingredients, monkeypatch)
+    genesis = _register(ingredients, b"root", ())
+    first = _append(ingredients, b"first intent")
+    second = _append(ingredients, b"second intent")
+
+    view = _read(ingredients)
+
+    assert [digest for digest, _ in view.entries] == [genesis, first, second]
+    assert view.genesis_digest == view.entries[0][0] == genesis
+    assert view.entries[0][1] == GenesisEntry(payload=b"root", baseline=())
+    assert view.entries[1] == (first, IntentEntry(b"first intent"))
+    assert view.entries[-1] == (second, IntentEntry(b"second intent"))
+    assert view.entries[-1][0] == view.tip == second
+
+
+def test_read_chain_refuses_an_unregistered_root_without_transaction_artifacts(
+    coordinator_on, monkeypatch
+):
+    ingredients = coordinator_on()
+    _enable_commands(ingredients, monkeypatch)
+    _, project_root, metadata_root, _ = ingredients
+    view = None
+
+    with pytest.raises(PreconditionRefused):
+        view = _read(ingredients)
+
+    assert view is None
+    assert not (Path(project_root) / CHAIN_LEAF).exists()
+    assert list((Path(metadata_root) / "work").iterdir()) == []
+    assert list((Path(metadata_root) / "blobs" / "sha256").iterdir()) == []
+    assert _store_counts(metadata_root) == (0, 0)
+
+
+def test_read_chain_treats_a_missing_chain_with_a_live_record_as_corruption(
+    coordinator_on, leased
+):
+    from atoms.chain.errors import ChainStateInvalid
+    from tests.store_support import APPROVAL_EVIDENCE, one_effect_spec
+
+    ingredients = coordinator_on()
+    with leased(ingredients) as lease, lease._store.transaction() as transaction:
+        transaction.insert_record(
+            "tx1", one_effect_spec(), approval_evidence=APPROVAL_EVIDENCE
+        )
+        transaction.set_active("tx1")
+    view = None
+
+    with pytest.raises(ChainStateInvalid):
+        view = _read(ingredients)
+
+    assert view is None
+
+
+def test_read_chain_refuses_a_forked_chain_without_returning_a_partial_view(
+    coordinator_on, monkeypatch
+):
+    from atoms.chain.errors import ChainStateInvalid
+    from atoms.chain.model import IntentEntry, encode_entry, entry_digest
+
+    ingredients = coordinator_on()
+    _enable_commands(ingredients, monkeypatch)
+    _, project_root, _, _ = ingredients
+    genesis = _register(ingredients, b"root", ())
+    first = _append(ingredients, b"first intent")
+    forked = encode_entry(genesis, IntentEntry(b"forked intent"))
+    fork_digest = entry_digest(forked)
+    (Path(project_root) / CHAIN_LEAF / fork_digest).write_bytes(forked)
+    view = None
+
+    with pytest.raises(ChainStateInvalid, match="more than one successor"):
+        view = _read(ingredients)
+
+    assert view is None
+    assert set(_durable_entries(project_root)) == {genesis, first, fork_digest}
+
+
+def test_read_chain_is_a_recovery_barrier_that_discharges_a_stage_survivor(
+    coordinator_on, monkeypatch
+):
+    from atoms.chain.model import GenesisEntry
+    from atoms.chain.read import STAGING_LEAF
+    from atoms.fs.audit import AuditedBackend
+
+    ingredients = coordinator_on()
+    _enable_commands(ingredients, monkeypatch)
+    _, project_root, metadata_root, _ = ingredients
+    genesis = _register(ingredients, b"root", ())
+    transfer = AuditedBackend.transfer_noclobber
+    armed = True
+
+    def cut_once(self, src_fd, src, dst_fd, dst):
+        nonlocal armed
+        if armed and src == STAGING_LEAF:
+            armed = False
+            raise RuntimeError("cut between staging and transfer")
+        return transfer(self, src_fd, src, dst_fd, dst)
+
+    monkeypatch.setattr(AuditedBackend, "transfer_noclobber", cut_once)
+    with pytest.raises(RuntimeError, match="cut between staging and transfer"):
+        _append(ingredients, b"dead caller")
+    assert STAGING_LEAF in _durable_entries(project_root)
+
+    view = _read(ingredients)
+
+    assert view.entries == ((genesis, GenesisEntry(payload=b"root", baseline=())),)
+    assert view.genesis_digest == view.tip == genesis
+    assert STAGING_LEAF not in _durable_entries(project_root)
+    assert set(_durable_entries(project_root)) == {genesis}
+    assert _fresh_process(project_root, metadata_root)["lease"]["chain"] == {
+        "tip": genesis,
+        "digests": [genesis],
+    }
+
+
+def test_read_chain_releases_every_descriptor_and_the_lease_on_both_paths(
+    coordinator_on, monkeypatch
+):
+    """`read_chain` hands back no descriptor and no lock, on either outcome.
+
+    On the success arm the chain descriptor is `_registered_root`'s and its `finally`
+    closes it. On the `ChainStateInvalid` arm the foreign leaf is caught by the
+    lease's own `resolve`, which validates the same directory before `_registered_root`
+    runs -- so what is proved there is that the whole lease stack unwinds. There is no
+    input that makes `_registered_root` raise `ChainStateInvalid` after `resolve`
+    passed: both call one `validate_chain` on one directory under one lock.
+    """
+
+    from atoms.chain.errors import ChainStateInvalid
+
+    ingredients = coordinator_on()
+    _enable_commands(ingredients, monkeypatch)
+    backend, project_root, metadata_root, _ = ingredients
+    genesis = _register(ingredients, b"root", ())
+    _read(ingredients)  # Warm every lazily created path before counting.
+    before = len(os.listdir("/proc/self/fd"))
+
+    view = _read(ingredients)
+
+    assert view.tip == genesis
+    assert len(os.listdir("/proc/self/fd")) == before
+    assert _project_lock_is_free(backend, metadata_root)
+
+    (Path(project_root) / CHAIN_LEAF / "foreign").write_bytes(b"not an entry")
+    before = len(os.listdir("/proc/self/fd"))
+
+    with pytest.raises(ChainStateInvalid, match="foreign chain-directory leaf"):
+        _read(ingredients)
+
+    assert len(os.listdir("/proc/self/fd")) == before
+    assert _project_lock_is_free(backend, metadata_root)
+
+
+def test_the_chain_view_is_frozen_and_holds_no_engine_resource(
+    coordinator_on, monkeypatch
+):
+    from dataclasses import FrozenInstanceError
+
+    from atoms.chain.model import GenesisEntry
+
+    ingredients = coordinator_on()
+    _enable_commands(ingredients, monkeypatch)
+    backend, _, metadata_root, _ = ingredients
+    genesis = _register(ingredients, b"root", ())
+
+    view = _read(ingredients)
+
+    assert _project_lock_is_free(backend, metadata_root)
+    for field, replacement in (
+        ("genesis_digest", "0" * 64),
+        ("entries", ()),
+        ("tip", "0" * 64),
+    ):
+        with pytest.raises(FrozenInstanceError):
+            setattr(view, field, replacement)
+
+    assert view.genesis_digest == genesis
+    assert view.entries == ((genesis, GenesisEntry(payload=b"root", baseline=())),)
+    assert view.tip == genesis
