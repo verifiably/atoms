@@ -2,21 +2,24 @@
 
 from __future__ import annotations
 
-import os
-import re
-import stat
 from dataclasses import dataclass
 from enum import Enum
+from typing import cast as _cast
 
 from atoms.chain.errors import ChainStateInvalid
-from atoms.chain.model import Entry, GenesisEntry, decode_entry, entry_digest
+from atoms.chain.inspect import (
+    STAGING_LEAF,
+    ChainDefect,
+    ChainScan,
+    WellFormedChain,
+    foreign_leaf,
+    read_leaf,
+    scan_chain_directory,
+    validate_scan,
+)
+from atoms.chain.model import Entry, decode_entry, entry_digest
 from atoms.core.errors import ProtocolError
-from atoms.core.scratch import CHAIN_LEAF
-from atoms.fs.audit import AuditedBackend, Provenance, RootKind
-
-STAGING_LEAF = ".#~stage"
-_DIGEST_NAME = re.compile(r"^[0-9a-f]{64}$")
-_READ_SIZE = 1024 * 1024
+from atoms.fs.audit import AuditedBackend
 
 
 class SurvivorDisposition(Enum):
@@ -38,32 +41,13 @@ class ValidatedChain:
     survivors: tuple[SurvivorAction, ...]
 
 
-def _read_regular(
-    backend: AuditedBackend, chain_fd: int, name: str
-) -> bytes:
-    try:
-        fd = backend.open_regular_nofollow(chain_fd, name)
-    except OSError as caught:
-        raise ChainStateInvalid(
-            f"chain entry {name!r} is not a readable no-follow regular file"
-        ) from caught
-    try:
-        try:
-            info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode):
-                raise ChainStateInvalid(
-                    f"chain entry {name!r} is not a regular file"
-                )
-            chunks: list[bytes] = []
-            while chunk := os.read(fd, _READ_SIZE):
-                chunks.append(chunk)
-            return b"".join(chunks)
-        except OSError as caught:
-            raise ChainStateInvalid(
-                f"chain entry {name!r} could not be read coherently"
-            ) from caught
-    finally:
-        backend.close_fd(fd)
+def _read_regular(backend: AuditedBackend, chain_fd: int, name: str) -> bytes:
+    """`read_leaf`'s raising disposition -- one predicate, one FOREIGN_LEAF wording."""
+
+    data = read_leaf(backend, chain_fd, name)
+    if data is None:
+        raise ChainStateInvalid(foreign_leaf(name).detail)
+    return data
 
 
 def _planned(planned: tuple[bytes, ...]) -> dict[bytes, str | None]:
@@ -85,89 +69,42 @@ def _planned(planned: tuple[bytes, ...]) -> dict[bytes, str | None]:
     return checked
 
 
-def _linearize(
-    found: dict[str, tuple[str | None, Entry, bytes]],
-) -> tuple[tuple[tuple[str, Entry], ...], str | None]:
-    if not found:
-        return (), None
-    genesis = [
-        digest
-        for digest, (previous, entry, _) in found.items()
-        if previous is None and type(entry) is GenesisEntry
-    ]
-    if len(genesis) != 1:
-        raise ChainStateInvalid("a non-empty chain must contain exactly one genesis")
-    successors: dict[str, str] = {}
-    for digest, (previous, _, _) in found.items():
-        if previous is None:
-            continue
-        if previous not in found:
-            raise ChainStateInvalid(
-                f"chain entry {digest} names missing predecessor {previous}"
-            )
-        if previous in successors:
-            raise ChainStateInvalid(
-                f"chain entry {previous} has more than one successor"
-            )
-        successors[previous] = digest
-
-    ordered: list[tuple[str, Entry]] = []
-    current = genesis[0]
-    while True:
-        if any(digest == current for digest, _ in ordered):
-            raise ChainStateInvalid("the chain contains a cycle")
-        ordered.append((current, found[current][1]))
-        successor = successors.get(current)
-        if successor is None:
-            break
-        current = successor
-    if len(ordered) != len(found):
-        raise ChainStateInvalid("the chain contains an orphan history")
-    return tuple(ordered), current
-
-
 def validate_chain(
     backend: AuditedBackend,
     chain_fd: int,
     planned: tuple[bytes, ...] = (),
 ) -> ValidatedChain:
-    """Validate every durable entry and classify the fixed staging survivor."""
+    """Validate every durable entry and classify the fixed staging survivor.
+
+    The raising disposition of `atoms.chain.inspect`'s core (design §4.6): this
+    computes no defect of its own, so the taxonomy the inspecting commands report and
+    the taxonomy the mutating paths refuse cannot fork. `_planned` runs first,
+    preserving the current ordering of `ProtocolError` against `ChainStateInvalid`.
+    """
 
     planned_entries = _planned(planned)
-    if backend.provenance_of(chain_fd) != Provenance(RootKind.PROJECT, CHAIN_LEAF):
-        raise ProtocolError("chain_fd must name the reserved chain directory")
-    try:
-        names = sorted(os.listdir(chain_fd))
-    except OSError as caught:
-        raise ChainStateInvalid("the chain directory cannot be listed") from caught
-
-    found: dict[str, tuple[str | None, Entry, bytes]] = {}
-    staged: bytes | None = None
-    for name in names:
-        if name == STAGING_LEAF:
-            staged = _read_regular(backend, chain_fd, name)
-            continue
-        if _DIGEST_NAME.fullmatch(name) is None:
-            raise ChainStateInvalid(f"foreign chain-directory leaf {name!r}")
-        envelope = _read_regular(backend, chain_fd, name)
-        if entry_digest(envelope) != name:
-            raise ChainStateInvalid(
-                f"chain entry name {name!r} does not match its bytes"
-            )
-        previous, entry = decode_entry(envelope)
-        found[name] = (previous, entry, envelope)
-
-    entries, tip = _linearize(found)
+    scanned = scan_chain_directory(backend, chain_fd)
+    if type(scanned) is ChainDefect:
+        raise ChainStateInvalid(scanned.detail)
+    scan = _cast(ChainScan, scanned)
+    result = validate_scan(scan)
+    # The one place a returned arm is flattened, and it is exact: an absent chain is
+    # `ValidatedChain`'s existing empty shape, which every call site already handles.
+    entries: tuple[tuple[str, Entry], ...] = ()
+    tip: str | None = None
+    if type(result) is WellFormedChain:
+        entries, tip = result.entries, result.tip
+    durable_envelopes = {digest: envelope for digest, _, _, envelope in scan.found}
+    staged = scan.staged
     for envelope, previous in planned_entries.items():
-        durable = found.get(entry_digest(envelope))
-        if (durable is None or durable[2] != envelope) and previous != tip:
+        durable = durable_envelopes.get(entry_digest(envelope))
+        if durable != envelope and previous != tip:
             raise ProtocolError(
                 "a planned envelope must already be durable or derive from the validated tip"
             )
     survivors: tuple[SurvivorAction, ...] = ()
     if staged is not None:
-        digest = entry_digest(staged)
-        already_durable = digest in found and found[digest][2] == staged
+        already_durable = durable_envelopes.get(entry_digest(staged)) == staged
         if staged in planned_entries and not already_durable:
             action = SurvivorAction(
                 STAGING_LEAF, SurvivorDisposition.FINISH, staged
