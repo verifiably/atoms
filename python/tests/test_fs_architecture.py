@@ -1191,10 +1191,19 @@ def test_chain_commands_keep_the_lease_and_approval_proofs_private():
         if not name.startswith("_")
     }
     assert commands.__all__ == (
+        "AbsentChain",
+        "ChainDefect",
+        "ChainInspection",
         "ChainView",
+        "DefectKind",
         "Entry",
+        "MalformedChain",
         "TransactionOutcome",
+        "WellFormedChain",
         "append_intent",
+        "capture_states",
+        "inspect_chain",
+        "inspect_chain_detached",
         "read_chain",
         "register_root",
         "run_transaction",
@@ -1204,18 +1213,53 @@ def test_chain_commands_keep_the_lease_and_approval_proofs_private():
         "append_intent",
         "run_transaction",
         "read_chain",
+        "inspect_chain",
+        "inspect_chain_detached",
+        "capture_states",
     }
 
-    for name, function in public.items():
-        assert any(
+    def _enters(function, manager: str) -> bool:
+        return any(
             isinstance(node, ast.With)
             and any(
                 isinstance(item.context_expr, ast.Call)
-                and _called_name(item.context_expr) == "_recovery_lease"
+                and _called_name(item.context_expr) == manager
                 for item in node.items
             )
             for node in ast.walk(function)
-        ), f"{name} does not enter _recovery_lease"
+        )
+
+    def _names(function, called: str) -> bool:
+        return any(
+            isinstance(node, ast.Call) and _called_name(node) == called
+            for node in ast.walk(function)
+        )
+
+    # Clause 1: the four mutating-or-reading commands still enter `_recovery_lease`,
+    # so the recovery barrier they publish is unchanged by the split.
+    for name in ("register_root", "append_intent", "run_transaction", "read_chain"):
+        assert _enters(public[name], "_recovery_lease"), f"{name} skips _recovery_lease"
+        assert not _names(public[name], "resolve"), f"{name} names resolve"
+
+    # Clause 2: structural inspection interposes between reclamation and resolution,
+    # and it is the ONLY public function permitted to do so.
+    assert _enters(public["inspect_chain"], "_project_lease")
+    assert not _enters(public["inspect_chain"], "_recovery_lease")
+    assert {
+        name for name, function in public.items() if _enters(function, "_project_lease")
+    } == {"inspect_chain"}
+    assert {
+        name for name, function in public.items() if _names(function, "resolve")
+    } == {"inspect_chain"}
+
+    # Clause 3: the named exempt pair takes no lease and no lock at all.
+    for name in ("inspect_chain_detached", "capture_states"):
+        assert not _enters(public[name], "_recovery_lease")
+        assert not _enters(public[name], "_project_lease")
+        assert not _names(public[name], "acquire_project_lock")
+        assert not _names(public[name], "resolve")
+
+    for name, function in public.items():
         annotations = [
             argument.annotation
             for argument in function.args.args
@@ -1241,6 +1285,28 @@ def test_chain_commands_keep_the_lease_and_approval_proofs_private():
         )
     }
     assert lease_acceptors == set()
+
+    # Clause 4: `_recovery_lease` is literally `_project_lease` plus `resolve`, so the
+    # split cannot drift into two lease bodies with two entry orders.
+    root_tree = ast.parse(
+        (SOURCE_ROOT / "coordinator" / "root.py").read_text(encoding="utf-8")
+    )
+    recovery_lease = next(
+        node
+        for node in root_tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_recovery_lease"
+    )
+    body = [
+        node
+        for node in recovery_lease.body
+        if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant))
+    ]
+    expected = ast.parse(
+        "with _project_lease(backend, project_root, metadata_root, storage) as lease:\n"
+        "    resolve(lease._binding, lease._store)\n"
+        "    yield lease\n"
+    ).body
+    assert [ast.dump(node) for node in body] == [ast.dump(node) for node in expected]
 
 
 def test_ledger_entry_nine_is_discharged_after_a8_added_no_entry_point():

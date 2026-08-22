@@ -8,6 +8,23 @@ from typing import cast as _cast
 
 from atoms.chain.append import append_entry as _append_entry
 from atoms.chain.append import bootstrap_chain as _bootstrap_chain
+from atoms.chain.errors import ChainStateInvalid, PendingUnresolved
+from atoms.chain.inspect import (
+    OCCUPIED_CHAIN_LEAF,
+    AbsentChain,
+    ChainDefect,
+    ChainInspection,
+    ChainScan,
+    DefectKind,
+    MalformedChain,
+    WellFormedChain,
+    _pending_of,
+)
+from atoms.chain.inspect import committed_fulfillments as _committed_fulfillments
+from atoms.chain.inspect import fulfills_fault as _fulfills_fault
+from atoms.chain.inspect import inspect_scan as _inspect_scan
+from atoms.chain.inspect import scan_chain_directory as _scan_chain_directory
+from atoms.chain.inspect import staged_pending as _staged_pending
 from atoms.chain.model import (
     ChainOutcome,
     Entry,
@@ -18,8 +35,12 @@ from atoms.chain.model import (
 from atoms.chain.read import validate_chain as _validate_chain
 from atoms.coordinator.capture import PayloadSource
 from atoms.coordinator.execute import _run_under_lease
-from atoms.coordinator.recover import _registered_root
-from atoms.coordinator.root import _recovery_lease, _require_chain_publication
+from atoms.coordinator.recover import _registered_root, resolve
+from atoms.coordinator.root import (
+    _project_lease,
+    _recovery_lease,
+    _require_chain_publication,
+)
 from atoms.core.compiler import compile_spec
 from atoms.core.errors import PreconditionRefused, ProtocolError, SpecValidationError
 from atoms.core.fingerprint import ABSENT, PathState
@@ -30,22 +51,41 @@ from atoms.core.recovery.model import (
     ObservedFile,
     ObservedSymlink,
 )
+from atoms.core.scratch import CHAIN_LEAF
 from atoms.core.spec import TransactionSpec
 from atoms.fs.audit import AuditedBackend
 from atoms.fs.backend import Backend
 from atoms.fs.lock import close_all
 from atoms.fs.observe import Observation
 from atoms.fs.volume import StorageProfile
+from atoms.store.connection import Store
 
 __all__ = (
+    "AbsentChain",
+    "ChainDefect",
+    "ChainInspection",
     "ChainView",
+    "DefectKind",
     "Entry",
+    "MalformedChain",
     "TransactionOutcome",
+    "WellFormedChain",
     "append_intent",
+    "capture_states",
+    "inspect_chain",
+    "inspect_chain_detached",
     "read_chain",
     "register_root",
     "run_transaction",
 )
+
+_ABSENT_PARENT = frozenset({errno.ENOENT, errno.ENOTDIR, errno.ELOOP})
+_UNSTABLE_CHAIN_LEAF = frozenset({errno.ENOTDIR, errno.ELOOP, errno.EXDEV})
+_FULFILLS_REFUSAL = {
+    "missing": "fulfills names no entry of the validated chain",
+    "non-ancestor": "fulfills names an entry that is not an ancestor",
+    "non-intent": "fulfills names an entry that is not an intent",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,8 +100,8 @@ class TransactionOutcome:
 class ChainView:
     """One validated chain, projected for a consumer, holding no engine resource.
 
-    `entries` is `_linearize`'s order: genesis first, one successor per entry, tip
-    last. `genesis_digest` is `entries[0][0]` and `tip` is the validator's own tip,
+    `entries` is the core's linearized order: genesis first, one successor per entry,
+    tip last. `genesis_digest` is `entries[0][0]` and `tip` is the validator's own tip,
     not a re-derivation of `entries[-1][0]`.
     """
 
@@ -118,7 +158,9 @@ def _capture_path(
             try:
                 parent_fd = backend.open_child_directory(parent_fd, component)
             except OSError as caught:
-                if caught.errno == errno.ENOENT:
+                # The named path does not exist when its parent is a file or a symlink
+                # either; the parent's own state is separately capturable by naming it.
+                if caught.errno in _ABSENT_PARENT:
                     return ABSENT
                 raise
             owned.append(parent_fd)
@@ -127,9 +169,153 @@ def _capture_path(
         )
         if type(observed) is ObservedAbsent:
             return ABSENT
+        if type(observed) not in (ObservedFile, ObservedDirectory, ObservedSymlink):
+            # The PathState vocabulary is closed by authority §6: an unrepresentable or
+            # unreadable entry is refused, never coerced to ABSENT and never widened.
+            raise PreconditionRefused(
+                f"{path!r} was observed as {type(observed).__name__}, which is outside "
+                "the closed path-state vocabulary"
+            )
         return _cast(ObservedFile | ObservedDirectory | ObservedSymlink, observed).state
     finally:
         close_all(backend, reversed(owned))
+
+
+def _require_capture_paths(value: object) -> tuple[str, ...]:
+    """Design §9.2. Sortedness is `registered_surface`'s requirement, not capture's."""
+
+    if type(value) is not tuple or any(type(path) is not str for path in value):
+        raise PreconditionRefused("paths must be an exact tuple of exact strings")
+    paths = _cast(tuple[str, ...], value)
+    if len(paths) != len(set(paths)):
+        # Two rows for one path invite a coherence question that has no good answer.
+        raise PreconditionRefused("paths must be duplicate-free")
+    try:
+        for path in paths:
+            require_rel_path("capture path", path)
+    except SpecValidationError as caught:
+        raise PreconditionRefused(str(caught)) from caught
+    return paths
+
+
+def _require_no_pending(entries: tuple[tuple[str, Entry], ...]) -> None:
+    """Design §10: an unsettled chain is not a chain you may mutate.
+
+    Post-recovery this is honest: a durable registration always had a durable record
+    before it, so a registration still unsettled after resolution has no record left to
+    settle it. Its evidence is gone, and no retry will bring it back.
+    """
+
+    pending = _pending_of(entries)
+    if pending:
+        raise PendingUnresolved(
+            "the chain carries unsettled registrations: "
+            + ", ".join(f"{txid} at {digest}" for txid, digest in pending)
+        )
+
+
+def _require_admissible_fulfills(
+    entries: tuple[tuple[str, Entry], ...], fulfills: str | None
+) -> None:
+    """Design §11.2's two independent submission checks, before any record exists.
+
+    The referent check is the core's own predicate at the index the registration is
+    about to occupy, so "membership in the validated chain" and the inspection's
+    "strictly below the referencing index" are the same question -- which is why a
+    `fulfills` naming the current tip is accepted.
+
+    The duplicate check cannot be that predicate: the inspection recognizes
+    DUPLICATE_FULFILLMENT only at the second committed settlement, which at submission
+    has not been appended, has not been decided, and may never be. So this is a
+    deliberate over-refusal against a strictly earlier state: a spec it rejects would
+    have condemned the chain only if the transaction had been appended AND committed.
+    """
+
+    if fulfills is None:
+        return
+    fault = _fulfills_fault(entries, len(entries), fulfills)
+    if fault is not None:
+        raise PreconditionRefused(f"{_FULFILLS_REFUSAL[fault]}: {fulfills}")
+    if fulfills in _committed_fulfillments(entries):
+        raise PreconditionRefused(
+            f"an earlier committed registration already fulfills {fulfills}"
+        )
+
+
+def _inspect_under(
+    backend: AuditedBackend,
+    project_root_fd: int,
+    store: Store,
+    *,
+    after_resolution: bool,
+) -> ChainInspection:
+    """Registered-mode structural inspection, under the held project lease.
+
+    `_registered_root`'s errno handling reproduced with inspecting dispositions: it
+    raises where this must classify, so it stays exactly as it is for the three
+    mutators and `read_chain`. A record that contradicts the chain keeps raising --
+    that is a claim about the metadata store, which detached mode by construction
+    cannot see, so giving it a taxonomy row would fork the taxonomy (design §12).
+    """
+
+    try:
+        chain_fd = backend.open_child_directory(project_root_fd, CHAIN_LEAF)
+    except OSError as caught:
+        if caught.errno == errno.ENOENT:
+            if store.read_active() is not None:
+                raise ChainStateInvalid(
+                    "a live transaction record exists without its project chain"
+                ) from caught
+            return AbsentChain()
+        if caught.errno in _UNSTABLE_CHAIN_LEAF:
+            return MalformedChain(OCCUPIED_CHAIN_LEAF)
+        raise
+    try:
+        scanned = _scan_chain_directory(backend, chain_fd)
+    finally:
+        backend.close_fd(chain_fd)
+    if type(scanned) is ChainDefect:
+        return MalformedChain(scanned)
+    scan = _cast(ChainScan, scanned)
+    if after_resolution and scan.staged is not None:
+        # `resolve` adjudicates every survivor; one that outlives it is the existing
+        # engine-internal impossibility, not a fifteenth defect (design §8).
+        raise ChainStateInvalid("chain staging appeared after lease resolution")
+    result = _inspect_scan(scan)
+    if type(result) is AbsentChain and store.read_active() is not None:
+        raise ChainStateInvalid(
+            "a live transaction record exists without a chain genesis"
+        )
+    return result
+
+
+def _inspect_detached(
+    backend: AuditedBackend, project_root_fd: int
+) -> ChainInspection:
+    """The same table under strictly less evidence: no store to consult (design §7.2)."""
+
+    try:
+        chain_fd = backend.open_child_directory(project_root_fd, CHAIN_LEAF)
+    except OSError as caught:
+        if caught.errno == errno.ENOENT:
+            return AbsentChain()
+        if caught.errno in _UNSTABLE_CHAIN_LEAF:
+            return MalformedChain(OCCUPIED_CHAIN_LEAF)
+        raise
+    try:
+        scanned = _scan_chain_directory(backend, chain_fd)
+    finally:
+        backend.close_fd(chain_fd)
+    if type(scanned) is ChainDefect:
+        return MalformedChain(scanned)
+    scan = _cast(ChainScan, scanned)
+    result = _inspect_scan(scan)
+    if type(result) is WellFormedChain:
+        # Detached mode cannot adjudicate a survivor -- FINISH versus REMOVE is decided
+        # by the active record's planned envelope, and there is no store -- so it
+        # reports the registration evidence instead of finishing or removing it.
+        return _staged_pending(scan, result)
+    return result
 
 
 def register_root(
@@ -153,6 +339,12 @@ def register_root(
             validated = _validate_chain(chain_backend, chain_fd)
             if validated.survivors:
                 raise ProtocolError("chain staging appeared after lease resolution")
+            # Before the genesis/surface comparison, deliberately: the dangerous outcome
+            # on the existing-chain arm is the idempotent success return below, and one
+            # uniform rule -- an unsettled chain is not one you may re-register against
+            # -- is worth more than the more informative refusal a mismatched payload
+            # would otherwise have produced. Vacuous on the bootstrap path.
+            _require_no_pending(validated.entries)
             if validated.entries:
                 digest, genesis = validated.entries[0]
                 if (
@@ -192,6 +384,7 @@ def append_intent(
         chain_backend = _cast(AuditedBackend, lease._binding.backend)
         _require_chain_publication(lease._binding.evidence)
         with _registered_root(lease) as (chain_fd, validated):
+            _require_no_pending(validated.entries)
             return _append_entry(
                 chain_backend, chain_fd, validated, IntentEntry(payload)
             )
@@ -211,6 +404,11 @@ def run_transaction(
     ) as lease:
         _require_chain_publication(lease._binding.evidence)
         with _registered_root(lease) as (chain_fd, validated):
+            # An unsettled chain is refused whatever the new spec says, and the
+            # `fulfills` gate runs before `admit` -- before any record exists, which is
+            # the one point at which refusing is free.
+            _require_no_pending(validated.entries)
+            _require_admissible_fulfills(validated.entries, compiled.spec.fulfills)
             result = _run_under_lease(
                 lease, chain_fd, validated, compiled, payloads
             )
@@ -247,3 +445,90 @@ def read_chain(
             entries=validated.entries,
             tip=validated.tip,
         )
+
+
+def inspect_chain(
+    backend: Backend,
+    project_root: str,
+    metadata_root: str,
+    storage: StorageProfile,
+) -> ChainInspection:
+    """Render a structural verdict about a registered root's chain (design §6.2).
+
+    Lock, reclaim probe survivors, bind, open store, reclaim orphans, **inspect**;
+    malformed returns without resolving, because recovery must never run over damage.
+    Otherwise resolve and inspect again: `resolve` can append a registration or a
+    settlement and discharges the staging survivor, so a verdict taken before it would
+    be stale in exactly the way the recovery barrier exists to prevent.
+
+    Reclamation sits above the split, so auditing a damaged root does discard
+    metadata-side debris before the caller learns the chain is damaged. It touches no
+    chain leaf. A consumer that must disturb nothing has `inspect_chain_detached`.
+    """
+    with _project_lease(backend, project_root, metadata_root, storage) as lease:
+        chain_backend = _cast(AuditedBackend, lease._binding.backend)
+        root_fd = lease._binding.project_root_fd
+        first = _inspect_under(
+            chain_backend, root_fd, lease._store, after_resolution=False
+        )
+        if type(first) is MalformedChain:
+            return first
+        resolve(lease._binding, lease._store)
+        return _inspect_under(
+            chain_backend, root_fd, lease._store, after_resolution=True
+        )
+
+
+def inspect_chain_detached(
+    backend: Backend,
+    project_root: str,
+) -> ChainInspection:
+    """Render the same verdict over a root this engine is not registered on.
+
+    Two parameters, not four: an arriving root has no metadata root and no storage
+    profile, and accepting either would be a parameter the caller could only fabricate.
+    No lock, no volume binding, no store, no `resolve`, no `bootstrap_chain`.
+
+    It gives content-name integrity, canonical decodability, and the linkage and
+    entry-class relation over exactly the set it read -- but NOT that this set is the
+    durable chain at any instant. Against a concurrently written root it can report a
+    stale tip or a spurious defect. That is the price of having no metadata root to
+    lock against, and it is why the supported caller is an import boundary whose
+    subject is a copy no engine is live on.
+    """
+    audited = AuditedBackend.detached(backend, project_root=project_root)
+    root_fd = audited.open_root(project_root)
+    try:
+        return _inspect_detached(audited, root_fd)
+    finally:
+        audited.close_fd(root_fd)
+
+
+def capture_states(
+    backend: Backend,
+    root: str,
+    paths: tuple[str, ...],
+) -> tuple[tuple[str, PathState], ...]:
+    """State exactly the named paths, in the caller's order, one pair each.
+
+    No directory walking, no enumeration, no inference of siblings: what to enumerate
+    is the consumer's projection under the consumer's grammar, and what a path *is* is
+    the engine's. Sharing `_capture_path` with `register_root`'s baseline capture is
+    what makes "no second summary model" a mechanism rather than a promise.
+
+    One `Observation` across the whole batch, which is the coherence this command
+    exists to provide: identity pinning is shared, so no inode observed early in the
+    batch can be recycled onto a different entry later in it. A caller looping over a
+    single-path command would get n incomparable observations. Serialization is the
+    caller's; this takes no lock and asserts nothing about registration.
+    """
+    audited = AuditedBackend.detached(backend, project_root=root)
+    root_fd = audited.open_root(root)
+    try:
+        with Observation(audited) as observation:
+            return tuple(
+                (path, _capture_path(audited, root_fd, path, observation))
+                for path in _require_capture_paths(paths)
+            )
+    finally:
+        audited.close_fd(root_fd)

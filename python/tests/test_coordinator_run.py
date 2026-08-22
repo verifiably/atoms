@@ -9,10 +9,30 @@ from pathlib import Path
 
 import pytest
 
-from atoms.chain.model import ChainOutcome, RegisteredEntry, SettledEntry, decode_entry
-from atoms.coordinator.commands import TransactionOutcome, run_transaction
+from atoms.chain.inspect import (
+    ChainScan,
+    DefectKind,
+    MalformedChain,
+    WellFormedChain,
+    inspect_scan,
+)
+from atoms.chain.model import (
+    ChainOutcome,
+    IntentEntry,
+    RegisteredEntry,
+    SettledEntry,
+    decode_entry,
+)
+from atoms.coordinator.commands import (
+    TransactionOutcome,
+    inspect_chain_detached,
+    read_chain,
+    run_transaction,
+)
+from atoms.core.errors import PreconditionRefused
 from atoms.core.recovery import CommitDecision, TransactionState
 from atoms.core.scratch import CHAIN_LEAF
+from atoms.fs.linux import LinuxBackend
 from tests.capture_support import DictPayloads, digest_of
 from tests.coordinator_support import (
     AFTER,
@@ -25,7 +45,12 @@ from tests.coordinator_support import (
     nested_directory_spec,
     replace_spec,
 )
-from tests.test_coordinator_commands import _durable_entries, _enable_commands, _register
+from tests.test_coordinator_commands import (
+    _append,
+    _durable_entries,
+    _enable_commands,
+    _register,
+)
 
 
 def test_run_transaction_commits_the_world_chain_and_public_outcome(
@@ -351,16 +376,23 @@ def test_caught_failure_before_registration_is_reconciled_then_rolled_back(
 def test_registration_carries_the_specs_consumer_intent_and_surface_projection(
     coordinator_on, monkeypatch
 ) -> None:
+    """Ledger row 27's verification: the engine's opaque carriage of `fulfills`.
+
+    The referent is a real intent this test appends first, because the submission gate
+    now refuses an unresolvable one. The carriage assertion itself is unchanged, so
+    nothing row 27 proved before is weakened -- only the referent is resolvable.
+    """
     ingredients = coordinator_on()
     _enable_commands(ingredients, monkeypatch)
     backend, project_root, metadata_root, storage = ingredients
     (Path(project_root) / "d").mkdir()
     _register(ingredients, b"root", ())
+    intent = _append(ingredients, b"an intent to fulfill")
     spec = replace(
         create_file_spec(),
         consumer_tag="consumer-x",
         intent_digest="sha256:" + "a" * 64,
-        fulfills="b" * 64,
+        fulfills=intent,
         registered_paths=("d/f.txt",),
     )
 
@@ -379,9 +411,170 @@ def test_registration_carries_the_specs_consumer_intent_and_surface_projection(
     assert type(registered) is RegisteredEntry
     assert registered.consumer_tag == "consumer-x"
     assert registered.intent_digest == "sha256:" + "a" * 64
-    assert registered.fulfills == "b" * 64
+    assert registered.fulfills == intent
     assert tuple(path for path, _ in registered.initial) == ("d/f.txt",)
     assert tuple(path for path, _ in registered.final) == ("d/f.txt",)
+
+
+def _fulfilling_spec(fulfills: str | None):
+    return replace(create_file_spec(), fulfills=fulfills, registered_paths=("d/f.txt",))
+
+
+def _registration_of(fulfills: str | None, txid: str = "tx_gate") -> RegisteredEntry:
+    return RegisteredEntry(
+        txid=txid,
+        intent_digest="sha256:" + "1" * 64,
+        consumer_tag="consumer",
+        initial=(),
+        final=(),
+        fulfills=fulfills,
+    )
+
+
+def _settlement_of(
+    registration: str, outcome: ChainOutcome = ChainOutcome.COMMITTED
+) -> SettledEntry:
+    return SettledEntry(txid="tx_gate", registration=registration, outcome=outcome)
+
+
+def _inspect_with(entries, *appended):
+    """Run the core over the chain the gate refused to let the command build."""
+    rows = []
+    previous = None
+    for digest, entry in tuple(entries) + appended:
+        rows.append((digest, previous, entry, b""))
+        previous = digest
+    scan = ChainScan(found=tuple(sorted(rows, key=lambda row: row[0])), staged=None)
+    return inspect_scan(scan)
+
+
+def test_a_fulfills_naming_the_current_tip_is_accepted(
+    coordinator_on, monkeypatch
+) -> None:
+    """Design §11.2: the referent condition is membership, not strict ancestry.
+
+    An intent appended and immediately fulfilled is science's live post-intent-refusal
+    shape, and the three-entry slice below is what its acceptance suite pins downstream.
+    """
+    ingredients = coordinator_on()
+    _enable_commands(ingredients, monkeypatch)
+    backend, project_root, metadata_root, storage = ingredients
+    (Path(project_root) / "d").mkdir()
+    genesis = _register(ingredients, b"root", ())
+    intent = _append(ingredients, b"an intent")
+
+    outcome = run_transaction(
+        backend,
+        project_root,
+        metadata_root,
+        storage,
+        _fulfilling_spec(intent),
+        DictPayloads({digest_of(AFTER): AFTER}),
+    )
+
+    view = read_chain(backend, project_root, metadata_root, storage)
+    assert [digest for digest, _ in view.entries] == [
+        genesis,
+        intent,
+        outcome.registration,
+        outcome.settlement,
+    ]
+    assert [type(entry) for _, entry in view.entries[1:]] == [
+        IntentEntry,
+        RegisteredEntry,
+        SettledEntry,
+    ]
+    assert type(inspect_chain_detached(LinuxBackend(), project_root)) is WellFormedChain
+
+
+def test_the_referent_check_refuses_exactly_what_the_inspection_would_condemn(
+    coordinator_on, monkeypatch
+) -> None:
+    """Every spec the referent check refuses would have yielded FULFILLS_UNRESOLVED.
+
+    The condemned entry is appended through the core rather than through the gated
+    command, because the gate is what makes the durable spelling unreachable.
+    """
+    ingredients = coordinator_on()
+    _enable_commands(ingredients, monkeypatch)
+    backend, project_root, metadata_root, storage = ingredients
+    (Path(project_root) / "d").mkdir()
+    _register(ingredients, b"root", ())
+    outcome = run_transaction(
+        backend,
+        project_root,
+        metadata_root,
+        storage,
+        create_file_spec(),
+        DictPayloads({digest_of(AFTER): AFTER}),
+    )
+    (Path(project_root) / "d" / "f.txt").unlink()
+    view = read_chain(backend, project_root, metadata_root, storage)
+
+    for fulfills in ("b" * 64, outcome.registration, outcome.settlement):
+        with pytest.raises(PreconditionRefused, match="fulfills names"):
+            run_transaction(
+                backend,
+                project_root,
+                metadata_root,
+                storage,
+                _fulfilling_spec(fulfills),
+                DictPayloads({digest_of(AFTER): AFTER}),
+            )
+        condemned = _inspect_with(
+            view.entries, ("f" * 64, _registration_of(fulfills))
+        )
+        assert type(condemned) is MalformedChain
+        assert condemned.defect.kind is DefectKind.FULFILLS_UNRESOLVED
+
+
+def test_the_duplicate_check_over_refuses_only_what_a_commit_would_condemn(
+    coordinator_on, monkeypatch
+) -> None:
+    """Design §11.2: the weaker true claim, and the other half of it.
+
+    A registration naming an already-committed-fulfilled intent condemns the chain only
+    if it *also* commits; the same registration rolled back leaves a well-formed chain.
+    That asymmetry is why the gate is a deliberate over-refusal, not a mirror.
+    """
+    ingredients = coordinator_on()
+    _enable_commands(ingredients, monkeypatch)
+    backend, project_root, metadata_root, storage = ingredients
+    (Path(project_root) / "d").mkdir()
+    _register(ingredients, b"root", ())
+    intent = _append(ingredients, b"an intent")
+    run_transaction(
+        backend,
+        project_root,
+        metadata_root,
+        storage,
+        _fulfilling_spec(intent),
+        DictPayloads({digest_of(AFTER): AFTER}),
+    )
+    (Path(project_root) / "d" / "f.txt").unlink()
+
+    with pytest.raises(PreconditionRefused, match="already fulfills"):
+        run_transaction(
+            backend,
+            project_root,
+            metadata_root,
+            storage,
+            _fulfilling_spec(intent),
+            DictPayloads({digest_of(AFTER): AFTER}),
+        )
+
+    view = read_chain(backend, project_root, metadata_root, storage)
+    second = ("f" * 64, _registration_of(intent))
+    committed = _inspect_with(view.entries, second, ("e" * 64, _settlement_of("f" * 64)))
+    rolled_back = _inspect_with(
+        view.entries,
+        second,
+        ("e" * 64, _settlement_of("f" * 64, ChainOutcome.ROLLED_BACK)),
+    )
+
+    assert type(committed) is MalformedChain
+    assert committed.defect.kind is DefectKind.DUPLICATE_FULFILLMENT
+    assert type(rolled_back) is WellFormedChain
 
 
 @pytest.mark.parametrize("variant", ["replace", "delete", "move"])
