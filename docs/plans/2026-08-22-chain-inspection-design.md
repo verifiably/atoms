@@ -61,9 +61,9 @@ make impossible.
   core. `ValidatedChain`, `SurvivorAction`, `SurvivorDisposition`, and `STAGING_LEAF`
   keep their exact current shapes, so `chain/append.py` and `coordinator/recover.py` are
   not touched by the refactor.
-- Six new invariants in the core that `validate_chain` does not check today (§4.3), and
-  the one **submission gate** (§11) that keeps the engine from minting a chain those
-  invariants would condemn.
+- Six new invariants in the core that `validate_chain` does not check today (§4.3), and the
+  **submission gate** (§11) — two independent checks in `run_transaction` — that keeps the
+  engine from minting a chain those invariants would condemn.
 - Three public commands in `atoms/coordinator/commands.py`: `inspect_chain`,
   `inspect_chain_detached`, `capture_states`.
 - Splitting `_recovery_lease` into `_project_lease` + `resolve` (§6), so structural
@@ -168,9 +168,14 @@ ChainInspection = WellFormedChain | MalformedChain | AbsentChain
 ```
 
 Fourteen kinds, one per taxonomy row of the consumer contract's §2.1 list, in that list's
-order. `subject` names the offending leaf name or entry digest and is `None` only for the
-two whole-chain defects (`GENESIS_COUNT`, `ORPHAN_HISTORY`); §4.4 pins what it names for
-each of the other twelve. `detail` is the defect's one-sentence wording, minted here and
+order. `subject` names the offending leaf name or entry digest, and §4.4 pins what it names
+for each kind. **It is `None` for exactly one kind, `GENESIS_COUNT`** — a chain with zero or
+several genesis entries has no single offending entry to name, and naming an arbitrary one
+of several would invent a fact. Every other kind names something, including the two the
+consuming design's gate of 2026-08-22 ruled on: `ORPHAN_HISTORY` names the **lowest
+unvisited digest**, and `DUPLICATE_FULFILLMENT` names the **second committed settlement's
+digest**. Both rulings are adopted here; §4.4 steps 10 and pass 3 carry them. `detail` is
+the defect's one-sentence wording, minted here and
 nowhere else: it is what `MalformedChain` carries to a consumer and, byte for byte, what
 `ChainStateInvalid` carries on the raising path. `FULFILLS_UNRESOLVED` covers the
 contract's single "`fulfills` naming a missing, non-ancestor, or non-intent entry" row;
@@ -270,12 +275,14 @@ For each leaf, in this sub-order:
    staging leaf is engine bookkeeping only when it *is* a staged envelope; a directory or
    symlink squatting on the reserved name is a foreign object, not bookkeeping, and this
    is the one carve-out in the contract's "the staging leaf is never a foreign-leaf
-   defect". **This carve-out is pending Science-side ratification at the consuming design's
-   gate** (§16.10): the consuming contract states the exemption flatly, and narrowing it to
-   "only when the leaf is a staged envelope" is an amendment to that sentence, not a
-   reading of it. Both dispositions are implementable; the alternative is a fifteenth
-   defect kind for the squatting case, which would break the fourteen-row taxonomy, or
-   raising, which would break "never raises on structural damage";
+   defect". **Ratified at the consuming design's gate, 2026-08-22, with the exemption's
+   scope pinned to exactly this wording: the staging exemption applies to a readable,
+   no-follow regular staging file, and to nothing else.** A `.#~stage` that is anything
+   else — a directory, a symlink, a device, or a regular file that cannot be opened
+   no-follow and read — is `FOREIGN_LEAF`. The pin is what makes the carve-out testable:
+   the three conditions are exactly `_read_regular`'s (`chain/read.py:41-66`), so the
+   exemption's boundary is the same predicate the engine already applies to every entry
+   leaf, not a second notion of readability;
 2. the name is not sixty-four lowercase hexadecimal characters → `FOREIGN_LEAF`
    (`subject` = the name); this is `chain/read.py:150-151`;
 3. the leaf is not a readable no-follow regular file → `FOREIGN_LEAF` (`subject` = the
@@ -305,8 +312,12 @@ Otherwise:
    `SIBLING_BRANCH` (`subject` = the predecessor's digest);
 9. walk from genesis along the successor relation; revisiting a digest → `CYCLE`
    (`subject` = the revisited digest);
-10. the walk covered every scanned entry → otherwise `ORPHAN_HISTORY` (`subject` =
-    `None`).
+10. the walk covered every scanned entry → otherwise `ORPHAN_HISTORY` (`subject` = **the
+    lowest unvisited digest**, in ascending digest order over the scanned set minus the
+    walked set). Naming a member of the disconnected component is strictly more useful than
+    naming nothing — it is the operator's entry point into the orphan — and taking the
+    lowest keeps the choice deterministic under the same ordering steps 7 and 8 use, rather
+    than exposing set-iteration order. Ruled at the consuming design's gate, 2026-08-22.
 
 Ascending digest order is the order `found.items()` already iterates in today, because
 `names` is sorted and dicts preserve insertion order (`chain/read.py:140,158`). Pinning it
@@ -317,7 +328,12 @@ before the next.** At a `RegisteredEntry`: `DUPLICATE_REGISTRATION`, then
 `FULFILLS_UNRESOLVED` in the sub-order `missing`, `non-ancestor`, `non-intent`. At a
 `SettledEntry`: `SETTLEMENT_WITHOUT_REGISTRATION`, then `SETTLEMENT_TXID_MISMATCH`, then
 `DUPLICATE_SETTLEMENT`, then `DUPLICATE_FULFILLMENT`. `subject` is the offending entry's
-digest in all six.
+digest in all six — which for `DUPLICATE_FULFILLMENT` means **the second committed
+settlement's digest**, not either registration's. That follows from §4.3's timing rather
+than being a separate choice: the defect is recognized at the settlement that completes the
+second commitment, so the entry at the reported position is that settlement, and reporting
+a registration instead would name an entry the traversal had already passed without fault.
+Ruled at the consuming design's gate, 2026-08-22.
 
 Pass 1 before pass 2 before pass 3 is not merely convenient: a leaf-level defect means the
 directory does not decode to a set of entries at all, and a linkage defect means "ancestor"
@@ -335,6 +351,19 @@ Pass 3 has already run, so this is unambiguous: at most one registration per txi
 one settlement per txid, and every settlement's txid agrees with the registration it
 names. `entry_digest` is the registration entry's own content name — the same string that
 appears as its leaf name and as `TransactionOutcome.registration`.
+
+**The invariant `pending` carries, stated exactly, because it differs by mode.** In
+**registered** mode every digest in `pending` is the digest of an entry of `entries`; the
+pairs are drawn from the linearized sequence and from nothing else. In **detached** mode
+that is *not* guaranteed: §8's staged-registration rule can add one pair whose digest names
+staged, non-durable bytes, so **a detached `pending` digest need not occur in `entries`**.
+This is the weaker invariant deliberately, ratified at the consuming design's gate on
+2026-08-22 — that contract will state that detached pending digests need not occur in
+`entries` — and it is stated here rather than left for a consumer to discover, because a
+reader of `WellFormedChain(genesis_digest, entries, tip, pending)` would otherwise assume
+the stronger one from the shape alone. Nothing else about `pending` differs between the
+modes: the pair's meaning is identical, and a detached pair is still `(txid, the content
+name those bytes take)`.
 
 A **rolled-back** settlement settles: `ChainOutcome.ROLLED_BACK` is a decided outcome, and
 a rolled-back transaction is not evidence-starved. Only the *absence* of a settlement is.
@@ -545,6 +574,13 @@ an empty chain directory is `AbsentChain()`, unconditionally. That is not the re
 rule weakened — it is the same rule under strictly less evidence, and it is the reason the
 contradiction has no taxonomy row in the first place (§12).
 
+All three dispositions above are **ratified at the consuming design's gate, 2026-08-22**,
+and unchanged from this design's own ruling: that contract now defines `AbsentChain` as
+*no durable chain claim*, under which an empty directory with no live record is absent, an
+empty directory with a live record is the chain/store contradiction §12 keeps raising, and
+detached mode's unconditional `AbsentChain()` is the correct reading of the same
+definition with no store to consult. Nothing here is provisional.
+
 ### 6.3 Why twice
 
 The first inspection decides whether resolution is safe. The second describes what
@@ -646,8 +682,15 @@ It **does not give**:
 ## 8. The staging leaf in both modes
 
 The fixed staging leaf `.#~stage` is engine bookkeeping and is **never** a foreign-leaf
-defect, in either mode, with the single carve-out §4.4 step 1 states: a `.#~stage` that is
-not a readable regular file is not a staged envelope and is not bookkeeping.
+defect, in either mode, with the single carve-out §4.4 step 1 states. That carve-out's
+scope is pinned, as ratified at the consuming design's gate on 2026-08-22:
+
+> **The staging exemption applies to readable, no-follow regular staging files only.** A
+> `.#~stage` that is anything else — a directory, a symlink, a device, or a regular file
+> that cannot be opened no-follow and read — is `FOREIGN_LEAF`, not bookkeeping.
+
+The three conditions are `_read_regular`'s (`chain/read.py:41-66`), so the exemption ends
+exactly where the engine's own notion of a readable entry leaf ends.
 
 **Registered mode** handles survivors exactly as `validate_chain` does today. Concretely:
 
@@ -681,19 +724,18 @@ survivor a defect. So it classifies it as **pending-adjacent bookkeeping**:
   stale or non-registration survivor makes no claim about settlement, and it is exactly the
   debris `resolve` would have removed.
 
-**This first rule is pending Science-side ratification at the consuming design's gate**
-(§16.10), and the reason is precise. It weakens an invariant a reader of the pinned
-`WellFormedChain(genesis_digest, entries, tip, pending)` would reasonably assume: that
-every digest in `pending` also appears in `entries`. Under this rule a detached inspection
-can return a `pending` pair whose digest names bytes that are staged and **not durable**,
-so the pair resolves to no member of `entries`. The design chooses it because the
+**This first rule is ratified at the consuming design's gate, 2026-08-22**: staged
+registration evidence **stays** in `pending`, and that contract will state that detached
+pending digests need not occur in `entries`. What it weakens is stated plainly rather than
+buried, because a reader of the pinned
+`WellFormedChain(genesis_digest, entries, tip, pending)` would otherwise assume from the
+shape that every digest in `pending` also appears in `entries`: under this rule a detached
+inspection can return a pair whose digest names bytes that are staged and **not durable**,
+resolving to no member of `entries` (§4.5). The ruling went this way because the
 alternative — dropping the survivor entirely — silently under-reports pending at exactly
 the boundary whose job is to refuse an arrival carrying unsettled work, and the contract's
 own instruction is that the survivor be *reported*, never silently finished or removed.
-But which of the two errors the consumer prefers is the consumer's call, not atoms's: only
-the consuming design knows whether its step-3 pending check and its report can carry a
-digest that indexes nothing. Both are a one-line difference in `inspect_scan`, so the
-ruling can be flipped at the gate without disturbing anything else here.
+The over-report is a refusal; the under-report is an admission.
 
 ## 9. `capture_states`
 
@@ -867,7 +909,8 @@ and it is short because the discipline is narrow:
   exactly the collision assumption `admit`'s own loop already rests on.
 - **`DUPLICATE_FULFILLMENT`** requires two committed registrations naming one intent. The
   engine mints no `fulfills` value at all, so this can only follow from a consumer doing it
-  — which §11.2 gates.
+  — which §11.2's **separate** duplicate-fulfillment submission check gates, at a strictly
+  earlier state than the settlement-time check §4.3 performs.
 
 ### 11.2 The one that can — and the gate that closes it
 
@@ -883,10 +926,14 @@ So the core cannot simply start condemning those chains without the engine also 
 producing them. The gate:
 
 > **`run_transaction` validates `fulfills` against the validated chain in hand, before the
-> transaction's record becomes durable.** A non-`None` `fulfills` that **is not the digest
-> of an entry of the validated chain**, or names an entry that is not an `IntentEntry`,
-> refuses with `PreconditionRefused`. So does one that names an intent already
-> committed-fulfilled by an earlier registration.
+> transaction's record becomes durable.** Two independent checks, both refusing with
+> `PreconditionRefused`:
+>
+> - **the referent check** — a non-`None` `fulfills` that **is not the digest of an entry
+>   of the validated chain**, or names an entry that is not an `IntentEntry`;
+> - **the duplicate-fulfillment check** — a `fulfills` naming an intent that is **already
+>   committed-fulfilled** in the validated chain, i.e. some earlier `RegisteredEntry` names
+>   the same intent and carries a `SettledEntry` with outcome `COMMITTED`.
 
 **The referent condition is membership, not strict ancestry of the tip**, and the
 difference is exactly one entry — the tip itself. A consumer that appends an intent and
@@ -901,28 +948,53 @@ that live path. Membership is also not a weakening: the entry the gate is about 
 lands *after* the tip, so under the append discipline (§11.1) every entry of the validated
 chain — the tip included — is a strict ancestor of it.
 
-**On sharing the helper with §4.3.** The two predicates are literally different
-expressions: the gate asks "is `fulfills` a member of the validated chain", and the
-inspection asks "is the referent's index strictly below the referencing registration's
-index" (§4.3). They are provably equivalent for a to-be-appended registration, by the
-sentence above — the hypothetical next entry's index is `len(entries)`, so "index <
-len(entries)" is membership. The code makes the equivalence structural rather than
-argued: the core exports one helper taking the referencing entry's index, and the gate
-calls it with `len(validated.entries)`, the index the registration is about to occupy.
-The `IntentEntry`-class and duplicate-committed-fulfillment conditions are the same
-expression in both callers with no adaptation. So there is one helper and one predicate,
-evaluated at two indices.
+**On sharing with §4.3 — the referent check only.** The earlier draft of this section
+claimed one shared predicate covering all of it. That claim conflated two *times* and is
+withdrawn. The two checks divide as follows, and the division is not stylistic:
+
+- **The referent check is genuinely one predicate at two indices.** The gate asks "is
+  `fulfills` a member of the validated chain, and is that member an `IntentEntry`"; §4.3
+  asks "is the referent's index strictly below the referencing registration's index, and is
+  it an `IntentEntry`". For a to-be-appended registration these are equal, by the paragraph
+  above: the hypothetical next entry's index is `len(entries)`, so "index < len(entries)"
+  *is* membership. The code makes the equivalence structural rather than argued — the core
+  exports one helper taking the referencing entry's index, §4.3 calls it with the
+  registration's own index, and the gate calls it with `len(validated.entries)`, the index
+  the registration is about to occupy. This helper covers exactly the `missing`,
+  `non-ancestor`, and `non-intent` referent faults, and nothing else.
+- **The duplicate-fulfillment check cannot be the same predicate, because the two run
+  against different states.** §4.3 recognizes `DUPLICATE_FULFILLMENT` only at the **second
+  committed settlement** — the position at which the second commitment exists at all — and
+  at submission time that settlement has not been appended, has not been decided, and may
+  never be: the transaction being gated can still roll back, in which case no defect would
+  ever have arisen. So the gate cannot evaluate §4.3's condition; it evaluates a *different,
+  strictly earlier* condition over the committed fulfillments already durable in the
+  validated chain. Two checks, two states, two call sites, and the design says so instead of
+  claiming a sharing that does not exist.
+
+What the gate therefore guarantees about duplicates is correspondingly narrower and is
+stated exactly: **a `fulfills` the duplicate check rejects would have become
+`MalformedChain(DUPLICATE_FULFILLMENT)` if the transaction had been appended *and
+subsequently committed*** — not merely appended. A registration naming an
+already-committed-fulfilled intent that then rolls back yields a well-formed chain, which is
+why the gate is a deliberate over-refusal at submission rather than a mirror of the
+inspection. It refuses the attempt because the attempt's success is what would condemn the
+chain, and refusing before any record exists is the only point at which refusing is free.
 
 Placement: inside `run_transaction`'s `_registered_root` block, after the pending gate and
 **before** `_run_under_lease` (`commands.py:213-216`) — that is, before `admit`, before
-`prepare_transaction`, before any record exists. A spec that would mint a condemnable entry
-is refused while refusing is still free.
+`prepare_transaction`, before any record exists. A spec whose referent is unresolvable would
+mint a condemnable entry outright; a spec the duplicate check rejects would mint one only on
+commit. Both are refused at the one point where refusing is free.
 
 `append_intent` needs no such gate: an `IntentEntry` carries only an opaque payload.
 `register_root` needs none: a `GenesisEntry` carries no `fulfills`.
 
 ### 11.3 The existing artifacts that trip it
 
+**The gate is approved**, at the consuming design's gate on 2026-08-22, including the
+`test_coordinator_run.py` edit below with its ledger-row-27 carriage assertion preserved.
+Nothing in this section is provisional; it records what lands with the implementation.
 Checked against both trees rather than assumed:
 
 - **science does pass `fulfills`, on a live path**, and the mechanism is what makes it
@@ -1017,8 +1089,11 @@ unrepresentable/unreadable entry (§9.2, §9.3), and `ProtocolError` for engine 
    directory content — so two callers, two processes, and two atoms versions of this core
    report the same defect for the same bytes;
 5. `pending` exactly as §4.5 defines it over the durable entries, computed by the same
-   function the gate uses — plus, in detached mode only, §8's staged-registration extension,
-   whose weaker digest invariant is disclosed there and at §16.10;
+   function the gate uses. In **registered** mode every `pending` digest is the digest of an
+   entry of `entries`. In **detached** mode that invariant is deliberately weaker: §8's
+   staged-registration rule may add one pair whose digest names staged, non-durable bytes,
+   so **a detached `pending` digest need not occur in `entries`** (§4.5, §16.10 — ratified
+   2026-08-22);
 6. no staging leaf counted as chain state, and never a foreign-leaf defect except when the
    reserved name is occupied by a non-entry;
 7. an inert return value: every field is a `str` or a tuple whose transitive closure is
@@ -1053,6 +1128,15 @@ non-intent, duplicate committed fulfillment. Each is asserted **twice**: once as
 `validate_chain`, with the same message — that pair is what proves the taxonomy has not
 forked.
 
+Two `subject` assertions are named individually because §4.1's ruling makes them
+non-obvious. The `.#~stage`-as-a-directory case asserts `subject == ".#~stage"`, and the
+suite carries the ratified pin's other spellings alongside it — `.#~stage` as a symlink and
+as an unreadable regular file are `FOREIGN_LEAF` too, while a readable no-follow regular
+`.#~stage` is exempt (§8). The duplicate-committed-fulfillment case asserts `subject` is the
+**second committed settlement's** digest, not either registration's, and its fixture makes
+the distinction visible by placing the two registrations non-adjacently so a
+registration-naming implementation reports a different string.
+
 ### 14.2 The three core-only classes
 
 **`CYCLE`, `ORPHAN_HISTORY`, and the `non-ancestor` variant of `FULFILLS_UNRESOLVED`
@@ -1078,6 +1162,11 @@ the wrong code path. The test obligation splits exactly here: twelve kinds throu
 surfaces on real directories, three classes through the pure core, and the corresponding
 `ChainStateInvalid` raises for those three are asserted by calling the core-level helper
 `validate_chain` delegates to.
+
+The `ORPHAN_HISTORY` case additionally asserts §4.1's ruled subject: with an injected scan
+carrying a disconnected component of several entries, `subject` is the **lowest unvisited
+digest**, and the fixture is built so the lowest unvisited digest is not the component's
+own root — otherwise a "name the component root" implementation would pass by accident.
 
 ### 14.3 Command, gate, and capture tests
 
@@ -1105,7 +1194,11 @@ surfaces on real directories, three classes through the pure core, and the corre
 6. `inspect_chain_detached` reports a copied root whose settlement leaf was deleted with a
    non-empty `pending` naming the surviving registration's txid and digest; a copy carrying
    a `.#~stage` registration linking from the tip reports that pair too (§8), and a copy
-   carrying an undecodable `.#~stage` reports neither a defect nor a pending pair.
+   carrying an undecodable `.#~stage` reports neither a defect nor a pending pair. The
+   staged case asserts the ratified weaker invariant directly: that pair's digest is
+   **absent** from `entries`, while every other `pending` digest is present — so the split
+   §4.5 and §13 describe is pinned rather than narrated, and a later implementation that
+   quietly restored the stronger invariant would turn the test red.
 7. The detached facade refuses to mutate: every mutating `AuditedBackend` method raises
    `ProtocolError` on a `detached` instance, asserted over the method list.
 8. The pending gate: over a root whose settlement leaf was removed by hand,
@@ -1122,10 +1215,17 @@ surfaces on real directories, three classes through the pure core, and the corre
     SettledEntry)`, the sequence `tests/acceptance/test_n2_cut5.py:251` pins downstream. It
     **refuses** with `PreconditionRefused` a `fulfills` naming no entry, naming a
     `RegisteredEntry` or `SettledEntry`, and naming an intent an earlier committed
-    registration already fulfilled. A companion asserts the gate's helper and §4.3's
-    inspection agree on the same chain: every spec the gate accepts yields a
-    `WellFormedChain`, and every one it refuses would have yielded
-    `MalformedChain(FULFILLS_UNRESOLVED | DUPLICATE_FULFILLMENT)` had it been appended.
+    registration already fulfilled. Two companions, one per check, because the two have
+    different obligations (§11.2): for the **referent** check, the gate's helper and §4.3's
+    inspection agree on the same chain — every spec the gate accepts yields a
+    `WellFormedChain`, and every one the referent check refuses would have yielded
+    `MalformedChain(FULFILLS_UNRESOLVED)` had it been appended, asserted by appending the
+    condemned entry through the core rather than through the gated command. For the
+    **duplicate** check the claim is the weaker, true one: a rejected spec would have
+    yielded `MalformedChain(DUPLICATE_FULFILLMENT)` had it been appended **and
+    subsequently committed**, and the companion pins the other half too — the same
+    registration appended and then *rolled back* leaves a `WellFormedChain`, which is why
+    the gate is a deliberate over-refusal and not a mirror.
 10. `capture_states` returns exactly the named paths in the given order, across all four
     vocabulary arms plus absence, and returns the identical states `register_root`'s
     baseline capture records for the same paths. It refuses a duplicate, an absolute path,
@@ -1237,18 +1337,21 @@ slice's implementation must not be reported as integrable until it has been push
    change. A consumer that must inspect a live root with *nothing* disturbed has
    `inspect_chain_detached`, which takes no lease at all — at the cost of §7.3's weaker
    guarantees.
-10. **Two rulings are provisional, pending Science-side ratification** at the consuming
-    design's own review gate, and are marked as such where they are made: §8's detached
-    `pending` may carry a `(txid, digest)` pair whose digest names **no entry of
-    `entries`** — a weaker invariant than a reader of the pinned four-member
-    `WellFormedChain` would assume, and one the consumer must ratify because only the
-    consumer knows whether its step-3 pending check tolerates it; and §4.4 step 1's
-    `FOREIGN_LEAF` carve-out for a `.#~stage` that is not a readable regular file, which
-    reads against the consuming contract's flat sentence that the staging leaf is never a
-    foreign-leaf defect. Neither is settled here: the first needs the consumer's ruling on
-    the invariant, and the second needs that contract sentence amended rather than
-    reinterpreted on the atoms side. Both are implementable either way and neither blocks
-    the rest of this design.
+10. **Two rulings were escalated and are now decided** at the consuming design's gate,
+    2026-08-22. Both are recorded here as limitations because each is a real weakening a
+    reader must know about, not because either is open.
+    - **Detached `pending` may name a non-durable entry — ratified.** §8's staged
+      registration evidence stays in `pending`, so a detached inspection can return a
+      `(txid, digest)` pair whose digest is the content name of staged bytes and therefore
+      occurs in **no** member of `entries`. The consuming contract will state that detached
+      pending digests need not occur in `entries`. §4.5 and §13 carry the invariant
+      explicitly, split by mode. Registered mode is unaffected: there, every `pending`
+      digest is an entry's.
+    - **The staging carve-out — ratified with a tightening.** The exemption applies to
+      **readable, no-follow regular staging files only**; a `.#~stage` that is anything else
+      is `FOREIGN_LEAF`. §4.4 step 1 and §8 carry that wording verbatim, and its three
+      conditions are `_read_regular`'s, so the exemption's boundary is the engine's existing
+      predicate rather than a second one.
 
 ## 17. Acceptance criteria
 
@@ -1261,7 +1364,10 @@ slice's implementation must not be reported as integrable until it has been push
    no edit for the refactor.
 3. Every one of the fourteen kinds is reachable, and §14.1's paired assertions show the
    same defect from the returning and the raising surface for every directory-constructible
-   kind.
+   kind. Every kind's `subject` is the one §4.4 pins, and `subject is None` for
+   `GENESIS_COUNT` and for no other kind — in particular `ORPHAN_HISTORY` names the lowest
+   unvisited digest and `DUPLICATE_FULFILLMENT` names the second committed settlement's
+   digest, as ruled 2026-08-22.
 4. §4.4's traversal order is implemented as written, and the first-defect determinism is
    pinned by a test that plants two defects and asserts which one is reported.
 5. `inspect_chain`'s body is §6.2's: `_project_lease`, inspect, return on malformed,
@@ -1274,12 +1380,18 @@ slice's implementation must not be reported as integrable until it has been push
    baseline capture.
 8. `PendingUnresolved` refuses from all three mutating placements and from none of the four
    reading ones, through one shared check over the core's own `pending`.
-9. The `fulfills` submission gate refuses in `run_transaction` before any record exists,
-   on the **membership** condition of §11.2 — a `fulfills` naming the current tip is
-   **accepted**, and a test pins that by appending an intent and immediately fulfilling it,
-   the shape `tests/acceptance/test_n2_cut5.py:251` depends on. The gate and §4.3's
-   inspection call the same core helper, the gate passing `len(validated.entries)` as the
-   referencing index. `test_coordinator_run.py:351` is corrected rather than exempted, and
-   keeps its ledger-row-27 carriage assertion (§11.3).
+9. The `fulfills` submission gate refuses in `run_transaction` before any record exists, as
+   **two independent checks** (§11.2). Its **referent** check uses the **membership**
+   condition — a `fulfills` naming the current tip is **accepted**, pinned by a test that
+   appends an intent and immediately fulfills it, the shape
+   `tests/acceptance/test_n2_cut5.py:251` depends on — and calls the same core helper §4.3
+   calls, the gate passing `len(validated.entries)` as the referencing index. Its
+   **duplicate-fulfillment** check is a **separate** check against the committed
+   fulfillments already durable in the validated chain, sharing no predicate with §4.3's
+   settlement-time check, and its acceptance claim is the weaker true one: a spec it rejects
+   would have become `MalformedChain(DUPLICATE_FULFILLMENT)` only if the transaction had
+   been appended **and subsequently committed**, never merely appended.
+   `test_coordinator_run.py:351` is corrected rather than exempted, and keeps its
+   ledger-row-27 carriage assertion (§11.3).
 10. `__all__`, the widened architecture guards, `test_docs_status.py`, and the full pytest,
     ruff, and pyright gate all pass.
