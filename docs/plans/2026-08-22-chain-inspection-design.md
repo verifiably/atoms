@@ -1,6 +1,6 @@
 # Chain inspection, batch path-state capture, and the pending gate
 
-**Status:** Designed on 2026-08-22; unimplemented. A9 remains unimplemented.
+**Status:** Designed on 2026-08-22; implemented on 2026-08-22. A9 remains unimplemented.
 
 **Authority:** [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md)
 §4.1, §4.3, §6, §7.1, §11, §12.2, §13.5.
