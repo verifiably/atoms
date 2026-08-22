@@ -1349,9 +1349,10 @@ slice's implementation must not be reported as integrable until it has been push
       digest is an entry's.
     - **The staging carve-out — ratified with a tightening.** The exemption applies to
       **readable, no-follow regular staging files only**; a `.#~stage` that is anything else
-      is `FOREIGN_LEAF`. §4.4 step 1 and §8 carry that wording verbatim, and its three
-      conditions are `_read_regular`'s, so the exemption's boundary is the engine's existing
-      predicate rather than a second one.
+      is `FOREIGN_LEAF`. §4.4 step 1 paraphrases the pin ("a … file, and to nothing
+      else") and §8 carries it in the ratified wording; both state the same three
+      conditions, which are `_read_regular`'s, so the exemption's boundary is the
+      engine's existing predicate rather than a second one.
 
 ## 17. Acceptance criteria
 
