@@ -114,7 +114,7 @@ existing commands import.
 unchanged. It is not copied, re-declared, narrowed, or wrapped. `commands.py` already imports from
 `atoms.chain.model`; this adds `Entry` to that import and to `__all__`.
 
-`__all__` becomes, keeping the module's existing plain-sorted order:
+`__all__` becomes, keeping the module's existing plain-sorted order *(amended 2026-08-22 by [`2026-08-22-chain-inspection-design.md`](2026-08-22-chain-inspection-design.md) §5, which extends the same plain-sorted tuple to sixteen names for the two inspection commands, `capture_states`, and the inspection arms; the seven-name tuple below is the record of what it was on 2026-08-21, and the live machine claim is the architecture test)*:
 
 ```python
 __all__ = (
@@ -221,7 +221,13 @@ whose docstring records the opposite property (`coordinator/lease.py:13-18`).
 ## 7. Errors
 
 `read_chain` adds no error type and no new error path. Everything it can raise, it raises because an
-existing internal raised it:
+existing internal raised it *(amended 2026-08-22 by
+[`2026-08-22-chain-inspection-design.md`](2026-08-22-chain-inspection-design.md) §4.6, which
+rewrote `validate_chain` as the raising disposition of one typed core: the conditions and the
+exception types below are unchanged, but the `chain/read.py` citations in the fourth row now name
+`chain/inspect.py`'s passes, and three of `_read_regular`'s bespoke messages became one foreign-leaf
+wording. The line numbers below are a record of what the code was on 2026-08-21, not a status
+claim)*:
 
 | Condition | Error | Raised by |
 | --- | --- | --- |

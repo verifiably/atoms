@@ -2179,7 +2179,11 @@ commit arm.
     "register_root", "run_transaction")` *(amended 2026-08-21, the `read_chain`
     design: the guard now pins the seven-name tuple that adds `ChainView`,
     `Entry`, and `read_chain`, and the public-function set it also pins is four
-    names, not three)*, every public command's signature
+    names, not three; amended again 2026-08-22, the chain-inspection design: the
+    tuple is sixteen names and the public-function set is seven, and the
+    lease clause is widened rather than weakened — `inspect_chain` enters
+    `_project_lease`, and `inspect_chain_detached` and `capture_states` enter
+    neither lease)*, every public command's signature
     accepts neither `Lease` nor `ProjectApprovedSpec` (source scan of
     `commands.py`), and each acquires `_recovery_lease` in its body.
   - `set_assembly_halt` is called from exactly one production site,

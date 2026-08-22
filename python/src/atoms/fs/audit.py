@@ -87,13 +87,61 @@ class AuditedBackend:
         }
         if metadata_parent != project_spelling:
             roots[metadata_parent] = Provenance(RootKind.METADATA_PARENT, "")
+        self._install(
+            inner,
+            roots,
+            metadata_leaf,
+            metadata_parent == project_spelling,
+            detached=False,
+        )
+
+    @classmethod
+    def detached(cls, inner: Backend, *, project_root: str) -> AuditedBackend:
+        """A read-only facade over one project root that has no metadata root at all.
+
+        An arriving root has none, and fabricating one would be a silent fallback --
+        worse, a fabricated metadata root under the project root would reclassify chain
+        leaves as METADATA targets. `_metadata_leaf` is `None`, so
+        `_is_metadata_root_child` is constantly false, and the `_detached` flag makes
+        the read-only property one of the facade rather than of its callers' care.
+        """
+
+        if type(project_root) is not str or not project_root:
+            raise ProtocolError("project_root must be a non-empty string")
+        spelling = _guarded_spelling(project_root)
+        if ".." in spelling.split(os.sep):
+            raise ProtocolError("configured roots must not contain a parent component")
+        facade = cls.__new__(cls)
+        facade._install(
+            inner,
+            {spelling: Provenance(RootKind.PROJECT, "")},
+            None,
+            False,
+            detached=True,
+        )
+        return facade
+
+    def _install(
+        self,
+        inner: Backend,
+        roots: dict[str, Provenance],
+        metadata_leaf: str | None,
+        metadata_parent_is_project: bool,
+        *,
+        detached: bool,
+    ) -> None:
         self._inner = inner
         self._roots = roots
         self._metadata_leaf = metadata_leaf
-        self._metadata_parent_is_project = metadata_parent == project_spelling
+        self._metadata_parent_is_project = metadata_parent_is_project
+        self._detached = detached
         self._provenance: dict[int, Provenance] = {}
         self._declared_paths: frozenset[str] = frozenset()
         self._records: list[AuditRecord] = []
+
+    def _require_attached(self) -> None:
+        if self._detached:
+            raise ProtocolError("a detached backend performs no mutation")
 
     @property
     def records(self) -> tuple[AuditRecord, ...]:
@@ -151,6 +199,7 @@ class AuditedBackend:
         self._declared_paths = frozenset()
 
     def create_exclusive(self, parent_fd: int, name: str, mode: int) -> int:
+        self._require_attached()
         provenance = self.provenance_of(parent_fd)
         target = self._classify_child(provenance, name)
         fd = self._inner.create_exclusive(parent_fd, name, mode)
@@ -159,14 +208,17 @@ class AuditedBackend:
         return fd
 
     def write(self, fd: int, data: bytes) -> int:
+        self._require_attached()
         target = self._classify_provenance(self.provenance_of(fd))
         return self._audited("write", (target,), lambda: self._inner.write(fd, data))
 
     def set_mode(self, fd: int, mode: int) -> None:
+        self._require_attached()
         target = self._classify_provenance(self.provenance_of(fd))
         self._audited("set_mode", (target,), lambda: self._inner.set_mode(fd, mode))
 
     def mkdir_child(self, parent_fd: int, name: str, mode: int) -> None:
+        self._require_attached()
         provenance = self.provenance_of(parent_fd)
         target = self._classify_child(
             provenance,
@@ -180,6 +232,7 @@ class AuditedBackend:
         )
 
     def unlink_child(self, parent_fd: int, name: str) -> None:
+        self._require_attached()
         target = self._classify_child(self.provenance_of(parent_fd), name)
         self._audited(
             "unlink_child",
@@ -188,6 +241,7 @@ class AuditedBackend:
         )
 
     def rmdir_child(self, parent_fd: int, name: str) -> None:
+        self._require_attached()
         target = self._classify_child(self.provenance_of(parent_fd), name)
         self._audited(
             "rmdir_child",
@@ -196,6 +250,7 @@ class AuditedBackend:
         )
 
     def symlink_child(self, parent_fd: int, name: str, target: str) -> None:
+        self._require_attached()
         audit_target = self._classify_child(self.provenance_of(parent_fd), name)
         self._audited(
             "symlink_child",
@@ -204,6 +259,7 @@ class AuditedBackend:
         )
 
     def create_or_open(self, parent_fd: int, name: str, mode: int) -> int:
+        self._require_attached()
         provenance = self.provenance_of(parent_fd)
         target = self._classify_child(provenance, name)
         fd = self._inner.create_or_open(parent_fd, name, mode)
@@ -231,6 +287,7 @@ class AuditedBackend:
         return fd
 
     def set_marker_xattr(self, fd: int, name: str, value: bytes) -> None:
+        self._require_attached()
         target = self._classify_provenance(self.provenance_of(fd))
         self._audited(
             "set_marker_xattr",
@@ -246,6 +303,7 @@ class AuditedBackend:
         *,
         before_change: Callable[[], None],
     ) -> None:
+        self._require_attached()
         target = self._classify_child(self.provenance_of(parent_fd), name)
         self._audited(
             "repair_entry_mode",
@@ -296,6 +354,7 @@ class AuditedBackend:
         return fd
 
     def exchange(self, parent_fd: int, left: str, right: str) -> None:
+        self._require_attached()
         provenance = self.provenance_of(parent_fd)
         targets = (
             self._classify_child(provenance, left),
@@ -310,6 +369,7 @@ class AuditedBackend:
     def transfer_noclobber(
         self, src_fd: int, src: str, dst_fd: int, dst: str
     ) -> None:
+        self._require_attached()
         targets = (
             self._classify_child(self.provenance_of(src_fd), src),
             self._classify_child(self.provenance_of(dst_fd), dst),
@@ -321,6 +381,7 @@ class AuditedBackend:
         )
 
     def link_anchor(self, src_fd: int, src: str, dst_fd: int, dst: str) -> None:
+        self._require_attached()
         targets = (
             self._classify_child(self.provenance_of(src_fd), src),
             self._classify_child(self.provenance_of(dst_fd), dst),

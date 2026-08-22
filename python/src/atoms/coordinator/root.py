@@ -25,18 +25,29 @@ def _require_chain_publication(evidence: VolumeEvidence) -> None:
 
 
 @contextlib.contextmanager
-def _recovery_lease(
+def _project_lease(
     backend: Backend,
     project_root: str,
     metadata_root: str,
     storage: StorageProfile,
 ) -> Iterator[Lease]:
-    """Design §5.1's entry order, exactly.
+    """Design §5.1's entry order up to, but not including, resolution.
 
     The one production call site that names `CERTIFIED_ALLOWLIST`. It is empty until A8b
     crash-certifies a configuration tuple, so this path refuses every real volume today.
     That is the intended fail-closed behaviour, and it is why ledger #18 is proved by an
     architecture assertion over this call rather than by an end-to-end run.
+
+    The `Lease` this yields is one `resolve` has NOT run over, which weakens that
+    invariant from a property of the type to a property of the two constructors. The
+    compensation is `test_fs_architecture.py`'s clause making `inspect_chain` the only
+    public function permitted to name this manager or `resolve`: structural inspection
+    must interpose between reclamation and resolution, and nothing else may.
+
+    Reclamation stays above the split because ledger #17 and #23 require it at EVERY
+    lease entry, and neither step reads or writes the chain -- an orphan is unreferenced
+    by definition. `resolve` is the opposite: it interprets the chain and can append to
+    it, which is exactly what must not happen over damage.
     """
     backend = AuditedBackend(
         backend, project_root=project_root, metadata_root=metadata_root
@@ -53,5 +64,21 @@ def _recovery_lease(
             # and #23 says "at every lease entry", which holds only if it runs even
             # when resolution then refuses, halts, or traps.
             _reclaim_orphans(store)
-            resolve(binding, store)
             yield Lease(_binding=binding, _store=store)
+
+
+@contextlib.contextmanager
+def _recovery_lease(
+    backend: Backend,
+    project_root: str,
+    metadata_root: str,
+    storage: StorageProfile,
+) -> Iterator[Lease]:
+    """Design §5.1's entry order, exactly: the project lease plus resolution.
+
+    Keeps its name, its signature, and its meaning -- "recovery has resolved before this
+    yields" -- so `read_chain` design §8's recovery-barrier property is preserved.
+    """
+    with _project_lease(backend, project_root, metadata_root, storage) as lease:
+        resolve(lease._binding, lease._store)
+        yield lease
