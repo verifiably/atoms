@@ -28,6 +28,8 @@ from atoms.store.records import (
     INSERT_ACTIVE,
     INSERT_EFFECT,
     INSERT_RECORD,
+    INSERT_ROOT_LIFECYCLE,
+    INSERT_ROOT_OPERATION,
     SELECT_ACTIVE,
     SELECT_APPROVAL_EVIDENCE,
     SELECT_RECORD,
@@ -37,12 +39,20 @@ from atoms.store.records import (
     UPDATE_JOURNAL_STATE,
     UPDATE_REGISTRATION_DIGEST,
     UPDATE_ROLLBACK_RESULT,
+    UPDATE_ROOT_LIFECYCLE_STATE,
+    UPDATE_ROOT_OPERATION_PHASE,
+    UPDATE_ROOT_OPERATION_SOURCE_SNAPSHOT,
+    UPDATE_ROOT_OPERATION_TREE_PROOF,
     UPDATE_SETTLEMENT_DIGEST,
     UPDATE_STATE,
+    RootLifecycleRow,
+    RootOperationRow,
     StoredRecord,
     coherence_findings,
     encode_diagnostic,
     load_record,
+    load_root_lifecycle,
+    load_root_operation,
     referenced_digests,
     require_assembly_halt_binding,
     require_identifier,
@@ -382,6 +392,12 @@ def classify(connection: sqlite3.Connection) -> Verdict:
     catalog = _catalog(connection)
 
     if application_id == APPLICATION_ID:
+        if user_version == 2:
+            raise MetadataStoreInvalid(
+                "this is a pre-lifecycle version-2 store; normal open never "
+                "migrates it. migrate_root_to_lifecycle_v3 is its only "
+                "transition to this build's schema"
+            )
         if user_version != SCHEMA_VERSION:
             raise MetadataStoreInvalid(
                 f"incompatible store version {user_version}; this build knows "
@@ -694,6 +710,71 @@ class _StoreTransaction:
                 )
             self._touched.add(txid)
 
+    def insert_root_operation(
+        self,
+        operation_id: str,
+        kind: str,
+        request_json: str,
+        request_hash: str,
+    ) -> None:
+        with self._mutating() as store:
+            require_text("request_json", request_json)
+            with translated("recording a root operation"):
+                store._connection.execute(
+                    INSERT_ROOT_OPERATION,
+                    (operation_id, kind, request_json, request_hash),
+                )
+
+    def insert_root_lifecycle(
+        self, state: str, machine_id: str, root_path: str, origin: str
+    ) -> None:
+        with self._mutating() as store:
+            require_text("root_path", root_path)
+            with translated("stamping the root lifecycle"):
+                store._connection.execute(
+                    INSERT_ROOT_LIFECYCLE,
+                    (state, machine_id, root_path, origin),
+                )
+
+    def set_root_lifecycle_state(self, state: str) -> None:
+        with self._mutating() as store:
+            with translated("transitioning the root lifecycle"):
+                cursor = store._connection.execute(
+                    UPDATE_ROOT_LIFECYCLE_STATE, (state,)
+                )
+            if cursor.rowcount != 1:
+                raise ProtocolError("no root lifecycle row to transition")
+
+    def set_root_operation_phase(self, phase: str) -> None:
+        with self._mutating() as store:
+            with translated("advancing the root operation phase"):
+                cursor = store._connection.execute(
+                    UPDATE_ROOT_OPERATION_PHASE, (phase,)
+                )
+            if cursor.rowcount != 1:
+                raise ProtocolError("no root operation row to advance")
+
+    def set_root_operation_source_snapshot(self, source_snapshot_json: str) -> None:
+        with self._mutating() as store:
+            with translated("storing the source snapshot proof"):
+                cursor = store._connection.execute(
+                    UPDATE_ROOT_OPERATION_SOURCE_SNAPSHOT, (source_snapshot_json,)
+                )
+            if cursor.rowcount != 1:
+                raise ProtocolError("no root operation row for the snapshot proof")
+
+    def set_root_operation_tree_proof(
+        self, destination_snapshot_json: str, genesis_digest: str | None
+    ) -> None:
+        with self._mutating() as store:
+            with translated("storing the tree-durable proof"):
+                cursor = store._connection.execute(
+                    UPDATE_ROOT_OPERATION_TREE_PROOF,
+                    (destination_snapshot_json, genesis_digest),
+                )
+            if cursor.rowcount != 1:
+                raise ProtocolError("no root operation row for the tree proof")
+
     def set_active(self, txid: str | None) -> None:
         with self._mutating() as store:
             if txid is None:
@@ -781,6 +862,18 @@ class Store:
             record = None if row is None else load_record(connection, row[0])
         self._require_live()
         return record
+
+    def read_root_lifecycle(self) -> RootLifecycleRow | None:
+        with self._read_transaction() as connection:
+            row = load_root_lifecycle(connection)
+        self._require_live()
+        return row
+
+    def read_root_operation(self) -> RootOperationRow | None:
+        with self._read_transaction() as connection:
+            row = load_root_operation(connection)
+        self._require_live()
+        return row
 
     @contextmanager
     def transaction(self) -> Iterator[_StoreTransaction]:

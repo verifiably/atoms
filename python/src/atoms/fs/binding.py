@@ -85,7 +85,14 @@ class ProjectBinding:
     must never close one.
     """
 
-    __slots__ = ("_active", "_backend", "_evidence", "_lock", "_project_root_fd")
+    __slots__ = (
+        "_active",
+        "_backend",
+        "_evidence",
+        "_lock",
+        "_project_root_fd",
+        "_project_root_path",
+    )
 
     def __init__(self, *, _construction_token: object | None = None, **kwargs) -> None:
         if _construction_token is not _TOKEN:
@@ -93,6 +100,7 @@ class ProjectBinding:
         self._lock = kwargs["lock"]
         self._backend = kwargs["backend"]
         self._project_root_fd = kwargs["project_root_fd"]
+        self._project_root_path = kwargs["project_root_path"]
         self._evidence = kwargs["evidence"]
         self._active = True
 
@@ -123,6 +131,18 @@ class ProjectBinding:
     def project_root_fd(self) -> int:
         self._require_active()
         return self._project_root_fd
+
+    @property
+    def project_root_path(self) -> str:
+        """The normalized spelling `establish_root` returned after its guarded
+        no-symlink walk — the canonical path lifecycle bindings store."""
+        self._require_active()
+        return self._project_root_path
+
+    @property
+    def metadata_root_path(self) -> str:
+        self._require_active()
+        return self._lock.metadata_root_path
 
     @property
     def metadata_root_fd(self) -> int:
@@ -175,7 +195,9 @@ def bind_project_volume(
     backend = lock.backend
     metadata_root_fd = lock.metadata_root_fd
 
-    project_root_fd, _, _ = establish_root(backend, project_root, create=False)
+    project_root_fd, project_root_path, _ = establish_root(
+        backend, project_root, create=False
+    )
     try:
         metadata_info = os.fstat(metadata_root_fd)
         project_info = os.fstat(project_root_fd)
@@ -269,5 +291,6 @@ def bind_project_volume(
         lock=lock,
         backend=backend,
         project_root_fd=project_root_fd,
+        project_root_path=project_root_path,
         evidence=evidence,
     )

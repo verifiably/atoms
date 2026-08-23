@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import ast
 import shutil
-import sqlite3
 from collections.abc import Iterator
 from dataclasses import FrozenInstanceError, dataclass
 from pathlib import Path
@@ -676,30 +675,40 @@ def test_inspect_chain_resolves_and_reports_what_resolution_left(
 def test_inspect_chain_reports_an_unregistered_root_as_absent(
     coordinator_on, monkeypatch
 ) -> None:
+    from atoms.core.errors import PreconditionRefused
+
     ingredients = coordinator_on()
     _enable_commands(ingredients, monkeypatch)
     _, project_root, metadata_root, _ = ingredients
 
-    assert _inspect(ingredients) == AbsentChain()
+    # Registered-mode inspection presupposes a lifecycle carrier; the gate
+    # refuses a metadata-less root before creating anything. The detached
+    # mode still classifies the bare tree as chain-absent.
+    with pytest.raises(
+        PreconditionRefused, match="metadata-less"
+    ):
+        _inspect(ingredients)
+    assert inspect_chain_detached(LinuxBackend(), project_root) == AbsentChain()
 
     assert not (Path(project_root) / CHAIN_LEAF).exists()
-    with sqlite3.connect(Path(metadata_root) / "atoms.db") as connection:
-        counts = tuple(
-            connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-            for table in ("transaction_record", "blob")
-        )
-    assert counts == (0, 0)
+    assert sorted(entry.name for entry in Path(metadata_root).iterdir()) == ["lock"]
 
 
 def test_inspect_chain_reports_an_occupied_chain_leaf_as_a_foreign_leaf(
     coordinator_on, monkeypatch
 ) -> None:
+    from atoms.core.errors import PreconditionRefused
+
     ingredients = coordinator_on()
     _enable_commands(ingredients, monkeypatch)
     _, project_root, _, _ = ingredients
     (Path(project_root) / CHAIN_LEAF).write_bytes(b"not a directory")
 
-    result = _inspect(ingredients)
+    # The lifecycle gate refuses the carrier-less root first; the taxonomy
+    # classification of the squatting leaf is the detached mode's.
+    with pytest.raises(PreconditionRefused, match="metadata-less"):
+        _inspect(ingredients)
+    result = inspect_chain_detached(LinuxBackend(), project_root)
 
     assert type(result) is MalformedChain
     assert result.defect.kind is DefectKind.FOREIGN_LEAF
@@ -710,6 +719,7 @@ def test_an_empty_chain_directory_splits_on_the_live_record(
     coordinator_on, leased, monkeypatch
 ) -> None:
     """Design §6.2's last two rows, pinned as a pair rather than one of them alone."""
+    from atoms.core.errors import PreconditionRefused
     from tests.store_support import APPROVAL_EVIDENCE, one_effect_spec
 
     ingredients = coordinator_on()
@@ -717,7 +727,8 @@ def test_an_empty_chain_directory_splits_on_the_live_record(
     _, project_root, _, _ = ingredients
     (Path(project_root) / CHAIN_LEAF).mkdir()
 
-    assert _inspect(ingredients) == AbsentChain()
+    with pytest.raises(PreconditionRefused, match="metadata-less"):
+        _inspect(ingredients)
     assert inspect_chain_detached(LinuxBackend(), project_root) == AbsentChain()
 
     with leased(ingredients) as lease, lease._store.transaction() as transaction:

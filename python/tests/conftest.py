@@ -559,24 +559,31 @@ def store_on(ext4_volume, ext4_project_root, test_storage_profile):
 
 
 @pytest.fixture
-def coordinator_on(ext4_volume, ext4_project_root, test_storage_profile):
+def coordinator_on(ext4_volume, test_storage_profile):
     """The raw ingredients `_recovery_lease` builds its own stack from.
 
     Unlike `store_on`, this fixture binds nothing: the lease owns lock acquisition,
     probe reclamation, binding, and store opening, and a fixture that pre-bound them
     would leave four of the six entry-order steps unexercised. Each call names a fresh
-    metadata root under the same ext4 volume, so two calls model two projects rather
-    than a restart of one.
+    project root AND a fresh metadata root under the same ext4 volume, so two calls
+    really are two projects: under the lifecycle rules a genesis without its own
+    carrier is never re-registrable, so a shared project root would make the second
+    scenario a bare-genesis refusal rather than a fresh project. Restart modeling
+    retains one call's paths and rebinds them explicitly, as the fresh-process tests
+    do.
     """
     counter = itertools.count()
 
     def ingredients():
         from atoms.fs.linux import LinuxBackend
 
-        metadata_root = ext4_volume / f"coordinator-metadata-{next(counter)}"
+        index = next(counter)
+        project_root = ext4_volume / f"coordinator-project-{index}"
+        metadata_root = ext4_volume / f"coordinator-metadata-{index}"
+        project_root.mkdir()
         return (
             LinuxBackend(),
-            str(ext4_project_root),
+            str(project_root),
             str(metadata_root),
             test_storage_profile,
         )

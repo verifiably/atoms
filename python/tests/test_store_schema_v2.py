@@ -434,7 +434,12 @@ def test_assembly_halt_freezes_every_journal_update(opened_store):
 def test_schema_v2_has_the_new_columns_and_complete_trigger_set(
     opened_store, store_binding
 ):
-    assert SCHEMA_VERSION == 2
+    # The v2-era gates persist verbatim inside schema v3: the frozen v2
+    # statements are the prefix of the current DDL (lifecycle design 5).
+    from atoms.store.schema import SCHEMA_STATEMENTS, V2_SCHEMA_STATEMENTS
+
+    assert SCHEMA_VERSION == 3
+    assert SCHEMA_STATEMENTS[: len(V2_SCHEMA_STATEMENTS)] == V2_SCHEMA_STATEMENTS
     raw = raw_connect(store_binding)
     try:
         columns = {row[1]: (row[2], row[3]) for row in raw.execute(

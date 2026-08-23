@@ -30,6 +30,16 @@ from tests.test_coordinator_commands import (
 )
 
 
+def _durable_genesis_digest(project_root: str) -> str:
+    """The genesis entry's digest, read from the durable chain leaves."""
+    from atoms.chain.model import GenesisEntry
+
+    for name, payload in _durable_entries(project_root).items():
+        if type(decode_entry(payload)[1]) is GenesisEntry:
+            return name
+    raise AssertionError("no durable genesis entry")
+
+
 def _unsettle(project_root: str) -> tuple[str, str]:
     """Remove the settlement leaf by hand, leaving evidence-starved pending work."""
     registration: tuple[str, str] | None = None
@@ -66,8 +76,14 @@ def test_the_three_mutators_refuse_an_unsettled_chain(coordinator_on, monkeypatc
     _run(ingredients)
     pending = _unsettle(project_root)
 
-    with pytest.raises(PendingUnresolved, match="unsettled registrations"):
+    # A completed register retry answers from its retained operation record
+    # without touching the chain (lifecycle design §8), so the pending gate
+    # holds for exactly the two chain mutators.
+    genesis = _durable_genesis_digest(project_root)
+    assert (
         register_root(backend, project_root, metadata_root, storage, b"root", ())
+        == genesis
+    )
     with pytest.raises(PendingUnresolved):
         append_intent(backend, project_root, metadata_root, storage, b"an intent")
     with pytest.raises(PendingUnresolved):

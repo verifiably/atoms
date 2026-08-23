@@ -140,5 +140,5 @@ def test_the_stored_ddl_has_its_terminal_semicolon_stripped():
 
 
 def test_the_version_constants_are_what_the_store_writes():
-    assert SCHEMA_VERSION == 2
+    assert SCHEMA_VERSION == 3
     assert APPLICATION_ID == int.from_bytes(b"atms", "big")
