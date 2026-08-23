@@ -47,8 +47,10 @@ callback.
 
 These are requirements, not atoms-side choices:
 
-- Writability is a durable grant in host bookkeeping. Every coordinator
-  mutation refuses without it. A metadata-less tree cold-bootstraps read-only
+- Writability is a durable grant in host bookkeeping. Every cooperative
+  coordinator mutation of an existing root refuses without it; a creation
+  command necessarily writes its claimed destination pre-grant, under its own
+  recorded operation. A metadata-less tree cold-bootstraps read-only
   and unserviceable.
 - Every grant binds to the stable machine identity and canonical root path.
   Binding mismatch reports `binding-mismatched` and conveys no grant. Moving
@@ -81,6 +83,13 @@ These are requirements, not atoms-side choices:
 - `read_lifecycle_state` returns the closed five-value union and validates the
   binding while reading.
 
+One refinement of the frozen wording is accepted explicitly: "stamp durable
+before exposure" admits pre-stamp publication of the claimed destination
+directory containing exactly the root-local operation claim. The claim is
+engine bookkeeping — never payload, chain, or a snapshot entry — and
+cross-carrier no-clobber needs a filesystem-level ownership point (§5.1,
+§15). No byte a consumer can read as content exists before the stamp.
+
 In scope are the carrier, schema transition, signatures, types, errors,
 validation, durability order, and exact retry conditions. Out of scope are
 Science semantics; authentication of the serviceability grant; proof of
@@ -103,6 +112,7 @@ design adds none:
 | Pre-grant tree contradicts its operation proof | `RootOperationInvalid`; preserve row and tree. |
 | Pre-lifecycle v2 store has no binding | Reads read-only unserviceable; only explicit migration may attest it writable. |
 | Validated metadata-less cold root needs read admission | Grant creates fresh matching read-only-serviceable bookkeeping. |
+| Cold copy carrying `.#~root-claim` or a staging survivor | Grant refuses; the residue marks an incomplete creation. |
 
 ## 4. State and binding
 
@@ -134,7 +144,8 @@ Tests replace the private reader.
 
 For an existing root, the binding uses the normalized spelling returned by
 `establish_root` only after its guarded no-symlink walk. `ProjectBinding`
-retains this as `project_root_path`. For an absent copy destination, atoms
+gains a `project_root_path` slot to retain it; today only the metadata-root
+spelling is retained, on the lock. For an absent copy destination, atoms
 guarded-opens the parent, validates the final leaf, and joins the normalized
 parent spelling to that exact leaf; creation later occurs relative to the held
 parent descriptor.
@@ -709,7 +720,7 @@ path:
 
 | Carrier | Result |
 | --- | --- |
-| metadata root, database, or committed lifecycle row absent | `METADATA_LESS` |
+| metadata root or database absent, or neither lifecycle nor operation row committed | `METADATA_LESS` |
 | exact schema v2 store | `READ_ONLY_UNSERVICEABLE` |
 | exact v3 row with binding delta | `BINDING_MISMATCHED` |
 | exact v3 row with matching binding | stored three-value state |
@@ -755,6 +766,12 @@ appending. Detached cold inspection remains its existing explicitly
 non-coherent, non-mutating path. Thus every probe, reclamation, staging change,
 and `resolve` append is downstream of a validated writable grant, including
 operations reached through APIs named as reads.
+
+The root-creation commands are the single deliberate exception: register and
+fork write payload, overrides, and chain genesis into their claimed
+destination before any grant exists — the transition trigger itself demands a
+durable genesis before writable is reachable. The gate binds cooperative
+mutators entering an existing root, never the command creating one.
 
 ## 8. `register_root`
 
@@ -896,8 +913,9 @@ from destination; none plus absent destination -> mint once -> `fork_root`.
 The command classifies through §7's explicitly read-only path first. It accepts:
 
 1. metadata-less existing root whose detached inspection is
-   `WellFormedChain` and has no operation: create v3 and insert fresh-binding
-   read-only-serviceable `origin='read-serviceability'`;
+   `WellFormedChain`, whose chain holds no staging survivor, whose root
+   carries no `.#~root-claim` leaf, and that has no operation: create v3 and
+   insert fresh-binding read-only-serviceable `origin='read-serviceability'`;
 2. matching read-only-unserviceable v3 with no incomplete operation, no active
    transaction, no staging survivor, and a well-formed chain under the held
    lock: update only state;
@@ -913,8 +931,10 @@ under the same still-held lock, close the read-only store and open the existing
 store writable for the one state update. The already-serviceable branch exits
 before that boundary, making its exact retry a byte-for-byte no-write operation.
 
-Writable, binding-mismatched, malformed/absent-chain, incomplete-operation, and
-exact-v2 roots refuse. V2 must explicitly migrate writable or have its carrier
+Writable, binding-mismatched, malformed/absent-chain, incomplete-operation,
+creation-residue (a `.#~root-claim` leaf or staging survivor), and exact-v2
+roots refuse. Residue is creation evidence: a tree §5.2 rejects as a copy
+source must not read serviceable. V2 must explicitly migrate writable or have its carrier
 discarded before cold admission. Grant never upgrades v2, overwrites mismatch,
 or grants writable.
 
@@ -1016,9 +1036,9 @@ One focused `~/d/atoms/python/tests/test_lifecycle_commands.py` covers:
 - pairwise copy-path nesting refusals, second-lock contention without deadlock,
   exact request/snapshot/claim encoding including Unicode/base64/storage, and
   root/containing-parent durability barriers;
-- grant refusals, cold carrier creation, one transition, and no-write repeated
-  success with traps on writable SQLite open, sidecar change, probes,
-  reclamation, and recovery;
+- grant refusals including claim-leaf and staging-survivor residue, cold
+  carrier creation, one transition, and no-write repeated success with traps
+  on writable SQLite open, sidecar change, probes, reclamation, and recovery;
 - exact v2 migration, all structural refusals, and atomic cut outcomes.
 
 Store/schema tests pin version 3, the exact two-table/ten-trigger catalog,
