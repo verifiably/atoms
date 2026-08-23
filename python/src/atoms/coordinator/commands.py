@@ -33,13 +33,24 @@ from atoms.chain.model import (
     state_to_json,
 )
 from atoms.chain.read import validate_chain as _validate_chain
+from atoms.coordinator import lifecycle as _lifecycle
 from atoms.coordinator.capture import PayloadSource
 from atoms.coordinator.execute import _run_under_lease
+from atoms.coordinator.lifecycle import (
+    DestinationOverride,
+    LifecycleState,
+    RootOperationId,
+    RootOperationInvalid,
+    RootOperationMismatch,
+    SourceSnapshotMoved,
+)
 from atoms.coordinator.recover import _registered_root, resolve
 from atoms.coordinator.root import (
+    _lifecycle_view,
     _project_lease,
     _recovery_lease,
     _require_chain_publication,
+    _writable_recovery_lease,
 )
 from atoms.core.compiler import compile_spec
 from atoms.core.errors import PreconditionRefused, ProtocolError, SpecValidationError
@@ -55,7 +66,7 @@ from atoms.core.scratch import CHAIN_LEAF
 from atoms.core.spec import TransactionSpec
 from atoms.fs.audit import AuditedBackend
 from atoms.fs.backend import Backend
-from atoms.fs.lock import close_all
+from atoms.fs.lock import close_all, establish_root
 from atoms.fs.observe import Observation
 from atoms.fs.volume import StorageProfile
 from atoms.store.connection import Store
@@ -66,8 +77,14 @@ __all__ = (
     "ChainInspection",
     "ChainView",
     "DefectKind",
+    "DestinationOverride",
     "Entry",
+    "LifecycleState",
     "MalformedChain",
+    "RootOperationId",
+    "RootOperationInvalid",
+    "RootOperationMismatch",
+    "SourceSnapshotMoved",
     "TransactionOutcome",
     "WellFormedChain",
     "append_intent",
@@ -75,6 +92,7 @@ __all__ = (
     "inspect_chain",
     "inspect_chain_detached",
     "read_chain",
+    "read_lifecycle_state",
     "register_root",
     "run_transaction",
 )
@@ -318,6 +336,74 @@ def _inspect_detached(
     return result
 
 
+def _register_completed_retry(
+    backend: Backend,
+    view: _lifecycle.CarrierView,
+    project_root: str,
+    metadata_root: str,
+    storage: StorageProfile,
+    genesis_payload: bytes,
+    registered_surface: tuple[str, ...],
+) -> str:
+    """A writable root: only its own completed register operation may retry."""
+    operation = view.operation
+    if operation is None or operation.kind != "register":
+        raise PreconditionRefused(
+            "this writable root was not created by register_root; forked or "
+            "migrated roots are never register retries"
+        )
+    root_fd, root_path, _ = establish_root(backend, project_root, create=False)
+    backend.close_fd(root_fd)
+    metadata_fd, metadata_path, _ = establish_root(
+        backend, metadata_root, create=False
+    )
+    backend.close_fd(metadata_fd)
+    request = _lifecycle.OperationRequest.of(
+        _lifecycle.register_request(
+            root_path, metadata_path, storage, genesis_payload, registered_surface
+        )
+    )
+    if operation.request_json != request.operation_json:
+        raise RootOperationMismatch(
+            "the project root is already registered with a different "
+            "payload or surface"
+        )
+    if operation.genesis_digest is None:
+        raise RootOperationInvalid(
+            "a completed register operation carries no genesis digest"
+        )
+    return operation.genesis_digest
+
+
+def _refuse_bare_genesis(
+    backend: Backend,
+    project_root: str,
+    genesis_payload: bytes,
+    registered_surface: tuple[str, ...],
+) -> None:
+    """A chain with no claim and no carrier is never a register retry.
+
+    Checked before any claim, lock, metadata directory, or store is created,
+    so the refusal leaves the arriving tree exactly as it was found.
+    """
+    inspected = inspect_chain_detached(backend, project_root)
+    if type(inspected) is not WellFormedChain or not inspected.entries:
+        return
+    _digest, genesis = inspected.entries[0]
+    if (
+        type(genesis) is GenesisEntry
+        and genesis.payload == genesis_payload
+        and tuple(path for path, _ in genesis.baseline) == registered_surface
+    ):
+        raise PreconditionRefused(
+            "matching genesis has no local initialization operation"
+        )
+    raise PreconditionRefused(
+        "the project root is already registered with a different "
+        "payload or surface"
+    )
+
+
 def register_root(
     backend: Backend,
     project_root: str,
@@ -329,48 +415,229 @@ def register_root(
     if type(genesis_payload) is not bytes:
         raise ProtocolError("genesis_payload must be exact bytes")
     registered_surface = _validate_registered_surface(registered_surface)
+
+    view = _lifecycle_view(backend, project_root, metadata_root, storage)
+    if view.state is LifecycleState.WRITABLE:
+        return _register_completed_retry(
+            backend,
+            view,
+            project_root,
+            metadata_root,
+            storage,
+            genesis_payload,
+            registered_surface,
+        )
+    if view.state is LifecycleState.BINDING_MISMATCHED:
+        raise PreconditionRefused(
+            "the root lifecycle binding is mismatched; a moved or copied root "
+            "is never a register retry"
+        )
+    if view.state is LifecycleState.READ_ONLY_SERVICEABLE:
+        raise PreconditionRefused(
+            "a read-only-serviceable root is never a register retry"
+        )
+    if view.schema_version == 2:
+        raise PreconditionRefused(
+            "this root's metadata store is the pre-lifecycle version 2; "
+            "migrate_root_to_lifecycle_v3 is its only transition"
+        )
+    if view.state is LifecycleState.READ_ONLY_UNSERVICEABLE:
+        operation = view.operation
+        if operation is None or operation.kind != "register":
+            raise PreconditionRefused(
+                "this read-only root was not created by an interrupted "
+                "register_root; replicated or forked roots are never register "
+                "retries"
+            )
+    else:
+        # Metadata-less: an existing chain must carry this host's claim or it
+        # is a bare copied genesis, refused before anything is created.
+        if _root_claim_bytes(backend, project_root) is None:
+            _refuse_bare_genesis(
+                backend, project_root, genesis_payload, registered_surface
+            )
+
     with _recovery_lease(backend, project_root, metadata_root, storage) as lease:
         chain_backend = _cast(AuditedBackend, lease._binding.backend)
         _require_chain_publication(lease._binding.evidence)
-        chain_fd = _bootstrap_chain(
-            chain_backend, lease._binding.project_root_fd
+        binding = lease._binding
+        request = _lifecycle.OperationRequest.of(
+            _lifecycle.register_request(
+                binding.project_root_path,
+                binding.metadata_root_path,
+                storage,
+                genesis_payload,
+                registered_surface,
+            )
         )
+        operation_id = _register_operation(lease, binding, request)
+        claim = _lifecycle.encode_claim(operation_id, request)
+
+        chain_fd = _bootstrap_chain(chain_backend, binding.project_root_fd)
         try:
             validated = _validate_chain(chain_backend, chain_fd)
             if validated.survivors:
                 raise ProtocolError("chain staging appeared after lease resolution")
-            # Before the genesis/surface comparison, deliberately: the dangerous outcome
-            # on the existing-chain arm is the idempotent success return below, and one
-            # uniform rule -- an unsettled chain is not one you may re-register against
-            # -- is worth more than the more informative refusal a mismatched payload
-            # would otherwise have produced. Vacuous on the bootstrap path.
             _require_no_pending(validated.entries)
             if validated.entries:
                 digest, genesis = validated.entries[0]
                 if (
-                    type(genesis) is GenesisEntry
-                    and genesis.payload == genesis_payload
-                    and tuple(path for path, _ in genesis.baseline)
-                    == registered_surface
+                    type(genesis) is not GenesisEntry
+                    or genesis.payload != genesis_payload
+                    or tuple(path for path, _ in genesis.baseline)
+                    != registered_surface
                 ):
-                    return digest
-                raise PreconditionRefused(
-                    "the project root is already registered with a different "
-                    "payload or surface"
+                    raise RootOperationInvalid(
+                        "the durable genesis contradicts this root's recorded "
+                        "register operation"
+                    )
+            else:
+                baseline = _capture_baseline(
+                    chain_backend,
+                    binding.project_root_fd,
+                    registered_surface,
                 )
-            baseline = _capture_baseline(
-                chain_backend,
-                lease._binding.project_root_fd,
-                registered_surface,
-            )
-            return _append_entry(
-                chain_backend,
-                chain_fd,
-                validated,
-                GenesisEntry(genesis_payload, baseline),
-            )
+                digest = _append_entry(
+                    chain_backend,
+                    chain_fd,
+                    validated,
+                    GenesisEntry(genesis_payload, baseline),
+                )
         finally:
             chain_backend.close_fd(chain_fd)
+
+        _prove_register_tree(lease, chain_backend, binding, digest)
+        _lifecycle.remove_root_claim(
+            chain_backend, binding.project_root_fd, claim
+        )
+        _lifecycle._complete_root_operation(lease._store, final_state="writable")
+        return digest
+
+
+def _root_claim_bytes(backend: Backend, project_root: str) -> bytes | None:
+    root_fd, _, _ = establish_root(backend, project_root, create=False)
+    try:
+        return _lifecycle.read_root_claim(backend, root_fd)
+    finally:
+        backend.close_fd(root_fd)
+
+
+def _register_operation(
+    lease, binding, request: _lifecycle.OperationRequest
+) -> str:
+    """Adopt or record the register operation and its unserviceable stamp.
+
+    The claim and the carrier must name one operation: an existing claim with
+    different request bytes, or a claim/row identity disagreement, is
+    `RootOperationMismatch` before any tree or lifecycle change.
+    """
+    chain_backend = binding.backend
+    row = lease._store.read_root_operation()
+    existing_claim = _lifecycle.read_root_claim(
+        chain_backend, binding.project_root_fd
+    )
+    claimed_id: str | None = None
+    if existing_claim is not None:
+        decoded = _lifecycle.decode_claim(existing_claim)
+        if decoded.request_json != request.operation_json:
+            raise RootOperationMismatch(
+                "the root claim names a different register operation"
+            )
+        claimed_id = decoded.operation_id
+
+    if row is not None:
+        if row.kind != "register" or row.request_json != request.operation_json:
+            raise RootOperationMismatch(
+                "the recorded operation is not this register request"
+            )
+        if claimed_id is not None and claimed_id != row.operation_id:
+            raise RootOperationMismatch(
+                "the root claim and the recorded operation disagree"
+            )
+        return row.operation_id
+
+    operation_id = claimed_id or _lifecycle.mint_operation_id()
+    if existing_claim is None:
+        try:
+            _lifecycle.create_root_claim(
+                chain_backend,
+                binding.project_root_fd,
+                _lifecycle.encode_claim(operation_id, request),
+            )
+        except OSError as caught:
+            if caught.errno != errno.EEXIST:
+                raise
+            # Lost the cross-carrier race at the claim: adopt an exact winner,
+            # refuse any other. Two metadata roots cannot claim one root.
+            raced = _lifecycle.read_root_claim(
+                chain_backend, binding.project_root_fd
+            )
+            if raced is None:
+                raise RootOperationMismatch(
+                    "the root claim appeared and vanished during registration"
+                ) from caught
+            decoded = _lifecycle.decode_claim(raced)
+            if decoded.request_json != request.operation_json:
+                raise RootOperationMismatch(
+                    "the root claim names a different register operation"
+                ) from caught
+            operation_id = decoded.operation_id
+    machine_id = _lifecycle._read_machine_identity()
+    with lease._store.transaction() as txn:
+        txn.insert_root_operation(
+            operation_id,
+            "register",
+            request.operation_json,
+            request.operation_hash,
+        )
+        txn.insert_root_lifecycle(
+            "read-only-unserviceable",
+            machine_id,
+            binding.project_root_path,
+            "register",
+        )
+    return operation_id
+
+
+def _prove_register_tree(lease, chain_backend, binding, digest: str) -> None:
+    """Snapshot the whole registered tree and advance to tree-durable.
+
+    On a retry whose proof is already stored, re-prove instead: the recorded
+    genesis digest and snapshot must match the tree as it stands, because
+    nothing may mutate a pre-grant root but its own operation.
+    """
+    snapshot = _lifecycle.tree_snapshot(
+        chain_backend, binding.project_root_fd, digest
+    )
+    row = lease._store.read_root_operation()
+    if row is None:
+        raise ProtocolError("the register operation row vanished mid-command")
+    if row.phase == "recorded":
+        with lease._store.transaction() as txn:
+            txn.set_root_operation_tree_proof(snapshot.operation_json, digest)
+        return
+    if row.genesis_digest != digest:
+        raise RootOperationInvalid(
+            "the recorded genesis digest does not name the durable genesis"
+        )
+    if row.destination_snapshot_json != snapshot.operation_json:
+        raise RootOperationInvalid(
+            "the recorded tree proof does not match the pre-grant tree"
+        )
+
+
+def read_lifecycle_state(
+    backend: Backend,
+    root: str,
+    metadata_root: str,
+    storage: StorageProfile,
+) -> LifecycleState:
+    """The closed five-value lifecycle union, validated while reading.
+
+    Never creates or upgrades a root, metadata directory, lock, database,
+    schema, row, or WAL (lifecycle design §7).
+    """
+    return _lifecycle_view(backend, root, metadata_root, storage).state
 
 
 def append_intent(
@@ -380,7 +647,9 @@ def append_intent(
     storage: StorageProfile,
     payload: bytes,
 ) -> str:
-    with _recovery_lease(backend, project_root, metadata_root, storage) as lease:
+    with _writable_recovery_lease(
+        backend, project_root, metadata_root, storage
+    ) as lease:
         chain_backend = _cast(AuditedBackend, lease._binding.backend)
         _require_chain_publication(lease._binding.evidence)
         with _registered_root(lease) as (chain_fd, validated):
@@ -399,7 +668,7 @@ def run_transaction(
     payloads: PayloadSource,
 ) -> TransactionOutcome:
     compiled = compile_spec(spec)
-    with _recovery_lease(
+    with _writable_recovery_lease(
         backend, project_root, metadata_root, storage
     ) as lease:
         _require_chain_publication(lease._binding.evidence)

@@ -1196,8 +1196,14 @@ def test_chain_commands_keep_the_lease_and_approval_proofs_private():
         "ChainInspection",
         "ChainView",
         "DefectKind",
+        "DestinationOverride",
         "Entry",
+        "LifecycleState",
         "MalformedChain",
+        "RootOperationId",
+        "RootOperationInvalid",
+        "RootOperationMismatch",
+        "SourceSnapshotMoved",
         "TransactionOutcome",
         "WellFormedChain",
         "append_intent",
@@ -1205,6 +1211,7 @@ def test_chain_commands_keep_the_lease_and_approval_proofs_private():
         "inspect_chain",
         "inspect_chain_detached",
         "read_chain",
+        "read_lifecycle_state",
         "register_root",
         "run_transaction",
     )
@@ -1213,6 +1220,7 @@ def test_chain_commands_keep_the_lease_and_approval_proofs_private():
         "append_intent",
         "run_transaction",
         "read_chain",
+        "read_lifecycle_state",
         "inspect_chain",
         "inspect_chain_detached",
         "capture_states",
@@ -1235,10 +1243,16 @@ def test_chain_commands_keep_the_lease_and_approval_proofs_private():
             for node in ast.walk(function)
         )
 
-    # Clause 1: the four mutating-or-reading commands still enter `_recovery_lease`,
-    # so the recovery barrier they publish is unchanged by the split.
-    for name in ("register_root", "append_intent", "run_transaction", "read_chain"):
+    # Clause 1: the creating and reading commands still enter `_recovery_lease`;
+    # the two cooperative mutators enter the lifecycle-gated variant, whose
+    # stack is the same one behind the writability gate (lifecycle design §7).
+    for name in ("register_root", "read_chain"):
         assert _enters(public[name], "_recovery_lease"), f"{name} skips _recovery_lease"
+        assert not _names(public[name], "resolve"), f"{name} names resolve"
+    for name in ("append_intent", "run_transaction"):
+        assert _enters(public[name], "_writable_recovery_lease"), (
+            f"{name} skips the writability gate"
+        )
         assert not _names(public[name], "resolve"), f"{name} names resolve"
 
     # Clause 2: structural inspection interposes between reclamation and resolution,

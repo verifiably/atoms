@@ -203,6 +203,55 @@ class HeldProjectLock:
         close_all(self._backend, (self._lock_fd, self._root_fd))
 
 
+def acquire_existing_project_lock(
+    backend: Backend, metadata_root: str, *, blocking: bool = True
+) -> HeldProjectLock | None:
+    """Existing-only acquisition: opens the root and lock, creates neither.
+
+    The lifecycle read paths and the mutator gate must be able to hold the
+    metadata lock without conjuring a metadata root for a tree that has none —
+    creation stays `acquire_project_lock`'s. An absent root or lock propagates
+    the OSError; the caller classifies it (usually as metadata-less). With
+    ``blocking=False`` a busy lock returns None instead of waiting, which is
+    the copy commands' second-lock discipline.
+    """
+    root_fd, root_path, created = establish_root(backend, metadata_root, create=False)
+    assert not created
+    try:
+        lock_fd = backend.open_existing(
+            root_fd, "lock", read_write=True, nofollow=True
+        )
+    except BaseException:
+        backend.close_fd(root_fd)
+        raise
+    try:
+        if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
+            raise ProtocolError("metadata_root/lock is not a regular file")
+        if blocking:
+            try:
+                backend.lock_exclusive(lock_fd)
+            except OSError as caught:
+                if caught.errno in UNSUPPORTED_ERRNO["lock"]:
+                    raise CapabilityUnavailable(
+                        "advisory_project_lock is unavailable on this volume, so "
+                        "access to metadata_root cannot be serialized"
+                    ) from caught
+                raise
+        elif not backend.try_lock_exclusive(lock_fd):
+            close_all(backend, (lock_fd, root_fd))
+            return None
+    except BaseException:
+        close_all(backend, (lock_fd, root_fd))
+        raise
+    return HeldProjectLock(
+        _construction_token=_TOKEN,
+        backend=backend,
+        root_fd=root_fd,
+        root_path=root_path,
+        lock_fd=lock_fd,
+    )
+
+
 def acquire_project_lock(backend: Backend, metadata_root: str) -> HeldProjectLock:
     root_fd, root_path, created = establish_root(backend, metadata_root, create=True)
     try:

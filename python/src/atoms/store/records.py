@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, NoReturn
 
 from atoms.core.assembly import AssemblyHalt, decode_assembly_halt
 from atoms.core.canonical import canonical_json, from_canonical_json
@@ -653,3 +653,182 @@ def load_record(connection: Any, txid: str) -> StoredRecord | None:
         assembly_halt=assembly_halt,
         journals=journal_vector(spec, rows),
     )
+
+
+# --- Root lifecycle and root-creation operation rows (design 2026-08-23 §5) ---
+
+_HEX_LOWER = frozenset("0123456789abcdef")
+
+ROOT_LIFECYCLE_STATES = (
+    "writable",
+    "read-only-serviceable",
+    "read-only-unserviceable",
+)
+ROOT_LIFECYCLE_ORIGINS = (
+    "register",
+    "replicate",
+    "fork",
+    "read-serviceability",
+    "migration-v2",
+)
+ROOT_OPERATION_KINDS = ("register", "replicate", "fork")
+ROOT_OPERATION_PHASES = (
+    "recorded",
+    "source-snapshot-durable",
+    "tree-durable",
+    "complete",
+)
+
+INSERT_ROOT_LIFECYCLE = (
+    "INSERT INTO root_lifecycle (singleton, state, machine_id, root_path, origin)"
+    " VALUES (0, ?, ?, ?, ?)"
+)
+INSERT_ROOT_OPERATION = (
+    "INSERT INTO root_operation (singleton, operation_id, kind, phase,"
+    " request_json, request_hash) VALUES (0, ?, ?, 'recorded', ?, ?)"
+)
+UPDATE_ROOT_LIFECYCLE_STATE = "UPDATE root_lifecycle SET state = ? WHERE singleton = 0"
+UPDATE_ROOT_OPERATION_PHASE = "UPDATE root_operation SET phase = ? WHERE singleton = 0"
+UPDATE_ROOT_OPERATION_SOURCE_SNAPSHOT = (
+    "UPDATE root_operation SET source_snapshot_json = ? WHERE singleton = 0"
+)
+UPDATE_ROOT_OPERATION_TREE_PROOF = (
+    "UPDATE root_operation SET destination_snapshot_json = ?, genesis_digest = ?,"
+    " phase = 'tree-durable' WHERE singleton = 0"
+)
+SELECT_ROOT_LIFECYCLE = (
+    "SELECT state, machine_id, root_path, origin FROM root_lifecycle"
+    " WHERE singleton = 0"
+)
+SELECT_ROOT_OPERATION = (
+    "SELECT operation_id, kind, phase, request_json, request_hash,"
+    " source_snapshot_json, destination_snapshot_json, genesis_digest"
+    " FROM root_operation WHERE singleton = 0"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class RootLifecycleRow:
+    state: str
+    machine_id: str
+    root_path: str
+    origin: str
+
+
+@dataclass(frozen=True, slots=True)
+class RootOperationRow:
+    operation_id: str
+    kind: str
+    phase: str
+    request_json: str
+    request_hash: str
+    source_snapshot_json: str | None
+    destination_snapshot_json: str | None
+    genesis_digest: str | None
+
+
+def _lifecycle_refuse(message: str) -> NoReturn:
+    raise MetadataStoreInvalid(f"root lifecycle bookkeeping is malformed: {message}")
+
+
+def _require_hex(value: object, length: int, label: str) -> str:
+    if type(value) is not str or len(value) != length or not set(value) <= _HEX_LOWER:
+        _lifecycle_refuse(f"{label} must be {length} lowercase hexadecimal characters")
+    return value
+
+
+def load_root_lifecycle(connection: Any) -> RootLifecycleRow | None:
+    """Read and validate the singleton lifecycle row, defensively.
+
+    The CHECK constraints already refuse these shapes at write time, but this
+    reads stores other processes wrote: a row the constraints could not have
+    admitted is raw tampering and classifies as an invalid store, never as any
+    lifecycle state.
+    """
+    with translated("reading the root lifecycle row"):
+        row = connection.execute(SELECT_ROOT_LIFECYCLE).fetchone()
+    if row is None:
+        return None
+    state, machine_id, root_path, origin = row
+    if state not in ROOT_LIFECYCLE_STATES:
+        _lifecycle_refuse(f"state {state!r} is outside the stored domain")
+    if origin not in ROOT_LIFECYCLE_ORIGINS:
+        _lifecycle_refuse(f"origin {origin!r} is outside the closed domain")
+    _require_hex(machine_id, 32, "machine_id")
+    if machine_id == "0" * 32:
+        _lifecycle_refuse("machine_id is the uninitialized all-zero identity")
+    if type(root_path) is not str or not root_path:
+        _lifecycle_refuse("root_path must be a non-empty string")
+    return RootLifecycleRow(
+        state=state, machine_id=machine_id, root_path=root_path, origin=origin
+    )
+
+
+def load_root_operation(connection: Any) -> RootOperationRow | None:
+    with translated("reading the root operation row"):
+        row = connection.execute(SELECT_ROOT_OPERATION).fetchone()
+    if row is None:
+        return None
+    (
+        operation_id,
+        kind,
+        phase,
+        request_json,
+        request_hash,
+        source_snapshot_json,
+        destination_snapshot_json,
+        genesis_digest,
+    ) = row
+    _require_hex(operation_id, 32, "operation_id")
+    if kind not in ROOT_OPERATION_KINDS:
+        _lifecycle_refuse(f"operation kind {kind!r} is outside the closed domain")
+    if phase not in ROOT_OPERATION_PHASES:
+        _lifecycle_refuse(f"operation phase {phase!r} is outside the closed domain")
+    if type(request_json) is not str or type(request_hash) is not str:
+        _lifecycle_refuse("operation request fields must be strings")
+    _require_hex(request_hash, 64, "request_hash")
+    for label, value in (
+        ("source_snapshot_json", source_snapshot_json),
+        ("destination_snapshot_json", destination_snapshot_json),
+    ):
+        if value is not None and type(value) is not str:
+            _lifecycle_refuse(f"{label} must be NULL or a string")
+    if genesis_digest is not None:
+        _require_hex(genesis_digest, 64, "genesis_digest")
+    return RootOperationRow(
+        operation_id=operation_id,
+        kind=kind,
+        phase=phase,
+        request_json=request_json,
+        request_hash=request_hash,
+        source_snapshot_json=source_snapshot_json,
+        destination_snapshot_json=destination_snapshot_json,
+        genesis_digest=genesis_digest,
+    )
+
+
+def require_root_row_pair(
+    lifecycle: RootLifecycleRow | None, operation: RootOperationRow | None
+) -> None:
+    """The atomic-pair rule: creation origins carry their operation, the
+    operation-less origins never do, and an operation row alone is invalid."""
+    if lifecycle is None:
+        if operation is not None:
+            _lifecycle_refuse(
+                "a root operation row exists without its atomic lifecycle row"
+            )
+        return
+    if lifecycle.origin in ROOT_OPERATION_KINDS:
+        if operation is None:
+            _lifecycle_refuse(
+                f"lifecycle origin {lifecycle.origin!r} has no operation row"
+            )
+        elif operation.kind != lifecycle.origin:
+            _lifecycle_refuse(
+                f"lifecycle origin {lifecycle.origin!r} does not match operation "
+                f"kind {operation.kind!r}"
+            )
+    elif operation is not None:
+        _lifecycle_refuse(
+            f"lifecycle origin {lifecycle.origin!r} must not carry an operation row"
+        )

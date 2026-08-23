@@ -14,6 +14,9 @@ from atoms.core.identifiers import is_valid_identifier, require_valid_identifier
 
 SCRATCH_SIGIL = ".#~"
 CHAIN_LEAF = ".#~chain"
+ROOT_CLAIM_LEAF = ".#~root-claim"
+"""The fixed root-creation claim (lifecycle design §5.1): temporary engine
+bookkeeping at the root, published no-clobber, removed before completion."""
 SCRATCH_ROLES: frozenset[str] = frozenset({"staging", "tombstone", "anchor", "work"})
 
 

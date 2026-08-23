@@ -9,7 +9,7 @@ from enum import Enum
 from typing import TypeVar
 
 from atoms.core.errors import ProtocolError
-from atoms.core.scratch import CHAIN_LEAF, is_scratch_leaf
+from atoms.core.scratch import CHAIN_LEAF, ROOT_CLAIM_LEAF, is_scratch_leaf
 from atoms.fs.backend import Backend
 from atoms.fs.lock import _guarded_spelling
 
@@ -450,6 +450,10 @@ class AuditedBackend:
         if provenance.root is RootKind.PROJECT:
             if path.partition("/")[0] == CHAIN_LEAF:
                 return TargetClass.CHAIN_BOOKKEEPING, path
+            if path == ROOT_CLAIM_LEAF:
+                # The fixed root-creation claim is engine bookkeeping at the
+                # root itself (lifecycle design §5.1).
+                return TargetClass.ENGINE_SCRATCH, path
             if is_scratch_leaf(leaf):
                 return TargetClass.ENGINE_SCRATCH, path
             if path in self._declared_paths:
@@ -469,6 +473,8 @@ class AuditedBackend:
         if provenance.root is RootKind.PROJECT and provenance.path:
             if provenance.path.partition("/")[0] == CHAIN_LEAF:
                 return TargetClass.CHAIN_BOOKKEEPING, provenance.path
+            if provenance.path == ROOT_CLAIM_LEAF:
+                return TargetClass.ENGINE_SCRATCH, provenance.path
             if is_scratch_leaf(provenance.path.rsplit("/", 1)[-1]):
                 return TargetClass.ENGINE_SCRATCH, provenance.path
             if provenance.path in self._declared_paths:

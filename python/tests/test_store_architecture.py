@@ -597,9 +597,26 @@ def _literal_structure_names(
     counts = _module_binding_counts(tree)
     values = _static_values(path)
 
+    bindings = {
+        name: value
+        for name, value in _module_bindings(tree)
+        if counts[name] == 1
+    }
+
     def is_immutable_static(node: ast.expr) -> bool:
         if isinstance(node, ast.Tuple):
             return all(is_immutable_static(element) for element in node.elts)
+        if isinstance(node, ast.Starred):
+            # A concatenation of frozen literal tuples — schema v3 is exactly
+            # the frozen v2 statements plus the lifecycle statements — is as
+            # static as its parts, provided each part is itself a once-bound
+            # module-level literal structure of this module.
+            inner = node.value
+            return (
+                isinstance(inner, ast.Name)
+                and isinstance(bindings.get(inner.id), ast.Tuple)
+                and is_immutable_static(bindings[inner.id])
+            )
         if _string_value(node, values) is not None:
             return True
         try:
@@ -1135,6 +1152,12 @@ def test_the_transaction_attribute_set_is_exactly_the_documented_surface():
         "set_settlement_digest",
         "set_assembly_halt",
         "set_active",
+        "insert_root_operation",
+        "insert_root_lifecycle",
+        "set_root_lifecycle_state",
+        "set_root_operation_phase",
+        "set_root_operation_source_snapshot",
+        "set_root_operation_tree_proof",
     }
     assert "insert_blobs" not in public
 

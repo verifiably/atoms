@@ -244,6 +244,8 @@ STORE_SURFACE: tuple[tuple[str, tuple[object, ...]], ...] = (
     ("transaction", ()),
     ("read_record", ("tx1",)),
     ("read_active", ()),
+    ("read_root_lifecycle", ()),
+    ("read_root_operation", ()),
     ("open_blob", ("sha256:" + "a" * 64,)),
     ("list_unindexed_blobs", ()),
     ("remove_unindexed_blob", ("sha256:" + "a" * 64,)),

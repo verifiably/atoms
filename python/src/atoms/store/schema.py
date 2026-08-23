@@ -27,7 +27,7 @@ from atoms.core.recovery.model import (
 )
 from atoms.core.recovery.plan import EffectVariant
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 APPLICATION_ID = int.from_bytes(b"atms", "big")
 
 _EnumT = TypeVar("_EnumT", bound=Enum)
@@ -43,7 +43,7 @@ def check_list(members: type[_EnumT]) -> str:
     return ", ".join(f"'{member.value}'" for member in sorted(members, key=lambda m: m.value))
 
 
-SCHEMA_STATEMENTS: tuple[str, ...] = (
+V2_SCHEMA_STATEMENTS: tuple[str, ...] = (
     f"""CREATE TABLE transaction_record (
     txid                TEXT PRIMARY KEY,
     spec_json           TEXT NOT NULL,
@@ -197,6 +197,225 @@ END;""",
 )
 
 
+ROOT_LIFECYCLE_V3_STATEMENTS: tuple[str, ...] = (
+    """CREATE TABLE root_lifecycle (
+    singleton  INTEGER PRIMARY KEY CHECK (singleton = 0),
+    state      TEXT NOT NULL CHECK (state IN (
+        'writable', 'read-only-serviceable', 'read-only-unserviceable'
+    )),
+    machine_id TEXT NOT NULL,
+    root_path  TEXT NOT NULL,
+    origin     TEXT NOT NULL CHECK (origin IN (
+        'register', 'replicate', 'fork',
+        'read-serviceability', 'migration-v2'
+    )),
+    CHECK (length(machine_id) = 32
+        AND machine_id NOT GLOB '*[^0-9a-f]*'
+        AND machine_id != '00000000000000000000000000000000'),
+    CHECK (length(root_path) > 0),
+    CHECK (
+        (origin IN ('register', 'fork') AND state IN (
+            'read-only-unserviceable', 'writable'
+        ))
+        OR (origin = 'replicate' AND state IN (
+            'read-only-unserviceable', 'read-only-serviceable'
+        ))
+        OR (origin = 'read-serviceability'
+            AND state = 'read-only-serviceable')
+        OR (origin = 'migration-v2' AND state = 'writable')
+    )
+) STRICT;""",
+    """CREATE TABLE root_operation (
+    singleton                 INTEGER PRIMARY KEY CHECK (singleton = 0),
+    operation_id              TEXT NOT NULL UNIQUE,
+    kind                      TEXT NOT NULL CHECK (kind IN (
+        'register', 'replicate', 'fork'
+    )),
+    phase                     TEXT NOT NULL CHECK (phase IN (
+        'recorded', 'source-snapshot-durable',
+        'tree-durable', 'complete'
+    )),
+    request_json              TEXT NOT NULL,
+    request_hash              TEXT NOT NULL,
+    source_snapshot_json      TEXT,
+    destination_snapshot_json TEXT,
+    genesis_digest            TEXT,
+    CHECK (length(operation_id) = 32
+        AND operation_id NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(request_hash) = 64
+        AND request_hash NOT GLOB '*[^0-9a-f]*'),
+    CHECK (genesis_digest IS NULL OR (
+        length(genesis_digest) = 64
+        AND genesis_digest NOT GLOB '*[^0-9a-f]*'
+    )),
+    CHECK (
+        (kind = 'register'
+            AND source_snapshot_json IS NULL
+            AND (
+                (phase = 'recorded'
+                    AND destination_snapshot_json IS NULL
+                    AND genesis_digest IS NULL)
+                OR (phase IN ('tree-durable', 'complete')
+                    AND destination_snapshot_json IS NOT NULL
+                    AND genesis_digest IS NOT NULL)
+            ))
+        OR (kind = 'replicate'
+            AND genesis_digest IS NULL
+            AND (
+                (phase = 'recorded'
+                    AND source_snapshot_json IS NULL
+                    AND destination_snapshot_json IS NULL)
+                OR (phase = 'source-snapshot-durable'
+                    AND source_snapshot_json IS NOT NULL
+                    AND destination_snapshot_json IS NULL)
+                OR (phase IN ('tree-durable', 'complete')
+                    AND source_snapshot_json IS NOT NULL
+                    AND destination_snapshot_json IS NOT NULL)
+            ))
+        OR (kind = 'fork' AND (
+            (phase = 'recorded'
+                AND source_snapshot_json IS NULL
+                AND destination_snapshot_json IS NULL
+                AND genesis_digest IS NULL)
+            OR (phase = 'source-snapshot-durable'
+                AND source_snapshot_json IS NOT NULL
+                AND destination_snapshot_json IS NULL
+                AND genesis_digest IS NULL)
+            OR (phase IN ('tree-durable', 'complete')
+                AND source_snapshot_json IS NOT NULL
+                AND destination_snapshot_json IS NOT NULL
+                AND genesis_digest IS NOT NULL)
+        ))
+    )
+) STRICT;""",
+    """CREATE TRIGGER trg_root_lifecycle_insert_gate
+BEFORE INSERT ON root_lifecycle
+WHEN NOT (
+    (NEW.origin IN ('register', 'replicate', 'fork')
+        AND NEW.state = 'read-only-unserviceable'
+        AND EXISTS (
+            SELECT 1 FROM root_operation
+            WHERE singleton = 0
+                AND kind = NEW.origin
+                AND phase = 'recorded'
+        ))
+    OR (NEW.origin = 'read-serviceability'
+        AND NEW.state = 'read-only-serviceable'
+        AND NOT EXISTS (SELECT 1 FROM root_operation))
+    OR (NEW.origin = 'migration-v2'
+        AND NEW.state = 'writable'
+        AND NOT EXISTS (SELECT 1 FROM root_operation))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'root lifecycle insert lacks initial operation state');
+END;""",
+    """CREATE TRIGGER trg_root_lifecycle_identity_write_once
+BEFORE UPDATE OF machine_id, root_path, origin ON root_lifecycle
+WHEN NEW.machine_id IS NOT OLD.machine_id
+    OR NEW.root_path IS NOT OLD.root_path
+    OR NEW.origin IS NOT OLD.origin
+BEGIN
+    SELECT RAISE(ABORT, 'root lifecycle binding and origin are write-once');
+END;""",
+    """CREATE TRIGGER trg_root_lifecycle_transition
+BEFORE UPDATE OF state ON root_lifecycle
+WHEN NOT (
+    NEW.state = OLD.state
+    OR (OLD.state = 'read-only-unserviceable'
+        AND NEW.state = 'read-only-serviceable'
+        AND NOT EXISTS (
+            SELECT 1 FROM root_operation WHERE phase != 'complete'
+        ))
+    OR (OLD.state = 'read-only-unserviceable'
+        AND NEW.state = 'writable'
+        AND OLD.origin IN ('register', 'fork')
+        AND EXISTS (
+            SELECT 1 FROM root_operation
+            WHERE kind = OLD.origin AND phase = 'tree-durable'
+        ))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'illegal root lifecycle transition');
+END;""",
+    """CREATE TRIGGER trg_root_lifecycle_no_delete
+BEFORE DELETE ON root_lifecycle
+BEGIN
+    SELECT RAISE(ABORT, 'root lifecycle is retained');
+END;""",
+    """CREATE TRIGGER trg_root_operation_insert_gate
+BEFORE INSERT ON root_operation
+WHEN NEW.phase != 'recorded'
+    OR EXISTS (SELECT 1 FROM root_lifecycle)
+BEGIN
+    SELECT RAISE(ABORT, 'root operation insert requires empty lifecycle and recorded phase');
+END;""",
+    """CREATE TRIGGER trg_root_operation_identity_write_once
+BEFORE UPDATE OF operation_id, kind, request_json, request_hash ON root_operation
+WHEN NEW.operation_id IS NOT OLD.operation_id
+    OR NEW.kind IS NOT OLD.kind
+    OR NEW.request_json IS NOT OLD.request_json
+    OR NEW.request_hash IS NOT OLD.request_hash
+BEGIN
+    SELECT RAISE(ABORT, 'root operation identity is write-once');
+END;""",
+    """CREATE TRIGGER trg_root_operation_proof_write_once
+BEFORE UPDATE OF source_snapshot_json,
+    destination_snapshot_json, genesis_digest ON root_operation
+WHEN (OLD.source_snapshot_json IS NOT NULL
+        AND NEW.source_snapshot_json IS NOT OLD.source_snapshot_json)
+    OR (OLD.destination_snapshot_json IS NOT NULL
+        AND NEW.destination_snapshot_json IS NOT OLD.destination_snapshot_json)
+    OR (OLD.genesis_digest IS NOT NULL
+        AND NEW.genesis_digest IS NOT OLD.genesis_digest)
+BEGIN
+    SELECT RAISE(ABORT, 'root operation proof fields are write-once');
+END;""",
+    """CREATE TRIGGER trg_root_operation_phase_transition
+BEFORE UPDATE OF phase ON root_operation
+WHEN NOT (
+    (OLD.phase = 'recorded'
+        AND NEW.phase = 'source-snapshot-durable'
+        AND OLD.kind IN ('replicate', 'fork'))
+    OR (OLD.phase = 'recorded'
+        AND NEW.phase = 'tree-durable'
+        AND OLD.kind = 'register')
+    OR (OLD.phase = 'source-snapshot-durable'
+        AND NEW.phase = 'tree-durable')
+    OR (OLD.phase = 'tree-durable' AND NEW.phase = 'complete')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'illegal root operation phase transition');
+END;""",
+    """CREATE TRIGGER trg_root_operation_complete_gate
+BEFORE UPDATE OF phase ON root_operation
+WHEN NEW.phase = 'complete' AND NOT EXISTS (
+    SELECT 1 FROM root_lifecycle
+    WHERE singleton = 0
+        AND origin = NEW.kind
+        AND state = CASE NEW.kind
+            WHEN 'replicate' THEN 'read-only-unserviceable'
+            ELSE 'writable'
+        END
+)
+BEGIN
+    SELECT RAISE(ABORT, 'root operation completion lacks lifecycle state');
+END;""",
+    """CREATE TRIGGER trg_root_operation_no_delete
+BEFORE DELETE ON root_operation
+BEGIN
+    SELECT RAISE(ABORT, 'root operation is retained');
+END;""",
+)
+"""Design 2026-08-23 §5, verbatim: the DDL is the contract, including trigger
+names and error strings. Version 3 is exactly the frozen v2 statements plus
+these, in this order."""
+
+SCHEMA_STATEMENTS: tuple[str, ...] = (
+    *V2_SCHEMA_STATEMENTS,
+    *ROOT_LIFECYCLE_V3_STATEMENTS,
+)
+
+
 def _catalog_row(statement: str) -> tuple[str, str, str, str]:
     """Derive one (type, name, tbl_name, sql) row from a DDL statement.
 
@@ -216,15 +435,26 @@ def _catalog_row(statement: str) -> tuple[str, str, str, str]:
     return ("table", name, name, body)
 
 
+_V2_AUTOINDEXES: tuple[tuple[str, str, str, None], ...] = (
+    ("index", "sqlite_autoindex_transaction_record_1", "transaction_record", None),
+    ("index", "sqlite_autoindex_transaction_record_2", "transaction_record", None),
+    ("index", "sqlite_autoindex_transaction_record_3", "transaction_record", None),
+    ("index", "sqlite_autoindex_effect_1", "effect", None),
+    ("index", "sqlite_autoindex_blob_1", "blob", None),
+)
+
+V2_EXPECTED_CATALOG: frozenset[tuple[str, str, str, str | None]] = frozenset(
+    [_catalog_row(statement) for statement in V2_SCHEMA_STATEMENTS]
+    + list(_V2_AUTOINDEXES)
+)
+"""The pre-lifecycle store, frozen: `migrate_root_to_lifecycle_v3` proves this
+exact catalog before its writable open, and the read-only classifier reads an
+exact match as read-only unserviceable."""
+
 EXPECTED_CATALOG: frozenset[tuple[str, str, str, str | None]] = frozenset(
     [_catalog_row(statement) for statement in SCHEMA_STATEMENTS]
-    + [
-        ("index", "sqlite_autoindex_transaction_record_1", "transaction_record", None),
-        ("index", "sqlite_autoindex_transaction_record_2", "transaction_record", None),
-        ("index", "sqlite_autoindex_transaction_record_3", "transaction_record", None),
-        ("index", "sqlite_autoindex_effect_1", "effect", None),
-        ("index", "sqlite_autoindex_blob_1", "blob", None),
-    ]
+    + list(_V2_AUTOINDEXES)
+    + [("index", "sqlite_autoindex_root_operation_1", "root_operation", None)]
 )
 
 EFFECT_VARIANTS: Mapping[type[Effect], EffectVariant] = {
