@@ -690,7 +690,8 @@ INSERT_ROOT_OPERATION = (
 UPDATE_ROOT_LIFECYCLE_STATE = "UPDATE root_lifecycle SET state = ? WHERE singleton = 0"
 UPDATE_ROOT_OPERATION_PHASE = "UPDATE root_operation SET phase = ? WHERE singleton = 0"
 UPDATE_ROOT_OPERATION_SOURCE_SNAPSHOT = (
-    "UPDATE root_operation SET source_snapshot_json = ? WHERE singleton = 0"
+    "UPDATE root_operation SET source_snapshot_json = ?,"
+    " phase = 'source-snapshot-durable' WHERE singleton = 0"
 )
 UPDATE_ROOT_OPERATION_TREE_PROOF = (
     "UPDATE root_operation SET destination_snapshot_json = ?, genesis_digest = ?,"

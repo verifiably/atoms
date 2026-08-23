@@ -20,6 +20,7 @@ from atoms.fs.lock import (
     acquire_existing_project_lock,
     acquire_project_lock,
     establish_root,
+    try_acquire_project_lock,
 )
 from atoms.fs.volume import CERTIFIED_ALLOWLIST, StorageProfile
 from atoms.store.connection import open_store
@@ -178,4 +179,42 @@ def _recovery_lease(
     """
     with _project_lease(backend, project_root, metadata_root, storage) as lease:
         resolve(lease._binding, lease._store)
+        yield lease
+
+
+@contextlib.contextmanager
+def _claimed_destination_lease(
+    backend: Backend,
+    dest_root: str,
+    dest_metadata_root: str,
+    storage: StorageProfile,
+) -> Iterator[Lease]:
+    """The copy destination's nonblocking lock plus its bound store lease.
+
+    Lives here because the audit facade and the bind call are this module's
+    to construct; the copy commands consume only the lease.
+    """
+    audited = AuditedBackend(
+        backend, project_root=dest_root, metadata_root=dest_metadata_root
+    )
+    lock = try_acquire_project_lock(audited, dest_metadata_root)
+    if lock is None:
+        raise PreconditionRefused("copy destination lock is busy")
+    with lock, _leased_stack(lock, dest_root, storage) as lease:
+        yield lease
+
+
+@contextlib.contextmanager
+def _creation_lease(
+    backend: Backend,
+    project_root: str,
+    metadata_root: str,
+    storage: StorageProfile,
+) -> Iterator[Lease]:
+    """A creating, blocking lease with no recovery resolution — the
+    serviceability grant's cold-admission stack."""
+    audited = AuditedBackend(
+        backend, project_root=project_root, metadata_root=metadata_root
+    )
+    with acquire_project_lock(audited, metadata_root) as lock, _leased_stack(lock, project_root, storage) as lease:
         yield lease

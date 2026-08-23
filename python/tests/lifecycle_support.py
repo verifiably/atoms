@@ -45,3 +45,11 @@ def fabricate_v3_store(metadata_root: str) -> Path:
     from atoms.store.schema import SCHEMA_STATEMENTS
 
     return _fabricate(metadata_root, SCHEMA_STATEMENTS, 3)
+
+
+def claim_operation_id(root: str) -> str:
+    """The operation_id a durable root claim names, read with raw json."""
+    import json
+
+    payload = (Path(root) / ".#~root-claim").read_bytes()
+    return json.loads(payload)["operation_id"]

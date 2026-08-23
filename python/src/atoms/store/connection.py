@@ -717,20 +717,24 @@ class _StoreTransaction:
         request_json: str,
         request_hash: str,
     ) -> None:
-        with self._mutating() as store, translated("recording a root operation"):
-            store._connection.execute(
-                INSERT_ROOT_OPERATION,
-                (operation_id, kind, request_json, request_hash),
-            )
+        with self._mutating() as store:
+            require_text("request_json", request_json)
+            with translated("recording a root operation"):
+                store._connection.execute(
+                    INSERT_ROOT_OPERATION,
+                    (operation_id, kind, request_json, request_hash),
+                )
 
     def insert_root_lifecycle(
         self, state: str, machine_id: str, root_path: str, origin: str
     ) -> None:
-        with self._mutating() as store, translated("stamping the root lifecycle"):
-            store._connection.execute(
-                INSERT_ROOT_LIFECYCLE,
-                (state, machine_id, root_path, origin),
-            )
+        with self._mutating() as store:
+            require_text("root_path", root_path)
+            with translated("stamping the root lifecycle"):
+                store._connection.execute(
+                    INSERT_ROOT_LIFECYCLE,
+                    (state, machine_id, root_path, origin),
+                )
 
     def set_root_lifecycle_state(self, state: str) -> None:
         with self._mutating() as store:

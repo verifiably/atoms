@@ -1,8 +1,8 @@
 # Root lifecycle commands and fail-closed writability
 
-**Status:** Approved by atoms-side human review on 2026-08-23; review findings
-landed through `6555e46`. Downstream implementation is authorized only after
-the Science Task 1 amendment lands.
+**Status:** Implemented on 2026-08-23. Approved by atoms-side human review
+(findings landed through `6555e46`); the implementation landed on
+`design/root-lifecycle` with the full suite and gates green.
 
 **Authority:** `~/d/science/docs/superpowers/specs/2026-08-23-world-index-root-lifecycle-design.md`
 §2–§4.

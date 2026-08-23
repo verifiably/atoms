@@ -252,6 +252,44 @@ def acquire_existing_project_lock(
     )
 
 
+def try_acquire_project_lock(
+    backend: Backend, metadata_root: str
+) -> HeldProjectLock | None:
+    """Create-if-needed acquisition that never blocks: None when busy.
+
+    The copy commands' destination discipline (lifecycle design §9): the
+    source lock is held blocking, the destination lock is only ever tried,
+    so an opposite-direction pair cannot wait on each other.
+    """
+    root_fd, root_path, created = establish_root(backend, metadata_root, create=True)
+    try:
+        if created:
+            try:
+                backend.set_marker_xattr(root_fd, SYNC_IGNORE_ATTRIBUTE, b"1")
+            except OSError:
+                pass
+        lock_fd = backend.create_or_open(root_fd, "lock", 0o600)
+    except BaseException:
+        backend.close_fd(root_fd)
+        raise
+    try:
+        if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
+            raise ProtocolError("metadata_root/lock is not a regular file")
+        if not backend.try_lock_exclusive(lock_fd):
+            close_all(backend, (lock_fd, root_fd))
+            return None
+    except BaseException:
+        close_all(backend, (lock_fd, root_fd))
+        raise
+    return HeldProjectLock(
+        _construction_token=_TOKEN,
+        backend=backend,
+        root_fd=root_fd,
+        root_path=root_path,
+        lock_fd=lock_fd,
+    )
+
+
 def acquire_project_lock(backend: Backend, metadata_root: str) -> HeldProjectLock:
     root_fd, root_path, created = establish_root(backend, metadata_root, create=True)
     try:

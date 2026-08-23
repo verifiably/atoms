@@ -591,6 +591,7 @@ class CarrierView:
     lifecycle: RootLifecycleRow | None
     operation: RootOperationRow | None
     schema_version: int
+    active_txid: str | None = None
 
 
 def _classify_connection(
@@ -633,16 +634,22 @@ def _classify_connection(
     lifecycle = load_root_lifecycle(connection)
     operation = load_root_operation(connection)
     require_root_row_pair(lifecycle, operation)
+    active_row = connection.execute("SELECT txid FROM active").fetchone()
+    active_txid = None if active_row is None else active_row[0]
     if lifecycle is None:
-        return CarrierView(LifecycleState.METADATA_LESS, None, operation, 3)
+        return CarrierView(
+            LifecycleState.METADATA_LESS, None, operation, 3, active_txid
+        )
     if root_path is None or (lifecycle.machine_id, lifecycle.root_path) != (
         machine_id,
         root_path,
     ):
         return CarrierView(
-            LifecycleState.BINDING_MISMATCHED, lifecycle, operation, 3
+            LifecycleState.BINDING_MISMATCHED, lifecycle, operation, 3, active_txid
         )
-    return CarrierView(LifecycleState(lifecycle.state), lifecycle, operation, 3)
+    return CarrierView(
+        LifecycleState(lifecycle.state), lifecycle, operation, 3, active_txid
+    )
 
 
 def _verify_volume(
@@ -788,3 +795,553 @@ def _complete_root_operation(store: object, *, final_state: str) -> None:
     with store.transaction() as txn:  # type: ignore[attr-defined]
         txn.set_root_lifecycle_state(final_state)
         txn.set_root_operation_phase("complete")
+
+
+# --- Copy requests and boundary validation (design §5.1, §6.1) ---
+
+
+def replicate_request(
+    source_root: str,
+    source_metadata_root: str,
+    dest_root: str,
+    dest_metadata_root: str,
+    storage: StorageProfile,
+    source_head: str,
+) -> dict[str, object]:
+    return {
+        "domain": OPERATION_DOMAIN,
+        "kind": "replicate",
+        "source_root": source_root,
+        "source_metadata_root": source_metadata_root,
+        "dest_root": dest_root,
+        "dest_metadata_root": dest_metadata_root,
+        "storage_profile": {"profile_id": storage.profile_id},
+        "source_head": source_head,
+    }
+
+
+def fork_request(
+    source_root: str,
+    source_metadata_root: str,
+    dest_root: str,
+    dest_metadata_root: str,
+    storage: StorageProfile,
+    expected_source_head: str,
+    genesis_payload: bytes,
+    surface_paths: tuple[str, ...],
+    dest_overrides: tuple[DestinationOverride, ...],
+) -> dict[str, object]:
+    return {
+        "domain": OPERATION_DOMAIN,
+        "kind": "fork",
+        "source_root": source_root,
+        "source_metadata_root": source_metadata_root,
+        "dest_root": dest_root,
+        "dest_metadata_root": dest_metadata_root,
+        "storage_profile": {"profile_id": storage.profile_id},
+        "expected_source_head": expected_source_head,
+        "genesis_payload_b64": _b64(genesis_payload),
+        "surface_paths": list(surface_paths),
+        "dest_overrides": [
+            {
+                "path": override.path,
+                "payload_b64": _b64(override.payload),
+                "mode": override.mode,
+            }
+            for override in dest_overrides
+        ],
+    }
+
+
+def require_source_head(value: object) -> str:
+    if type(value) is not str:
+        raise ProtocolError("expected_source_head must be an exact str")
+    if len(value) != 64 or not set(value) <= _HEX_LOWER:
+        raise PreconditionRefused(
+            "expected_source_head must be 64 lowercase hexadecimal characters"
+        )
+    return value
+
+
+def require_overrides(value: object) -> tuple[DestinationOverride, ...]:
+    from atoms.core.errors import SpecValidationError
+    from atoms.core.paths import require_rel_path
+
+    if type(value) is not tuple or any(
+        type(item) is not DestinationOverride for item in value
+    ):
+        raise ProtocolError(
+            "dest_overrides must be an exact tuple of exact DestinationOverride"
+        )
+    overrides = cast(tuple[DestinationOverride, ...], value)
+    paths = [override.path for override in overrides]
+    if any(type(path) is not str for path in paths):
+        raise ProtocolError("override paths must be exact strings")
+    if paths != sorted(paths):
+        raise PreconditionRefused("dest_overrides must be sorted by path")
+    if len(paths) != len(set(paths)):
+        raise PreconditionRefused("dest_overrides must be duplicate-free")
+    for override in overrides:
+        try:
+            require_rel_path("override path", override.path)
+        except SpecValidationError as caught:
+            raise PreconditionRefused(str(caught)) from caught
+        if type(override.payload) is not bytes:
+            raise ProtocolError("override payloads must be exact bytes")
+        if type(override.mode) is not int or type(override.mode) is bool:
+            raise ProtocolError("override modes must be exact int")
+        if not 0 <= override.mode <= 0o7777:
+            raise PreconditionRefused("override modes must be in 0..0o7777")
+    for path in paths:
+        for other in paths:
+            if other != path and other.startswith(path + "/"):
+                raise PreconditionRefused(
+                    f"override path {path!r} is an ancestor of {other!r}"
+                )
+    return overrides
+
+
+def canonical_absent_ok(backend: Backend, path: str) -> tuple[str, bool]:
+    """(canonical spelling, exists) for a root that may not exist yet.
+
+    An existing root gets the guarded walk's normalized spelling. An absent
+    one gets the guarded-opened parent's normalized spelling joined to the
+    validated final leaf — creation later happens relative to that held
+    parent, so the spelling and the entry cannot diverge.
+    """
+    try:
+        fd, spelled, _ = establish_root(backend, path, create=False)
+    except OSError as caught:
+        if caught.errno not in (errno.ENOENT, errno.ENOTDIR):
+            raise
+    else:
+        backend.close_fd(fd)
+        return spelled, True
+    from atoms.fs.lock import _guarded_spelling
+
+    spelled = _guarded_spelling(path)
+    parent, leaf = os.path.split(spelled)
+    if not leaf or leaf == "..":
+        raise ProtocolError(
+            f"cannot claim a destination whose final component is {leaf!r}"
+        )
+    try:
+        parent_fd, parent_path, _ = establish_root(backend, parent, create=False)
+    except OSError as caught:
+        if caught.errno in (errno.ENOENT, errno.ENOTDIR):
+            # No parent to walk: the lexical spelling is enough for the
+            # pairwise-overlap refusal, which is the only consumer of a
+            # destination this unreachable.
+            return os.path.normpath(spelled), False
+        raise
+    backend.close_fd(parent_fd)
+    return os.path.join(parent_path, leaf), False
+
+
+def require_nonoverlapping(paths: dict[str, str]) -> None:
+    """Pairwise: no two equal, none an ancestor or descendant of another."""
+    items = sorted(paths.items())
+    for index, (label, path) in enumerate(items):
+        for other_label, other in items[index + 1 :]:
+            if path == other or other.startswith(path + os.sep) or path.startswith(
+                other + os.sep
+            ):
+                raise PreconditionRefused(
+                    f"copy paths must be pairwise non-overlapping: {label} "
+                    f"{path!r} overlaps {other_label} {other!r}"
+                )
+
+
+# --- Claim publication and the copy pipeline seams (design §5.1, §9) ---
+
+
+def _publish_claimed_destination(
+    backend: Backend,
+    dest_parent: str,
+    dest_leaf: str,
+    claim: bytes,
+    operation_id: str,
+) -> None:
+    """Prepare the claim inside a private sibling and publish it no-clobber.
+
+    The rename is the filesystem-level cross-metadata-carrier ownership
+    point: exactly one invocation publishes the destination directory.
+    EEXIST propagates for the loser's adopt-or-refuse decision.
+    """
+    sibling = f".#~{operation_id}.root-claim"
+    parent_fd, _, _ = establish_root(backend, dest_parent, create=False)
+    try:
+        backend.mkdir_child(parent_fd, sibling, 0o700)
+        try:
+            sibling_fd = backend.open_child_directory(parent_fd, sibling)
+            try:
+                fd = backend.create_exclusive(sibling_fd, ROOT_CLAIM_LEAF, CLAIM_MODE)
+                try:
+                    _write_all(backend, fd, claim)
+                    backend.flush_file(fd)
+                finally:
+                    backend.close_fd(fd)
+                backend.flush_directory(sibling_fd)
+            finally:
+                backend.close_fd(sibling_fd)
+            backend.transfer_noclobber(parent_fd, sibling, parent_fd, dest_leaf)
+        except BaseException:
+            # A caught failure before publication removes only this
+            # invocation's private sibling; the destination stays absent.
+            try:
+                backend.unlink_child(parent_fd, f"{sibling}/{ROOT_CLAIM_LEAF}")
+            except OSError:
+                pass
+            try:
+                backend.rmdir_child(parent_fd, sibling)
+            except OSError:
+                pass
+            raise
+        backend.flush_directory(parent_fd)
+    finally:
+        backend.close_fd(parent_fd)
+
+
+def _stamp_copy_destination(
+    store: object,
+    operation_id: str,
+    kind: str,
+    request: OperationRequest,
+    machine_id: str,
+    dest_root_path: str,
+) -> None:
+    """The first durable destination transaction: recorded operation, then
+    the read-only-unserviceable lifecycle row, atomically."""
+    with store.transaction() as txn:  # type: ignore[attr-defined]
+        txn.insert_root_operation(
+            operation_id, kind, request.operation_json, request.operation_hash
+        )
+        txn.insert_root_lifecycle(
+            "read-only-unserviceable", machine_id, dest_root_path, kind
+        )
+
+
+def _store_source_snapshot(store: object, snapshot: OperationRequest) -> None:
+    """One UPDATE: the snapshot and its phase land together, because the
+    kind/phase nullability CHECK admits no in-between row."""
+    with store.transaction() as txn:  # type: ignore[attr-defined]
+        txn.set_root_operation_source_snapshot(snapshot.operation_json)
+
+
+def _store_tree_proof(
+    store: object, snapshot: OperationRequest, genesis_digest: str | None
+) -> None:
+    with store.transaction() as txn:  # type: ignore[attr-defined]
+        txn.set_root_operation_tree_proof(snapshot.operation_json, genesis_digest)
+
+
+def _reread_phase_after_reacquisition(store: object) -> RootOperationRow | None:
+    """Read the operation row again after the destination lock came back.
+
+    A retry that released the destination to take the source in canonical
+    order must not act on the phase it remembered.
+    """
+    return store.read_root_operation()  # type: ignore[attr-defined]
+
+
+def parse_snapshot(text: str) -> tuple[str, dict[str, PathStateJSON]]:
+    """(chain_head, entries) from stored canonical snapshot bytes."""
+    decoded = _decode_canonical(
+        text.encode("utf-8"), MetadataStoreInvalid, "stored snapshot"
+    )
+    if type(decoded) is not dict:
+        raise MetadataStoreInvalid("stored snapshot must be an object")
+    obj = cast(dict[str, object], decoded)
+    if obj.get("domain") != SNAPSHOT_DOMAIN:
+        raise MetadataStoreInvalid("stored snapshot carries the wrong domain")
+    chain_head = obj.get("chain_head")
+    if type(chain_head) is not str:
+        raise MetadataStoreInvalid("stored snapshot chain_head must be a string")
+    raw_entries = obj.get("entries")
+    if type(raw_entries) is not list:
+        raise MetadataStoreInvalid("stored snapshot entries must be an array")
+    entries: dict[str, PathStateJSON] = {}
+    for item in cast(list[object], raw_entries):
+        if type(item) is not list or len(cast(list[object], item)) != 2:
+            raise MetadataStoreInvalid("stored snapshot entry must be a pair")
+        path, state = cast(list[object], item)
+        if type(path) is not str:
+            raise MetadataStoreInvalid("stored snapshot path must be a string")
+        pairs = tuple(
+            (str(pair[0]), str(pair[1]))
+            for pair in cast(list[list[object]], state)
+        )
+        entries[path] = cast(PathStateJSON, pairs)
+    return chain_head, entries
+
+
+def _copy_tree(
+    source_backend: Backend | None,
+    source_root_fd: int | None,
+    dest_backend: Backend,
+    dest_root_fd: int,
+    entries: dict[str, PathStateJSON],
+) -> tuple[str, ...]:
+    """Parent-before-child copy: retain matching entries, create missing
+    ones, refuse changed entries. Every created file and changed directory
+    is flushed.
+
+    With no source (``source_backend is None``) this is the destination-only
+    verification pass: matching entries are proved, contradictions refuse,
+    and the missing ones are returned instead of created — the caller's
+    signal that the source must be opened after all.
+    """
+    from atoms.chain.model import state_from_json
+
+    missing: list[str] = []
+    source_dirs: dict[str, int] = {"": source_root_fd}  # type: ignore[dict-item]
+    dest_dirs: dict[str, int] = {"": dest_root_fd}
+    changed: dict[int, None] = {}
+
+    def directory_fd(cache: dict[str, int], backend: Backend, path: str) -> int:
+        if path in cache:
+            return cache[path]
+        parent, _, leaf = path.rpartition("/")
+        parent_fd = directory_fd(cache, backend, parent)
+        fd = backend.open_child_directory(parent_fd, leaf)
+        cache[path] = fd
+        return fd
+
+    def source_bytes(path: str, expected: FileState) -> bytes:
+        assert source_backend is not None
+        parent, _, leaf = path.rpartition("/")
+        parent_fd = directory_fd(source_dirs, source_backend, parent)
+        fd = source_backend.open_regular_nofollow(parent_fd, leaf)
+        try:
+            content = _read_fd(fd)
+        finally:
+            source_backend.close_fd(fd)
+        if (
+            f"sha256:{_sha256_hex(content)}" != expected.content_hash
+            or len(content) != expected.byte_len
+        ):
+            raise RootOperationInvalid(
+                f"source entry {path!r} no longer matches the retained snapshot"
+            )
+        return content
+
+    def verify_existing(path: str, info: os.stat_result, state: PathState) -> None:
+        parent, _, leaf = path.rpartition("/")
+        parent_fd = directory_fd(dest_dirs, dest_backend, parent)
+        if type(state) is DirectoryState:
+            if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != state.mode:
+                raise RootOperationInvalid(
+                    f"destination entry {path!r} contradicts the retained snapshot"
+                )
+            return
+        if type(state) is SymlinkState:
+            if not stat.S_ISLNK(info.st_mode) or os.readlink(
+                leaf, dir_fd=parent_fd
+            ) != state.target:
+                raise RootOperationInvalid(
+                    f"destination entry {path!r} contradicts the retained snapshot"
+                )
+            return
+        if type(state) is FileState:
+            if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != state.mode:
+                raise RootOperationInvalid(
+                    f"destination entry {path!r} contradicts the retained snapshot"
+                )
+            fd = dest_backend.open_regular_nofollow(parent_fd, leaf)
+            try:
+                content = _read_fd(fd)
+            finally:
+                dest_backend.close_fd(fd)
+            if (
+                f"sha256:{_sha256_hex(content)}" != state.content_hash
+                or len(content) != state.byte_len
+            ):
+                raise RootOperationInvalid(
+                    f"destination entry {path!r} contradicts the retained snapshot"
+                )
+            return
+        raise RootOperationInvalid(
+            f"snapshot entry {path!r} is outside the closed vocabulary"
+        )
+
+    missing_prefixes: set[str] = set()
+    try:
+        for path in sorted(entries):
+            state = state_from_json(entries[path])
+            parent, _, leaf = path.rpartition("/")
+            if parent in missing_prefixes:
+                # An absent ancestor makes the whole subtree missing; there
+                # is no destination directory to even look inside.
+                missing.append(path)
+                if type(state) is DirectoryState:
+                    missing_prefixes.add(path)
+                continue
+            parent_fd = directory_fd(dest_dirs, dest_backend, parent)
+            try:
+                info = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                info = None
+            if info is not None:
+                verify_existing(path, info, state)
+                continue
+            if source_backend is None:
+                missing.append(path)
+                if type(state) is DirectoryState:
+                    missing_prefixes.add(path)
+                continue
+            if type(state) is DirectoryState:
+                dest_backend.mkdir_child(parent_fd, leaf, state.mode)
+                fd = dest_backend.open_child_directory(parent_fd, leaf)
+                dest_dirs[path] = fd
+                dest_backend.set_mode(fd, state.mode)
+                changed[fd] = None
+            elif type(state) is SymlinkState:
+                dest_backend.symlink_child(parent_fd, leaf, state.target)
+            elif type(state) is FileState:
+                content = source_bytes(path, state)
+                fd = dest_backend.create_exclusive(parent_fd, leaf, state.mode)
+                try:
+                    _write_all(dest_backend, fd, content)
+                    dest_backend.set_mode(fd, state.mode)
+                    dest_backend.flush_file(fd)
+                finally:
+                    dest_backend.close_fd(fd)
+            else:
+                raise RootOperationInvalid(
+                    f"snapshot entry {path!r} is outside the closed vocabulary"
+                )
+            changed[parent_fd] = None
+        for fd in changed:
+            dest_backend.flush_directory(fd)
+        return tuple(missing)
+    finally:
+        for path, fd in source_dirs.items():
+            if path and source_backend is not None:
+                source_backend.close_fd(fd)
+        for path, fd in dest_dirs.items():
+            if path:
+                dest_backend.close_fd(fd)
+
+
+# --- Serviceability transition and the v2 migration (design §12, §13) ---
+
+
+def _open_writable_store(metadata_root_path: str) -> sqlite3.Connection:
+    connection = sqlite3.connect(
+        os.path.join(metadata_root_path, "atoms.db"), isolation_level=None
+    )
+
+    def authorize(action: int, *_rest: object) -> int:
+        if action in (sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH):
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    connection.set_authorizer(authorize)
+    return connection
+
+
+def _transition_serviceability(metadata_root_path: str) -> None:
+    """The one state update of grant case 2, under the caller's held lock.
+
+    The read-only store is already closed; this opens the existing store
+    writable for exactly one UPDATE the transition trigger validates.
+    """
+    connection = _open_writable_store(metadata_root_path)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = connection.execute(
+                "UPDATE root_lifecycle SET state = 'read-only-serviceable'"
+                " WHERE singleton = 0"
+            )
+            if cursor.rowcount != 1:
+                raise MetadataStoreInvalid(
+                    "no root lifecycle row to make serviceable"
+                )
+            connection.execute("COMMIT")
+        except BaseException:
+            try:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+            except sqlite3.DatabaseError:
+                pass
+            raise
+    except sqlite3.IntegrityError as caught:
+        raise PreconditionRefused(
+            f"the lifecycle transition was refused by the store: {caught}"
+        ) from caught
+    finally:
+        connection.close()
+
+
+def _execute_migration_statement(
+    connection: sqlite3.Connection, statement: str
+) -> None:
+    """One migration DDL statement; a seam the atomicity tests cut."""
+    connection.execute(statement)
+
+
+def _migrate_v2_store(
+    metadata_root_path: str, machine_id: str, root_path: str
+) -> None:
+    """The one explicit v2-to-v3 transition, atomic under BEGIN IMMEDIATE.
+
+    A failure rolls back to exact v2 with no grant; success is exact v3 with
+    the fresh writable migration binding. No partial catalog survives.
+    """
+    from atoms.store.schema import ROOT_LIFECYCLE_V3_STATEMENTS
+
+    connection = _open_writable_store(metadata_root_path)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            for statement in ROOT_LIFECYCLE_V3_STATEMENTS:
+                _execute_migration_statement(connection, statement)
+            connection.execute(
+                "INSERT INTO root_lifecycle"
+                " (singleton, state, machine_id, root_path, origin)"
+                " VALUES (0, 'writable', ?, ?, 'migration-v2')",
+                (machine_id, root_path),
+            )
+            catalog = _read_catalog(connection)
+            if catalog != EXPECTED_CATALOG:
+                raise MetadataStoreInvalid(
+                    "the migrated catalog is not exactly the version-3 schema"
+                )
+            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            connection.execute("COMMIT")
+        except BaseException:
+            try:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+            except sqlite3.DatabaseError:
+                pass
+            raise
+    finally:
+        connection.close()
+
+
+def _create_serviceability_row(
+    metadata_root_path: str, machine_id: str, root_path: str
+) -> None:
+    """Grant case 1's row, inserted through the store's own triggers."""
+    connection = _open_writable_store(metadata_root_path)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute(
+                "INSERT INTO root_lifecycle"
+                " (singleton, state, machine_id, root_path, origin)"
+                " VALUES (0, 'read-only-serviceable', ?, ?, 'read-serviceability')",
+                (machine_id, root_path),
+            )
+            connection.execute("COMMIT")
+        except BaseException:
+            try:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+            except sqlite3.DatabaseError:
+                pass
+            raise
+    finally:
+        connection.close()

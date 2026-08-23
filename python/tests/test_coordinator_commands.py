@@ -596,10 +596,10 @@ def test_read_chain_refuses_an_unregistered_root_without_transaction_artifacts(
         view = _read(ingredients)
 
     assert view is None
+    # The lifecycle gate refuses before the lease: no chain leaf, and the
+    # metadata root still holds only the lock the allowlist build created.
     assert not (Path(project_root) / CHAIN_LEAF).exists()
-    assert list((Path(metadata_root) / "work").iterdir()) == []
-    assert list((Path(metadata_root) / "blobs" / "sha256").iterdir()) == []
-    assert _store_counts(metadata_root) == (0, 0)
+    assert sorted(entry.name for entry in Path(metadata_root).iterdir()) == ["lock"]
 
 
 def test_read_chain_treats_a_missing_chain_with_a_live_record_as_corruption(
