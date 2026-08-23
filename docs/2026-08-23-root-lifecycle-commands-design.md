@@ -22,7 +22,8 @@ manifests, or root kinds.
 Use the existing `atoms.db` as the durable carrier. Schema v3 adds one
 singleton lifecycle row and one retained singleton root-creation operation row.
 The lifecycle row carries the host/root binding. The operation row is the
-atomic no-clobber claim and exact-retry record.
+retained exact-retry record; a temporary root-local claim published with the
+destination directory is the cross-metadata-root atomic no-clobber claim.
 
 The public surface adds the closed `LifecycleState` enum;
 `replicate_root`, `fork_root`, `grant_read_serviceability`, and
@@ -60,7 +61,8 @@ These are requirements, not atoms-side choices:
   restored copies are never auto-upgraded.
 - `replicate_root` holds the source lease; creates destination bookkeeping
   first; makes a read-only stamp durable before any destination tree byte is
-  exposable; copies chain and payload unchanged; grants neither writability nor
+  exposable (the root-local operation claim is bookkeeping, not payload or
+  chain); copies chain and payload unchanged; grants neither writability nor
   serviceability; and is no-clobber and exact-retry.
 - `fork_root` treats genesis and override bytes as opaque; applies overrides
   before baseline capture, genesis, and grant; captures over `surface_paths`;
@@ -142,10 +144,11 @@ machine identity, derives the canonical root path, compares
 `(machine_id, root_path)`, and only then interprets state. Mismatch returns
 `BINDING_MISMATCHED` regardless of claimed state.
 
-During a copy's `recorded` phase the final root leaf may not exist yet. The
-operation row and intended path suffice to report its durable
-read-only-unserviceable stamp. Outside that phase, a missing root cannot validate
-a writable/serviceable grant and reports `binding-mismatched`.
+During a copy's `recorded` phase the final root exists and contains only its
+durable root-operation claim until the lifecycle stamp commits. The claim and
+row name the same operation and intended canonical path. A missing root cannot
+validate any recorded, writable, or serviceable lifecycle row and reports
+`binding-mismatched`.
 
 ## 5. Schema v3
 
@@ -163,7 +166,22 @@ CREATE TABLE root_lifecycle (
     origin     TEXT NOT NULL CHECK (origin IN (
         'register', 'replicate', 'fork',
         'read-serviceability', 'migration-v2'
-    ))
+    )),
+    CHECK (length(machine_id) = 32
+        AND machine_id NOT GLOB '*[^0-9a-f]*'
+        AND machine_id != '00000000000000000000000000000000'),
+    CHECK (length(root_path) > 0),
+    CHECK (
+        (origin IN ('register', 'fork') AND state IN (
+            'read-only-unserviceable', 'writable'
+        ))
+        OR (origin = 'replicate' AND state IN (
+            'read-only-unserviceable', 'read-only-serviceable'
+        ))
+        OR (origin = 'read-serviceability'
+            AND state = 'read-only-serviceable')
+        OR (origin = 'migration-v2' AND state = 'writable')
+    )
 ) STRICT;
 
 CREATE TABLE root_operation (
@@ -180,15 +198,167 @@ CREATE TABLE root_operation (
     request_hash              TEXT NOT NULL,
     source_snapshot_json      TEXT,
     destination_snapshot_json TEXT,
-    genesis_digest            TEXT
+    genesis_digest            TEXT,
+    CHECK (length(operation_id) = 32
+        AND operation_id NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(request_hash) = 64
+        AND request_hash NOT GLOB '*[^0-9a-f]*'),
+    CHECK (genesis_digest IS NULL OR (
+        length(genesis_digest) = 64
+        AND genesis_digest NOT GLOB '*[^0-9a-f]*'
+    )),
+    CHECK (
+        (kind = 'register'
+            AND source_snapshot_json IS NULL
+            AND (
+                (phase = 'recorded'
+                    AND destination_snapshot_json IS NULL
+                    AND genesis_digest IS NULL)
+                OR (phase IN ('tree-durable', 'complete')
+                    AND destination_snapshot_json IS NOT NULL
+                    AND genesis_digest IS NOT NULL)
+            ))
+        OR (kind = 'replicate'
+            AND genesis_digest IS NULL
+            AND (
+                (phase = 'recorded'
+                    AND source_snapshot_json IS NULL
+                    AND destination_snapshot_json IS NULL)
+                OR (phase = 'source-snapshot-durable'
+                    AND source_snapshot_json IS NOT NULL
+                    AND destination_snapshot_json IS NULL)
+                OR (phase IN ('tree-durable', 'complete')
+                    AND source_snapshot_json IS NOT NULL
+                    AND destination_snapshot_json IS NOT NULL)
+            ))
+        OR (kind = 'fork' AND (
+            (phase = 'recorded'
+                AND source_snapshot_json IS NULL
+                AND destination_snapshot_json IS NULL
+                AND genesis_digest IS NULL)
+            OR (phase = 'source-snapshot-durable'
+                AND source_snapshot_json IS NOT NULL
+                AND destination_snapshot_json IS NULL
+                AND genesis_digest IS NULL)
+            OR (phase IN ('tree-durable', 'complete')
+                AND source_snapshot_json IS NOT NULL
+                AND destination_snapshot_json IS NOT NULL
+                AND genesis_digest IS NOT NULL)
+        ))
+    )
 ) STRICT;
+
+CREATE TRIGGER trg_root_lifecycle_identity_write_once
+BEFORE UPDATE OF machine_id, root_path, origin ON root_lifecycle
+WHEN NEW.machine_id IS NOT OLD.machine_id
+    OR NEW.root_path IS NOT OLD.root_path
+    OR NEW.origin IS NOT OLD.origin
+BEGIN
+    SELECT RAISE(ABORT, 'root lifecycle binding and origin are write-once');
+END;
+
+CREATE TRIGGER trg_root_lifecycle_transition
+BEFORE UPDATE OF state ON root_lifecycle
+WHEN NOT (
+    NEW.state = OLD.state
+    OR (OLD.state = 'read-only-unserviceable'
+        AND NEW.state = 'read-only-serviceable'
+        AND NOT EXISTS (
+            SELECT 1 FROM root_operation WHERE phase != 'complete'
+        ))
+    OR (OLD.state = 'read-only-unserviceable'
+        AND NEW.state = 'writable'
+        AND OLD.origin IN ('register', 'fork')
+        AND EXISTS (
+            SELECT 1 FROM root_operation
+            WHERE kind = OLD.origin AND phase = 'tree-durable'
+        ))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'illegal root lifecycle transition');
+END;
+
+CREATE TRIGGER trg_root_lifecycle_no_delete
+BEFORE DELETE ON root_lifecycle
+BEGIN
+    SELECT RAISE(ABORT, 'root lifecycle is retained');
+END;
+
+CREATE TRIGGER trg_root_operation_insert_recorded
+BEFORE INSERT ON root_operation
+WHEN NEW.phase != 'recorded'
+BEGIN
+    SELECT RAISE(ABORT, 'root operation starts recorded');
+END;
+
+CREATE TRIGGER trg_root_operation_identity_write_once
+BEFORE UPDATE OF operation_id, kind, request_json, request_hash ON root_operation
+WHEN NEW.operation_id IS NOT OLD.operation_id
+    OR NEW.kind IS NOT OLD.kind
+    OR NEW.request_json IS NOT OLD.request_json
+    OR NEW.request_hash IS NOT OLD.request_hash
+BEGIN
+    SELECT RAISE(ABORT, 'root operation identity is write-once');
+END;
+
+CREATE TRIGGER trg_root_operation_proof_write_once
+BEFORE UPDATE OF source_snapshot_json,
+    destination_snapshot_json, genesis_digest ON root_operation
+WHEN (OLD.source_snapshot_json IS NOT NULL
+        AND NEW.source_snapshot_json IS NOT OLD.source_snapshot_json)
+    OR (OLD.destination_snapshot_json IS NOT NULL
+        AND NEW.destination_snapshot_json IS NOT OLD.destination_snapshot_json)
+    OR (OLD.genesis_digest IS NOT NULL
+        AND NEW.genesis_digest IS NOT OLD.genesis_digest)
+BEGIN
+    SELECT RAISE(ABORT, 'root operation proof fields are write-once');
+END;
+
+CREATE TRIGGER trg_root_operation_phase_transition
+BEFORE UPDATE OF phase ON root_operation
+WHEN NOT (
+    (OLD.phase = 'recorded'
+        AND NEW.phase = 'source-snapshot-durable'
+        AND OLD.kind IN ('replicate', 'fork'))
+    OR (OLD.phase = 'recorded'
+        AND NEW.phase = 'tree-durable'
+        AND OLD.kind = 'register')
+    OR (OLD.phase = 'source-snapshot-durable'
+        AND NEW.phase = 'tree-durable')
+    OR (OLD.phase = 'tree-durable' AND NEW.phase = 'complete')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'illegal root operation phase transition');
+END;
+
+CREATE TRIGGER trg_root_operation_complete_gate
+BEFORE UPDATE OF phase ON root_operation
+WHEN NEW.phase = 'complete' AND NOT EXISTS (
+    SELECT 1 FROM root_lifecycle
+    WHERE singleton = 0
+        AND origin = NEW.kind
+        AND state = CASE NEW.kind
+            WHEN 'replicate' THEN 'read-only-unserviceable'
+            ELSE 'writable'
+        END
+)
+BEGIN
+    SELECT RAISE(ABORT, 'root operation completion lacks lifecycle state');
+END;
+
+CREATE TRIGGER trg_root_operation_no_delete
+BEFORE DELETE ON root_operation
+BEGIN
+    SELECT RAISE(ABORT, 'root operation is retained');
+END;
 ```
 
-Lifecycle binding and `origin` are write-once. State permits equality,
-read-only-unserviceable to read-only-serviceable, and
-read-only-unserviceable to writable only for register/fork. Migration inserts
-directly as writable inside the v2-to-v3 transaction. Nothing leaves writable
-or read-only-serviceable.
+The DDL is the contract, including trigger names and error strings. Lifecycle
+binding and `origin` are write-once. State permits equality,
+read-only-unserviceable to read-only-serviceable only with no incomplete
+operation, and read-only-unserviceable to writable only for a tree-durable
+register/fork. Migration inserts directly as writable inside the v2-to-v3
+transaction. Nothing leaves writable or read-only-serviceable.
 
 Operation ID, kind, request bytes, and request hash are write-once. Phase edges
 are only:
@@ -198,38 +368,96 @@ recorded -> source-snapshot-durable -> tree-durable -> complete
 recorded -> tree-durable -> complete  # register_root
 ```
 
-Snapshot/genesis fields become write-once when set and must agree with phase.
-The singleton is deliberate: register, replicate, and fork are mutually
-exclusive no-clobber creation origins. The completed row is retained for the
-carrier's lifetime, longer than every retry path.
+Snapshot/genesis fields become write-once when set; table checks pin their
+nullability to kind and phase. The lifecycle transition occurs before the
+operation's `tree-durable -> complete` update in their one transaction, which
+lets the completion trigger validate the final lifecycle state. The singleton
+is per carrier; cross-carrier exclusion comes from §5.1's root-local claim.
+The completed row is retained for the carrier's lifetime, longer than every
+retry path.
+
+`schema.py` freezes the current version-2 values as
+`V2_SCHEMA_STATEMENTS` and `V2_EXPECTED_CATALOG`. Version 3 defines
+`ROOT_LIFECYCLE_V3_STATEMENTS` as exactly the two tables and nine triggers
+above, in shown order, then defines
+`SCHEMA_STATEMENTS = (*V2_SCHEMA_STATEMENTS,
+*ROOT_LIFECYCLE_V3_STATEMENTS)`. `EXPECTED_CATALOG` uses the existing
+`_catalog_row` derivation over that full tuple plus the existing v2 automatic
+indexes and exactly
+`('index', 'sqlite_autoindex_root_operation_1', 'root_operation', None)`.
+No extra table, index, trigger, or view is accepted in either frozen catalog.
 
 ### 5.1 Stamp, request, and operation identity
 
-The first durable transaction for register and both copy commands inserts the
-read-only-unserviceable lifecycle row with fresh binding and the `recorded`
-operation row. Both commit together through the existing
-`Store.transaction()` SQLite-WAL durability barrier. Before commit the root is
-metadata-less. After commit it is read-only unserviceable and durably claimed.
-No copy destination tree byte is created before this commit returns.
+The root-local claim leaf is the fixed engine-reserved regular file
+`.#~root-claim`, mode `0o600`. Its canonical object is exactly
+four fields: `domain` is `atoms.root-claim.v1`; `operation_id` is the retained
+32-hex ID; `request_hash` is the retained 64-hex hash; and `request_json` is the
+complete canonical string, not a second parsed representation. The object uses
+§5.1's serializer. The file is temporary bookkeeping, never a surface or
+snapshot entry.
 
-A fresh copy has no destination tree to pass to `bind_project_volume`.
-`_destination_claim_lease` therefore reuses the existing mechanism with
-the guarded parent of `dest_metadata_root` as the temporary project root and
-`dest_metadata_root` as the distinct metadata root. This is the
-`AuditedBackend` case where the metadata root is a direct project child, so
-the volume proof, lock, and `Store` are all the existing mechanisms; no tree
-mutation is authorized through the temporary binding. The lifecycle row records
-the separately guarded intended destination path, never the metadata parent.
-After the stamp commits, atoms creates the destination root no-clobber, binds
-that real root under the still-held metadata lock, and only then writes
-children. This is a coordinator composition detail, not a second binding type
-or store API.
+For a fresh copy, atoms mints the operation and creates mode-`0o700` sibling
+directory `.#~<operation_id>.root-claim` under the guarded destination parent.
+It writes and flushes the claim file, flushes that directory, then uses the
+existing `transfer_noclobber` to publish the prepared directory at the final
+destination leaf. That one rename atomically binds the claim bytes and
+operation identity to the newly created destination directory. Atoms
+immediately flushes the held destination-parent descriptor. A caught failure
+before publication removes only that invocation's private sibling; a crash may
+leave it, but the final destination remains absent and no operation was
+claimed. An existing destination is resumable only when its claim bytes are
+canonical and match the exact operation request, including
+`dest_metadata_root`; absence or mismatch is no-clobber refusal. Thus two
+metadata roots cannot claim one destination.
+
+Only after the root claim is durable does `_destination_claim_lease` acquire
+the distinct, non-nested destination metadata root and create the store. Its
+first durable transaction inserts the read-only-unserviceable lifecycle row
+with fresh binding and the matching `recorded` operation row. Both commit
+together through the existing `Store.transaction()` SQLite-WAL durability
+barrier. Before that commit the root still classifies metadata-less and exposes
+only engine bookkeeping. After it, the root is read-only unserviceable. No
+payload, chain, or override entry is created before the stamp commits.
+
+`register_root` uses the same fixed claim file, created no-clobber and flushed
+in its already-existing root before it stamps its operation. This prevents two
+metadata carriers from registering one root. Copy and register keep the marker
+through `tree-durable`; the final suffix verifies and removes it, flushes the
+root directory, then atomically performs the lifecycle/`complete` transaction.
+Once removed, the retained external operation row owns retries; a different
+metadata carrier sees an occupied root without a claim and refuses.
 
 `RootOperationId` is a once-minted `secrets.token_hex(16)`, exposed through a
-`NewType`. `request_json` is canonical UTF-8 JSON with domain
-`atoms.root-operation.v1`, sorted keys, no insignificant whitespace, and
-base64 for opaque bytes. `request_hash` is lowercase SHA-256 of those exact
-bytes.
+`NewType`. Request, claim, and snapshot encoding reuse one private serializer:
+
+```python
+json.dumps(
+    value,
+    sort_keys=True,
+    separators=(",", ":"),
+    ensure_ascii=False,
+    allow_nan=False,
+).encode("utf-8")
+```
+
+The value grammar is closed to exact `dict[str, ...]`, `list`, `str`, `int`,
+and `None`; booleans and floats are absent. Strings are emitted as supplied,
+without Unicode normalization; validation rejects NULs, lone surrogates, and
+non-canonical path spellings before encoding. `ensure_ascii=False` leaves
+non-ASCII code points as UTF-8 and the stdlib encoder escapes JSON controls,
+quote, and backslash. Opaque bytes use padded RFC 4648 standard base64 via
+`base64.b64encode(value).decode("ascii")`. `StorageProfile` encodes exactly as
+`{"profile_id": storage.profile_id}`. All absolute paths in a request are the
+canonical guarded spellings, and all path tuples become JSON arrays in their
+already-validated order.
+
+`request_json` is the UTF-8 decode of the canonical bytes for the
+`atoms.root-operation.v1` object. `request_hash` is lowercase SHA-256 of those
+exact bytes. Decoding accepts only bytes that re-encode identically; alternate
+escaping, key order, whitespace, numeric spelling, or base64 refuses as
+`MetadataStoreInvalid` for stored evidence and `RootOperationInvalid` for a
+root claim.
 
 Closed request shapes:
 
@@ -250,8 +478,10 @@ fork:
 
 Every shape also carries domain and kind. Exact retry compares retained
 canonical bytes and hash; hash is never the sole byte-identity proof. The
-engine mints the ID because the destination singleton is the atomic claim. A
-lost fork ID is recovered by the pending query. For replication,
+engine mints the ID and the root claim, not the destination-store singleton,
+is the cross-carrier atomic ownership point. A lost fork ID and request are
+recovered from the claim before the stamp or from the retained row after it.
+For replication,
 `source_head` is the head captured by the first invocation, not a caller
 argument: a retained retry first compares every caller-derived field, then
 reuses the stored head when reconstructing the exact request and when proving
@@ -260,19 +490,37 @@ the operation.
 
 ### 5.2 Snapshot proof
 
-Snapshots reuse `PathStateJSON`: the sorted tuple of every root-relative
-directory, regular file, and symlink, symlinks not followed. File state includes
-SHA-256, byte length, and mode; directory state includes mode; symlink state
-includes target and mode. Source snapshot also records the validated chain head.
+Snapshots use the same serializer over this exact object:
+
+```text
+{
+  "domain": "atoms.root-snapshot.v1",
+  "chain_head": <64-lowercase-hex string>,
+  "entries": [[<root-relative path>, <PathStateJSON>], ...]
+}
+```
+
+`entries` is sorted by the exact Python string ordering of path. Each
+`PathStateJSON` is `state_to_json(state)` represented as a JSON array of
+two-item arrays in that function's existing canonical field order. File state
+therefore contains lowercase SHA-256, byte length, and mode; directory state
+contains mode; symlink state contains target and mode. Symlinks are not
+followed. Source and destination snapshots both record their validated chain
+head.
 
 The walker refuses unreadable/unrepresentable entries, non-UTF-8 names, mount
-crossings, and duplicate spellings. Replication includes every entry. Fork
-excludes only the reserved chain leaf because the child receives a new chain.
+crossings, and duplicate spellings. Copy path pairs are non-nested (§6.1), so a
+source walk cannot encounter live metadata. Replication includes every source
+entry. Fork excludes only the reserved chain leaf because the child receives a
+new chain. An incomplete root carrying `.#~root-claim` is not an admissible copy
+source.
 
 `source_snapshot_json` is durable before destination copying.
 `destination_snapshot_json` is set only after every destination file and
-directory is flushed and the final tree is re-read. It is internal retry proof,
-not a consumer summary API.
+directory is flushed, the containing parent flush from destination publication
+has completed, and the final tree is re-read. The root claim is excluded from
+the proof, removed and followed by a root-directory flush before `complete`.
+Snapshots are internal retry proof, not a consumer summary API.
 
 ## 6. Public contract
 
@@ -377,7 +625,12 @@ def register_root(
 ### 6.1 Boundary validation
 
 - Root spellings are exact non-empty NUL-free `str` and pass guarded
-  traversal. Source/destination differ. Metadata roots differ from tree roots.
+  traversal. For a copy, the canonical source root, source metadata root,
+  destination root, and destination metadata root are pairwise non-overlapping:
+  no two are equal and none is an ancestor or descendant of another. This
+  rejects both copying live source bookkeeping and trying to stamp metadata
+  beneath an absent destination. Existing non-copy commands retain atoms'
+  current direct-child metadata support.
 - `expected_source_head` is exact 64-character lowercase hexadecimal.
 - Genesis and override payloads are exact `bytes`.
 - `surface_paths` uses the current sorted, duplicate-free surface validator.
@@ -396,18 +649,24 @@ raises `PreconditionRefused`, except the named conditions below.
 
 ### 6.2 Exact retry
 
-An invocation is an exact retry only when it targets the retained destination
-operation and canonical request bytes match byte-for-byte. Kind, paths, storage
-profile, source head, genesis, surfaces, and every override field participate.
+An invocation is an exact retry only when it targets the retained root claim or
+destination operation and canonical request bytes match byte-for-byte. Kind,
+paths, storage profile, source head, genesis, surfaces, and every override field
+participate. A fresh call mints an ID only after proving the destination absent.
+When a claim already exists, an exact request adopts its retained ID; it never
+mints and then compares a new ID.
 
-Different request raises `RootOperationMismatch` before changing tree or
-lifecycle. Fresh destination/tree or non-resumable metadata occupancy is
+Different request or a claim/carrier identity disagreement raises
+`RootOperationMismatch` before changing tree or lifecycle. Fresh occupied
+destination without a valid claim and non-resumable metadata occupancy are
 no-clobber `PreconditionRefused`. Evidence claiming the same operation but
-failing its snapshot is `RootOperationInvalid`; preserve row and tree.
+failing its snapshot is `RootOperationInvalid`; preserve claim, row, and tree.
 
-Concurrent duplicates serialize on the destination metadata lock. The second
-observes the first row and never starts a second operation because the first
-appears slow.
+Concurrent fresh calls race only at `transfer_noclobber` of the claimed root.
+Exactly one publishes the destination directory; every loser opens that root
+and either adopts the exact claim or refuses. The destination metadata lock
+then serializes work for the winning claim. A different metadata-root spelling
+is part of the request and therefore can never adopt the winner.
 
 ## 7. Query and writability gate
 
@@ -429,19 +688,40 @@ invalid. A lifecycle row without an operation row is valid only for
 `origin IN ('read-serviceability', 'migration-v2')`; every root-creation
 origin requires the pair.
 
-`append_intent`, `run_transaction`, and future cooperative tree mutators
-enter one `_writable_recovery_lease`:
+The private `_existing_read_only_lease` is the common lifecycle/read/source
+entry. It guarded-opens only already-existing roots, metadata root, and lock;
+acquires that lock without creating or repairing it; verifies the volume and
+declared `StorageProfile` with read-only observations; and opens `atoms.db`
+strictly `mode=ro`. It does not call `bind_project_volume`, `open_store`, the
+bootstrap probe, either reclaimer, a write PRAGMA, or `resolve`. If SQLite
+would need to create or change a WAL/SHM sidecar to read, the open refuses; it
+has no writable fallback. Catalog, lifecycle, binding, operation, active-row,
+and chain checks run under this lease.
 
-1. acquire/bind existing project and metadata roots;
-2. validate schema and binding;
-3. require `LifecycleState.WRITABLE`;
-4. only then reclaim debris, resolve recovery, validate registration, and enter
-   the existing body.
+`append_intent`, `run_transaction`, and future cooperative tree mutators enter
+one `_writable_recovery_lease`:
+
+1. enter `_existing_read_only_lease` and validate schema and binding;
+2. require `LifecycleState.WRITABLE`;
+3. while retaining the same lock, close the read-only connection and activate
+   the existing writable binding/store path;
+4. only then probe, reclaim debris, resolve recovery, validate registration,
+   and enter the existing body.
 
 Other states raise `PreconditionRefused("root lifecycle state <value> does not
 grant writability")`. A non-writable pending root stops at lifecycle; a
-writable pending root reaches `PendingUnresolved`. `read_chain` and
-inspection remain read surfaces and do not require writability.
+writable pending root reaches `PendingUnresolved`.
+
+`read_chain`, `inspect_chain`, and copy-source acquisition also begin with
+`_existing_read_only_lease`. A matching writable root may activate the same
+recovery suffix before reading. A non-writable source/read never activates it:
+it requires no active transaction, no incomplete root operation, and no chain
+staging survivor, then invokes the shared typed chain validator directly under
+the lock. Any state requiring recovery refuses instead of reclaiming or
+appending. Detached cold inspection remains its existing explicitly
+non-coherent, non-mutating path. Thus every probe, reclamation, staging change,
+and `resolve` append is downstream of a validated writable grant, including
+operations reached through APIs named as reads.
 
 ## 8. `register_root`
 
@@ -462,28 +742,56 @@ register retries.
 
 ## 9. Shared copy order
 
-Both copy commands:
+Fresh invocations use this order:
 
-1. validate without destination state;
-2. enter source recovery lease and obtain validated head; fork checks expected
-   head here, before destination creation;
-3. require absent destination root/metadata, except exact resumable carrier;
-4. create bookkeeping and durably commit stamp/operation before destination
-   root or child bytes;
-5. capture/store full source snapshot under the same lease;
-6. create destination no-clobber and copy parent-before-child. Retry retains
-   matching entries, creates missing entries, and raises
-   `RootOperationInvalid` for changed/extra entries. Flush files/directories;
-7. perform command-specific chain/override work;
-8. prove/store destination snapshot and move to `tree-durable`;
-9. perform final lifecycle transition and mark complete atomically.
+1. validate types, canonicalize all four pairwise non-overlapping paths, and
+   perform read-only destination preflight;
+2. enter the source through §7's lifecycle-aware coherent lease, obtain its
+   validated head, and for fork compare the expected head before creating any
+   destination state;
+3. while retaining the source lock, publish the claimed destination directory
+   no-clobber and flush its containing parent;
+4. acquire the destination metadata lock with existing
+   `try_lock_exclusive`, never the blocking acquisition. Busy raises
+   `PreconditionRefused("copy destination lock is busy")`, releases the source,
+   and leaves the exact root claim resumable;
+5. create the destination store and durably commit the matching lifecycle
+   stamp/operation before any payload, chain, or override entry;
+6. capture and store the full source snapshot under the same source lock;
+7. copy parent-before-child. Retain matching entries, create missing entries,
+   and raise `RootOperationInvalid` for changed/extra entries. Flush every file
+   and every changed directory;
+8. perform command-specific chain/override work;
+9. verify that the containing-parent flush from step 3 completed, prove and
+   store the destination snapshot, and move to `tree-durable`;
+10. verify/remove the root claim and flush the destination root directory;
+11. perform the final lifecycle transition and mark complete atomically.
 
-Destination may be visibly incomplete while read-only unserviceable. This is
-intentional crash residue: stamp first, no serviceability, exact retry.
+This source-first/blocking then destination-second/nonblocking rule is the only
+two-lock order. An A-to-B/B-to-A cycle cannot wait: at least one second-lock
+attempt refuses and releases its source lock. Same-destination contenders are
+already serialized by atomic root publication and then the one destination
+lock.
 
-Before `tree-durable`, retry needing missing source bytes requires the held
-head to equal the stored head; otherwise `SourceSnapshotMoved`. At
-`tree-durable` and later, destination proof completes without source.
+Retry first acquires only the destination lock and re-reads the claim, row, and
+tree. `tree-durable` and `complete` never open the source. An earlier phase also
+stays destination-only when the retained source snapshot plus destination
+evidence proves that all source bytes, overrides, baseline, and genesis are
+already durable; it advances the missing proof/grant suffix locally. This is
+the fork crash-after-genesis case.
+
+Only when destination proof identifies missing source bytes does retry release
+the destination, acquire the source lock, and reacquire the destination with
+`try_lock_exclusive`; after reacquisition it re-reads the phase before acting.
+The held source head must equal the retained head or `SourceSnapshotMoved` is
+raised. A missing/unopenable source propagates existing `OSError` behavior.
+Either failure preserves claim, row, and tree for a later retry. No phase that
+can finish from destination evidence touches the source, so moved or unavailable
+source roots do not block that suffix.
+
+Before the stamp, the published destination exposes only the engine claim and
+classifies metadata-less. After the stamp it may be visibly incomplete while
+read-only unserviceable. Both are intentional crash residues with exact retry.
 
 ## 10. `replicate_root`
 
@@ -500,7 +808,8 @@ no-clobber; different request is `RootOperationMismatch`.
 
 ### 11.1 Source binding
 
-After source recovery/validation but before a fresh destination claim, compare
+After lifecycle-aware source coherence/validation but before a fresh
+destination claim, compare
 `expected_source_head` to held validated tip. Inequality raises
 `SourceSnapshotMoved` naming expected/observed. No operation, metadata, child
 bytes, or grant is minted.
@@ -517,9 +826,10 @@ baseline; flushes override files/parents; captures baseline over exactly
 genesis, baseline, and overrides; stores snapshot/digest as
 `tree-durable`; then atomically grants writable and completes.
 
-Pre-grant retry proves operation/request, required source head, tree, genesis,
-baseline, and overrides, then performs only the missing suffix. A kill after
-genesis but before grant completes from destination evidence after source moves.
+Pre-grant retry first proves operation/request, tree, genesis, baseline, and
+overrides from destination evidence. It checks a live source head only when
+that proof shows source bytes are still missing. A kill after genesis but
+before grant therefore completes after the source moves or becomes unavailable.
 
 Post-grant exact retry returns without comparing destination tree: legitimate
 logged writes may have changed it. Different input remains
@@ -527,24 +837,30 @@ logged writes may have changed it. Different input remains
 
 ### 11.3 Pending-fork seam
 
-`read_pending_fork_operation` returns the retained ID only for a
-binding-matching v3 fork whose phase is not `complete`. Metadata-less or a
-binding-matching completed operation returns `None`; exact v2 and a retained
-non-fork operation raise `PreconditionRefused`; binding mismatch raises
+`read_pending_fork_operation` first reads the destination root claim. A
+canonical pre-stamp fork claim whose request names the supplied canonical
+destination and metadata root returns its retained ID even though lifecycle
+state is metadata-less. After the stamp, it returns the retained ID only for a
+binding-matching v3 fork whose phase is not `complete`, and requires claim and
+row to agree while the marker remains. No claim/carrier or a binding-matching
+completed operation returns `None`; exact v2 and a retained non-fork operation
+raise `PreconditionRefused`; a different valid claim is
+`RootOperationMismatch`; binding mismatch raises
 `PreconditionRefused("destination lifecycle binding mismatched")`; malformed
-rows/catalog raise `MetadataStoreInvalid`.
+claim is `RootOperationInvalid`, and malformed rows/catalog are
+`MetadataStoreInvalid`.
 
 `resume_fork_root` accepts that ID/destination, loads source paths, head,
-genesis, surfaces, and overrides from retained request, and runs the same state
-machine. Caller supplies no child bytes. Wrong ID/kind/completed is
-`RootOperationMismatch`.
+genesis, surfaces, and overrides from the root claim before the stamp or the
+retained row after it, and runs the same state machine. Caller supplies no
+child bytes. Wrong ID/kind/completed is `RootOperationMismatch`.
 
 Science checks pending before minting: pending -> resume -> read child identity
 from destination; none plus absent destination -> mint once -> `fork_root`.
 
 ## 12. `grant_read_serviceability`
 
-Under one metadata lock it accepts:
+The command classifies through §7's explicitly read-only path first. It accepts:
 
 1. metadata-less existing root whose detached inspection is
    `WellFormedChain` and has no operation: create v3 and insert fresh-binding
@@ -552,12 +868,17 @@ Under one metadata lock it accepts:
 2. matching read-only-unserviceable v3 with no incomplete operation, no active
    transaction, no staging survivor, and a well-formed chain under the held
    lock: update only state;
-3. already read-only-serviceable: perform the same read-only checks and return
-   before a write transaction; no row, WAL frame, chain, or tree write.
+3. already read-only-serviceable: under `_existing_read_only_lease`, perform
+   the same checks and return without ever calling `bind_project_volume`,
+   `open_store`, a writable SQLite open, a write PRAGMA, or a sidecar-creating
+   path; no metadata, SQLite sidecar, row, chain, or tree write occurs.
 
 The v3 checks call the shared typed chain-validation core directly. They do not
-enter recovery, reclaim metadata, or append/remove a staging leaf; otherwise
-the already-serviceable arm could not truthfully be a no-write exact retry.
+enter recovery, reclaim metadata, or append/remove a staging leaf. Only after
+a matching unserviceable root is selected for transition does the command,
+under the same still-held lock, close the read-only store and open the existing
+store writable for the one state update. The already-serviceable branch exits
+before that boundary, making its exact retry a byte-for-byte no-write operation.
 
 Writable, binding-mismatched, malformed/absent-chain, incomplete-operation, and
 exact-v2 roots refuse. V2 must explicitly migrate writable or have its carrier
@@ -576,9 +897,14 @@ Accepted input is exact atoms application ID, `user_version = 2`, retained
 exact `V2_EXPECTED_CATALOG`, existing guarded roots, no active transaction,
 and well-formed registered chain with no staging survivor.
 
-Under existing lock, one transaction creates v3 tables/triggers, inserts
-writable `origin='migration-v2'` with fresh binding, and sets version 3. Crash
-leaves exact v2/no grant or exact v3/grant.
+The command enters through the read-only path and proves exact
+`V2_EXPECTED_CATALOG` before any writable open. Under the same existing lock it
+then opens the v2 database writable, begins `BEGIN IMMEDIATE`, executes each
+statement of `ROOT_LIFECYCLE_V3_STATEMENTS` once, inserts writable
+`origin='migration-v2'` with fresh binding, verifies the resulting catalog is
+exactly `EXPECTED_CATALOG`, sets `PRAGMA user_version = 3`, and commits. A
+failure rolls back. Crash leaves exact v2/no grant or exact v3/grant; no partial
+catalog is accepted or repaired on normal open.
 
 Metadata-less, active-v2, non-v2, and every v3 carrier refuse except a no-write
 exact retry of matching migration origin. Binding-mismatched v3 always refuses.
@@ -605,7 +931,10 @@ class RootOperationInvalid(AtomsError):
 | Non-writable mutator | `PreconditionRefused` before recovery/tree mutation |
 | Source head delta while bytes needed | `SourceSnapshotMoved` |
 | Different request/resume ID | `RootOperationMismatch` |
+| Claim/row operation disagreement | `RootOperationMismatch` |
+| Malformed root claim | `RootOperationInvalid`; preserve evidence |
 | Fresh destination occupancy | no-clobber `PreconditionRefused` |
+| Busy second copy lock | `PreconditionRefused("copy destination lock is busy")` |
 | Operation/tree contradiction | `RootOperationInvalid`; preserve evidence |
 | Bad lifecycle/catalog/canonical row | `MetadataStoreInvalid` |
 | Chain damage | existing `ChainStateInvalid`/inspection disposition |
@@ -616,14 +945,23 @@ class RootOperationInvalid(AtomsError):
 
 ## 15. Rejected alternatives
 
-- Sidecar file: duplicates SQLite locking, codec, atomicity, durability,
-  corruption, and agreement.
+- Permanent lifecycle sidecar: duplicates SQLite locking, codec, atomicity,
+  durability, corruption, and agreement; the temporary root claim carries only
+  creation ownership and is removed before completion.
+- Destination-metadata-lock-only claim: caller-selected metadata paths do not
+  serialize one destination; the claimed directory must select the winner.
 - Lifecycle in chain: replication must preserve chain while changing host-local
   state; copied chains must not carry grants.
 - Caller host ID or writable rebind: makes copied grants satisfiable.
 - Hash without request bytes: cannot recover original child bytes or prove byte
   identity.
 - Re-mint then no-clobber: strands original child identity.
+- Nested copy roots/metadata plus walker exclusions: exclusion would make
+  "copy every entry" path-dependent and still cannot stamp beneath an absent
+  destination, so copy paths are simply non-overlapping.
+- Blocking acquisition of both copy locks: opposite-direction work can cycle;
+  one nonblocking second acquisition uses the existing primitive and fails
+  closed.
 - Generic migration framework: one explicit v2-to-v3 transition does not
   justify it; automatic migration weakens the operator exception.
 
@@ -636,18 +974,26 @@ One focused `~/d/atoms/python/tests/test_lifecycle_commands.py` covers:
 - metadata-less, host/path deltas, five-member enum, and mutation-gate
   precedence against `PendingUnresolved`;
 - replication byte identity, unserviceable state, no-clobber,
-  before/after-stamp cuts, partial retry, request mismatch, and source move;
+  different-metadata-root collision, before/after-claim/stamp/parent-flush
+  cuts, partial retry, request mismatch, and source move;
 - fork override-before-baseline, new opaque genesis, source-moved-before-claim,
-  pre-grant cuts, different opaque bytes, post-grant retry after legitimate
-  writes, and pending-query/resume identity reuse;
+  pre-grant cuts, destination-only retry with moved/missing source, different
+  opaque bytes, post-grant retry after legitimate writes, and pending
+  claim/row query/resume identity reuse;
+- pairwise copy-path nesting refusals, second-lock contention without deadlock,
+  exact request/snapshot/claim encoding including Unicode/base64/storage, and
+  root/containing-parent durability barriers;
 - grant refusals, cold carrier creation, one transition, and no-write repeated
-  success;
+  success with traps on writable SQLite open, sidecar change, probes,
+  reclamation, and recovery;
 - exact v2 migration, all structural refusals, and atomic cut outcomes.
 
-Store/schema tests pin version 3, DDL, write-once/phase triggers, exact v2
+Store/schema tests pin version 3, the exact two-table/nine-trigger catalog,
+every trigger refusal and kind/phase nullability check, exact v2
 classification, normal-open v2 refusal, and migration-only transition.
-Architecture guards pin cooperative mutators to
-`_writable_recovery_lease`, dependency direction
+Architecture guards pin every recovery/reclamation/probe path downstream of
+the writability gate and no-write reads to `_existing_read_only_lease`,
+dependency direction
 `coordinator -> {store, fs, chain, core}`, and public exports.
 
 Implementation gate, from `~/d/atoms/python`:
