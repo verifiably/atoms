@@ -1,7 +1,8 @@
 # Root lifecycle commands and fail-closed writability
 
-**Status:** Proposed on 2026-08-23; pending atoms-side human review. No
-implementation is authorized by this document yet.
+**Status:** Approved by atoms-side human review on 2026-08-23; review findings
+landed through `6555e46`. Downstream implementation is authorized only after
+the Science Task 1 amendment lands.
 
 **Authority:** `~/d/science/docs/superpowers/specs/2026-08-23-world-index-root-lifecycle-design.md`
 §2–§4.
