@@ -248,6 +248,28 @@ CREATE TABLE root_operation (
     )
 ) STRICT;
 
+CREATE TRIGGER trg_root_lifecycle_insert_gate
+BEFORE INSERT ON root_lifecycle
+WHEN NOT (
+    (NEW.origin IN ('register', 'replicate', 'fork')
+        AND NEW.state = 'read-only-unserviceable'
+        AND EXISTS (
+            SELECT 1 FROM root_operation
+            WHERE singleton = 0
+                AND kind = NEW.origin
+                AND phase = 'recorded'
+        ))
+    OR (NEW.origin = 'read-serviceability'
+        AND NEW.state = 'read-only-serviceable'
+        AND NOT EXISTS (SELECT 1 FROM root_operation))
+    OR (NEW.origin = 'migration-v2'
+        AND NEW.state = 'writable'
+        AND NOT EXISTS (SELECT 1 FROM root_operation))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'root lifecycle insert lacks initial operation state');
+END;
+
 CREATE TRIGGER trg_root_lifecycle_identity_write_once
 BEFORE UPDATE OF machine_id, root_path, origin ON root_lifecycle
 WHEN NEW.machine_id IS NOT OLD.machine_id
@@ -284,11 +306,12 @@ BEGIN
     SELECT RAISE(ABORT, 'root lifecycle is retained');
 END;
 
-CREATE TRIGGER trg_root_operation_insert_recorded
+CREATE TRIGGER trg_root_operation_insert_gate
 BEFORE INSERT ON root_operation
 WHEN NEW.phase != 'recorded'
+    OR EXISTS (SELECT 1 FROM root_lifecycle)
 BEGIN
-    SELECT RAISE(ABORT, 'root operation starts recorded');
+    SELECT RAISE(ABORT, 'root operation insert requires empty lifecycle and recorded phase');
 END;
 
 CREATE TRIGGER trg_root_operation_identity_write_once
@@ -354,7 +377,17 @@ END;
 ```
 
 The DDL is the contract, including trigger names and error strings. Lifecycle
-binding and `origin` are write-once. State permits equality,
+creation inserts only these shapes: a matching recorded
+register/replicate/fork operation followed by read-only-unserviceable
+lifecycle state; operation-less read-only-serviceable
+`read-serviceability`; or operation-less writable `migration-v2`. Root creation
+inserts operation first and lifecycle second in the same transaction. The
+operation insert gate prevents either operation-less origin from acquiring an
+operation afterward. A committed operation-only row conveys no lifecycle or
+grant and is invalid on store read; cooperative code never commits that
+transaction-local intermediate.
+
+Lifecycle binding and `origin` are write-once. State permits equality,
 read-only-unserviceable to read-only-serviceable only with no incomplete
 operation, and read-only-unserviceable to writable only for a tree-durable
 register/fork. Migration inserts directly as writable inside the v2-to-v3
@@ -378,7 +411,7 @@ retry path.
 
 `schema.py` freezes the current version-2 values as
 `V2_SCHEMA_STATEMENTS` and `V2_EXPECTED_CATALOG`. Version 3 defines
-`ROOT_LIFECYCLE_V3_STATEMENTS` as exactly the two tables and nine triggers
+`ROOT_LIFECYCLE_V3_STATEMENTS` as exactly the two tables and ten triggers
 above, in shown order, then defines
 `SCHEMA_STATEMENTS = (*V2_SCHEMA_STATEMENTS,
 *ROOT_LIFECYCLE_V3_STATEMENTS)`. `EXPECTED_CATALOG` uses the existing
@@ -413,8 +446,8 @@ metadata roots cannot claim one destination.
 
 Only after the root claim is durable does `_destination_claim_lease` acquire
 the distinct, non-nested destination metadata root and create the store. Its
-first durable transaction inserts the read-only-unserviceable lifecycle row
-with fresh binding and the matching `recorded` operation row. Both commit
+first durable transaction inserts the matching `recorded` operation row, then
+the read-only-unserviceable lifecycle row with fresh binding. Both commit
 together through the existing `Store.transaction()` SQLite-WAL durability
 barrier. Before that commit the root still classifies metadata-less and exposes
 only engine bookkeeping. After it, the root is read-only unserviceable. No
@@ -988,8 +1021,10 @@ One focused `~/d/atoms/python/tests/test_lifecycle_commands.py` covers:
   reclamation, and recovery;
 - exact v2 migration, all structural refusals, and atomic cut outcomes.
 
-Store/schema tests pin version 3, the exact two-table/nine-trigger catalog,
-every trigger refusal and kind/phase nullability check, exact v2
+Store/schema tests pin version 3, the exact two-table/ten-trigger catalog,
+negative INSERT cases for premature writable register/fork and premature
+serviceable replication, the legal recorded-operation-first paths, every
+update-trigger refusal and kind/phase nullability check, exact v2
 classification, normal-open v2 refusal, and migration-only transition.
 Architecture guards pin every recovery/reclamation/probe path downstream of
 the writability gate and no-write reads to `_existing_read_only_lease`,
