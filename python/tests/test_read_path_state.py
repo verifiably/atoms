@@ -358,6 +358,28 @@ def test_a_writable_read_never_recreates_a_vanished_metadata_carrier(
     assert not Path(metadata_root).exists(), "the read recreated the carrier"
 
 
+def test_a_registered_root_refusal_propagates_and_is_not_boundary_loss(
+    coordinator_on, monkeypatch
+) -> None:
+    """A writable root missing its chain refuses inside the held lease
+    ("project root is not registered"). Chain absence is not boundary loss:
+    the refusal propagates under the table's catch-all row, never converted
+    to `root-unresolvable`."""
+    import shutil
+
+    from atoms.core.errors import PreconditionRefused
+
+    ingredients = coordinator_on()
+    _enable_commands(ingredients, monkeypatch)
+    backend, project_root, metadata_root, storage = ingredients
+    _register(ingredients, b"root", ())
+    _write_payload(project_root)
+    shutil.rmtree(Path(project_root) / CHAIN_LEAF)
+
+    with pytest.raises(PreconditionRefused):
+        read_path_state(backend, project_root, metadata_root, storage, "d/f.bin")
+
+
 def test_a_routine_failure_after_the_observation_begins_is_unestablished(
     coordinator_on, monkeypatch
 ) -> None:

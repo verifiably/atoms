@@ -1073,27 +1073,32 @@ def read_path_state(
                     NotAttemptedReason.ROOT_UNRESOLVABLE, detail=str(caught)
                 )
             raise
+    # The existing-only gated lease, not the create-capable one: a carrier
+    # that vanished after classification must read root-unresolvable, never
+    # be recreated and read against fresh (review P1). The conversion is
+    # scoped to LEASE ENTRY alone — classification said writable, so a
+    # refusal there is a post-classification state change; a refusal from
+    # inside the held lease (an unregistered root, say) is not boundary loss
+    # and propagates under the table's catch-all row.
+    entered = False
     try:
-        # The existing-only gated lease, not the create-capable one: a carrier
-        # that vanished after classification must read root-unresolvable, never
-        # be recreated and read against fresh (review P1). Classification said
-        # writable, so a refusal here is a post-classification state change.
-        with (
-            _writable_recovery_lease(
-                backend, project_root, metadata_root, storage
-            ) as lease,
-            _registered_root(lease) as (_chain_fd, _validated),
-        ):
-            chain_backend = _cast(AuditedBackend, lease._binding.backend)
-            return _observe_path(
-                chain_backend, lease._binding.project_root_fd, path
-            )
+        with _writable_recovery_lease(
+            backend, project_root, metadata_root, storage
+        ) as lease:
+            entered = True
+            with _registered_root(lease) as (_chain_fd, _validated):
+                chain_backend = _cast(AuditedBackend, lease._binding.backend)
+                return _observe_path(
+                    chain_backend, lease._binding.project_root_fd, path
+                )
     except PreconditionRefused as caught:
+        if entered:
+            raise
         return ReadNotAttempted(
             NotAttemptedReason.ROOT_UNRESOLVABLE, detail=str(caught)
         )
     except OSError as caught:
-        if caught.errno in (errno.ENOENT, errno.ENOTDIR):
+        if not entered and caught.errno in (errno.ENOENT, errno.ENOTDIR):
             return ReadNotAttempted(
                 NotAttemptedReason.ROOT_UNRESOLVABLE, detail=str(caught)
             )
