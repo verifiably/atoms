@@ -5,7 +5,8 @@ implementation (the root-lifecycle gate's discipline).
 
 **Authority:**
 `~/d/science/docs/superpowers/specs/2026-08-24-world-index-holdings-design.md`
-§2 (the atoms seam), at science commit `eb2899a`.
+§2 (the atoms seam), at science commit `1f77781` — the §2.2 correction that
+this design's discovery forced is part of the authority, not ahead of it.
 
 **Directly inherits:** the coordinator command and lease surfaces as landed
 through `bf559c2`; the one path-summary model (`_capture_path`,
@@ -32,15 +33,18 @@ machinery**.
   `PathState` or a closed, phase-bearing refusal. Built on `_capture_path`
   and `Observation` — the existing summary model, no second one — under
   `read_chain`'s two read arms.
-- **`TransactionOutcome` gains `final_states`** — the committed
-  registration's final path-state rows, returned to the caller. This is a
+- **`TransactionOutcome` gains `final_states`** — the transaction's
+  **canonical `final_surface`** rows, returned to the caller. This is a
   **return channel for evidence the engine already establishes**:
   `compile_spec`'s coverage phase requires the final surface to name every
   path an effect mutates, and `verify_committed_surface` observes every
   final-surface path on disk under the lease — content hash streamed from
   a pinned descriptor — and refuses commit on any mismatch. The consumer's
   post-write hash, post-delete absence, and move dual-location result are
-  those rows.
+  those rows. The **chain** durably carries only the `registered_paths`
+  **subset** of those rows in the registration entry (`_registration_entry`
+  projects both surfaces over `spec.registered_paths`); the return and the
+  chain row set are deliberately not conflated (§5).
 
 There is no per-effect opt-in selection, no `CreateDirectory`
 special-casing, no capture flag on `capture_states`, no consumer-facing
@@ -92,49 +96,62 @@ def read_path_state(
 ) -> PathReadResult
 ```
 
-Sequence:
+Sequence: grammar preflight, lifecycle view (`_lifecycle_view` exactly as
+`read_chain` computes it), boundary acquisition (`WRITABLE` under the
+recovery lease; `READ_ONLY_SERVICEABLE` under the quiescent read-only
+root), then one `Observation`, one `_capture_path` call. The command never
+creates or upgrades a root, metadata directory, lock, database, schema,
+row, or WAL (the lifecycle design's read discipline).
 
-1. **Grammar preflight.** `require_rel_path` over `path` — a refusal is
-   `ReadNotAttempted(reason="path-grammar")`.
-2. **Lifecycle view.** `_lifecycle_view` exactly as `read_chain` computes
-   it. `WRITABLE` proceeds under the recovery lease;
-   `READ_ONLY_SERVICEABLE` proceeds under the quiescent read-only root
-   (schema v2, incomplete operation, and active-transaction records
-   refuse). Every other state is
-   `ReadNotAttempted(reason="lifecycle-state", state=<LifecycleState>)`.
-3. **Observation.** Under the held boundary, one `Observation`, one
-   `_capture_path` call. The result is the observed `PathState` —
-   `FileState` (content hash, mode, byte length), `AbsentState`,
-   `DirectoryState`, or `SymlinkState`.
-4. **Mid-read failure.** An I/O error after the boundary is held, or an
-   entry outside the closed path-state vocabulary, is
-   `ReadUnestablished(reason=...)` — the read was attempted and
-   established nothing. It is never coerced to `ABSENT` and never widened.
+**The translation table is normative.** Every condition the read path can
+produce lands in exactly one row; the implementation may not invent a
+translation this table does not pin:
 
-The command never creates or upgrades a root, metadata directory, lock,
-database, schema, row, or WAL (the lifecycle design's read discipline).
+| condition | result |
+|---|---|
+| malformed arguments (non-str, NUL, wrong types) | raise `ProtocolError` — a programming error, not a read outcome |
+| `path` fails the project-relative grammar | `ReadNotAttempted("path-grammar")` |
+| root or metadata directory unopenable (`ENOENT`/`ENOTDIR` at root establishment or lock acquisition) | `ReadNotAttempted("root-unresolvable")` |
+| lifecycle classifies `METADATA_LESS`, `READ_ONLY_UNSERVICEABLE`, or `BINDING_MISMATCHED` | `ReadNotAttempted("lifecycle-state", lifecycle_state=<state>)` |
+| exact schema-v2 root (pre-lifecycle) | `ReadNotAttempted("lifecycle-state", lifecycle_state=<its classified state>)` |
+| `READ_ONLY_SERVICEABLE` but the quiescent preconditions refuse — incomplete root operation, active transaction record, or an entry-less chain | `ReadNotAttempted("quiescence")` |
+| `CapabilityUnavailable`, storage-profile or certified-allowlist refusal | raise — an environment failure, unattributable to this path |
+| `TransactionHalted`, `ChainStateInvalid` (e.g. a live transaction record on a root with no grant) | raise — alarm-class engine states demand attention; a routine result variant would under-report them |
+| any other `OSError` before the observation begins | raise |
+| any failure **after** the observation begins — I/O error mid-traversal or mid-hash, an entry outside the closed path-state vocabulary | `ReadUnestablished("io-failure" \| "outside-vocabulary")` — never coerced to `ABSENT`, never widened |
 
-## 4. `PathReadResult` — a closed, never-raises union
+**The position invariant closes the phases.** From the moment the
+observation begins (boundary held, `_capture_path` entered), **no engine
+error escapes**: every failure is caught into `ReadUnestablished`. A raise
+from `read_path_state` therefore proves no observation began, so the
+consumer never needs to classify exception types to recover the phase —
+position carries it. This invariant is a test obligation (§8).
 
-On the `inspect_chain` family's precedent, the result is a closed union
-rather than an exception taxonomy, because the phases are contract, not
-diagnostics:
+## 4. `PathReadResult` — a closed union for read outcomes
+
+On the `inspect_chain` family's precedent, read *outcomes* are a closed
+union rather than an exception taxonomy, because the phases are contract,
+not diagnostics. The union is not "never-raises": alarm-class,
+environment, and programming failures still raise, and the position
+invariant keeps every raise pre-observation.
 
 ```
 PathReadResult =
     PathObserved(state: PathState)
   | ReadNotAttempted(reason: NotAttemptedReason,
-                     lifecycle_state: LifecycleState | None)
-  | ReadUnestablished(reason: UnestablishedReason)
+                     lifecycle_state: LifecycleState | None,
+                     detail: str)
+  | ReadUnestablished(reason: UnestablishedReason,
+                      detail: str)
 
-NotAttemptedReason = path-grammar | lifecycle-state | root-unresolvable
+NotAttemptedReason = path-grammar | root-unresolvable
+                   | lifecycle-state | quiescence
 UnestablishedReason = io-failure | outside-vocabulary
 ```
 
-Reasons are closed enums; human-readable diagnostics travel beside the
-variant (a `detail: str` member), never *as* the contract. Programming
-errors (`ProtocolError`) still raise — a protocol violation is not a read
-outcome.
+Reasons are closed enums and are the contract; `detail` is human-readable
+diagnostic text and is never the contract. `lifecycle_state` is populated
+exactly for `reason="lifecycle-state"` and `None` otherwise.
 
 ## 5. `TransactionOutcome.final_states`
 
@@ -148,24 +165,36 @@ class TransactionOutcome:
     final_states: tuple[tuple[str, PathState], ...]
 ```
 
-- **Source of truth:** the committed registration's final rows — the same
-  `(path, PathState)` pairs `verify_committed_surface` matched against
-  the observed disk under the lease, and the same rows the registration
-  entry carries durably in the chain. The return decodes them to typed
-  `PathState`; it re-observes nothing.
-- **Every mutated path is present** (coverage phase 10), in the
-  registration entry's canonical row order: a delete's path with
-  `AbsentState`, a move's source and destination both, a directory
+- **Source of truth:** the transaction's **canonical
+  `compiled.spec.final_surface`** — exactly the `(path, PathState)` rows
+  `verify_committed_surface` matched against the observed disk under the
+  lease. The return hands them back typed, in the canonical surface
+  order; it re-observes nothing.
+- **Every mutated path is present** (coverage phase 10): a delete's path
+  with `AbsentState`, a move's source and destination both, a directory
   creation with its `DirectoryState`. Consumers ignore rows they do not
   need; there is no selection parameter to get wrong.
+- **The return and the chain rows are two different sets, not conflated.**
+  `_registration_entry` projects the durable `initial`/`final` rows over
+  `spec.registered_paths` only — a subset of the final surface the
+  caller's spec chooses. `final_states` is the **complete verified
+  surface**; the chain carries the **registered subset** of it. The two
+  agree row-for-row where they overlap, and a consumer that needs a row to
+  be durable in the chain must put its path in `registered_paths` — the
+  consumer's own registered-surface discipline, not this command's.
 - **Committed outcomes only:** `run_transaction` returns only committed
   outcomes today (a rolled-back transaction raises); if a rolled-back
   return path is ever added, its `final_states` is empty — a rolled-back
   transaction verified no final surface.
-- Additive: no existing field, entry codec, or chain byte changes.
-  `read_chain` consumers can independently re-derive the same rows from
-  the registration entry — the return is a convenience with the same
-  authority, not a second source.
+- **Compatibility decision, stated rather than waved at:** adding a
+  required field to a public frozen dataclass **breaks direct
+  constructors and equality** — existing tests that build
+  `TransactionOutcome` literals must add the field, and they are updated
+  in the same change. The field deliberately has **no default**: a
+  defaulted empty tuple would fabricate "no mutated paths" for any
+  construction site that forgot it, which is exactly the silent evidence
+  loss this return exists to prevent. No entry codec or chain byte
+  changes.
 
 ## 6. What the consumer builds on this (recorded, not owned)
 
@@ -214,9 +243,17 @@ The implementation lands with, at minimum:
   state when a cooperative writer is serialized behind the same
   lease/lock;
 - grammar refusals landing in `ReadNotAttempted("path-grammar")`;
+- **the translation table row-by-row**, each condition constructed and
+  asserted to land in its exact variant or raise — including at least one
+  raising row per raise class the table names;
+- **the position invariant**: a failure injected after the observation
+  begins returns `ReadUnestablished` and does not raise;
 - `final_states` presence and typed decoding for each effect variant, the
-  move's two rows from one effect among them, and equality with the rows
-  the registration entry carries via `read_chain`.
+  move's two rows from one effect among them; and **the subset
+  distinction**: a transaction whose `registered_paths` is a proper subset
+  of its final surface returns the complete surface in `final_states`
+  while `read_chain`'s registration entry carries exactly the registered
+  subset, the overlap agreeing row-for-row.
 
 ## 9. Review gate
 
