@@ -37,6 +37,7 @@ from tests.capture_support import DictPayloads, digest_of
 from tests.coordinator_support import (
     AFTER,
     BEFORE,
+    POST,
     create_file_spec,
     deep_directory_spec,
     delete_spec,
@@ -76,6 +77,7 @@ def test_run_transaction_commits_the_world_chain_and_public_outcome(
         ChainOutcome.COMMITTED,
         outcome.registration,
         outcome.settlement,
+        final_states=(("d/f.txt", POST),),
     )
     assert (Path(project_root) / "d/f.txt").read_bytes() == AFTER
     entries = _durable_entries(project_root)

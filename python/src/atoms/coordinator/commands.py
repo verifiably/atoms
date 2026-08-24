@@ -130,6 +130,12 @@ class TransactionOutcome:
     outcome: ChainOutcome
     registration: str
     settlement: str
+    final_states: tuple[tuple[str, PathState], ...]
+    """The complete canonical final surface commit verification observed and
+    matched on disk under the lease — every mutated path, not only the
+    `registered_paths` subset the chain entry carries. Deliberately no
+    default: a defaulted empty tuple would fabricate "no mutated paths" at
+    any construction site that forgot it."""
 
 
 @dataclass(frozen=True)
@@ -704,6 +710,9 @@ def run_transaction(
         outcome=ChainOutcome.COMMITTED,
         registration=result.registration,
         settlement=result.settlement,
+        final_states=tuple(
+            (entry.path, entry.state) for entry in compiled.spec.final_surface
+        ),
     )
 
 
