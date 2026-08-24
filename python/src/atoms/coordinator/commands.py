@@ -810,12 +810,25 @@ def inspect_chain(
                 return _inspect_detached(audited, root_fd)
             finally:
                 audited.close_fd(root_fd)
-    if view.state is not LifecycleState.WRITABLE:
+    if view.state is LifecycleState.METADATA_LESS:
         if view.active_txid is not None:
             raise ChainStateInvalid(
                 "a live transaction record exists on a root whose lifecycle "
                 "carries no grant"
             )
+        # A carrier-less root has nothing for registered mode to be coherent
+        # against, and creating a carrier to answer a question is exactly
+        # what a read must not do. The detached classification is the whole
+        # honest answer: explicitly non-coherent, non-mutating, staging
+        # reported as evidence — which is what keeps a cold copy's chain
+        # evaluable (its pending honestly unresolved) without a grant.
+        audited = AuditedBackend.detached(backend, project_root=project_root)
+        root_fd = audited.open_root(project_root)
+        try:
+            return _inspect_detached(audited, root_fd)
+        finally:
+            audited.close_fd(root_fd)
+    if view.state is not LifecycleState.WRITABLE:
         raise PreconditionRefused(
             f"root lifecycle state {view.state.value} does not admit a "
             "coherent chain inspection"
