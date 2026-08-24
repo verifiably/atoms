@@ -1200,11 +1200,17 @@ def test_chain_commands_keep_the_lease_and_approval_proofs_private():
         "Entry",
         "LifecycleState",
         "MalformedChain",
+        "NotAttemptedReason",
+        "PathObserved",
+        "PathReadResult",
+        "ReadNotAttempted",
+        "ReadUnestablished",
         "RootOperationId",
         "RootOperationInvalid",
         "RootOperationMismatch",
         "SourceSnapshotMoved",
         "TransactionOutcome",
+        "UnestablishedReason",
         "WellFormedChain",
         "append_intent",
         "capture_states",
@@ -1215,6 +1221,7 @@ def test_chain_commands_keep_the_lease_and_approval_proofs_private():
         "migrate_root_to_lifecycle_v3",
         "read_chain",
         "read_lifecycle_state",
+        "read_path_state",
         "read_pending_fork_operation",
         "register_root",
         "replicate_root",
@@ -1227,6 +1234,7 @@ def test_chain_commands_keep_the_lease_and_approval_proofs_private():
         "run_transaction",
         "read_chain",
         "read_lifecycle_state",
+        "read_path_state",
         "read_pending_fork_operation",
         "replicate_root",
         "resume_fork_root",
@@ -1258,7 +1266,7 @@ def test_chain_commands_keep_the_lease_and_approval_proofs_private():
     # Clause 1: the creating and reading commands still enter `_recovery_lease`;
     # the two cooperative mutators enter the lifecycle-gated variant, whose
     # stack is the same one behind the writability gate (lifecycle design §7).
-    for name in ("register_root", "read_chain"):
+    for name in ("register_root", "read_chain", "read_path_state"):
         assert _enters(public[name], "_recovery_lease"), f"{name} skips _recovery_lease"
         assert not _names(public[name], "resolve"), f"{name} names resolve"
     for name in ("append_intent", "run_transaction"):
