@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import enum
 import errno
 import os
 import stat as _stat_module
@@ -61,7 +62,12 @@ from atoms.coordinator.root import (
     _writable_recovery_lease,
 )
 from atoms.core.compiler import compile_spec
-from atoms.core.errors import PreconditionRefused, ProtocolError, SpecValidationError
+from atoms.core.errors import (
+    CapabilityUnavailable,
+    PreconditionRefused,
+    ProtocolError,
+    SpecValidationError,
+)
 from atoms.core.fingerprint import ABSENT, PathState
 from atoms.core.paths import require_rel_path
 from atoms.core.recovery.model import (
@@ -79,6 +85,7 @@ from atoms.fs.lock import (
     close_all,
     establish_root,
 )
+from atoms.fs.observe import _UNSUPPORTED as _UNSUPPORTED_ERRNOS
 from atoms.fs.observe import Observation
 from atoms.fs.volume import StorageProfile
 from atoms.store.connection import Store
@@ -93,11 +100,17 @@ __all__ = (
     "Entry",
     "LifecycleState",
     "MalformedChain",
+    "NotAttemptedReason",
+    "PathObserved",
+    "PathReadResult",
+    "ReadNotAttempted",
+    "ReadUnestablished",
     "RootOperationId",
     "RootOperationInvalid",
     "RootOperationMismatch",
     "SourceSnapshotMoved",
     "TransactionOutcome",
+    "UnestablishedReason",
     "WellFormedChain",
     "append_intent",
     "capture_states",
@@ -108,6 +121,7 @@ __all__ = (
     "migrate_root_to_lifecycle_v3",
     "read_chain",
     "read_lifecycle_state",
+    "read_path_state",
     "read_pending_fork_operation",
     "register_root",
     "replicate_root",
@@ -130,6 +144,12 @@ class TransactionOutcome:
     outcome: ChainOutcome
     registration: str
     settlement: str
+    final_states: tuple[tuple[str, PathState], ...]
+    """The complete canonical final surface commit verification observed and
+    matched on disk under the lease — every mutated path, not only the
+    `registered_paths` subset the chain entry carries. Deliberately no
+    default: a defaulted empty tuple would fabricate "no mutated paths" at
+    any construction site that forgot it."""
 
 
 @dataclass(frozen=True)
@@ -181,6 +201,13 @@ def _validate_registered_surface(value: object) -> tuple[str, ...]:
     return paths
 
 
+class _OutsideVocabulary(PreconditionRefused):
+    """Module-private: `_capture_path` observed an entry outside the closed
+    path-state vocabulary. A subclass so existing callers keep catching
+    `PreconditionRefused` unchanged while `read_path_state` can classify the
+    refusal without message inspection (holdings read design §3)."""
+
+
 def _capture_path(
     backend: AuditedBackend,
     project_root_fd: int,
@@ -208,7 +235,7 @@ def _capture_path(
         if type(observed) not in (ObservedFile, ObservedDirectory, ObservedSymlink):
             # The PathState vocabulary is closed by authority §6: an unrepresentable or
             # unreadable entry is refused, never coerced to ABSENT and never widened.
-            raise PreconditionRefused(
+            raise _OutsideVocabulary(
                 f"{path!r} was observed as {type(observed).__name__}, which is outside "
                 "the closed path-state vocabulary"
             )
@@ -704,6 +731,9 @@ def run_transaction(
         outcome=ChainOutcome.COMMITTED,
         registration=result.registration,
         settlement=result.settlement,
+        final_states=tuple(
+            (entry.path, entry.state) for entry in compiled.spec.final_surface
+        ),
     )
 
 
@@ -900,6 +930,179 @@ def capture_states(
             )
     finally:
         audited.close_fd(root_fd)
+
+
+# --- The lease-held single-path read (holdings read/evidence design §3–§4) ---
+
+
+class NotAttemptedReason(enum.StrEnum):
+    PATH_GRAMMAR = "path-grammar"
+    ROOT_UNRESOLVABLE = "root-unresolvable"
+    LIFECYCLE_STATE = "lifecycle-state"
+    QUIESCENCE = "quiescence"
+
+
+class UnestablishedReason(enum.StrEnum):
+    IO_FAILURE = "io-failure"
+    OUTSIDE_VOCABULARY = "outside-vocabulary"
+
+
+@dataclass(frozen=True, slots=True)
+class PathObserved:
+    state: PathState
+
+
+@dataclass(frozen=True, slots=True)
+class ReadNotAttempted:
+    reason: NotAttemptedReason
+    lifecycle_state: LifecycleState | None = None
+    detail: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ReadUnestablished:
+    reason: UnestablishedReason
+    detail: str = ""
+
+
+PathReadResult = PathObserved | ReadNotAttempted | ReadUnestablished
+
+
+def _observe_path(
+    backend: AuditedBackend, root_fd: int, path: str
+) -> PathObserved | ReadUnestablished:
+    """The observation phase, under an already-held boundary.
+
+    Routine failures translate; non-routine failures propagate whatever their
+    position, under `translated_lookup`'s exact errno classification — the raw
+    ancestor opens and descriptor cleanup in `_capture_path` sit outside its
+    wrappers, so the classification is applied here as well (design §3).
+    """
+    try:
+        with Observation(backend) as observation:
+            observed = _capture_path(backend, root_fd, path, observation)
+        return PathObserved(observed)
+    except _OutsideVocabulary as caught:
+        return ReadUnestablished(UnestablishedReason.OUTSIDE_VOCABULARY, str(caught))
+    except PreconditionRefused as caught:
+        # translated_lookup's namespace-contradiction arm: for a bare read,
+        # concurrent raw-mutation evidence — established nothing.
+        return ReadUnestablished(UnestablishedReason.IO_FAILURE, str(caught))
+    except OSError as caught:
+        if caught.errno in _UNSUPPORTED_ERRNOS:
+            raise CapabilityUnavailable(
+                f"the backend cannot supply the semantics needed while "
+                f"reading {path!r}: {caught}"
+            ) from caught
+        if caught.errno == errno.EBADF:
+            raise ProtocolError(
+                f"a descriptor was already closed while reading {path!r}: {caught}"
+            ) from caught
+        return ReadUnestablished(UnestablishedReason.IO_FAILURE, str(caught))
+
+
+def read_path_state(
+    backend: Backend,
+    project_root: str,
+    metadata_root: str,
+    storage: StorageProfile,
+    path: str,
+) -> PathReadResult:
+    """Observe exactly one named path under the held boundary (design §3).
+
+    Never creates or upgrades a root, metadata directory, lock, database,
+    schema, row, or WAL. The normative translation table in the design decides
+    every outcome; the consumer's found/absent classification is the
+    consumer's.
+    """
+    if type(path) is not str:
+        raise ProtocolError("path must be an exact str")
+    if "\x00" in path:
+        raise ProtocolError("path contains a NUL byte")
+    try:
+        require_rel_path("path", path)
+    except SpecValidationError as caught:
+        return ReadNotAttempted(NotAttemptedReason.PATH_GRAMMAR, detail=str(caught))
+    view = _lifecycle_view(backend, project_root, metadata_root, storage)
+    if view.state in (
+        LifecycleState.METADATA_LESS,
+        LifecycleState.READ_ONLY_UNSERVICEABLE,
+        LifecycleState.BINDING_MISMATCHED,
+    ):
+        if view.active_txid is not None:
+            # read_chain's own alarm: a live transaction record on a root whose
+            # lifecycle carries no grant is not a routine read outcome.
+            raise ChainStateInvalid(
+                "a live transaction record exists on a root whose lifecycle "
+                "carries no grant"
+            )
+        return ReadNotAttempted(
+            NotAttemptedReason.LIFECYCLE_STATE, lifecycle_state=view.state
+        )
+    if view.state is LifecycleState.READ_ONLY_SERVICEABLE:
+        if view.schema_version == 2:
+            return ReadNotAttempted(
+                NotAttemptedReason.LIFECYCLE_STATE,
+                lifecycle_state=view.state,
+                detail="a pre-lifecycle version-2 store cannot be read coherently",
+            )
+        operation = view.operation
+        if operation is not None and operation.phase != "complete":
+            return ReadNotAttempted(
+                NotAttemptedReason.QUIESCENCE,
+                detail="this root carries an incomplete root operation",
+            )
+        if view.active_txid is not None:
+            return ReadNotAttempted(
+                NotAttemptedReason.QUIESCENCE,
+                detail="this root carries an active transaction record, which "
+                "only its writable owner may resolve",
+            )
+        try:
+            with _quiescent_read_only_root(
+                backend, project_root, metadata_root
+            ) as (source, _validated):
+                return _observe_path(
+                    _cast(AuditedBackend, source.backend), source.root_fd, path
+                )
+        except PreconditionRefused as caught:
+            return ReadNotAttempted(NotAttemptedReason.QUIESCENCE, detail=str(caught))
+        except OSError as caught:
+            if caught.errno in (errno.ENOENT, errno.ENOTDIR):
+                return ReadNotAttempted(
+                    NotAttemptedReason.ROOT_UNRESOLVABLE, detail=str(caught)
+                )
+            raise
+    # The existing-only gated lease, not the create-capable one: a carrier
+    # that vanished after classification must read root-unresolvable, never
+    # be recreated and read against fresh (review P1). The conversion is
+    # scoped to LEASE ENTRY alone — classification said writable, so a
+    # refusal there is a post-classification state change; a refusal from
+    # inside the held lease (an unregistered root, say) is not boundary loss
+    # and propagates under the table's catch-all row.
+    entered = False
+    try:
+        with _writable_recovery_lease(
+            backend, project_root, metadata_root, storage
+        ) as lease:
+            entered = True
+            with _registered_root(lease) as (_chain_fd, _validated):
+                chain_backend = _cast(AuditedBackend, lease._binding.backend)
+                return _observe_path(
+                    chain_backend, lease._binding.project_root_fd, path
+                )
+    except PreconditionRefused as caught:
+        if entered:
+            raise
+        return ReadNotAttempted(
+            NotAttemptedReason.ROOT_UNRESOLVABLE, detail=str(caught)
+        )
+    except OSError as caught:
+        if not entered and caught.errno in (errno.ENOENT, errno.ENOTDIR):
+            return ReadNotAttempted(
+                NotAttemptedReason.ROOT_UNRESOLVABLE, detail=str(caught)
+            )
+        raise
 
 
 # --- Copy commands, serviceability grant, and migration (lifecycle design) ---
