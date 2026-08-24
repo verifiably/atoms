@@ -107,6 +107,20 @@ def test_read_path_state_refuses_an_inadmissible_path_before_any_read(
         assert result.reason is NotAttemptedReason.PATH_GRAMMAR, path
 
 
+def test_read_path_state_raises_protocol_error_for_malformed_arguments(
+    coordinator_on, monkeypatch
+) -> None:
+    """The table's first row: a non-str or NUL-bearing `path` is a programming
+    error, never a grammar refusal."""
+    ingredients = coordinator_on()
+    _enable_commands(ingredients, monkeypatch)
+    backend, project_root, metadata_root, storage = ingredients
+
+    for path in (None, 0, b"bytes", ["a"], "a\x00b"):
+        with pytest.raises(ProtocolError):
+            read_path_state(backend, project_root, metadata_root, storage, path)  # type: ignore[arg-type]
+
+
 def test_read_path_state_refuses_a_metadata_less_root(
     coordinator_on, monkeypatch
 ) -> None:
@@ -308,12 +322,40 @@ def test_read_path_state_reports_root_unresolvable_when_the_boundary_vanishes(
         raise FileNotFoundError(errno.ENOENT, "root vanished at acquisition")
         yield
 
-    monkeypatch.setattr(commands, "_recovery_lease", vanished)
+    monkeypatch.setattr(commands, "_writable_recovery_lease", vanished)
 
     result = read_path_state(backend, project_root, metadata_root, storage, "d/f.bin")
 
     assert type(result) is ReadNotAttempted
     assert result.reason is NotAttemptedReason.ROOT_UNRESOLVABLE
+
+
+def test_a_writable_read_never_recreates_a_vanished_metadata_carrier(
+    coordinator_on, monkeypatch
+) -> None:
+    """The P1 the review found: a create-capable lease could rebuild the
+    carrier and answer against a fresh store. The writable arm must use an
+    existing-only boundary — the vanished carrier reads `root-unresolvable`
+    and nothing is recreated."""
+    import shutil
+
+    from atoms.coordinator.lifecycle import CarrierView
+
+    ingredients = coordinator_on()
+    _enable_commands(ingredients, monkeypatch)
+    backend, project_root, metadata_root, storage = ingredients
+    _register(ingredients, b"root", ())
+    _write_payload(project_root)
+    _doctored_view(
+        monkeypatch, CarrierView(LifecycleState.WRITABLE, None, None, 3)
+    )
+    shutil.rmtree(metadata_root)
+
+    result = read_path_state(backend, project_root, metadata_root, storage, "d/f.bin")
+
+    assert type(result) is ReadNotAttempted
+    assert result.reason is NotAttemptedReason.ROOT_UNRESOLVABLE
+    assert not Path(metadata_root).exists(), "the read recreated the carrier"
 
 
 def test_a_routine_failure_after_the_observation_begins_is_unestablished(
@@ -363,6 +405,71 @@ def test_a_non_routine_failure_propagates_whatever_its_position(
         read_path_state(backend, project_root, metadata_root, storage, "d/f.bin")
 
 
+def test_an_entry_outside_the_closed_vocabulary_is_unestablished(
+    coordinator_on, monkeypatch
+) -> None:
+    import os
+
+    ingredients = coordinator_on()
+    _enable_commands(ingredients, monkeypatch)
+    backend, project_root, metadata_root, storage = ingredients
+    _register(ingredients, b"root", ())
+    os.mkfifo(Path(project_root) / "pipe")
+
+    result = read_path_state(backend, project_root, metadata_root, storage, "pipe")
+
+    assert type(result) is ReadUnestablished
+    assert result.reason is UnestablishedReason.OUTSIDE_VOCABULARY
+
+
+def test_a_namespace_contradiction_mid_observation_is_unestablished(
+    coordinator_on, monkeypatch
+) -> None:
+    """translated_lookup's namespace-contradiction arm: for a bare read it is
+    concurrent raw-mutation evidence and converts, never propagates."""
+    from atoms.coordinator import commands
+    from atoms.core.errors import PreconditionRefused
+
+    ingredients = coordinator_on()
+    _enable_commands(ingredients, monkeypatch)
+    backend, project_root, metadata_root, storage = ingredients
+    _register(ingredients, b"root", ())
+
+    def contradicted(*_args, **_kwargs):
+        raise PreconditionRefused(
+            "the namespace no longer matches approval while streaming"
+        )
+
+    monkeypatch.setattr(commands, "_capture_path", contradicted)
+
+    result = read_path_state(backend, project_root, metadata_root, storage, "d/f.bin")
+
+    assert type(result) is ReadUnestablished
+    assert result.reason is UnestablishedReason.IO_FAILURE
+
+
+def test_transaction_halted_propagates_as_the_alarm_it_is(
+    coordinator_on, monkeypatch
+) -> None:
+    from atoms.coordinator import commands
+    from atoms.core.errors import TransactionHalted
+
+    ingredients = coordinator_on()
+    _enable_commands(ingredients, monkeypatch)
+    backend, project_root, metadata_root, storage = ingredients
+    _register(ingredients, b"root", ())
+
+    @contextlib.contextmanager
+    def halted(*_args, **_kwargs):
+        raise TransactionHalted("state is unattributable")
+        yield
+
+    monkeypatch.setattr(commands, "_writable_recovery_lease", halted)
+
+    with pytest.raises(TransactionHalted):
+        read_path_state(backend, project_root, metadata_root, storage, "d/f.bin")
+
+
 def test_read_path_state_serializes_behind_the_writable_recovery_lease(
     coordinator_on, monkeypatch
 ) -> None:
@@ -370,6 +477,7 @@ def test_read_path_state_serializes_behind_the_writable_recovery_lease(
     the held boundary and answers only after it releases."""
     import threading
 
+    from atoms.coordinator import commands
     from atoms.coordinator.root import _recovery_lease
 
     ingredients = coordinator_on()
@@ -379,6 +487,14 @@ def test_read_path_state_serializes_behind_the_writable_recovery_lease(
     _write_payload(project_root)
     results: list[object] = []
     done = threading.Event()
+    entered = threading.Event()
+    real_view = commands._lifecycle_view
+
+    def spying_view(*args, **kwargs):
+        entered.set()
+        return real_view(*args, **kwargs)
+
+    monkeypatch.setattr(commands, "_lifecycle_view", spying_view)
 
     def read() -> None:
         results.append(
@@ -389,6 +505,10 @@ def test_read_path_state_serializes_behind_the_writable_recovery_lease(
     with _recovery_lease(backend, project_root, metadata_root, storage):
         reader = threading.Thread(target=read)
         reader.start()
+        # The entered event closes the vacuous-start window: the reader is
+        # provably inside the command (at or past the lock it must wait on)
+        # before the still-blocked assertion runs.
+        assert entered.wait(timeout=30), "the reader never entered the command"
         assert not done.wait(timeout=0.3), "the read completed under a held lease"
     assert done.wait(timeout=30), "the read never completed after release"
     reader.join(timeout=30)

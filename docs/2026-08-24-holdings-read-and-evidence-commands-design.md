@@ -1,7 +1,11 @@
 # The path-read command and post-state evidence return
 
-**Status:** Draft — awaiting atoms-side review and approval before any
-implementation (the root-lifecycle gate's discipline).
+**Status:** Approved 2026-08-24 at `558817b` against Science authority
+`b231e08`; **implemented on `design/holdings-commands`** with the full
+suite and gates green, the review's four post-implementation findings
+closed by amendment (the writable arm corrected to the existing-only
+gated lease; malformed arguments raising `ProtocolError`; the §8 matrix
+completed). Not yet merged to `main`.
 
 **Authority:**
 `~/d/science/docs/superpowers/specs/2026-08-24-world-index-holdings-design.md`
@@ -100,10 +104,13 @@ def read_path_state(
 
 Sequence: grammar preflight, lifecycle view (`_lifecycle_view` exactly as
 `read_chain` computes it), boundary acquisition (`WRITABLE` under the
-recovery lease; `READ_ONLY_SERVICEABLE` under the quiescent read-only
-root), then one `Observation`, one `_capture_path` call. The command never
-creates or upgrades a root, metadata directory, lock, database, schema,
-row, or WAL (the lifecycle design's read discipline).
+**existing-only writability-gated lease** — never the create-capable
+`_recovery_lease`, whose creating lock could rebuild a carrier that
+vanished after classification and answer against a fresh store;
+`READ_ONLY_SERVICEABLE` under the quiescent read-only root), then one
+`Observation`, one `_capture_path` call. The command never creates or
+upgrades a root, metadata directory, lock, database, schema, row, or WAL
+(the lifecycle design's read discipline).
 
 **The translation table is normative.** Every condition the read path can
 produce lands in exactly one row; the implementation may not invent a
@@ -115,7 +122,7 @@ translation this table does not pin:
 | `path` fails the project-relative grammar | `ReadNotAttempted("path-grammar")` |
 | lifecycle classifies `METADATA_LESS`, `READ_ONLY_UNSERVICEABLE`, or `BINDING_MISMATCHED` — classification is **existing-only**, so an absent root or metadata directory lands *here* (absent metadata is metadata-less; an absent root over a stored row is binding-mismatched), never below | `ReadNotAttempted("lifecycle-state", lifecycle_state=<state>)` |
 | exact schema-v2 root (pre-lifecycle) | `ReadNotAttempted("lifecycle-state", lifecycle_state=<its classified state>)` |
-| the root boundary vanishes **after** classification — the lock or root directory unopenable at boundary acquisition (`ENOENT`/`ENOTDIR`). Classification never observes the chain, so chain absence is not this row's to claim — it is solely the quiescence row's | `ReadNotAttempted("root-unresolvable")` |
+| the root boundary vanishes or changes **after** classification — surfacing as the existing-only gated lease's refusal, or as `ENOENT`/`ENOTDIR` at boundary acquisition. Classification never observes the chain, so chain absence is not this row's to claim — it is solely the quiescence row's | `ReadNotAttempted("root-unresolvable")` |
 | any quiescent-read precondition refusal on a `READ_ONLY_SERVICEABLE` root — incomplete root operation, active transaction record, no registered chain, a chain staging survivor, an entry-less chain | `ReadNotAttempted("quiescence")` |
 | `CapabilityUnavailable`, storage-profile or certified-allowlist refusal | raise — an environment failure, unattributable to this path, **whatever its position** |
 | `TransactionHalted`, `ChainStateInvalid` (e.g. a live transaction record on a root with no grant) | raise — alarm-class engine states demand attention; a routine result variant would under-report them |

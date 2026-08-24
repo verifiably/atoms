@@ -19,6 +19,7 @@ from tests.coordinator_support import (
     create_file_spec,
     delete_spec,
     directory_spec,
+    replace_spec,
 )
 from tests.test_coordinator_commands import _enable_commands, _register
 
@@ -111,6 +112,32 @@ def test_final_states_carries_the_delete_rows_verified_absence(
     )
 
     assert outcome.final_states == (("d/f.txt", ABSENT),)
+
+
+def test_final_states_carries_a_replace_rows_verified_post_state(
+    coordinator_on, monkeypatch
+) -> None:
+    """The fifth effect variant: a replacement's row is the verified post
+    `FileState` (design §5)."""
+    ingredients = coordinator_on()
+    _enable_commands(ingredients, monkeypatch)
+    backend, project_root, metadata_root, storage = ingredients
+    directory = Path(project_root) / "d"
+    directory.mkdir()
+    _register(ingredients, b"root", ())
+    (directory / "f.txt").write_bytes(BEFORE)
+    (directory / "f.txt").chmod(0o644)
+
+    outcome = run_transaction(
+        backend,
+        project_root,
+        metadata_root,
+        storage,
+        replace_spec(),
+        DictPayloads({digest_of(AFTER): AFTER}),
+    )
+
+    assert outcome.final_states == (("d/f.txt", POST),)
 
 
 def test_final_states_carries_a_directory_row_like_any_other(

@@ -1015,6 +1015,10 @@ def read_path_state(
     every outcome; the consumer's found/absent classification is the
     consumer's.
     """
+    if type(path) is not str:
+        raise ProtocolError("path must be an exact str")
+    if "\x00" in path:
+        raise ProtocolError("path contains a NUL byte")
     try:
         require_rel_path("path", path)
     except SpecValidationError as caught:
@@ -1070,14 +1074,24 @@ def read_path_state(
                 )
             raise
     try:
+        # The existing-only gated lease, not the create-capable one: a carrier
+        # that vanished after classification must read root-unresolvable, never
+        # be recreated and read against fresh (review P1). Classification said
+        # writable, so a refusal here is a post-classification state change.
         with (
-            _recovery_lease(backend, project_root, metadata_root, storage) as lease,
+            _writable_recovery_lease(
+                backend, project_root, metadata_root, storage
+            ) as lease,
             _registered_root(lease) as (_chain_fd, _validated),
         ):
             chain_backend = _cast(AuditedBackend, lease._binding.backend)
             return _observe_path(
                 chain_backend, lease._binding.project_root_fd, path
             )
+    except PreconditionRefused as caught:
+        return ReadNotAttempted(
+            NotAttemptedReason.ROOT_UNRESOLVABLE, detail=str(caught)
+        )
     except OSError as caught:
         if caught.errno in (errno.ENOENT, errno.ENOTDIR):
             return ReadNotAttempted(

@@ -1266,14 +1266,20 @@ def test_chain_commands_keep_the_lease_and_approval_proofs_private():
     # Clause 1: the creating and reading commands still enter `_recovery_lease`;
     # the two cooperative mutators enter the lifecycle-gated variant, whose
     # stack is the same one behind the writability gate (lifecycle design §7).
-    for name in ("register_root", "read_chain", "read_path_state"):
+    for name in ("register_root", "read_chain"):
         assert _enters(public[name], "_recovery_lease"), f"{name} skips _recovery_lease"
         assert not _names(public[name], "resolve"), f"{name} names resolve"
-    for name in ("append_intent", "run_transaction"):
+    # The two cooperative mutators, and the writable-arm reader — which must
+    # never enter the create-capable lease: a carrier that vanished after
+    # classification reads root-unresolvable rather than being recreated.
+    for name in ("append_intent", "run_transaction", "read_path_state"):
         assert _enters(public[name], "_writable_recovery_lease"), (
             f"{name} skips the writability gate"
         )
         assert not _names(public[name], "resolve"), f"{name} names resolve"
+    assert not _enters(public["read_path_state"], "_recovery_lease"), (
+        "read_path_state entered the create-capable lease"
+    )
 
     # Clause 2: structural inspection interposes between reclamation and resolution,
     # and it is the ONLY public function permitted to do so.
