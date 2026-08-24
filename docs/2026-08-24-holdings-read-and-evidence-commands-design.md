@@ -5,8 +5,9 @@ implementation (the root-lifecycle gate's discipline).
 
 **Authority:**
 `~/d/science/docs/superpowers/specs/2026-08-24-world-index-holdings-design.md`
-§2 (the atoms seam), at science commit `1f77781` — the §2.2 correction that
-this design's discovery forced is part of the authority, not ahead of it.
+§2 (the atoms seam), at science commit `a50fdfb` — the §2.2 corrections
+this design's discoveries forced are part of the authority, not ahead of
+it.
 
 **Directly inherits:** the coordinator command and lease surfaces as landed
 through `bf559c2`; the one path-summary model (`_capture_path`,
@@ -25,7 +26,8 @@ holdings vocabulary, store identities, or record kinds. The consumer's
 
 ## 1. Decision
 
-One new public command and one additive widening; **no new capture
+One new public command and one deliberate widening of
+`TransactionOutcome` (a stated constructor break, §5); **no new capture
 machinery**.
 
 - **`read_path_state`** — a lease-held, lifecycle-honoring observation of
@@ -111,29 +113,35 @@ translation this table does not pin:
 |---|---|
 | malformed arguments (non-str, NUL, wrong types) | raise `ProtocolError` — a programming error, not a read outcome |
 | `path` fails the project-relative grammar | `ReadNotAttempted("path-grammar")` |
-| root or metadata directory unopenable (`ENOENT`/`ENOTDIR` at root establishment or lock acquisition) | `ReadNotAttempted("root-unresolvable")` |
-| lifecycle classifies `METADATA_LESS`, `READ_ONLY_UNSERVICEABLE`, or `BINDING_MISMATCHED` | `ReadNotAttempted("lifecycle-state", lifecycle_state=<state>)` |
+| lifecycle classifies `METADATA_LESS`, `READ_ONLY_UNSERVICEABLE`, or `BINDING_MISMATCHED` — classification is **existing-only**, so an absent root or metadata directory lands *here* (absent metadata is metadata-less; an absent root over a stored row is binding-mismatched), never below | `ReadNotAttempted("lifecycle-state", lifecycle_state=<state>)` |
 | exact schema-v2 root (pre-lifecycle) | `ReadNotAttempted("lifecycle-state", lifecycle_state=<its classified state>)` |
-| `READ_ONLY_SERVICEABLE` but the quiescent preconditions refuse — incomplete root operation, active transaction record, or an entry-less chain | `ReadNotAttempted("quiescence")` |
-| `CapabilityUnavailable`, storage-profile or certified-allowlist refusal | raise — an environment failure, unattributable to this path |
+| the root or chain boundary vanishes **after** classification — the lock, root, or chain directory unopenable at boundary acquisition (`ENOENT`/`ENOTDIR`) | `ReadNotAttempted("root-unresolvable")` |
+| any quiescent-read precondition refusal on a `READ_ONLY_SERVICEABLE` root — incomplete root operation, active transaction record, no registered chain, a chain staging survivor, an entry-less chain | `ReadNotAttempted("quiescence")` |
+| `CapabilityUnavailable`, storage-profile or certified-allowlist refusal | raise — an environment failure, unattributable to this path, **whatever its position** |
 | `TransactionHalted`, `ChainStateInvalid` (e.g. a live transaction record on a root with no grant) | raise — alarm-class engine states demand attention; a routine result variant would under-report them |
-| any other `OSError` before the observation begins | raise |
-| any failure **after** the observation begins — I/O error mid-traversal or mid-hash, an entry outside the closed path-state vocabulary | `ReadUnestablished("io-failure" \| "outside-vocabulary")` — never coerced to `ABSENT`, never widened |
+| routine observation failure **after** the observation begins — an `OSError` mid-traversal or mid-hash, an entry outside the closed path-state vocabulary | `ReadUnestablished("io-failure" \| "outside-vocabulary")` — never coerced to `ABSENT`, never widened |
+| **any other exception, at any position** | raise unchanged — the table pins translations; it does not convert what it does not name |
 
-**The position invariant closes the phases.** From the moment the
-observation begins (boundary held, `_capture_path` entered), **no engine
-error escapes**: every failure is caught into `ReadUnestablished`. A raise
-from `read_path_state` therefore proves no observation began, so the
-consumer never needs to classify exception types to recover the phase —
-position carries it. This invariant is a test obligation (§8).
+**The invariant translates routine failures only.** From the moment the
+observation begins (boundary held, `_capture_path` entered), no **routine
+observation failure** escapes as a raise — every `OSError` and
+closed-vocabulary violation there is caught into `ReadUnestablished`.
+Programming errors (`ProtocolError`), environment failures
+(`CapabilityUnavailable`), and alarm-class states propagate **regardless
+of position** — `Observation` itself can raise them mid-lookup, and a bug
+or a lost backend capability is not a read outcome and must not be
+laundered into one. A raise therefore no longer encodes phase; what it
+means for the consumer is §6's business. This invariant — routine
+failures translated, non-routine propagated, from both positions — is a
+test obligation (§8).
 
 ## 4. `PathReadResult` — a closed union for read outcomes
 
 On the `inspect_chain` family's precedent, read *outcomes* are a closed
 union rather than an exception taxonomy, because the phases are contract,
 not diagnostics. The union is not "never-raises": alarm-class,
-environment, and programming failures still raise, and the position
-invariant keeps every raise pre-observation.
+environment, and programming failures raise **whatever their position**
+(§3's table); only routine observation failures translate.
 
 ```
 PathReadResult =
@@ -207,6 +215,11 @@ check fitness, owned by the science spec:
   inconclusive attempt;
 - `ReadNotAttempted` → `byte-locator-untested`;
 - `ReadUnestablished` → `retrieval-failed`;
+- an engine **raise** aborts the consumer's act: no report and no
+  observation is minted — the act's own loud failure (its H4 discipline),
+  with the durable unmatched intent marking an intent-bearing attempt.
+  The consumer never classifies exception types into the two report
+  classes;
 - a committed mutation's observation records the digest/absence from
   `final_states` — post-write hash, post-delete absence, and the move's
   dual-location result read from the same transaction's rows.
@@ -246,8 +259,10 @@ The implementation lands with, at minimum:
 - **the translation table row-by-row**, each condition constructed and
   asserted to land in its exact variant or raise — including at least one
   raising row per raise class the table names;
-- **the position invariant**: a failure injected after the observation
-  begins returns `ReadUnestablished` and does not raise;
+- **the invariant, both halves**: a routine failure injected after the
+  observation begins returns `ReadUnestablished` and does not raise; a
+  non-routine failure (`ProtocolError`, `CapabilityUnavailable`) injected
+  there propagates unchanged;
 - `final_states` presence and typed decoding for each effect variant, the
   move's two rows from one effect among them; and **the subset
   distinction**: a transaction whose `registered_paths` is a proper subset
