@@ -4,8 +4,9 @@
 `b231e08`; **implemented on `design/holdings-commands`** with the full
 suite and gates green, the review's four post-implementation findings
 closed by amendment (the writable arm corrected to the existing-only
-gated lease; malformed arguments raising `ProtocolError`; the §8 matrix
-completed). Not yet merged to `main`.
+gated lease, the boundary-loss conversion scoped to lease entry;
+malformed arguments raising `ProtocolError`; the §8 matrix completed).
+Merged to `main` and pushed.
 
 **Authority:**
 `~/d/science/docs/superpowers/specs/2026-08-24-world-index-holdings-design.md`
