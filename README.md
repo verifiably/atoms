@@ -20,11 +20,12 @@ half-write.
 
 ## Status
 
-Early implementation. The engine was originally designed inside science through roughly a
+Plan A is substantially implemented: A1–A8b are complete, and A9 — the macOS
+backend — remains. The engine was originally designed inside science through roughly a
 dozen rounds of adversarial contract review; that review capital is carried into the
-standalone authority design below. The design is approved and its roadmap (§14) decomposes
-Plan A into nine sub-plans, A1–A9 (A9 — the macOS backend — added 2026-08-13 by the A7
-design's banking commit, so the macOS arm of Plan A item 6 has an owner).
+standalone authority design below. Its roadmap (§14) decomposes Plan A into nine sub-plans,
+A1–A9 (A9 was added 2026-08-13 by the A7 design's banking commit, so the macOS arm of
+Plan A item 6 has an owner).
 
 The pure core (`atoms.core`) is joined under `python/` by `atoms.fs` (capability backend,
 volume binding, project approval) and `atoms.store` (SQLite-in-WAL metadata store) beneath an
@@ -33,7 +34,8 @@ and recovery executor. A7a writes engine bookkeeping at the reserved `.#~chain/`
 approved effects against project paths.
 
 - **Authority design:** [`docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md`](docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md)
-  — standalone `atoms` engine, SQLite-in-WAL metadata store, `nodes`/science as deferred consumers.
+  — standalone `atoms` engine and SQLite-in-WAL metadata store; its originally deferred
+  Science adoption has begun with the holdings slice described below.
 - **A1 — core model (implemented):** [`docs/plans/2026-07-23-plan-a1-core-model.md`](docs/plans/2026-07-23-plan-a1-core-model.md)
 - **A2 — compilation validation (implemented):** [`docs/plans/2026-07-28-plan-a2-compilation-validation.md`](docs/plans/2026-07-28-plan-a2-compilation-validation.md)
   — pure filesystem-independent `CompiledSpec` proof; A4 still owns project/root approval and must
@@ -102,6 +104,8 @@ approved effects against project paths.
    dependency on the tiny, inactive third-party wrappers.
 3. **Vertical slice = a synthetic in-repo exerciser** (Plan A); production adoption —
    `nodes` corpus-write first, then science — is deferred to Plan B.
+   Science's independently governed adoption has since landed for composition-root corpus
+   writes and family adapters, followed by the holdings path-read and post-state evidence slice.
 
 ## Open items (to settle in Plan A)
 
@@ -117,6 +121,10 @@ approved effects against project paths.
 
 ## Relationship to science
 
-science currently owns its filesystem effects directly and works well enough; this
-extraction is deliberate and unhurried so it does not destabilize science. When `atoms`
-matures, science adopts it as a dependency — directly, or transitively via `nodes`.
+science now consumes `atoms` directly at its composition root: generic corpus writes and
+its supersede, revise, retraction, and import families flow through the certified engine.
+The later holdings slice uses `read_path_state` and `TransactionOutcome.final_states` for
+intent-bearing store acts, mechanical capture, reduction, receipts, and dataset admission.
+That slice merged into Science's local `main` as `35be6ff` on 2026-08-25; it had not been
+pushed as of 2026-08-26. Further Science adoption remains governed by Science's adoption
+ledger rather than this repository's Plan A roadmap.

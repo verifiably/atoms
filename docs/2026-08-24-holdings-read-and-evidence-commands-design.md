@@ -2,14 +2,16 @@
 
 **Status:** Approved 2026-08-24 at `558817b` against Science authority
 `b231e08`; **implemented on `design/holdings-commands`** with the full
-suite and gates green, the review's four post-implementation findings
+suite and gates green, the review's five post-implementation findings
 closed by amendment (the writable arm corrected to the existing-only
 gated lease, the boundary-loss conversion scoped to lease entry;
 malformed arguments raising `ProtocolError`; the §8 matrix completed).
-Merged to `main` and pushed.
+Merged to `main` and pushed at `038513f`. The consuming Science holdings
+slice merged into Science's local `main` as `35be6ff` on 2026-08-25 and
+had not been pushed as of 2026-08-26.
 
 **Authority:**
-`~/d/science/docs/superpowers/specs/2026-08-24-world-index-holdings-design.md`
+`~/d/science/docs/designs/2026-08-24-world-index-holdings-design.md`
 §2 (the atoms seam), at science commit `b231e08` — the §2.2 corrections
 this design's discoveries forced, and §4.1's engine-raise disposition, are
 part of the authority, not ahead of it.
