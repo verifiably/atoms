@@ -4,8 +4,9 @@ A recoverable filesystem effect engine: the durable, crash-safe substrate that o
 atomic multi-path filesystem mutation — write-ahead journaling, rollback, and
 post-crash recovery — over an OS-neutral capability vocabulary.
 
-`atoms` is a *physical* substrate. It sits below `nodes` (the logical knowledge
-substrate) and is consumed by `nodes` and by science:
+`atoms` is a *physical* substrate conceptually below `nodes` (the logical knowledge
+substrate). Science is its current direct consumer; direct adoption from portable `nodes`
+remains deferred behind a language-neutral execution seam:
 
 ```
 domain profiles    science, mindful v6
@@ -35,7 +36,8 @@ approved effects against project paths.
 
 - **Authority design:** [`docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md`](docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md)
   — standalone `atoms` engine and SQLite-in-WAL metadata store; its originally deferred
-  Science adoption has begun with the holdings slice described below.
+  Science adoption first landed at the composition root and family adapters, followed by
+  the holdings slice described below.
 - **A1 — core model (implemented):** [`docs/plans/2026-07-23-plan-a1-core-model.md`](docs/plans/2026-07-23-plan-a1-core-model.md)
 - **A2 — compilation validation (implemented):** [`docs/plans/2026-07-28-plan-a2-compilation-validation.md`](docs/plans/2026-07-28-plan-a2-compilation-validation.md)
   — pure filesystem-independent `CompiledSpec` proof; A4 still owns project/root approval and must
@@ -83,9 +85,10 @@ approved effects against project paths.
 
 ## Scope
 
-- **Python-first.** `nodes`' Python core is the first intended consumer. A TypeScript
-  port is not planned — these are OS-syscall-level primitives with no portable JS
-  equivalent, so this deliberately lives *outside* `nodes`' parity-bound kernel.
+- **Python-first.** Science's Python composition root is the current direct consumer.
+  Direct portable-`nodes` adoption remains deferred behind a language-neutral execution
+  seam: `nodes` maintains normative Python/TypeScript parity, while these OS-syscall-level
+  primitives have no portable JavaScript equivalent.
 - **Progressive platform support via the capability model.** Backends probe each mount
   for semantic capabilities (`atomic_exchange`, `noclobber_transfer`, `durable_publish`,
   …) and refuse only the specific effects a mount cannot satisfy. Linux lands complete
