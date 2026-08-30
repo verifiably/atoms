@@ -7,8 +7,9 @@ closed by amendment (the writable arm corrected to the existing-only
 gated lease, the boundary-loss conversion scoped to lease entry;
 malformed arguments raising `ProtocolError`; the §8 matrix completed).
 Merged to `main` and pushed at `038513f`. The consuming Science holdings
-slice merged into Science's local `main` as `35be6ff` on 2026-08-25 and
-had not been pushed as of 2026-08-26.
+slice merged into Science's `main` as `35be6ff` on 2026-08-25 and was an
+ancestor of both its local `main` and tracked `origin/main` at the
+2026-08-30 audit.
 
 **Authority:**
 `~/d/science/docs/designs/2026-08-24-world-index-holdings-design.md`

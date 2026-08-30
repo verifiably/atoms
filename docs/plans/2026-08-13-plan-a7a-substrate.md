@@ -1,5 +1,7 @@
 # A7a Substrate Implementation Plan
 
+**Status:** Implemented on 2026-08-13; retained as the historical execution record.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Land every A7 component that does not execute an effect: the extended `Backend` and the

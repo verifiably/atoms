@@ -1,7 +1,7 @@
 # Recoverable filesystem effect engine — delivery roadmap
 
 **Date:** 2026-07-21
-**Status:** **Superseded (2026-07-23)** — historical record. The current roadmap is §14 of the authority design [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md) (Plan A = engine core + synthetic exerciser; Plan B = production adoption, `nodes` then science). Still gated on owner approval; intentionally task-free.
+**Status:** **Superseded (2026-07-23)** — historical record. The current roadmap is §14 of the authority design [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md) (Plan A = engine core + synthetic exerciser; Plan B = Science composition-root and family adoption, while direct `nodes` adoption waits on a language-neutral seam). The historical roadmap was gated on owner approval and intentionally task-free.
 **Design:** [`2026-07-20-recoverable-fs-effect-engine-design.md`](2026-07-20-recoverable-fs-effect-engine-design.md)
 
 ## Why this document changed

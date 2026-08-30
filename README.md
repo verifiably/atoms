@@ -102,20 +102,20 @@ approved effects against project paths.
 2. **Leaf-primitive sourcing:** vendor/adapt `renameat2`/`openat2` (Linux) and
    `renamex_np`/`F_FULLFSYNC` (macOS); stdlib `os.replace` for the single-file case. No
    dependency on the tiny, inactive third-party wrappers.
-3. **Vertical slice = a synthetic in-repo exerciser** (Plan A); production adoption —
-   `nodes` corpus-write first, then science — is deferred to Plan B.
+3. **Vertical slice = a synthetic in-repo exerciser** (Plan A); production adoption is
+   Plan B: Science's composition root and families first, while direct `nodes` adoption
+   waits on a language-neutral execution seam.
    Science's independently governed adoption has since landed for composition-root corpus
    writes and family adapters, followed by the holdings path-read and post-state evidence slice.
 
-## Open items (to settle in Plan A)
+## Future hardening and extensions
 
-- **SQLite I/O layer:** whether the DB/WAL/SHM get a custom VFS (`openat`-anchored,
-  `O_NOFOLLOW`, interposer-visible) or the stdlib default with verified-directory
-  resolution and a bounded-surface audit (a pinned SQL profile — `temp_store=MEMORY`, no
-  `ATTACH`/`VACUUM` — keeps SQLite's file surface inside the store). Durability itself
-  needs no custom VFS — the stock VFS honors `PRAGMA fullfsync`. The stdlib baseline
-  trusts cooperating processes not to relocate `metadata_root` mid-lease; the custom VFS
-  is what closes that gap.
+- **SQLite I/O hardening:** A5a chose the stdlib `sqlite3` baseline with
+  verified-directory resolution and a bounded-surface audit (a pinned SQL profile —
+  `temp_store=MEMORY`, no `ATTACH`/`VACUUM`). Durability needs no custom VFS — the stock
+  VFS honors `PRAGMA fullfsync`. An optional custom VFS (`openat`-anchored,
+  `O_NOFOLLOW`, interposer-visible) would close the documented cooperating-process gap
+  around relocation of `metadata_root` during a lease.
 - **Data-VCS composition (downstream):** DVC / lakeFS / dolt version data *content* —
   orthogonal, but `atoms` could underlie safe checkout materialization. Not a driver now.
 
@@ -125,6 +125,7 @@ science now consumes `atoms` directly at its composition root: generic corpus wr
 its supersede, revise, retraction, and import families flow through the certified engine.
 The later holdings slice uses `read_path_state` and `TransactionOutcome.final_states` for
 intent-bearing store acts, mechanical capture, reduction, receipts, and dataset admission.
-That slice merged into Science's local `main` as `35be6ff` on 2026-08-25; it had not been
-pushed as of 2026-08-26. Further Science adoption remains governed by Science's adoption
-ledger rather than this repository's Plan A roadmap.
+That slice merged into Science's `main` as `35be6ff` on 2026-08-25 and was an ancestor of
+both its local `main` and tracked `origin/main` at the 2026-08-30 audit. Further Science
+adoption remains governed by Science's adoption ledger rather than this repository's Plan
+A roadmap.

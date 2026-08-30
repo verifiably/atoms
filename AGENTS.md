@@ -77,9 +77,9 @@ Plan B is written only after Plan A's interfaces settle.
 - **Downstream adoption — Science:** its composition-root corpus writes and family adapters consume
   the certified engine. The holdings slice added `read_path_state` and
   `TransactionOutcome.final_states` from remote `atoms/main` `038513f`, then merged into Science's
-  local `main` as `35be6ff` on 2026-08-25; it had not been pushed as of 2026-08-26. Science's
-  adoption ledger owns later consumer status; A9 remains this repository's first unimplemented
-  Plan A stage.
+  `main` as `35be6ff` on 2026-08-25 and was an ancestor of both its local `main` and tracked
+  `origin/main` at the 2026-08-30 audit. Science's adoption ledger owns later consumer status;
+  A9 remains this repository's first unimplemented Plan A stage.
 
 Work lives under `python/` (`uv run pytest`, `uv run ruff check`, `uv run pyright`, all from
 `python/`).
