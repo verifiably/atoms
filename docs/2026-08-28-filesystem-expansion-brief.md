@@ -34,7 +34,7 @@ also repair it.
 
 ### 1. Btrfs — recommended first experiment
 
-Btrfs is the strongest complement to ext4 for Atoms and Science:
+Btrfs is the strongest complement to ext4 for Atoms and Beliefs:
 
 - data and metadata checksums by default;
 - online scrub, with repair where a replicated profile supplies a good copy;

@@ -16,7 +16,7 @@ non-claims all stand. This document adds the *non-raising* sibling it deliberate
 not build, and it reuses that document's reasoning about lease entry, view inertness,
 and the anchor/replay split rather than restating it.
 
-**Consumer contract:** science's `2026-08-22-log-verification-design.md` §2 and §8 — four
+**Consumer contract:** Beliefs' `2026-08-22-log-verification-design.md` §2 and §8 — four
 obligations, sized exactly to them and nothing more.
 
 ---
@@ -25,7 +25,7 @@ obligations, sized exactly to them and nothing more.
 
 `read_chain` gives a registered consumer the validated chain or an exception. That is the
 right shape for a consumer that is *about to write*, and the wrong shape for one whose
-whole job is to render a verdict about a chain that may be damaged. Science's log
+whole job is to render a verdict about a chain that may be damaged. Beliefs' log
 evaluator needs three things the raising surface cannot express:
 
 - a **typed** structural verdict, because "malformed" is one of its four outcomes and an
@@ -44,7 +44,7 @@ refusal, over **one typed validation core**:
 > `ChainStateInvalid` carrying its message. There is exactly one place a defect is
 > recognized and exactly one place its wording is minted.
 
-The alternative — a second validator for the inspecting paths — is what the science
+The alternative — a second validator for the inspecting paths — is what the Beliefs
 contract's "one typed validation core shared with the raising paths so the defect taxonomy
 cannot fork" forbids, and rightly: two validators would let a chain be simultaneously
 appendable and reported malformed, which is the precise failure the log design exists to
@@ -105,7 +105,7 @@ obligations**. This design adds none. Each candidate was checked against the tre
 | `capture_states` can be asked for a path whose entry kind is outside the closed `PathState` vocabulary (FIFO, socket, device) | **Refused, not admitted** | §9.3 refuses with `PreconditionRefused` naming the path and the observed kind. The vocabulary is closed by authority §6; a widening is a design act, not a capture liberty. Refusing is the A4b-1 fail-closed-platform precedent, which the ledger's prose already excludes from admission. |
 | The six new invariants condemn a chain some earlier engine version legitimately produced | **Real, bounded, and closed in this commit** | §11 is the whole answer: five of the six cannot fire on an engine-produced chain and the sixth can, through today's unvalidated `fulfills`. The submission gate closes it prospectively and §11.3 enumerates the one existing artifact that trips it. Nothing is left for a later sub-plan to own. |
 | A record durable *before* the submission gate lands carries an unvalidated `fulfills` that reconciliation would append | **Closed by construction at landing, stated** | §11.4. Reconciliation must complete a durable record — refusing would strand it — so the gate is deliberately a submission gate only. The set of such records in existence is empty (§11.3), and the gate makes it stay empty. |
-| The public preimage/blob-read command science's §10.4 names | **Not created here** | This design neither admits nor discharges it. It is a science-side deferral whose atoms entry is written at that slice's banking, by the design act that admits it. Naming it here would add an entry with no admission. |
+| The public preimage/blob-read command Beliefs' §10.4 names | **Not created here** | This design neither admits nor discharges it. It is a Beliefs-side deferral whose atoms entry is written at that slice's banking, by the design act that admits it. Naming it here would add an entry with no admission. |
 
 **No authority amendment is claimed.** §4.1's submission boundary and §12's mutation
 boundary describe `TransactionSpec` submission and `ProjectApprovedSpec` mutation. The two
@@ -773,7 +773,7 @@ recycled onto a different entry later in it (`fs/observe.py:73-84`). A caller lo
 a single-path command would get *n* incomparable observations.
 
 The same detached facade as §7.1 serves it: `capture_states` takes no lock and asserts
-nothing about registration. Serialization is the caller's, and science's audit boundary
+nothing about registration. Serialization is the caller's, and Beliefs' audit boundary
 holds the subject's operation lock across inspection and capture precisely so the verdict
 and the surface it judged are one view.
 
@@ -938,7 +938,7 @@ producing them. The gate:
 **The referent condition is membership, not strict ancestry of the tip**, and the
 difference is exactly one entry — the tip itself. A consumer that appends an intent and
 then immediately submits the transaction fulfilling it names a `fulfills` that *is* the
-tip, which is the ordinary post-intent shape, not an anomaly: science's operation port does
+tip, which is the ordinary post-intent shape, not an anomaly: Beliefs' operation port does
 exactly this on its post-intent refusal path (`root.py:469-478`'s `execute_fulfilling`
 called from `corpus.py:1116` with the digest `corpus.py:1075`'s `append_intent` returned,
 with no intervening append), and its acceptance suite pins the resulting three-entry
@@ -997,7 +997,7 @@ commit. Both are refused at the one point where refusing is free.
 Nothing in this section is provisional; it records what lands with the implementation.
 Checked against both trees rather than assumed:
 
-- **science does pass `fulfills`, on a live path**, and the mechanism is what makes it
+- **Beliefs does pass `fulfills`, on a live path**, and the mechanism is what makes it
   safe rather than its absence. `root.py:469-478`'s `execute_fulfilling(plan, fulfills)`
   threads a consumer-supplied digest into the spec, and `corpus.py` calls it at `:1116`
   (the post-intent refusal path) and `:1125` (the success path). In both, the digest is
@@ -1007,7 +1007,7 @@ Checked against both trees rather than assumed:
   construction, not by abstention. The two call sites are in mutually exclusive branches of
   one `try`/`except` — the refusal path returns or re-raises, the success path is reached
   only when no `ScienceError` was caught — so **one intent digest is fulfilled at most
-  once** and `DUPLICATE_FULFILLMENT` cannot fire either. **No science-built chain is
+  once** and `DUPLICATE_FULFILLMENT` cannot fire either. **No Beliefs-built chain is
   condemned**, for that stated reason. This is also why the C1 correction above is
   load-bearing rather than cosmetic: `:1116`'s fulfillment names the tip.
 - **atoms** has exactly one artifact that trips the gate:
@@ -1210,7 +1210,7 @@ own root — otherwise a "name the component root" implementation would pass by 
    intact, is *not* refused — resolution settles it and the command proceeds.
 9a. The `fulfills` submission gate, four arms plus the boundary case: `run_transaction`
     **accepts** a `fulfills` naming the intent that is currently the tip — appended by an
-    immediately preceding `append_intent`, the science post-intent-refusal shape
+    immediately preceding `append_intent`, the Beliefs post-intent-refusal shape
     (§11.2) — and the resulting chain slice is `(IntentEntry, RegisteredEntry,
     SettledEntry)`, the sequence `tests/acceptance/test_n2_cut5.py:251` pins downstream. It
     **refuses** with `PreconditionRefused` a `fulfills` naming no entry, naming a

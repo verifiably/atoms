@@ -61,7 +61,7 @@ sabotage arm per §13.2 cross-substrate ordering (§9).
 
 - The macOS backend and its suites — **A9**.
 - Terminal-record GC — the structural gate exists (A7); the command still does not.
-- Science's L-row tests and every Plan B adoption item — Plan B, after A8.
+- Beliefs' L-row tests and every Plan B adoption item — Plan B, after A8.
 - Chain compaction and size — a future design under the log design's anchor rules.
 - Any weakening of fail-closed binding. A kernel upgrade or `BACKEND_REVISION`
   bump de-certifies by design; the mitigation is a one-command recertification,
@@ -530,8 +530,8 @@ Landing edits, enforced by `test_docs_status.py` in the same change:
 - Ledger #15 and #9's A8 clause are removed **only after their named
   verification passes** (#9 closes because A8 adds no production entry point;
   #15 through the three agreement legs).
-- Science's adoption-ledger row 4 is updated in the science repository as its
-  own commit after landing; nothing here edits science.
+- Beliefs' adoption-ledger row 4 is updated in the Beliefs repository as its
+  own commit after landing; nothing here edits Beliefs.
 
 **Acceptance criteria.** A8 is complete when:
 

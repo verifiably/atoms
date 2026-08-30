@@ -8,7 +8,7 @@ pytest, ruff, and pyright gate.
 
 **Authority:** [`2026-07-23-recoverable-fs-effect-engine-design.md`](2026-07-23-recoverable-fs-effect-engine-design.md)
 §5.5, §7.3–§7.5, §8, §9, §10, §11, §13.2, §13.5, §14, §15 — and, consumed as the
-chain's contract, science's `2026-08-03-tamper-evident-log-design.md` §3 and §9
+chain's contract, Beliefs' `2026-08-03-tamper-evident-log-design.md` §3 and §9
 as restated by authority §15.
 
 **Sub-plans below it:** [`2026-08-07-a6-coherent-capture-design.md`](2026-08-07-a6-coherent-capture-design.md),
@@ -85,8 +85,8 @@ Three structural decisions shape everything below:
   design's banking commit so Plan A item 6's "both backends" has an owner
   rather than a strategy.
 - Every Plan B adoption item, including the verified-holdings commands
-  (science's adoption ledger, artifact 4) — Plan B, after A8.
-- Anchor carriage, head capture, verification, and every L-row test — science's
+  (Beliefs' adoption ledger, artifact 4) — Plan B, after A8.
+- Anchor carriage, head capture, verification, and every L-row test — Beliefs'
   side of the log design's §9 split.
 - Terminal-record garbage collection — no removal command exists and none is
   added; A7 lands the *structural* gate it must someday pass (§10, §11).
@@ -109,7 +109,7 @@ the implementation lands and the named suite covers it.
 | 17 | Remove the `NotImplementedError` trap; resolve-and-complete at every lease entry | `_resolve` is widened and implemented (§9); the A5b trap tests are replaced by recovery tests preserving their invariants |
 | 19 | Execution-half re-resolution: after a durable record exists, mismatch **halts**, never refuses, never silently reapproves | Recovery compares fresh resolution against the persisted approval evidence and issues a fresh factory-controlled proof only on exact match; mismatch persists a durable halt through a path that does not require the proof whose issuance failed (§9, §12) |
 
-**Six late-captured entries.** Science's log design §9 states its obligations
+**Six late-captured entries.** Beliefs' log design §9 states its obligations
 were entered in this ledger at banking; they were recorded in authority §15
 instead. This design's banking commit adds them as entries **#24–#29**,
 admitted by the log design's banking (2026-08-03), first owner A7, so they come
@@ -554,7 +554,7 @@ the typed path/state fingerprints of the supplied projection under the lease
 appends the genesis entry embedding the consumer payload **opaquely** in the
 canonical envelope beside the engine-computed baseline. The three union arms
 of the log design — `corpus`/`world`/`store`, `forked_from`, id semantics —
-live in the payload and are science's to validate; atoms guarantees exactly
+live in the payload and are Beliefs' to validate; atoms guarantees exactly
 linearity, baseline capture, and durability. Genesis retry is restartable
 through §10.2's staging protocol, and a `register_root` call that finds an
 existing genesis returns its digest **only after proving the call is a
@@ -755,8 +755,8 @@ A7 lands with its own suites; the ledger halves it discharges name them.
    platform-portably; nothing is probed or implemented for macOS here.
 2. **Terminal-record GC** — the structural gate exists (§10.5, §11); the
    command does not.
-3. **The L-row tests** — science-side, unexercisable until Plan B adoption
-   gives science an atoms-backed boundary.
+3. **The L-row tests** — Beliefs-side, unexercisable until Plan B adoption
+   gives Beliefs an atoms-backed boundary.
 4. **Chain compaction and size** — one file per entry is unbounded;
    compaction, if ever, is a future design under the log design's anchor
    rules, not an A8 item.

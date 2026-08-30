@@ -38,7 +38,7 @@ audit snapshot `main` at `dd658acfda829896e862a49140d061a4a894c4b0`, not continu
 | `~/d/atoms/.worktrees/public-chain-read`, `design/public-chain-read` | `2c077ed745f6eabfec6816c16803e78eefaa279c` | Clean completed evidence worktree; tip was an ancestor of that snapshot, which was 33 commits ahead | None |
 | `~/d/atoms/.worktrees/root-lifecycle`, `design/root-lifecycle` | `fb95e1a5047dd1fe507e01290f721033446c88df` | Clean completed evidence worktree; tip was an ancestor of that snapshot, which was 16 commits ahead | None |
 
-No branch name was treated as proof of active ownership. Science was inspected only as
+No branch name was treated as proof of active ownership. Beliefs was inspected only as
 consumer evidence: its local `main` was `16f1688773e401705bf4efa903241658a3ef53fa`,
 tracked `origin/main` was `8cdb7657176e52a769aa7561bdc342e427d32828`, and holdings
 integration `35be6ff` was an ancestor of both. Atoms' completed design worktrees remain
@@ -49,9 +49,9 @@ untouched.
 | Document | Classification | Audit basis |
 | --- | --- | --- |
 | `AGENTS.md` | authority/current | Root authority order, roadmap boundary, obligation-ledger rule, and repository gate agree with the authority, code, and tests. |
-| `README.md` | authority/current | User-facing architecture, delivered stages, and Science relationship agree after the drift corrections below. |
+| `README.md` | authority/current | User-facing architecture, delivered stages, and Beliefs relationship agree after the drift corrections below. |
 | `docs/2026-08-23-root-lifecycle-commands-design.md` | authority/current | Implemented coordinator contract; named implementation and review commits are ancestors of `main`, and the public commands and tests exist. |
-| `docs/2026-08-24-holdings-read-and-evidence-commands-design.md` | authority/current | Implemented public read/evidence contract; `038513f` and the Science consumer integration are in the inspected histories. |
+| `docs/2026-08-24-holdings-read-and-evidence-commands-design.md` | authority/current | Implemented public read/evidence contract; `038513f` and the Beliefs consumer integration are in the inspected histories. |
 | `docs/2026-08-28-filesystem-expansion-brief.md` | active delivery | Explicit exploratory handoff for a future brainstorming session; it authorizes neither design nor implementation. |
 | `docs/certification/2026-08-16-ext4-linux-7.1.8-arch1-3.json` | historical/superseded | Valid zero-violation nine-scenario certification record; its configuration is no longer the singleton production allowlist row. |
 | `docs/certification/2026-08-27-ext4-linux-7.1.9-arch1-2.json` | historical/superseded | Valid zero-violation recertification record superseded in the singleton allowlist by the 7.1.10 tuple. |
@@ -86,20 +86,22 @@ untouched.
 | `docs/plans/2026-08-20-public-chain-read-design.md` | authority/current | Implemented `read_chain` contract; command and tests exist, and the branch tip is in `main`. |
 | `docs/plans/2026-08-22-chain-inspection-design.md` | authority/current | Implemented inspection/capture/pending-gate contract; code/tests exist, while its explicit public blob-read non-scope remains separate. |
 | `docs/plans/2026-08-30-atoms-tasks-migration.md` | historical/superseded | Completed migration record; stable integration and canonical registration passed with no deferred foreign dependency. |
+| `docs/plans/2026-08-30-parallel-certification-guests-note.md` | active delivery | Proposed input for open task `atoms-eabd89`; its own status says the A8b design-gate pass remains required before implementation. |
 
 ## Drift corrections
 
 | Document and claim | Evidence | Correction | Outward-grep result |
 | --- | --- | --- | --- |
-| `README.md` still said Plan B adoption was `nodes` first, then Science. | Authority §12.2 and §14 put Science's composition root and families first and defer direct `nodes` on a language-neutral seam; Science adoption is implemented. | Replaced the stale order with the current Plan B order. | `AGENTS.md` and the authority already use the current ownership split; the superseded 2026-07-20 roadmap pointer was corrected in the same pass. |
-| Final whole-slice review found three remaining `README.md` contradictions: the introduction called `nodes` and Science direct consumers, Scope called the `nodes` Python core the first intended consumer, and the authority summary said Science adoption began with holdings. | Authority §12.2/§14 makes Atoms conceptually lower than `nodes` while deferring direct portable-`nodes` adoption behind a language-neutral seam; Science composition-root and family adoption preceded the holdings slice. | Reconciled the introduction, authority summary, and Scope with the already-correct Plan B and Science-relationship sections. | The required outward search was rerun; `README.md`, `AGENTS.md`, the authority, and the superseded-roadmap pointer now agree, and targeted searches found none of the three stale claims. |
+| `README.md` still said Plan B adoption was `nodes` first, then Beliefs. | Authority §12.2 and §14 put Beliefs' composition root and families first and defer direct `nodes` on a language-neutral seam; Beliefs adoption is implemented. | Replaced the stale order with the current Plan B order. | `AGENTS.md` and the authority already use the current ownership split; the superseded 2026-07-20 roadmap pointer was corrected in the same pass. |
+| Final whole-slice review found three remaining `README.md` contradictions: the introduction called `nodes` and Beliefs direct consumers, Scope called the `nodes` Python core the first intended consumer, and the authority summary said Beliefs adoption began with holdings. | Authority §12.2/§14 makes Atoms conceptually lower than `nodes` while deferring direct portable-`nodes` adoption behind a language-neutral seam; Beliefs composition-root and family adoption preceded the holdings slice. | Reconciled the introduction, authority summary, and Scope with the already-correct Plan B and Beliefs-relationship sections. | The required outward search was rerun; `README.md`, `AGENTS.md`, the authority, and the superseded-roadmap pointer now agree, and targeted searches found none of the three stale claims. |
 | `README.md` called the SQLite I/O layer unsettled after A5a chose the stdlib baseline. | Authority §7 and the A5a design/code use stdlib `sqlite3` with verified-directory resolution; a custom VFS is optional hardening, not a correctness prerequisite or open obligation. | Renamed the section and stated the landed baseline plus optional hardening boundary. | Authority §7, A5a design, and the obligation ledger agree; no document claims a custom VFS shipped. |
-| `docs/plans/2026-07-20-recoverable-fs-effect-engine-implementation.md` pointed readers to the current authority while repeating the old `nodes`-then-Science order and saying the superseded plan was still gated. | Current authority §12.2/§14 and implemented Science history; the document's own header marks it superseded. | Corrected the pointer and made the historical approval state past tense. | README and AGENTS now agree with the authority; the historical body remains unchanged. |
+| `docs/plans/2026-07-20-recoverable-fs-effect-engine-implementation.md` pointed readers to the current authority while repeating the old `nodes`-then-Beliefs order and saying the superseded plan was still gated. | Current authority §12.2/§14 and implemented Beliefs history; the document's own header marks it superseded. | Corrected the pointer and made the historical approval state past tense. | README and AGENTS now agree with the authority; the historical body remains unchanged. |
 | The A5a, A5b, A6, and A7a implementation plans had no status header and retained authored unchecked steps after implementation. | Companion design statuses; `atoms/store`, coordinator/capture/observation/chain code; named implementation commits; the green full gate; every relevant commit is in `main`. | Added concise implemented/historical status headers without rewriting authored checkboxes. | README, AGENTS, authority status, companion designs, and `test_docs_status.py` all name these stages implemented. |
-| `AGENTS.md`, `README.md`, and the holdings command design stopped at the 2026-08-26 statement that Science integration `35be6ff` had not been pushed. | `35be6ff` is an ancestor of inspected Science `main` and tracked `origin/main`; Atoms implementation `038513f` is also present in the consumer history. | Recorded the 2026-08-30 branch/ref evidence in all three locations. | All Atoms occurrences of the old unpushed holdings claim were replaced; later consumer status remains explicitly Science-owned. |
+| `AGENTS.md`, `README.md`, and the holdings command design stopped at the 2026-08-26 statement that Beliefs integration `35be6ff` had not been pushed. | `35be6ff` is an ancestor of inspected Beliefs `main` and tracked `origin/main`; Atoms implementation `038513f` is also present in the consumer history. | Recorded the 2026-08-30 branch/ref evidence in all three locations. | All Atoms occurrences of the old unpushed holdings claim were replaced; later consumer status remains explicitly Beliefs-owned. |
+| The downstream repository was renamed from Science to Beliefs and moved from `~/d/science` to `~/d/beliefs` after this migration completed. | The same clean repository history is now checked out at `~/d/beliefs`; the portfolio migration assigns it permanent prefix `beliefs`. | Updated current project-facing names and paths, plus the two affected open task records through the Tasks CLI. Preserved historical `science` package names, code identifiers, and superseded framing. | Outside this evidence row, current authority and active-delivery documents contain no stale `Science` project name or `~/d/science` path; `tasks check` reports no errors or warnings. |
 
 The initial audit and final whole-slice review outward searches covered status headers, A1–A9,
-obligation, certification, adoption, Science, and supersession language. The review-found
+obligation, certification, adoption, Beliefs, and supersession language. The review-found
 consumer-order contradiction is recorded above; no current claim remains in conflict with code,
 tests, history, or the inspected branch/worktree evidence.
 
@@ -110,14 +112,14 @@ tests, history, or the inspected branch/worktree evidence.
 | Deliver Plan A stages A1–A8b | `FIRST_UNIMPLEMENTED = "A9"`, all named packages/suites, discharged obligation ledger, full green gate | Authority §14; AGENTS; README; stage designs/plans; `test_docs_status.py` | Completed on `main` | `xl` | — | None | no task — completed history | no task |
 | Deliver root lifecycle, chain read/inspection, and holdings evidence commands | Public implementations/tests and merge commits are in `main`; all design worktree tips are ancestors | Four post-A8 command designs; coordinator/chain code and tests | Completed on `main`; evidence worktrees are clean ancestors, not active ownership | `xl` | — | None | no task — completed history | no task |
 | Ship the A9 macOS backend and certification suite | Authority promises Linux and macOS with identical recovery tables; A9 remains the guarded first-unimplemented stage; no macOS backend, A9 design, certification record, branch, or owner exists | Authority §5.5, §13, §14, §16; AGENTS; README; `test_docs_status.py` | Explicit remaining Plan A delivery; no active work | `xl` | `todo` | None | create | `atoms-8be2dc` |
-| Deliver the public preimage blob-read seam | Internal verified `Store.open_blob` exists, but chain-inspection §3 explicitly did not create the public command; Science's current tier-2 L13 boundary requires an Atoms blob-read seam behind its own design gate | A5a design/blob tests; chain-inspection design §3; Science adoption ledger row 5 and 2026-08-29 roadmap `l13-preimage` | Required producer seam; no Atoms public command, design, branch, or owner | `l` | `todo` | None | create | `atoms-38887b` |
-| Certify the Science publication path under persistence cuts | A8 certifies engine-interior order only; Science X2 remains open and its current roadmap rejects a Science-side duplicate harness in favor of extending Atoms A8 behind an Atoms design gate | A8 design/plan/tooling; A7 known-gaps L-row split; Science cut 7, adoption ledger, and 2026-08-29 roadmap `persistence-cut` | Required cross-repository producer outcome; Science publication path is implemented, but no extension/design/owner exists | `xl` | `todo` | None | create | `atoms-f5779f` |
+| Deliver the public preimage blob-read seam | Internal verified `Store.open_blob` exists, but chain-inspection §3 explicitly did not create the public command; Beliefs' current tier-2 L13 boundary requires an Atoms blob-read seam behind its own design gate | A5a design/blob tests; chain-inspection design §3; Beliefs adoption ledger row 5 and 2026-08-29 roadmap `l13-preimage` | Required producer seam; no Atoms public command, design, branch, or owner | `l` | `todo` | None | create | `atoms-38887b` |
+| Certify the Beliefs publication path under persistence cuts | A8 certifies engine-interior order only; Beliefs X2 remains open and its current roadmap rejects a Beliefs-side duplicate harness in favor of extending Atoms A8 behind an Atoms design gate | A8 design/plan/tooling; A7 known-gaps L-row split; Beliefs cut 7, adoption ledger, and 2026-08-29 roadmap `persistence-cut` | Required cross-repository producer outcome; Beliefs publication path is implemented, but no extension/design/owner exists | `xl` | `todo` | None | create | `atoms-f5779f` |
 | Add terminal-record and unreferenced-blob garbage collection | Structural settlement gates exist; authority leaves retention to explicit consumer policy and A7 says no removal command exists | Authority §7.5/§15; A7 design §10.5/§16 | Unscheduled future policy, outside transaction correctness | `l` | — | None | no task — no approved delivery commitment | no task |
 | Compact or bound the chain | A7 and chain-inspection call one-file-per-entry unbounded and say compaction is a future design “if ever” | A7 design §16; chain-inspection design §2 | Speculative future design | `xl` | — | None | no task — speculative | no task |
 | Harden SQLite with a custom VFS | Stdlib is the implemented baseline; custom VFS is optional and no open obligation owns it | Authority §7; A5a design; README future-hardening note; obligation ledger | Optional hardening without a current requirement | `xl` | — | None | no task — optional | no task |
 | Expand support to another filesystem | Brief is expressly exploratory and authorizes no design or implementation; XFS/Btrfs still fail closed | Filesystem-expansion brief; resolver and certification code | Future brainstorming handoff only | `xl` | — | None | no task — exploratory | no task |
 | Add data-VCS composition, recursive effects, or a commit participant | Authority and README mark these as non-drivers or future extensions requiring new designs | README; authority §15 | Out of current scope | `xl` | — | None | no task — out of scope | no task |
-| Complete later Science adoption and conformance boundaries | Science owns consumer policy, tasks, and status; Atoms owns only the two producer seams above | AGENTS; README; authority §12.2/§14; Science adoption ledger and roadmap | Active in Science, not duplicate Atoms delivery | `xl` | — | Science-local ordering | no task — consumer-owned | no task |
+| Complete later Beliefs adoption and conformance boundaries | Beliefs owns consumer policy, tasks, and status; Atoms owns only the two producer seams above | AGENTS; README; authority §12.2/§14; Beliefs adoption ledger and roadmap | Active in Beliefs, not duplicate Atoms delivery | `xl` | — | Beliefs-local ordering | no task — consumer-owned | no task |
 
 ### Reviewed task body: Ship the A9 macOS backend and certification suite
 
@@ -141,48 +143,48 @@ Initial fields: priority `2`; status `todo`; size `xl`; tags `migration`, `macos
 
 ### Reviewed task body: Deliver the public preimage blob-read seam
 
-Outcome: Atoms exposes the narrow lease-held public command Science needs to read and verify an
+Outcome: Atoms exposes the narrow lease-held public command Beliefs needs to read and verify an
 indexed transaction preimage without exposing Store, Lease, or a private blob descriptor API.
 
 Acceptance evidence: Approve an Atoms-local design that fixes authorization, lifecycle, digest,
 descriptor/bytes ownership, and corruption behavior; implement the command through the existing
 verified Store.open_blob path under the correct read boundary; add architecture, corruption,
 lifetime, and consumer-contract tests; run the complete Python gate; and provide the stable seam
-Science can use to discharge L13's preimage-backed classification.
+Beliefs can use to discharge L13's preimage-backed classification.
 
 Sources: docs/plans/2026-07-31-a5a-metadata-store-design.md and its blob tests;
 docs/plans/2026-08-22-chain-inspection-design.md §3;
-~/d/science/docs/designs/2026-08-03-redesign-adoption-ledger.md row 5; and
-~/d/science/docs/plans/2026-08-29-implementation-roadmap.md l13-preimage row.
+~/d/beliefs/docs/designs/2026-08-03-redesign-adoption-ledger.md row 5; and
+~/d/beliefs/docs/plans/2026-08-29-implementation-roadmap.md l13-preimage row.
 
 Uncertainty: The verified internal blob reader exists, but Atoms has not designed the public
 authorization and return boundary and the deferred-obligation ledger currently admits no such
 shape.
 
-Initial fields: priority `2`; status `todo`; size `l`; tags `migration`, `science`,
+Initial fields: priority `2`; status `todo`; size `l`; tags `migration`, `beliefs`,
 `chain`.
 
-### Reviewed task body: Certify the Science publication path under persistence cuts
+### Reviewed task body: Certify the Beliefs publication path under persistence cuts
 
-Outcome: The Atoms persistence-cut and certification machinery exercises the adopted Science
-publication path end to end, so Science X2 no longer relies only on engine-interior certification.
+Outcome: The Atoms persistence-cut and certification machinery exercises the adopted Beliefs
+publication path end to end, so Beliefs X2 no longer relies only on engine-interior certification.
 
 Acceptance evidence: Approve the Atoms-local cross-repository test design; extend the existing
-record-reconstruct-recover or physical certification harness through the real Science
+record-reconstruct-recover or physical certification harness through the real Beliefs
 composition-root publication path without creating a second transaction authority; cover every
 consumer-side durability boundary named by X2; record reproducible zero-violation evidence or an
-explicit fail-closed result; and run the complete Atoms and affected Science gates.
+explicit fail-closed result; and run the complete Atoms and affected Beliefs gates.
 
 Sources: docs/plans/2026-08-14-a8-persistence-cut-and-certification-design.md;
-docs/plans/2026-08-13-a7-effect-recovery-execution-design.md §16; Science's cut-7
-X2 accounting; ~/d/science/docs/designs/2026-08-03-redesign-adoption-ledger.md; and
-~/d/science/docs/plans/2026-08-29-implementation-roadmap.md persistence-cut row.
+docs/plans/2026-08-13-a7-effect-recovery-execution-design.md §16; Beliefs' cut-7
+X2 accounting; ~/d/beliefs/docs/designs/2026-08-03-redesign-adoption-ledger.md; and
+~/d/beliefs/docs/plans/2026-08-29-implementation-roadmap.md persistence-cut row.
 
-Uncertainty: Science's publication path is implemented and its roadmap assigns the prerequisite
+Uncertainty: Beliefs' publication path is implemented and its roadmap assigns the prerequisite
 to an Atoms design gate, but the cross-repository harness boundary, hardware matrix, and verified
 owner are not yet designed.
 
-Initial fields: priority `2`; status `todo`; size `xl`; tags `migration`, `science`,
+Initial fields: priority `2`; status `todo`; size `xl`; tags `migration`, `beliefs`,
 `certification`.
 
 ## Deferred foreign dependencies
@@ -190,8 +192,8 @@ Initial fields: priority `2`; status `todo`; size `xl`; tags `migration`, `scien
 None.
 
 The three local outcomes have no verified delivery blocker in a not-yet-migrated project.
-Science's future L13 and X2 tasks consume the two Atoms producer IDs; that direction is recorded
-when Science migrates and does not create a dangling Atoms dependency now.
+Beliefs' future L13 and X2 tasks consume the two Atoms producer IDs; that direction is recorded
+when Beliefs migrates and does not create a dangling Atoms dependency now.
 
 ## Verification
 
@@ -204,7 +206,7 @@ when Science migrates and does not create a dangling Atoms dependency now.
 | `cd python && uv run pyright` before audit | Passed with zero errors, warnings, or informations. | Stable base `dd658acfda829896e862a49140d061a4a894c4b0` |
 | `git worktree list --porcelain`, `git branch --format=...`, per-worktree status, branch divergence, and ancestry checks | Six clean worktrees; all four completed design branch tips are ancestors of `main`; no active owner inferred. | `4daa09c79fc83374ec61c67e3022daaf95f29bcc` |
 | Certification JSON aggregation, commit-ancestry checks, and focused status/certification/allowlist tests | Three nine-scenario records, zero violations; 916/3,247, 916/3,269, and 915/3,281 marks/prefixes; every recorded source commit is an ancestor; 20 focused tests passed. | `4daa09c79fc83374ec61c67e3022daaf95f29bcc` |
-| Science `main`/`origin/main` ancestry check for `35be6ff` | Both checks passed; current consumer evidence replaces the dated unpushed snapshot. | `4daa09c79fc83374ec61c67e3022daaf95f29bcc` |
+| Beliefs `main`/`origin/main` ancestry check for `35be6ff` | Both checks passed; current consumer evidence replaces the dated unpushed snapshot. | `4daa09c79fc83374ec61c67e3022daaf95f29bcc` |
 | Required status/outward `rg`, exact document coverage `comm -3`, seven-section count, stale-phrase negative search, and `git diff --check` | 2,463 outward matches reviewed; all 38 denominator documents classified exactly; all seven required sections present; negative search, coverage comparison, and whitespace check produced no output. | `4daa09c79fc83374ec61c67e3022daaf95f29bcc` |
 | `cd python && uv run pytest && uv run ruff check . && uv run pyright` after reconciliation | 6,234 passed, seven skipped in 456.25 seconds; Ruff passed; Pyright reported zero errors, warnings, or informations. | `4daa09c79fc83374ec61c67e3022daaf95f29bcc` |
 | Normal-registry `TASKS_FORMAT=json tasks -C ~/d/atoms/.worktrees/tasks-migration-atoms prime` before initialization | Failed explicitly with `error.kind = "no_project"`; no normal-registry mutation was made. | `0e17e6c47b23febdd50c93a40950095bfcced56a` |
@@ -224,3 +226,4 @@ when Science migrates and does not create a dangling Atoms dependency now.
 | Final whole-slice required outward `rg`, targeted stale-README negative searches, Task 3 Step 3 exact document coverage `comm -3`, seven-section count, and `git diff --check` | The outward results were reviewed; all three stale README claims were absent; all 38 documents remained classified exactly; section, coverage, and whitespace checks passed. | Consumer-status reconciliation commit (this commit) |
 | `cd python && uv run pytest tests/test_docs_status.py` after the consumer-status correction | Eight passed. | Consumer-status reconciliation commit (this commit) |
 | `cd python && uv run pytest && uv run ruff check . && uv run pyright` after the consumer-status correction | 6,234 passed, seven skipped in 497.22 seconds; Ruff passed; Pyright reported zero errors, warnings, or informations. | Consumer-status reconciliation commit (this commit) |
+| Beliefs rename outward/negative searches excluding the rename evidence row, exact document coverage, `tasks show` field comparison, `TASKS_FORMAT=json tasks check`, and the complete Python gate | Current project identity and paths use Beliefs/`~/d/beliefs`; historical package identifiers remain; all 39 denominator documents remain classified; the two open task records match their reviewed bodies; Tasks errors/warnings are empty; the complete Python gate passes. | `docs: reconcile beliefs repository rename` correction commit |

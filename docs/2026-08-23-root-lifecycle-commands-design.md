@@ -4,7 +4,7 @@
 (findings landed through `6555e46`); the implementation landed on
 `design/root-lifecycle` with the full suite and gates green.
 
-**Authority:** `~/d/science/docs/superpowers/specs/2026-08-23-world-index-root-lifecycle-design.md`
+**Authority:** `~/d/beliefs/docs/superpowers/specs/2026-08-23-world-index-root-lifecycle-design.md`
 §2–§4.
 
 **Directly inherits:** the current coordinator command/lease surfaces and the
@@ -13,7 +13,7 @@ chain authority; this design creates no second validator.
 
 **Consumer contract:** world-index slice 4 consumes this API only through
 `science.root`. Atoms remains root-kind agnostic: it sees lifecycle state,
-paths, filesystem facts, and opaque bytes, never Science subjects, verdicts,
+paths, filesystem facts, and opaque bytes, never Beliefs subjects, verdicts,
 manifests, or root kinds.
 
 ---
@@ -93,7 +93,7 @@ cross-carrier no-clobber needs a filesystem-level ownership point (§5.1,
 
 In scope are the carrier, schema transition, signatures, types, errors,
 validation, durability order, and exact retry conditions. Out of scope are
-Science semantics; authentication of the serviceability grant; proof of
+Beliefs semantics; authentication of the serviceability grant; proof of
 migration provenance; raw writers and bookkeeping edits; copy-on-write,
 parallel, or incremental copying; and filesystem state outside the engine's
 closed directory/regular-file/symlink vocabulary.
@@ -906,7 +906,7 @@ genesis, surfaces, and overrides from the root claim before the stamp or the
 retained row after it, and runs the same state machine. Caller supplies no
 child bytes. Wrong ID/kind/completed is `RootOperationMismatch`.
 
-Science checks pending before minting: pending -> resume -> read child identity
+Beliefs checks pending before minting: pending -> resume -> read child identity
 from destination; none plus absent destination -> mint once -> `fork_root`.
 
 ## 12. `grant_read_serviceability`
@@ -940,7 +940,7 @@ discarded before cold admission. Grant never upgrades v2, overwrites mismatch,
 or grants writable.
 
 There is no verdict, subject, attestation, force, overwrite, or rebind
-parameter. Outside Science restore orchestration it is out-of-band.
+parameter. Outside Beliefs restore orchestration it is out-of-band.
 
 ## 13. `migrate_root_to_lifecycle_v3`
 
@@ -1064,5 +1064,5 @@ uv run --frozen pyright
 
 Human review must accept or revise signatures, carrier, binding, operation
 identity, error names, migration command, and retry conditions before
-implementation or downstream Science-plan amendment begins. This document is
+implementation or downstream Beliefs-plan amendment begins. This document is
 the hard stop.

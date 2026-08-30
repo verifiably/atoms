@@ -9,7 +9,7 @@
 §10 (the chain), [`2026-08-02-a5b-recovery-lease-design.md`](2026-08-02-a5b-recovery-lease-design.md)
 §5 (the lease).
 
-**Consumer contract:** science's `2026-08-20-world-index-slice-2-design.md` §2, whose four call
+**Consumer contract:** Beliefs' `2026-08-20-world-index-slice-2-design.md` §2, whose four call
 boundaries this design is sized to and nothing more.
 
 ---
@@ -72,7 +72,7 @@ past.
 
 | Candidate shape | Verdict | Why |
 | --- | --- | --- |
-| A consumer receives engine history and could treat it as anchor-verified or replayable | **Not an admitted shape** | No atoms sub-plan will ever own anchoring. A7's design §2 already assigns "anchor carriage, head capture, verification, and every L-row test" to science's side of the log design §9 split. An entry with no owner is the fictional-owner case the ledger's prose already refuses (A5a's threat-model limitation, A4b-1's fail-closed platforms). It is a documented non-guarantee (§9), not a deferred obligation. |
+| A consumer receives engine history and could treat it as anchor-verified or replayable | **Not an admitted shape** | No atoms sub-plan will ever own anchoring. A7's design §2 already assigns "anchor carriage, head capture, verification, and every L-row test" to Beliefs' side of the log design §9 split. An entry with no owner is the fictional-owner case the ledger's prose already refuses (A5a's threat-model limitation, A4b-1's fail-closed platforms). It is a documented non-guarantee (§9), not a deferred obligation. |
 | The returned view could be mutated, or could alias engine state | **Closed by construction** | `ChainView` is `frozen=True`; `entries` is a tuple; every `Entry` arm is a frozen slotted dataclass whose fields are `str`, `bytes`, `ChainOutcome`, `str \| None`, or `tuple[tuple[str, PathStateJSON], ...]` where `PathStateJSON = tuple[tuple[str, str], ...]` (`chain/model.py:27,36-63`). The transitive closure is immutable. No descriptor, fd, `Lease`, `Store`, or `ProjectBinding` crosses the boundary. |
 | The whole chain is materialized in memory, and the chain is unbounded | **Pre-existing, not admitted here** | `validate_chain` already reads and decodes every durable entry on **every** command, including the three that exist today (`chain/read.py:129-180`). `read_chain` adds no read. Unbounded chain size is A7 design §16 gap 4, owned by a future compaction design. |
 | A read command now enters the mutating commands' lease, so it takes the project lock and can complete recovery | **The lease's existing meaning, not new behavior** | Authority §7.1 requires *every mutating* command to enter the lease; it does not forbid a non-mutating one from entering, and §13.5's architecture test asserts the mutators do enter, which stays true. `resolve` runs at `root.py:56` before the lease yields, so recovery completion is already a property of lease *entry*, identical for all four commands. See §8. |

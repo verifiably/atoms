@@ -5,11 +5,11 @@ atomic multi-path filesystem mutation — write-ahead journaling, rollback, and
 post-crash recovery — over an OS-neutral capability vocabulary.
 
 `atoms` is a *physical* substrate conceptually below `nodes` (the logical knowledge
-substrate). Science is its current direct consumer; direct adoption from portable `nodes`
+substrate). Beliefs is its current direct consumer; direct adoption from portable `nodes`
 remains deferred behind a language-neutral execution seam:
 
 ```
-domain profiles    science, mindful v6
+domain profiles    beliefs, mindful v6
 logical substrate  nodes  (Node, Relation, shapes, indexes)
 physical substrate atoms  (durable atomic filesystem effects)   ← this repo
 ```
@@ -22,8 +22,8 @@ half-write.
 ## Status
 
 Plan A is substantially implemented: A1–A8b are complete, and A9 — the macOS
-backend — remains. The engine was originally designed inside science through roughly a
-dozen rounds of adversarial contract review; that review capital is carried into the
+backend — remains. The engine was originally designed inside the project now named
+Beliefs through roughly a dozen rounds of adversarial contract review; that review capital is carried into the
 standalone authority design below. Its roadmap (§14) decomposes Plan A into nine sub-plans,
 A1–A9 (A9 was added 2026-08-13 by the A7 design's banking commit, so the macOS arm of
 Plan A item 6 has an owner).
@@ -36,7 +36,7 @@ approved effects against project paths.
 
 - **Authority design:** [`docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md`](docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md)
   — standalone `atoms` engine and SQLite-in-WAL metadata store; its originally deferred
-  Science adoption first landed at the composition root and family adapters, followed by
+  Beliefs adoption first landed at the composition root and family adapters, followed by
   the holdings slice described below.
 - **A1 — core model (implemented):** [`docs/plans/2026-07-23-plan-a1-core-model.md`](docs/plans/2026-07-23-plan-a1-core-model.md)
 - **A2 — compilation validation (implemented):** [`docs/plans/2026-07-28-plan-a2-compilation-validation.md`](docs/plans/2026-07-28-plan-a2-compilation-validation.md)
@@ -85,7 +85,7 @@ approved effects against project paths.
 
 ## Scope
 
-- **Python-first.** Science's Python composition root is the current direct consumer.
+- **Python-first.** Beliefs' Python composition root is the current direct consumer.
   Direct portable-`nodes` adoption remains deferred behind a language-neutral execution
   seam: `nodes` maintains normative Python/TypeScript parity, while these OS-syscall-level
   primitives have no portable JavaScript equivalent.
@@ -106,9 +106,9 @@ approved effects against project paths.
    `renamex_np`/`F_FULLFSYNC` (macOS); stdlib `os.replace` for the single-file case. No
    dependency on the tiny, inactive third-party wrappers.
 3. **Vertical slice = a synthetic in-repo exerciser** (Plan A); production adoption is
-   Plan B: Science's composition root and families first, while direct `nodes` adoption
+   Plan B: Beliefs' composition root and families first, while direct `nodes` adoption
    waits on a language-neutral execution seam.
-   Science's independently governed adoption has since landed for composition-root corpus
+   Beliefs' independently governed adoption has since landed for composition-root corpus
    writes and family adapters, followed by the holdings path-read and post-state evidence slice.
 
 ## Future hardening and extensions
@@ -122,13 +122,13 @@ approved effects against project paths.
 - **Data-VCS composition (downstream):** DVC / lakeFS / dolt version data *content* —
   orthogonal, but `atoms` could underlie safe checkout materialization. Not a driver now.
 
-## Relationship to science
+## Relationship to Beliefs
 
-science now consumes `atoms` directly at its composition root: generic corpus writes and
+Beliefs now consumes `atoms` directly at its composition root: generic corpus writes and
 its supersede, revise, retraction, and import families flow through the certified engine.
 The later holdings slice uses `read_path_state` and `TransactionOutcome.final_states` for
 intent-bearing store acts, mechanical capture, reduction, receipts, and dataset admission.
-That slice merged into Science's `main` as `35be6ff` on 2026-08-25 and was an ancestor of
-both its local `main` and tracked `origin/main` at the 2026-08-30 audit. Further Science
-adoption remains governed by Science's adoption ledger rather than this repository's Plan
+That slice merged into Beliefs' `main` as `35be6ff` on 2026-08-25 and was an ancestor of
+both its local `main` and tracked `origin/main` at the 2026-08-30 audit. Further Beliefs
+adoption remains governed by Beliefs' adoption ledger rather than this repository's Plan
 A roadmap.

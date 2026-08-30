@@ -1,19 +1,19 @@
 # The path-read command and post-state evidence return
 
-**Status:** Approved 2026-08-24 at `558817b` against Science authority
+**Status:** Approved 2026-08-24 at `558817b` against Beliefs authority
 `b231e08`; **implemented on `design/holdings-commands`** with the full
 suite and gates green, the review's five post-implementation findings
 closed by amendment (the writable arm corrected to the existing-only
 gated lease, the boundary-loss conversion scoped to lease entry;
 malformed arguments raising `ProtocolError`; the §8 matrix completed).
-Merged to `main` and pushed at `038513f`. The consuming Science holdings
-slice merged into Science's `main` as `35be6ff` on 2026-08-25 and was an
+Merged to `main` and pushed at `038513f`. The consuming Beliefs holdings
+slice merged into Beliefs' `main` as `35be6ff` on 2026-08-25 and was an
 ancestor of both its local `main` and tracked `origin/main` at the
 2026-08-30 audit.
 
 **Authority:**
-`~/d/science/docs/designs/2026-08-24-world-index-holdings-design.md`
-§2 (the atoms seam), at science commit `b231e08` — the §2.2 corrections
+`~/d/beliefs/docs/designs/2026-08-24-world-index-holdings-design.md`
+§2 (the atoms seam), at Beliefs commit `b231e08` — the §2.2 corrections
 this design's discoveries forced, and §4.1's engine-raise disposition, are
 part of the authority, not ahead of it.
 
@@ -158,7 +158,7 @@ own `_ABSENT_PARENT` handling — `ENOENT`/`ENOTDIR`/`ELOOP` on an ancestor
 unchanged.)
 
 A raise therefore no longer encodes phase; what it means for the consumer
-is the science spec §4.1's ruling, recorded in §6. This invariant —
+is the Beliefs spec §4.1's ruling, recorded in §6. This invariant —
 routine failures translated under the pinned classification, non-routine
 propagated from both positions — is a test obligation (§8).
 
@@ -233,8 +233,8 @@ class TransactionOutcome:
 
 ## 6. What the consumer builds on this (recorded, not owned)
 
-For the science boundary's evidence mapping — recorded here so review can
-check fitness, owned by the science spec:
+For the Beliefs boundary's evidence mapping — recorded here so review can
+check fitness, owned by the Beliefs spec:
 
 - `PathObserved(FileState)` → `found(sha256:<hex>)` from `content_hash`;
 - `PathObserved(AbsentState)` → `absent`;
@@ -245,7 +245,7 @@ check fitness, owned by the science spec:
 - an engine **raise** aborts the consumer's act: no report and no
   observation is minted, the durable unmatched intent marking an
   intent-bearing attempt, and exception types never classified into the
-  two report classes — the science spec §4.1's own ruling, which this
+  two report classes — the Beliefs spec §4.1's own ruling, which this
   bullet records rather than owns;
 - a committed mutation's observation records the digest/absence from
   `final_states` — post-write hash, post-delete absence, and the move's
@@ -304,6 +304,6 @@ The implementation lands with, at minimum:
 
 This design is implemented only after atoms-side human review approves it.
 Findings are closed by amendment commits to this document; the approval
-commit is recorded in the science spec's status block, and the
+commit is recorded in the Beliefs spec's status block, and the
 implementation merges to `main` and is pushed before the consuming slice's
 discharge (the root-lifecycle precedent).

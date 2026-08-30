@@ -11,11 +11,11 @@ certification); A9 (macOS backend) remains unimplemented.
 **Supersedes:** the science-framed [`2026-07-20-recoverable-fs-effect-engine-design.md`](2026-07-20-recoverable-fs-effect-engine-design.md), retained as the historical, review-hardened record.
 
 > This is the authority design for `atoms` as a standalone engine. It recenters the 2026-07-20
-> design — which was written to converge science's archive/import/supersede/cohort families onto one
+> design — which was written to converge Beliefs' archive/import/supersede/cohort families onto one
 > executor — on the engine's own contract. Two things change from that document. First, framing: the
 > engine's public boundary is a validated `TransactionSpec`; how a consumer produces one (compiling
 > from a saved plan, authenticating it) is the consumer's concern, out of engine scope. Consumers are
-> now `nodes` and science, adopted later (§12, §14). Second, the durable metadata store is **SQLite in
+> now `nodes` and Beliefs, adopted later (§12, §14). Second, the durable metadata store is **SQLite in
 > WAL mode** (§7), replacing the hand-rolled directory-of-JSON write-ahead log. The capability
 > vocabulary (§5.5), coherent capture (§6), the per-effect contracts (§9), restartable materialization
 > (§10), and the recovery classifier (§8.4, §13.1) are carried near-verbatim from the reviewed design;
@@ -30,7 +30,7 @@ A consumer describes intent as a validated, internal `TransactionSpec` over a cl
 effects. A single engine exclusively owns filesystem mutation, write-ahead journaling, durability,
 rollback, recovery, and scratch paths. The engine is domain-neutral: it names no knowledge kinds and
 embeds no consumer's plan format. It sits **below** `nodes` (the logical knowledge substrate) and is
-consumed by `nodes` and science alike (§12).
+consumed by `nodes` and Beliefs alike (§12).
 
 The filesystem does not provide atomic visibility across multiple paths. The engine therefore does
 not claim ACID transactions. Its contract is:
@@ -1332,33 +1332,33 @@ without importing either.
 ### 12.2 Deferred production consumers
 
 Real adoption is Plan B (§14), one consumer at a time, each on its own clock and each responsible for
-producing and authenticating its own frozen intent (§4.1). Science's substrate-consolidation design
-(science `2026-08-02-substrate-consolidation-design.md`) rules that durability and concurrency belong
+producing and authenticating its own frozen intent (§4.1). Beliefs' substrate-consolidation design
+(Beliefs `2026-08-02-substrate-consolidation-design.md`) rules that durability and concurrency belong
 to this engine and that no interim transaction layer is built anywhere else; it also surfaces a
 constraint this section previously ignored: `nodes` holds normative Python/TypeScript parity while
 this engine is Python-only, so portable `nodes` should not depend on it until a language-neutral
 execution seam exists (a serialized spec plus out-of-process executor is the plausible shape, §15).
 
-- **science's composition root** — the likely first production consumer: Science's Python composition
-  root combines `nodes` and this engine ("Science as a `nodes` profile over `atoms`"), so corpus
-  writes flow through that root rather than through a `nodes`-internal adapter. Under science's world
+- **Beliefs' composition root** — the likely first production consumer: Beliefs' Python composition
+  root combines `nodes` and this engine ("Beliefs as a `nodes` profile over `atoms`"), so corpus
+  writes flow through that root rather than through a `nodes`-internal adapter. Under Beliefs' world
   model the write unit is a **corpus root**: the consumer keys the engine root — and therefore the
   lock and metadata root — on the corpus, not on a "project" that merely contributes to one.
-- **science's plan families** — archive, import, cohort-import, and supersede, whose mutation shapes
+- **Beliefs' plan families** — archive, import, cohort-import, and supersede, whose mutation shapes
   the engine was originally derived from. Each family keeps its planner and saved-plan authentication
   and compiles, after authentication, into a `TransactionSpec`. This adoption, and the deletion of
-  science's existing execution dialects, is science's own hard cut — outside this repo's authority.
+  Beliefs' existing execution dialects, is Beliefs' own hard cut — outside this repo's authority.
 - **`nodes` directly** — deferred behind the language-neutral seam above; adopting this engine from
   portable `nodes` before that seam exists would break parity or force a second engine implementation.
 
 No consumer adoption may redefine the engine protocol, add a feature flag, or introduce a runtime
 transaction-dialect choice.
 
-*(amended 2026-08-19: Science's Plan B item 2 is recast under the clean start in Science's
+*(amended 2026-08-19: Beliefs' Plan B item 2 is recast under the clean start in Beliefs'
 `2026-08-19-family-adapters-design.md`: the family list is supersede, retraction, and explicit import;
 the planner/Gate-B lapse with the save/apply boundary that no longer exists; dialect deletion is
 discharged by the clean start; archive/cohort require their own designs; the hard cut's surviving
-claim is "every Science corpus mutation flows through the certified engine".)*
+claim is "every Beliefs corpus mutation flows through the certified engine".)*
 
 ## 13. Verification strategy
 
@@ -1650,24 +1650,24 @@ trap removal), split 2026-08-13 at plan time on the design's §1 layering.
 ### Plan B — production adoption
 
 Written only after Plan A's interfaces settle, and it must not redefine the engine protocol. One
-consumer at a time, in the order §12.2 records (science's composition root, then science's plan
+consumer at a time, in the order §12.2 records (Beliefs' composition root, then Beliefs' plan
 families; direct `nodes` adoption waits on a language-neutral execution seam):
 
-1. science composition-root corpus-write adapter and its acceptance suite.
-2. science family adapters (supersede first, then archive, then import/cohort), each keeping its
-   planner and Gate-B authentication and compiling into a `TransactionSpec`, plus deletion of science's
-   superseded execution dialects. This is science's hard cut, tracked in science.
+1. Beliefs composition-root corpus-write adapter and its acceptance suite.
+2. Beliefs family adapters (supersede first, then archive, then import/cohort), each keeping its
+   planner and Gate-B authentication and compiling into a `TransactionSpec`, plus deletion of Beliefs'
+   superseded execution dialects. This is Beliefs' hard cut, tracked in Beliefs.
 
 The README platform-support statement lands with the first real consumer's hard cut — once the engine
 actually gates that consumer's mutating commands — not before, so the README never documents behavior
 that has not shipped. There is no feature flag, compatibility executor, or runtime transaction-dialect
 choice.
 
-*(amended 2026-08-19: Science's Plan B item 2 is recast under the clean start in Science's
+*(amended 2026-08-19: Beliefs' Plan B item 2 is recast under the clean start in Beliefs'
 `2026-08-19-family-adapters-design.md`: the family list is supersede, retraction, and explicit import;
 the planner/Gate-B lapse with the save/apply boundary that no longer exists; dialect deletion is
 discharged by the clean start; archive/cohort require their own designs; the hard cut's surviving
-claim is "every Science corpus mutation flows through the certified engine".)*
+claim is "every Beliefs corpus mutation flows through the certified engine".)*
 
 ## 15. Out of scope and future extension
 
@@ -1683,19 +1683,19 @@ Directory-tree recursive effects (recursive move/replace/delete) require a later
 explicit recursive content model (§5.2); they are not implied by the initial closed effect set.
 
 **One transaction, one root.** A `TransactionSpec` addresses a single engine root. Multi-corpus
-operations at the consumer layer — science's merge, a cross-corpus entity move — are consumer-composed
-sequences of per-root transactions; science's world-addressing design itself rules a merge non-atomic
+operations at the consumer layer — Beliefs' merge, a cross-corpus entity move — are consumer-composed
+sequences of per-root transactions; Beliefs' world-addressing design itself rules a merge non-atomic
 over a world larger than the checkout, with correctness carried by the redirect record rather than by
 atomicity. No multi-root transaction, cross-root lock ordering, or best-effort effect tier will be
 added.
 
 **The transaction is the publish, not the computation.** A long-running external computation
-(science's execution boundary running a workflow engine for hours into a boundary-owned output root)
+(Beliefs' execution boundary running a workflow engine for hours into a boundary-owned output root)
 is not an engine transaction. The consumer completes and freezes its output manifest first and
 compiles the spec from that settled surface, so the lease's write phase — and the lock hold — remains
 a publication, never a computation.
 
-**Tamper-evident mutation log (future obligation, not built here).** Science's epistemic-kernel and
+**Tamper-evident mutation log (future obligation, not built here).** Beliefs' epistemic-kernel and
 computation-reproducibility designs name this engine as the eventual owner of a general tamper-evident
 mutation log: every mutation durably registered *before* it is applied, in a sequence whose *removal
 is detectable*. That contract is stricter than crash recovery — a recovery journal that can itself be
@@ -1707,7 +1707,7 @@ remains an explicit consumer policy, never an assumed cleanup. And the spec alre
 tag and frozen-intent digest (§5.1), persisted in the durable record, so a recovery-completed publish
 remains attributable to the intent that authorized it.
 
-**Designed 2026-08-03** (science's `2026-08-03-tamper-evident-log-design.md`; its §9 enumerates the
+**Designed 2026-08-03** (Beliefs' `2026-08-03-tamper-evident-log-design.md`; its §9 enumerates the
 engine obligations, restated here so this document carries its own contract). The engine owns
 registration — a per-engine-root hash chain at a reserved in-corpus path — and the obligations land
 with A7–A8, not before (written as A6–A8; A6 landed 2026-08-08 carrying none of them), and are
