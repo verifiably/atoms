@@ -1,13 +1,14 @@
 # Atoms Tasks migration ledger
 
-**Status:** Initial migration prepared for review. Stable integration, canonical registration,
-and post-registration ledger finalization remain pending; this ledger is active delivery.
+**Status:** Complete (2026-08-30). The initial migration is integrated and canonically
+registered with no deferred foreign dependency; this ledger is retained as historical evidence.
 
 ## Scope and evidence
 
 | Field | Value |
 | --- | --- |
-| Stable checkout HEAD | `dd658acfda829896e862a49140d061a4a894c4b0` on `main` before migration |
+| Stable checkout HEAD | `dd658acfda829896e862a49140d061a4a894c4b0` before migration; `0e17e6c47b23febdd50c93a40950095bfcced56a` after the first fast-forward |
+| Integrated commits | `4daa09c79fc83374ec61c67e3022daaf95f29bcc` and `0e17e6c47b23febdd50c93a40950095bfcced56a` |
 | Tasks source commit | `ee5174abd0d9842025c30a23e7cf79c20c77c9ed` |
 | Audit date | 2026-08-30 |
 | Prefix | `atoms` |
@@ -25,14 +26,17 @@ evidence of remaining work.
 
 ## Git state inspected
 
+The completed-design divergence counts below are historical measurements against the initial
+audit snapshot `main` at `dd658acfda829896e862a49140d061a4a894c4b0`, not continuing invariants.
+
 | Branch or worktree | Commit | Read-only disposition | Dirty paths |
 | --- | --- | --- | --- |
-| Stable `~/d/atoms`, `main` | `dd658acfda829896e862a49140d061a4a894c4b0` | Stable authority checkout; base of this migration | None |
-| Migration `~/d/atoms/.worktrees/tasks-migration-atoms`, `chore/tasks-migration-atoms` | `dd658acfda829896e862a49140d061a4a894c4b0` before audit | Dedicated migration worktree | None before audit; ignored `python/.venv/` created by baseline setup |
-| `~/d/atoms/.worktrees/chain-inspection`, `design/chain-inspection` | `99831987b24cd8ec778b3fe4ebde207c38b12a9e` | Clean completed evidence worktree; tip is an ancestor of `main`, which is 25 commits ahead | None |
-| `~/d/atoms/.worktrees/holdings-commands`, `design/holdings-commands` | `5b3139f42fd5a3e4501fdda77d1793d103820952` | Clean completed evidence worktree; tip is an ancestor of `main`, which is five commits ahead | None |
-| `~/d/atoms/.worktrees/public-chain-read`, `design/public-chain-read` | `2c077ed745f6eabfec6816c16803e78eefaa279c` | Clean completed evidence worktree; tip is an ancestor of `main`, which is 33 commits ahead | None |
-| `~/d/atoms/.worktrees/root-lifecycle`, `design/root-lifecycle` | `fb95e1a5047dd1fe507e01290f721033446c88df` | Clean completed evidence worktree; tip is an ancestor of `main`, which is 16 commits ahead | None |
+| Stable `~/d/atoms`, `main` | `0e17e6c47b23febdd50c93a40950095bfcced56a` | First fast-forward complete; full gate and canonical Tasks registration passed | None |
+| Migration `~/d/atoms/.worktrees/tasks-migration-atoms`, `chore/tasks-migration-atoms` | `dd658acfda829896e862a49140d061a4a894c4b0` before audit; `0e17e6c47b23febdd50c93a40950095bfcced56a` before finalization | Dedicated migration worktree retained for the ledger-finalization commit and independent review | None before audit or finalization; ignored `python/.venv/` created by baseline setup |
+| `~/d/atoms/.worktrees/chain-inspection`, `design/chain-inspection` | `99831987b24cd8ec778b3fe4ebde207c38b12a9e` | Clean completed evidence worktree; tip was an ancestor of that snapshot, which was 25 commits ahead | None |
+| `~/d/atoms/.worktrees/holdings-commands`, `design/holdings-commands` | `5b3139f42fd5a3e4501fdda77d1793d103820952` | Clean completed evidence worktree; tip was an ancestor of that snapshot, which was five commits ahead | None |
+| `~/d/atoms/.worktrees/public-chain-read`, `design/public-chain-read` | `2c077ed745f6eabfec6816c16803e78eefaa279c` | Clean completed evidence worktree; tip was an ancestor of that snapshot, which was 33 commits ahead | None |
+| `~/d/atoms/.worktrees/root-lifecycle`, `design/root-lifecycle` | `fb95e1a5047dd1fe507e01290f721033446c88df` | Clean completed evidence worktree; tip was an ancestor of that snapshot, which was 16 commits ahead | None |
 
 No branch name was treated as proof of active ownership. Science was inspected only as
 consumer evidence: its local `main` was `16f1688773e401705bf4efa903241658a3ef53fa`,
@@ -81,7 +85,7 @@ untouched.
 | `docs/plans/2026-08-14-plan-a8b-certification.md` | historical/superseded | Executed A8b implementation plan; implemented status, certification tooling, allowlist, and records prove completion. |
 | `docs/plans/2026-08-20-public-chain-read-design.md` | authority/current | Implemented `read_chain` contract; command and tests exist, and the branch tip is in `main`. |
 | `docs/plans/2026-08-22-chain-inspection-design.md` | authority/current | Implemented inspection/capture/pending-gate contract; code/tests exist, while its explicit public blob-read non-scope remains separate. |
-| `docs/plans/2026-08-30-atoms-tasks-migration.md` | active delivery | Current audit, task-creation, and pre-integration evidence; stable registration and finalization remain pending. |
+| `docs/plans/2026-08-30-atoms-tasks-migration.md` | historical/superseded | Completed migration record; stable integration and canonical registration passed with no deferred foreign dependency. |
 
 ## Drift corrections
 
@@ -196,15 +200,22 @@ when Science migrates and does not create a dangling Atoms dependency now.
 | `cd python && uv run pytest` before audit | 6,234 passed, seven skipped in 484.73 seconds. | Stable base `dd658acfda829896e862a49140d061a4a894c4b0` |
 | `cd python && uv run ruff check .` before audit | Passed with `All checks passed!`. | Stable base `dd658acfda829896e862a49140d061a4a894c4b0` |
 | `cd python && uv run pyright` before audit | Passed with zero errors, warnings, or informations. | Stable base `dd658acfda829896e862a49140d061a4a894c4b0` |
-| `git worktree list --porcelain`, `git branch --format=...`, per-worktree status, branch divergence, and ancestry checks | Six clean worktrees; all four completed design branch tips are ancestors of `main`; no active owner inferred. | Documentation reconciliation commit (this commit) |
-| Certification JSON aggregation, commit-ancestry checks, and focused status/certification/allowlist tests | Three nine-scenario records, zero violations; 916/3,247, 916/3,269, and 915/3,281 marks/prefixes; every recorded source commit is an ancestor; 20 focused tests passed. | Documentation reconciliation commit (this commit) |
-| Science `main`/`origin/main` ancestry check for `35be6ff` | Both checks passed; current consumer evidence replaces the dated unpushed snapshot. | Documentation reconciliation commit (this commit) |
-| Required status/outward `rg`, exact document coverage `comm -3`, seven-section count, stale-phrase negative search, and `git diff --check` | 2,463 outward matches reviewed; all 38 denominator documents classified exactly; all seven required sections present; negative search, coverage comparison, and whitespace check produced no output. | Documentation reconciliation commit (this commit) |
-| `cd python && uv run pytest && uv run ruff check . && uv run pyright` after reconciliation | 6,234 passed, seven skipped in 456.25 seconds; Ruff passed; Pyright reported zero errors, warnings, or informations. | Documentation reconciliation commit (this commit) |
-| Normal-registry `TASKS_FORMAT=json tasks -C ~/d/atoms/.worktrees/tasks-migration-atoms prime` before initialization | Failed explicitly with `error.kind = "no_project"`; no normal-registry mutation was made. | Tasks initialization commit (this commit) |
-| Temporary-registry `tasks -C ~/d/familiar init --prefix fam` and `tasks -C ~/d/atoms/.worktrees/tasks-migration-atoms init --prefix atoms` | Both initializations succeeded with empty warning arrays; `prime` resolved the migration checkout as prefix `atoms`. | Tasks initialization commit (this commit) |
-| Three reviewed `tasks add` calls followed by `tasks show atoms-8be2dc`, `tasks show atoms-38887b`, and `tasks show atoms-f5779f` | All fields matched the reviewed rows and bodies; each task is `todo`, priority 2, unowned, and dependency-free, with no structured spec or plan. | Tasks initialization commit (this commit) |
-| Temporary-registry `tasks -C ~/d/atoms/.worktrees/tasks-migration-atoms check >/tmp/atoms-check.json` and `jq -e '.errors == [] and .warnings == []' /tmp/atoms-check.json` | Passed with empty errors and warnings arrays. | Tasks initialization commit (this commit) |
-| Temporary-registry `tasks -C ~/d/atoms/.worktrees/tasks-migration-atoms prime \| jq -e '.prefix == "atoms"'` and `tasks -C ~/d/atoms/.worktrees/tasks-migration-atoms ready` | Prefix assertion passed; all three created tasks were ready with an empty warnings array. | Tasks initialization commit (this commit) |
-| `cd python && uv run pytest && uv run ruff check . && uv run pyright` after task creation | 6,234 passed, seven skipped in 457.47 seconds; Ruff passed; Pyright reported zero errors, warnings, or informations. | Tasks initialization commit (this commit) |
-| `test ! -e tasks/projects.toml` and `git diff --check` | Both passed; no repository-local registry file or whitespace error exists. | Tasks initialization commit (this commit) |
+| `git worktree list --porcelain`, `git branch --format=...`, per-worktree status, branch divergence, and ancestry checks | Six clean worktrees; all four completed design branch tips are ancestors of `main`; no active owner inferred. | `4daa09c79fc83374ec61c67e3022daaf95f29bcc` |
+| Certification JSON aggregation, commit-ancestry checks, and focused status/certification/allowlist tests | Three nine-scenario records, zero violations; 916/3,247, 916/3,269, and 915/3,281 marks/prefixes; every recorded source commit is an ancestor; 20 focused tests passed. | `4daa09c79fc83374ec61c67e3022daaf95f29bcc` |
+| Science `main`/`origin/main` ancestry check for `35be6ff` | Both checks passed; current consumer evidence replaces the dated unpushed snapshot. | `4daa09c79fc83374ec61c67e3022daaf95f29bcc` |
+| Required status/outward `rg`, exact document coverage `comm -3`, seven-section count, stale-phrase negative search, and `git diff --check` | 2,463 outward matches reviewed; all 38 denominator documents classified exactly; all seven required sections present; negative search, coverage comparison, and whitespace check produced no output. | `4daa09c79fc83374ec61c67e3022daaf95f29bcc` |
+| `cd python && uv run pytest && uv run ruff check . && uv run pyright` after reconciliation | 6,234 passed, seven skipped in 456.25 seconds; Ruff passed; Pyright reported zero errors, warnings, or informations. | `4daa09c79fc83374ec61c67e3022daaf95f29bcc` |
+| Normal-registry `TASKS_FORMAT=json tasks -C ~/d/atoms/.worktrees/tasks-migration-atoms prime` before initialization | Failed explicitly with `error.kind = "no_project"`; no normal-registry mutation was made. | `0e17e6c47b23febdd50c93a40950095bfcced56a` |
+| Temporary-registry `tasks -C ~/d/familiar init --prefix fam` and `tasks -C ~/d/atoms/.worktrees/tasks-migration-atoms init --prefix atoms` | Both initializations succeeded with empty warning arrays; `prime` resolved the migration checkout as prefix `atoms`. | `0e17e6c47b23febdd50c93a40950095bfcced56a` |
+| Three reviewed `tasks add` calls followed by `tasks show atoms-8be2dc`, `tasks show atoms-38887b`, and `tasks show atoms-f5779f` | All fields matched the reviewed rows and bodies; each task is `todo`, priority 2, unowned, and dependency-free, with no structured spec or plan. | `0e17e6c47b23febdd50c93a40950095bfcced56a` |
+| Temporary-registry `tasks -C ~/d/atoms/.worktrees/tasks-migration-atoms check >/tmp/atoms-check.json` and `jq -e '.errors == [] and .warnings == []' /tmp/atoms-check.json` | Passed with empty errors and warnings arrays. | `0e17e6c47b23febdd50c93a40950095bfcced56a` |
+| Temporary-registry `tasks -C ~/d/atoms/.worktrees/tasks-migration-atoms prime \| jq -e '.prefix == "atoms"'` and `tasks -C ~/d/atoms/.worktrees/tasks-migration-atoms ready` | Prefix assertion passed; all three created tasks were ready with an empty warnings array. | `0e17e6c47b23febdd50c93a40950095bfcced56a` |
+| `cd python && uv run pytest && uv run ruff check . && uv run pyright` after task creation | 6,234 passed, seven skipped in 457.47 seconds; Ruff passed; Pyright reported zero errors, warnings, or informations. | `0e17e6c47b23febdd50c93a40950095bfcced56a` |
+| `test ! -e tasks/projects.toml` and `git diff --check` | Both passed; no repository-local registry file or whitespace error exists. | `0e17e6c47b23febdd50c93a40950095bfcced56a` |
+| `git -C ~/d/atoms merge --ff-only chore/tasks-migration-atoms` | Fast-forwarded stable `main` from `dd658acfda829896e862a49140d061a4a894c4b0` to `0e17e6c47b23febdd50c93a40950095bfcced56a`, integrating the two commits above. | Ledger-finalization commit (this commit) |
+| `cd ~/d/atoms/python && uv run pytest && uv run ruff check . && uv run pyright` | 6,234 passed, seven skipped in 473.21 seconds; Ruff passed; Pyright reported zero errors, warnings, or informations. | Ledger-finalization commit (this commit) |
+| From stable `~/d/atoms`, `TASKS_FORMAT=json tasks init --prefix atoms` run twice | Both calls returned prefix `atoms`, the stable root, and an empty warnings array; the second call was idempotent. | Ledger-finalization commit (this commit) |
+| `TASKS_FORMAT=json tasks check >/tmp/atoms-stable-check.json` and `jq -e '.errors == [] and .warnings == []' /tmp/atoms-stable-check.json` | Passed with empty errors and warnings arrays. | Ledger-finalization commit (this commit) |
+| `TASKS_FORMAT=json tasks prime \| jq -e '.prefix == "atoms"'` and `TASKS_FORMAT=json tasks ready` from stable `~/d/atoms` | Prefix assertion passed; prime reported three todo tasks and ready returned all three task IDs with an empty warnings array. | Ledger-finalization commit (this commit) |
+| `git status --short --branch` in stable `~/d/atoms` | Clean `main` at `0e17e6c47b23febdd50c93a40950095bfcced56a`, two commits ahead of tracked `origin/main`. | Ledger-finalization commit (this commit) |
+| Task 3 Step 3 exact document coverage `comm -3` and `git diff --check` after finalization | Coverage comparison and whitespace check produced no output; all 38 denominator documents remain classified exactly. | Ledger-finalization commit (this commit) |
