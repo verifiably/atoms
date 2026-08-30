@@ -119,3 +119,10 @@ after; it is §3 of each design.
   `FIRST_UNIMPLEMENTED` there; the guard then names every document that still disagrees. Do not
   add a per-sub-plan status test — four of those existed, and two ended up pinning claims the next
   sub-plan falsified.
+
+## Tasks workflow
+
+- Run `tasks prime` at the start of a work session and `tasks ready` before choosing work.
+- Run `tasks start ID` before implementation, add concise notes as evidence changes, and close the task with a one-line result in the same commit as the work.
+- Never edit `tasks/*.md` directly; use the `tasks` CLI for every task mutation.
+- Before completion, run `tasks check`. Require zero errors and report every warning. Registration-only `unreachable_dep` and `cycle_unverifiable` warnings are environmental on machines without all referenced projects; resolve every other warning.

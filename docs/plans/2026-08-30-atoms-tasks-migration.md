@@ -103,9 +103,9 @@ tests, history, or the inspected branch/worktree evidence.
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Deliver Plan A stages A1–A8b | `FIRST_UNIMPLEMENTED = "A9"`, all named packages/suites, discharged obligation ledger, full green gate | Authority §14; AGENTS; README; stage designs/plans; `test_docs_status.py` | Completed on `main` | `xl` | — | None | no task — completed history | no task |
 | Deliver root lifecycle, chain read/inspection, and holdings evidence commands | Public implementations/tests and merge commits are in `main`; all design worktree tips are ancestors | Four post-A8 command designs; coordinator/chain code and tests | Completed on `main`; evidence worktrees are clean ancestors, not active ownership | `xl` | — | None | no task — completed history | no task |
-| Ship the A9 macOS backend and certification suite | Authority promises Linux and macOS with identical recovery tables; A9 remains the guarded first-unimplemented stage; no macOS backend, A9 design, certification record, branch, or owner exists | Authority §5.5, §13, §14, §16; AGENTS; README; `test_docs_status.py` | Explicit remaining Plan A delivery; no active work | `xl` | `todo` | None | create | pending CLI creation |
-| Deliver the public preimage blob-read seam | Internal verified `Store.open_blob` exists, but chain-inspection §3 explicitly did not create the public command; Science's current tier-2 L13 boundary requires an Atoms blob-read seam behind its own design gate | A5a design/blob tests; chain-inspection design §3; Science adoption ledger row 5 and 2026-08-29 roadmap `l13-preimage` | Required producer seam; no Atoms public command, design, branch, or owner | `l` | `todo` | None | create | pending CLI creation |
-| Certify the Science publication path under persistence cuts | A8 certifies engine-interior order only; Science X2 remains open and its current roadmap rejects a Science-side duplicate harness in favor of extending Atoms A8 behind an Atoms design gate | A8 design/plan/tooling; A7 known-gaps L-row split; Science cut 7, adoption ledger, and 2026-08-29 roadmap `persistence-cut` | Required cross-repository producer outcome; Science publication path is implemented, but no extension/design/owner exists | `xl` | `todo` | None | create | pending CLI creation |
+| Ship the A9 macOS backend and certification suite | Authority promises Linux and macOS with identical recovery tables; A9 remains the guarded first-unimplemented stage; no macOS backend, A9 design, certification record, branch, or owner exists | Authority §5.5, §13, §14, §16; AGENTS; README; `test_docs_status.py` | Explicit remaining Plan A delivery; no active work | `xl` | `todo` | None | create | `atoms-8be2dc` |
+| Deliver the public preimage blob-read seam | Internal verified `Store.open_blob` exists, but chain-inspection §3 explicitly did not create the public command; Science's current tier-2 L13 boundary requires an Atoms blob-read seam behind its own design gate | A5a design/blob tests; chain-inspection design §3; Science adoption ledger row 5 and 2026-08-29 roadmap `l13-preimage` | Required producer seam; no Atoms public command, design, branch, or owner | `l` | `todo` | None | create | `atoms-38887b` |
+| Certify the Science publication path under persistence cuts | A8 certifies engine-interior order only; Science X2 remains open and its current roadmap rejects a Science-side duplicate harness in favor of extending Atoms A8 behind an Atoms design gate | A8 design/plan/tooling; A7 known-gaps L-row split; Science cut 7, adoption ledger, and 2026-08-29 roadmap `persistence-cut` | Required cross-repository producer outcome; Science publication path is implemented, but no extension/design/owner exists | `xl` | `todo` | None | create | `atoms-f5779f` |
 | Add terminal-record and unreferenced-blob garbage collection | Structural settlement gates exist; authority leaves retention to explicit consumer policy and A7 says no removal command exists | Authority §7.5/§15; A7 design §10.5/§16 | Unscheduled future policy, outside transaction correctness | `l` | — | None | no task — no approved delivery commitment | no task |
 | Compact or bound the chain | A7 and chain-inspection call one-file-per-entry unbounded and say compaction is a future design “if ever” | A7 design §16; chain-inspection design §2 | Speculative future design | `xl` | — | None | no task — speculative | no task |
 | Harden SQLite with a custom VFS | Stdlib is the implemented baseline; custom VFS is optional and no open obligation owns it | Authority §7; A5a design; README future-hardening note; obligation ledger | Optional hardening without a current requirement | `xl` | — | None | no task — optional | no task |
@@ -124,8 +124,8 @@ probe, and configuration binding; run the model, real-filesystem, subprocess-rec
 persistence-cut suites on macOS; add canonical crash-certification evidence for every admitted
 tuple; and move the guarded roadmap boundary past A9 only when the complete Python gate passes.
 
-Sources: `docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md` §5.5, §13,
-§14, and §16; `AGENTS.md`; `README.md`; and `python/tests/test_docs_status.py`.
+Sources: docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md §5.5, §13,
+§14, and §16; AGENTS.md; README.md; and python/tests/test_docs_status.py.
 
 Uncertainty: No A9 design, backend, certification record, active branch, or verified owner
 exists, and capability availability remains volume-specific.
@@ -136,18 +136,18 @@ Initial fields: priority `2`; status `todo`; size `xl`; tags `migration`, `macos
 ### Reviewed task body: Deliver the public preimage blob-read seam
 
 Outcome: Atoms exposes the narrow lease-held public command Science needs to read and verify an
-indexed transaction preimage without exposing `Store`, `Lease`, or a private blob descriptor API.
+indexed transaction preimage without exposing Store, Lease, or a private blob descriptor API.
 
 Acceptance evidence: Approve an Atoms-local design that fixes authorization, lifecycle, digest,
 descriptor/bytes ownership, and corruption behavior; implement the command through the existing
-verified `Store.open_blob` path under the correct read boundary; add architecture, corruption,
+verified Store.open_blob path under the correct read boundary; add architecture, corruption,
 lifetime, and consumer-contract tests; run the complete Python gate; and provide the stable seam
 Science can use to discharge L13's preimage-backed classification.
 
-Sources: `docs/plans/2026-07-31-a5a-metadata-store-design.md` and its blob tests;
-`docs/plans/2026-08-22-chain-inspection-design.md` §3;
-`~/d/science/docs/designs/2026-08-03-redesign-adoption-ledger.md` row 5; and
-`~/d/science/docs/plans/2026-08-29-implementation-roadmap.md` `l13-preimage` row.
+Sources: docs/plans/2026-07-31-a5a-metadata-store-design.md and its blob tests;
+docs/plans/2026-08-22-chain-inspection-design.md §3;
+~/d/science/docs/designs/2026-08-03-redesign-adoption-ledger.md row 5; and
+~/d/science/docs/plans/2026-08-29-implementation-roadmap.md l13-preimage row.
 
 Uncertainty: The verified internal blob reader exists, but Atoms has not designed the public
 authorization and return boundary and the deferred-obligation ledger currently admits no such
@@ -162,15 +162,15 @@ Outcome: The Atoms persistence-cut and certification machinery exercises the ado
 publication path end to end, so Science X2 no longer relies only on engine-interior certification.
 
 Acceptance evidence: Approve the Atoms-local cross-repository test design; extend the existing
-record–reconstruct–recover or physical certification harness through the real Science
+record-reconstruct-recover or physical certification harness through the real Science
 composition-root publication path without creating a second transaction authority; cover every
 consumer-side durability boundary named by X2; record reproducible zero-violation evidence or an
 explicit fail-closed result; and run the complete Atoms and affected Science gates.
 
-Sources: `docs/plans/2026-08-14-a8-persistence-cut-and-certification-design.md`;
-`docs/plans/2026-08-13-a7-effect-recovery-execution-design.md` §16; Science's cut-7
-X2 accounting; `~/d/science/docs/designs/2026-08-03-redesign-adoption-ledger.md`; and
-`~/d/science/docs/plans/2026-08-29-implementation-roadmap.md` `persistence-cut` row.
+Sources: docs/plans/2026-08-14-a8-persistence-cut-and-certification-design.md;
+docs/plans/2026-08-13-a7-effect-recovery-execution-design.md §16; Science's cut-7
+X2 accounting; ~/d/science/docs/designs/2026-08-03-redesign-adoption-ledger.md; and
+~/d/science/docs/plans/2026-08-29-implementation-roadmap.md persistence-cut row.
 
 Uncertainty: Science's publication path is implemented and its roadmap assigns the prerequisite
 to an Atoms design gate, but the cross-repository harness boundary, hardware matrix, and verified
@@ -201,3 +201,10 @@ when Science migrates and does not create a dangling Atoms dependency now.
 | Science `main`/`origin/main` ancestry check for `35be6ff` | Both checks passed; current consumer evidence replaces the dated unpushed snapshot. | Documentation reconciliation commit (this commit) |
 | Required status/outward `rg`, exact document coverage `comm -3`, seven-section count, stale-phrase negative search, and `git diff --check` | 2,463 outward matches reviewed; all 38 denominator documents classified exactly; all seven required sections present; negative search, coverage comparison, and whitespace check produced no output. | Documentation reconciliation commit (this commit) |
 | `cd python && uv run pytest && uv run ruff check . && uv run pyright` after reconciliation | 6,234 passed, seven skipped in 456.25 seconds; Ruff passed; Pyright reported zero errors, warnings, or informations. | Documentation reconciliation commit (this commit) |
+| Normal-registry `TASKS_FORMAT=json tasks -C ~/d/atoms/.worktrees/tasks-migration-atoms prime` before initialization | Failed explicitly with `error.kind = "no_project"`; no normal-registry mutation was made. | Tasks initialization commit (this commit) |
+| Temporary-registry `tasks -C ~/d/familiar init --prefix fam` and `tasks -C ~/d/atoms/.worktrees/tasks-migration-atoms init --prefix atoms` | Both initializations succeeded with empty warning arrays; `prime` resolved the migration checkout as prefix `atoms`. | Tasks initialization commit (this commit) |
+| Three reviewed `tasks add` calls followed by `tasks show atoms-8be2dc`, `tasks show atoms-38887b`, and `tasks show atoms-f5779f` | All fields matched the reviewed rows and bodies; each task is `todo`, priority 2, unowned, and dependency-free, with no structured spec or plan. | Tasks initialization commit (this commit) |
+| Temporary-registry `tasks -C ~/d/atoms/.worktrees/tasks-migration-atoms check >/tmp/atoms-check.json` and `jq -e '.errors == [] and .warnings == []' /tmp/atoms-check.json` | Passed with empty errors and warnings arrays. | Tasks initialization commit (this commit) |
+| Temporary-registry `tasks -C ~/d/atoms/.worktrees/tasks-migration-atoms prime \| jq -e '.prefix == "atoms"'` and `tasks -C ~/d/atoms/.worktrees/tasks-migration-atoms ready` | Prefix assertion passed; all three created tasks were ready with an empty warnings array. | Tasks initialization commit (this commit) |
+| `cd python && uv run pytest && uv run ruff check . && uv run pyright` after task creation | 6,234 passed, seven skipped in 457.47 seconds; Ruff passed; Pyright reported zero errors, warnings, or informations. | Tasks initialization commit (this commit) |
+| `test ! -e tasks/projects.toml` and `git diff --check` | Both passed; no repository-local registry file or whitespace error exists. | Tasks initialization commit (this commit) |
