@@ -101,7 +101,7 @@ CERTIFIED_ALLOWLIST = DurabilityAllowlist(
                 configuration=VolumeConfiguration(
                     backend_id="linux",
                     backend_revision="linux-4",
-                    kernel_identifier="7.1.10-arch1-1",
+                    kernel_identifier="7.1.11-arch1-1",
                     filesystem_type="ext4",
                     barrier_options=("async", "barrier=1", "commit=5", "data=ordered"),
                     durability_features=(
@@ -112,7 +112,7 @@ CERTIFIED_ALLOWLIST = DurabilityAllowlist(
                 ),
                 storage=StorageProfile(profile_id="flush-honoring-disk.v1"),
                 certification_ref=(
-                    "docs/certification/2026-08-28-ext4-linux-7.1.10-arch1-1.json"
+                    "docs/certification/2026-08-30-ext4-linux-7.1.11-arch1-1.json"
                 ),
             )
         }
