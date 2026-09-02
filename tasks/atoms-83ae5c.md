@@ -5,13 +5,17 @@ status: todo
 priority: 2
 size: s
 created: 2026-09-02T03:41:26Z
-updated: 2026-09-02T03:41:26Z
-depends: []
+updated: 2026-09-02T10:38:53Z
+depends: [atoms-fde058, atoms-6c3692]
 tags: [performance, testing, tooling]
 ---
 
-Why: the exhaustive Python gate takes 492.69s while collection takes about 1.6s. Most time is physical persistence and kill-matrix work; the 3,524-case recovery property module is not the bottleneck.
+Why: developers need an explicit fast local loop, but its benchmark target must be measured after rehearsal and duplicate-sweep removal.
 
-Change: document a zero-dependency focused workflow first using pytest node/keyword and last-failed selection. On a multicore host, benchmark pytest-xdist distribution compatible with fixture scope. Separately trial coverage-based changed-test selection for local use only and keep it only if recall checks and median savings justify the dependency.
+Change: first document the zero-dependency deterministic workflow using pytest node ids, -k, --lf, and --ff. Re-benchmark after the two prerequisite fixes. Only then trial fixture-compatible pytest-xdist on a multicore host or coverage-based changed-test selection if the native loop remains insufficient.
 
-Done when: one documented opt-in command provides a materially faster local loop; full pytest remains the required certification gate; benchmark method and limitations are recorded; no probabilistic omission is used for required verification.
+Done when: one documented opt-in command materially improves local iteration; full pytest remains the required certification gate; benchmark method and limitations are recorded; no probabilistic omission is used.
+
+## Notes
+
+- 2026-09-02T10:38:53Z (perf/revise-test-tasks): Reordered behind the two measured duplication fixes; native deterministic selection remains first.
