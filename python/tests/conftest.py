@@ -829,6 +829,37 @@ def exerciser_kill_matrix(ext4_volume, test_storage_profile, monkeypatch):
     return drive
 
 
+@pytest.fixture(scope="session")
+def rehearsals():
+    """The kill matrix's memoized rehearsals (`Rehearsals` in
+    `tests/test_coordinator_kill_matrix.py`): each distinct child configuration is
+    recorded once per session, and every case that shares it reads the same tuple.
+
+    Session-scoped, so it cannot take the function-scoped `ext4_volume` or
+    `monkeypatch`: it owns one temporary directory on the test volume for the whole
+    session and scopes `_prepare`'s allowlist patch to each launch with
+    `pytest.MonkeyPatch.context()`. The child is a separate process and never sees the
+    parent's patch; it is `register_root` in `_prepare` that needs it.
+    """
+    from tests.test_coordinator_kill_matrix import Rehearsals, _child, _prepare, _roots
+
+    base, reason = ext4_volume_or_skip_reason()
+    if base is None:
+        pytest.skip(reason)
+    base.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=base) as directory:
+        volume = Path(directory)
+        slots = itertools.count()
+
+        def launch(config: dict) -> list[str]:
+            project, metadata = _roots(volume, f"rehearsal-{next(slots)}")
+            with pytest.MonkeyPatch.context() as patch:
+                _prepare(project, metadata, config["variant"], patch)
+            return _child(project, metadata, config)["events"]
+
+        yield Rehearsals(launch)
+
+
 @pytest.fixture
 def opened_store(store_on):
     """A live Store over a fresh ext4 project, closed on exit."""

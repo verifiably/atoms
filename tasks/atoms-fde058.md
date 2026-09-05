@@ -1,11 +1,12 @@
 ---
 id: atoms-fde058
 title: Memoize equivalent kill-matrix rehearsals
-status: todo
+status: done
 priority: 1
 size: m
+owner: perf/memoize-kill-rehearsals
 created: 2026-09-02T03:41:26Z
-updated: 2026-09-02T10:38:53Z
+updated: 2026-09-05T12:02:59Z
 depends: []
 tags: [performance, testing, certification]
 ---
@@ -19,3 +20,5 @@ Done when: tests prove distinct rehearsal configurations remain distinct; subpro
 ## Notes
 
 - 2026-09-02T10:38:53Z (perf/revise-test-tasks): Rescoped from removing load-bearing recovery launches to memoizing only the 42 equivalent rehearsals.
+- 2026-09-05T11:12:48Z (perf/memoize-kill-rehearsals): Rehearsals memo keyed by json.dumps(config, sort_keys=True); session fixture owns its own tempdir on the test volume and scopes _prepare's patch with MonkeyPatch.context(); 56 rehearsal launches should become 13.
+- 2026-09-05T12:02:59Z (perf/memoize-kill-rehearsals): Rehearsals memo (whole-config key) + session fixture in conftest; rehearsal launches 56 -> 13 with killed (80) and recovery (158) launches unchanged. Kill-matrix timings before 110.2/109.3/120.2s, after 78.7/75.4/75.2s. Gates: ruff, pyright, full suite green.
