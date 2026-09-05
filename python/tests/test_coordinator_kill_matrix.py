@@ -7,6 +7,7 @@ import os
 import signal
 import subprocess
 import sys
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pytest
@@ -125,6 +126,34 @@ def _world(project: Path) -> dict[str, tuple[str, bytes | None]]:
     return found
 
 
+class Rehearsals:
+    """Memoized rehearsal recordings, keyed by the child's whole configuration.
+
+    A rehearsal runs the variant to completion under the recording backend and returns
+    its event stream; the cases then choose a cut site in that stream and kill a fresh
+    child there. The stream depends on nothing but the configuration the child is given
+    (`variant`, `store_cut`, `umask`, ...), so the parametrized cases that share one
+    configuration -- both `side`s of every barrier, all nine store barriers, every
+    backend cut of one variant -- are asking for the same recording. The first request
+    launches it; the rest read the same immutable tuple.
+
+    Only the rehearsal is memoized. Every killed child and both fresh-process recoveries
+    in `_assert_terminal` are the convergence property itself and run for every case.
+    """
+
+    def __init__(self, launch: Callable[[dict], Sequence[str]]) -> None:
+        self._launch = launch
+        self._events: dict[str, tuple[str, ...]] = {}
+
+    def __call__(self, config: dict) -> tuple[str, ...]:
+        key = json.dumps(config, sort_keys=True)
+        events = self._events.get(key)
+        if events is None:
+            events = tuple(self._launch(config))
+            self._events[key] = events
+        return events
+
+
 def _assert_terminal(
     project: Path,
     metadata: Path,
@@ -169,7 +198,7 @@ def _assert_terminal(
     assert world == expected
 
 
-def _effect_event_indexes(events: list[str], method: str, variant: str) -> list[int]:
+def _effect_event_indexes(events: Sequence[str], method: str, variant: str) -> list[int]:
     commits = [index for index, event in enumerate(events) if event == "commit"]
     windows = [(commits[3], commits[4])]
     if variant == "mkdir":
@@ -180,6 +209,41 @@ def _effect_event_indexes(events: list[str], method: str, variant: str) -> list[
         for index in range(start + 1, stop)
         if events[index].startswith(method)
     ]
+
+
+def test_rehearsals_are_memoized_by_the_whole_configuration() -> None:
+    """One launch per distinct child configuration, however many cases ask for it.
+
+    The key is the whole configuration, not a chosen subset: `{"record": True,
+    "variant": "create"}` and the same with `store_cut="record"` produce different
+    streams (the second interleaves `commit` events), and `umask` changes the mkdir
+    scaffold's recorded repairs. Equal configurations are equal however their keys are
+    ordered, and the memoized events are an immutable tuple, so a case cannot edit the
+    evidence every later case reads.
+    """
+    launched: list[dict] = []
+
+    def launch(config: dict) -> list[str]:
+        launched.append(dict(config))
+        return [f"{key}={config[key]}" for key in sorted(config)]
+
+    rehearse = Rehearsals(launch)
+    base = {"record": True, "variant": "mkdir", "umask": 0o022}
+    first = rehearse(base)
+    assert isinstance(first, tuple)
+    assert rehearse(dict(base)) is first
+    assert rehearse({"umask": 0o022, "variant": "mkdir", "record": True}) is first
+    assert launched == [base]
+
+    for changed in (
+        {**base, "umask": 0o777},
+        {**base, "variant": "create"},
+        {**base, "store_cut": "record", "countdown": 10_000},
+        {"record": True, "variant": "mkdir"},
+    ):
+        assert rehearse(changed) is not first, changed
+        assert rehearse(changed) == tuple(launch(changed)), changed
+    assert len(launched) == 9, "one real launch per distinct configuration"
 
 
 @pytest.mark.parametrize(
@@ -193,22 +257,16 @@ def _effect_event_indexes(events: list[str], method: str, variant: str) -> list[
 )
 @pytest.mark.parametrize("side", ["before", "after"])
 def test_every_forward_effect_flush_barrier_converges(
-    ext4_volume, monkeypatch, variant, method, side
+    ext4_volume, monkeypatch, rehearsals, variant, method, side
 ) -> None:
-    rehearsal_project, rehearsal_metadata = _roots(
-        ext4_volume, f"flush-rehearsal-{variant}-{method}-{side}"
-    )
-    _prepare(rehearsal_project, rehearsal_metadata, variant, monkeypatch)
-    events = _child(
-        rehearsal_project,
-        rehearsal_metadata,
+    events = rehearsals(
         {
             "record": True,
             "variant": variant,
             "store_cut": "record",
             "countdown": 10_000,
-        },
-    )["events"]
+        }
+    )
     targets = _effect_event_indexes(events, method, variant)
     assert targets
     for ordinal, target in enumerate(targets):
@@ -233,16 +291,10 @@ def test_every_forward_effect_flush_barrier_converges(
 
 
 @pytest.mark.parametrize("side", ["before", "after"])
-def test_every_chain_append_barrier_converges(ext4_volume, monkeypatch, side) -> None:
-    rehearsal_project, rehearsal_metadata = _roots(
-        ext4_volume, f"chain-all-rehearsal-{side}"
-    )
-    _prepare(rehearsal_project, rehearsal_metadata, "create", monkeypatch)
-    events = _child(
-        rehearsal_project,
-        rehearsal_metadata,
-        {"record": True, "variant": "create"},
-    )["events"]
+def test_every_chain_append_barrier_converges(
+    ext4_volume, monkeypatch, rehearsals, side
+) -> None:
+    events = rehearsals({"record": True, "variant": "create"})
     transfers = [
         index
         for index, event in enumerate(events)
@@ -301,18 +353,10 @@ def test_every_chain_append_barrier_converges(ext4_volume, monkeypatch, side) ->
 @pytest.mark.parametrize("umask", [0o022, 0o777], ids=["umask-022", "umask-777"])
 @pytest.mark.parametrize("cut", ["before-repair", "after-repair"])
 def test_mkdir_scaffold_cuts_follow_the_survivors_mode(
-    ext4_volume, monkeypatch, umask, cut
+    ext4_volume, monkeypatch, rehearsals, umask, cut
 ) -> None:
     method = "mkdir_child" if cut == "before-repair" else "repair_entry_mode"
-    rehearsal_project, rehearsal_metadata = _roots(
-        ext4_volume, f"mkdir-rehearsal-{cut}-{umask:o}"
-    )
-    _prepare(rehearsal_project, rehearsal_metadata, "mkdir", monkeypatch)
-    events = _child(
-        rehearsal_project,
-        rehearsal_metadata,
-        {"record": True, "variant": "mkdir", "umask": umask},
-    )["events"]
+    events = rehearsals({"record": True, "variant": "mkdir", "umask": umask})
     matches = [index for index, event in enumerate(events) if event.startswith(method)]
     assert matches
     chosen = matches[-1]
@@ -350,6 +394,7 @@ def test_mkdir_scaffold_cuts_follow_the_survivors_mode(
 def test_backend_and_chain_barrier_cuts_converge(
     ext4_volume,
     monkeypatch,
+    rehearsals,
     name,
     variant,
     method,
@@ -357,15 +402,7 @@ def test_backend_and_chain_barrier_cuts_converge(
     selection,
     side,
 ) -> None:
-    rehearsal_project, rehearsal_metadata = _roots(
-        ext4_volume, f"rehearsal-{name}-{side}"
-    )
-    _prepare(rehearsal_project, rehearsal_metadata, variant, monkeypatch)
-    events = _child(
-        rehearsal_project,
-        rehearsal_metadata,
-        {"record": True, "variant": variant},
-    )["events"]
+    events = rehearsals({"record": True, "variant": variant})
     matches = [
         index
         for index, event in enumerate(events)
@@ -408,23 +445,17 @@ def test_backend_and_chain_barrier_cuts_converge(
 @pytest.mark.parametrize("barrier", STORE_BARRIERS)
 @pytest.mark.parametrize("side", ["before", "after"])
 def test_store_commit_barrier_cuts_converge(
-    ext4_volume, monkeypatch, barrier, side
+    ext4_volume, monkeypatch, rehearsals, barrier, side
 ) -> None:
     index = STORE_BARRIERS.index(barrier) + 1
-    rehearsal_project, rehearsal_metadata = _roots(
-        ext4_volume, f"store-rehearsal-{barrier}-{side}"
-    )
-    _prepare(rehearsal_project, rehearsal_metadata, "create", monkeypatch)
-    rehearsal = _child(
-        rehearsal_project,
-        rehearsal_metadata,
+    events = rehearsals(
         {
             "variant": "create",
             "store_cut": "record",
             "countdown": 10_000,
-        },
+        }
     )
-    assert rehearsal["events"] == ["commit"] * len(STORE_BARRIERS)
+    assert events == ("commit",) * len(STORE_BARRIERS)
 
     project, metadata = _roots(ext4_volume, f"store-cut-{barrier}-{side}")
     _prepare(project, metadata, "create", monkeypatch)
