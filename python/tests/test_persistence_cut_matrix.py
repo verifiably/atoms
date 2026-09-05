@@ -579,6 +579,10 @@ def test_each_sabotaged_run_fails_only_its_own_designated_check(cut_matrix) -> N
     must not also break the returned-outcome invariant, and the committed-decision arm
     must not also lose a blob. A single-arm scenario can only ever name its own marker,
     so the three-arm scenario is the only place this says anything.
+
+    The three reports are the ones `test_sabotage_1`, `_2`, and `_5` already produced in
+    this process (`Sweeper._sabotaged_reports`); the equality here is the stronger
+    reading of the same evidence, not a second recording of it.
     """
     for arm, marker in (
         ("blob-flush", "blob-integrity"),
@@ -587,6 +591,29 @@ def test_each_sabotaged_run_fails_only_its_own_designated_check(cut_matrix) -> N
     ):
         report = cut_matrix("minimal-create", sabotage=arm)
         assert report.designated_failures == (marker,), arm
+
+
+def test_a_sabotaged_run_is_memoized_within_the_process(cut_matrix, monkeypatch) -> None:
+    """A `(scenario, arm)` pair records and checks once per process; the next request
+    for the same pair is the same immutable `SweepReport`, not a re-recording.
+
+    `test_each_sabotaged_run_fails_only_its_own_designated_check` asks for the same
+    three `minimal-create` pairs `test_sabotage_1`, `_2`, and `_5` already ran, and a
+    sabotaged run's evidence is plain data with no path in it, so the second run would
+    only reproduce the first. The cache is keyed by the arm as well as the scenario --
+    the three-arm test's per-arm equality is what proves one arm's report never serves
+    another's request. A fresh process has an empty cache and must record for itself.
+    """
+    from tests.persistence_model import Sweeper
+
+    first = cut_matrix("minimal-create", sabotage="blob-flush")
+    assert first.designated_failures == ("blob-integrity",)
+
+    def refuse(self, name, **kwargs):
+        raise AssertionError(f"a memoized sabotaged run re-recorded {name!r}")
+
+    monkeypatch.setattr(Sweeper, "record", refuse)
+    assert cut_matrix("minimal-create", sabotage="blob-flush") is first
 
 
 def test_unsabotaged_sweeps_raise_no_designated_failure(cut_matrix) -> None:

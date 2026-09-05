@@ -55,7 +55,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, NewType, cast
+from typing import TYPE_CHECKING, ClassVar, NewType, cast
 
 if TYPE_CHECKING:
     # Type-only: every *runtime* production import in this module is inside the function
@@ -3176,6 +3176,16 @@ class Sweeper:
     storage profile, never a path, so one is valid for every cell.
     """
 
+    # Sabotaged runs already performed in THIS process, by `(scenario, arm name)`.
+    # Class-level on purpose: the `cut_matrix` fixture builds one `Sweeper` per test, and
+    # the duplicate requests come from different tests (`test_sabotage_{1,2,5}` and the
+    # three-arm exactness test all ask for the same three `minimal-create` pairs). Only
+    # `_sabotaged` reads or writes it -- an unsabotaged, `caught=`, `drift=`, or
+    # `subprocess_subset=` sweep is never memoized, and a fresh process starts with it
+    # empty and records for itself. A `SweepReport` holds no path, so a report recorded
+    # on one test's volume is the same evidence on the next test's.
+    _sabotaged_reports: ClassVar[dict[tuple[str, str], SweepReport]] = {}
+
     def __init__(self, ext4_volume: Path, storage, monkeypatch) -> None:
         self._volume = Path(ext4_volume)
         self._storage = storage
@@ -3493,7 +3503,20 @@ class Sweeper:
         sweep's worth of cells to assert nothing the arm is about. Every check of the
         scenario runs, not just the sabotaged arm's own, so a run can assert that
         exactly one of them fired (`minimal-create` carries three).
+
+        **Memoized per process** by `(scenario, arm)` in `_sabotaged_reports`: the
+        second request for a pair this process has already run returns the first run's
+        immutable report instead of recording and checking again. The arm is part of
+        the key, so one arm's report never answers another's request.
         """
+        key = (scenario_name, arm.name)
+        memoized = self._sabotaged_reports.get(key)
+        if memoized is not None:
+            print(
+                f"\n[cut-matrix] {scenario_name} sabotage={arm.name}: memoized from an "
+                f"earlier run in this process, failures={memoized.designated_failures}"
+            )
+            return memoized
         started = time.monotonic()
         stream = self.record(scenario_name, sabotage=arm)
         designated = self.designated_failures(scenario_name, stream)
@@ -3520,6 +3543,7 @@ class Sweeper:
             f"designated-cells={report.cells} failures={designated} "
             f"in {report.seconds:.1f}s"
         )
+        self._sabotaged_reports[key] = report
         return report
 
     def designated_failures(self, scenario_name: str, stream: Stream) -> tuple[str, ...]:
