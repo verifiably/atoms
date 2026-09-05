@@ -81,8 +81,13 @@ Plan B is written only after Plan A's interfaces settle.
   `origin/main` at the 2026-08-30 audit. Beliefs' adoption ledger owns later consumer status;
   A9 remains this repository's first unimplemented Plan A stage.
 
-Work lives under `python/` (`uv run pytest`, `uv run ruff check`, `uv run pyright`, all from
-`python/`).
+Work lives under `python/`. Tests: `just test` runs the suite. `just check` runs the
+seconds-long gate (ruff, pyright, `tasks check`); `just gate` runs both. Every recipe
+records its run through `tools/tt`, the timing wrapper vendored from the ops repository;
+do not call `pytest` directly. The git hooks in `.githooks/` run the same commands; a fresh
+clone installs them with `git config core.hooksPath .githooks`. Before removing a
+worktree, run `tt-report` (in the ops repository) so its fallback test-timing log is
+harvested.
 A4a, A5a, and A6 write only to engine-owned paths under `metadata_root`; A7a also writes engine
 bookkeeping at the reserved `.#~chain/` leaf, and A7b executes approved effects against project paths.
 A8 adds no new transaction writer; it drives the existing public commands and guarded lease.
