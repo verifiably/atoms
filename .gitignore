@@ -5,3 +5,8 @@ __pycache__/
 .venv/
 .atoms-test-volume/
 .certify/
+# Fallback test-timing log, written by tools/tt when the shared log is unwritable and
+# emptied by ops `tt-report`; never committed.
+.tt/
+# pytest-testmon selection data for `just test-fast`; per checkout, never committed.
+python/.testmondata
