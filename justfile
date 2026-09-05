@@ -12,10 +12,16 @@ tt := "python3 tools/tt"
 # The package lives under python/; `uv run --frozen` syncs the dev group from the lock
 # file (pytest, pytest-testmon, ruff, pyright) and never rewrites it from a hook.
 # testmon keeps its selection data in python/.testmondata, per checkout and ignored.
-# Its coverage tracing sees only the parent process: a change reached solely through
-# the fresh-process children (tests/execute_child.py, tests/coordinator_child.py) is
-# selected only by tests that also run that code in-process. `just test` is the gate.
-fast_cmd := "cd python && uv run --frozen pytest --testmon"
+# test-fast also leaves out the three fresh-process suites (the SIGKILL matrix, the
+# persistence-cut matrix, the exerciser): they are ~400 of the suite's ~500 seconds and
+# depend on nearly every source module, so with them in, any source edit reselected
+# them and the loop ran 291-506s (measured 2026-09-05, atoms-83ae5c); without them the
+# whole in-process suite is 106s and a single module's tests take seconds. testmon's
+# tracing also sees only the parent process, so a change to code the children alone
+# run (tests/execute_child.py, tests/coordinator_child.py) selects nothing. Both
+# omissions are deterministic and named here; `just test` runs everything and is the
+# certification gate.
+fast_cmd := "cd python && uv run --frozen pytest --testmon --ignore=tests/test_coordinator_kill_matrix.py --ignore=tests/test_persistence_cut_matrix.py --ignore=tests/test_exerciser.py"
 test_cmd := "cd python && uv run --frozen pytest"
 check_cmd := "(cd python && uv run --frozen ruff check && uv run --frozen pyright) && tasks check"
 
