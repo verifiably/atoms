@@ -23,7 +23,7 @@ tt := "python3 tools/tt"
 # certification gate.
 fast_cmd := "cd python && uv run --frozen pytest --testmon --ignore=tests/test_coordinator_kill_matrix.py --ignore=tests/test_persistence_cut_matrix.py --ignore=tests/test_exerciser.py"
 test_cmd := "cd python && uv run --frozen pytest"
-check_cmd := "(cd python && uv run --frozen ruff check && uv run --frozen pyright) && tasks check"
+check_cmd := "python3 tools/ops-check && (cd python && uv run --frozen ruff check && uv run --frozen pyright) && tasks check"
 
 # Affected-only: the inner loop. An empty selection is a result, not a failure.
 test-fast:

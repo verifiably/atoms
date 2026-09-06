@@ -14,7 +14,7 @@ Plan B is written only after Plan A's interfaces settle.
 - **A1 — core model: implemented.** `python/src/atoms/core/` holds the transaction model,
   effect variants, capability vocabulary, scratch grammar, and canonical encode/decode.
   Stdlib only, no filesystem or SQLite dependency.
-- **A2 — compilation validation: implemented.** `compile_spec` in `atoms/core/compiler.py` produces
+- **A2 — compilation validation: implemented.** `compile_spec` in `python/src/atoms/core/compiler.py` produces
   the pure, filesystem-independent first-stage `CompiledSpec` proof; `paths.py` and `timeline.py`
   support it. A4b must produce the distinct `ProjectApprovedSpec` before A5–A8.
 - **A3 — executable recovery reference model: implemented.** The pure production authority exposes
@@ -29,11 +29,11 @@ Plan B is written only after Plan A's interfaces settle.
   `CERTIFIED_ALLOWLIST` contains the singleton ext4 tuple crash-certified by A8b; every other
   configuration still fails closed.
 - **A4b — rooted project approval: implemented on 2026-07-31.** A4b-1 owns
-  the resolution mechanism in `atoms/fs/resolve.py` and `atoms/fs/lookup.py` — `PathResolver`,
+  the resolution mechanism in `python/src/atoms/fs/resolve.py` and `python/src/atoms/fs/lookup.py` — `PathResolver`,
   lookup-constraint reading, real-filesystem limits, containment, and mount membership — and sees no
   `CompiledSpec`.
-  A4b-2 owns the judgment in `atoms/fs/approval.py`, `atoms/fs/judgment.py`, and
-  `atoms/fs/topology.py`: `approve_for_project`, `ProjectApprovedSpec`, and ledger entries #2,
+  A4b-2 owns the judgment in `python/src/atoms/fs/approval.py`, `python/src/atoms/fs/judgment.py`, and
+  `python/src/atoms/fs/topology.py`: `approve_for_project`, `ProjectApprovedSpec`, and ledger entries #2,
   #3 (its part), #4, #5, #6, #10, #11, #16, and #20 are discharged. The factory half of #9
   is complete; every A5–A7 entry point enforces it, and A8 added no production entry point.
   It admits #21, the txid binding, owned by A5.
@@ -45,7 +45,7 @@ Plan B is written only after Plan A's interfaces settle.
   COMMIT that references them, and per-txid workspaces. A5b composes it into the recovery-resolve
   lease, discharging #7, #18, #21, #22, and #23; A7b discharged the executor halves it left open.
   Its design is [`docs/plans/2026-08-02-a5b-recovery-lease-design.md`](docs/plans/2026-08-02-a5b-recovery-lease-design.md):
-  a new `atoms/coordinator/` package holding the lease, the admission gate, preparation, and A3
+  a new `python/src/atoms/coordinator/` package holding the lease, the admission gate, preparation, and A3
   transition persistence. A7b replaces the former build-stage trap with pinned recovery resolution.
 - **A6 — coherent capture and the observation mechanism: implemented on 2026-08-07.**
   `python/src/atoms/fs/observe.py` holds `Observation.observe`, the coherent single-descriptor read of
@@ -76,7 +76,7 @@ Plan B is written only after Plan A's interfaces settle.
   3,247 replay prefixes with zero violations.
 - **Downstream adoption — Beliefs:** its composition-root corpus writes and family adapters consume
   the certified engine. The holdings slice added `read_path_state` and
-  `TransactionOutcome.final_states` from remote `atoms/main` `038513f`, then merged into Beliefs'
+  `TransactionOutcome.final_states` from the remote branch atoms/main at `038513f`, then merged into Beliefs'
   `main` as `35be6ff` on 2026-08-25 and was an ancestor of both its local `main` and tracked
   `origin/main` at the 2026-08-30 audit. Beliefs' adoption ledger owns later consumer status;
   A9 remains this repository's first unimplemented Plan A stage.
