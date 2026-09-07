@@ -8,9 +8,35 @@ from pathlib import Path
 
 import pytest
 
+from atoms.core.errors import CapabilityUnavailable
 from atoms.fs.linux import LinuxBackend
 from atoms.fs.lock import acquire_project_lock
 from atoms.fs.volume import StorageProfile
+from tests.uncertified_host import uncertified_host
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_call(item):
+    """On a declared uncertified host, report a missing capability instead of failing.
+
+    A runner has no certified ext4 kernel and volume tuple. The volume fixtures already
+    skip when they cannot hand one over, but 969 tests reach the fs layer without going
+    through them and raise instead; this converts those, and only those.
+
+    The skipped set is defined by the capability probe at run time, not by a list anyone
+    maintains, so a new capability-dependent test needs no annotation and the set cannot
+    go stale. Every other failure still fails, so a real regression cannot hide here, and
+    a bug that surfaces *as* `CapabilityUnavailable` is caught on the certified host,
+    where nothing converts.
+    """
+    try:
+        return (yield)
+    except CapabilityUnavailable as error:
+        if uncertified_host(os.environ):
+            pytest.skip(f"certified tuple unavailable on this host: {error}")
+        raise
+
+
 from tests.fs_support import (
     build_test_allowlist,
     casefold_volume_or_reason,

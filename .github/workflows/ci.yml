@@ -29,3 +29,7 @@ jobs:
       # The full suite, then ops-check, ruff and pyright, through the recipe that records
       # them. Tests needing a certified volume skip themselves here; a runner has none.
       - run: just ci-python
+        env:
+          # A runner has no certified ext4 kernel and volume tuple; the capability-dependent
+          # tests report the missing capability as a skip instead of failing (AGENTS.md).
+          VERIFIABLY_UNCERTIFIED_HOST: "1"

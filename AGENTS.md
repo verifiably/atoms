@@ -88,6 +88,14 @@ do not call `pytest` directly. The git hooks in `.githooks/` run the same comman
 clone installs them with `git config core.hooksPath .githooks`. Before removing a
 worktree, run `tt-report` (in the ops repository) so its fallback test-timing log is
 harvested.
+
+CI (`.github/workflows/ci.yml`) runs `just ci-python` on 3.11 and 3.13. A GitHub runner
+has no certified ext4 kernel and volume tuple, so it sets `VERIFIABLY_UNCERTIFIED_HOST=1`,
+which converts *only* `CapabilityUnavailable` into a skip naming the missing capability;
+every other failure still fails, and only an explicit `1` disarms anything. About 969 of
+the roughly 6,240 tests skip there. So a green CI is evidence about the portable tests and
+never about the filesystem behaviour that is this project's point — that is proven by a run
+on the certified tuple, which the pre-push gate does, and recorded in `docs/certification/`.
 A4a, A5a, and A6 write only to engine-owned paths under `metadata_root`; A7a also writes engine
 bookkeeping at the reserved `.#~chain/` leaf, and A7b executes approved effects against project paths.
 A8 adds no new transaction writer; it drives the existing public commands and guarded lease.
