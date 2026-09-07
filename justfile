@@ -24,6 +24,9 @@ tt := "python3 tools/tt"
 fast_cmd := "cd python && uv run --frozen pytest --testmon --ignore=tests/test_coordinator_kill_matrix.py --ignore=tests/test_persistence_cut_matrix.py --ignore=tests/test_exerciser.py"
 test_cmd := "cd python && uv run --frozen pytest"
 check_cmd := "python3 tools/ops-check && (cd python && uv run --frozen ruff check && uv run --frozen pyright) && tasks check"
+# The same commands minus `tasks check`, whose binary is not on a runner; ops-check keeps
+# working there because its registry lookup is empty when absent.
+ci_check_cmd := "python3 tools/ops-check && (cd python && uv run --frozen ruff check && uv run --frozen pyright)"
 
 # Affected-only: the inner loop. An empty selection is a result, not a failure.
 test-fast:
@@ -46,3 +49,17 @@ hook-pre-commit:
 # What the pre-push hook runs: the same commands as `gate`, under one hook target.
 hook-pre-push:
     {{tt}} hook-pre-push -- sh -c '{{check_cmd}} && {{test_cmd}}'
+
+# CI runs the recipe rather than `just gate` so the whole job is one recorded number and
+# cannot drift from the local gate (design section 4.6). The full suite, not the fast
+# loop: `just test` is the certification gate. Capability-dependent tests skip themselves
+# on a runner — the volume fixtures return a reason instead of a volume — so this is
+# expected to be green with a large skip count, not a failure.
+#
+# test_cmd is parenthesised because it is a bare `cd python && ...`: unwrapped, its cd
+# leaks into whatever follows, and ops-check would be looked for under python/. The other
+# recipes never hit this only because they put test_cmd last.
+#
+# The full suite, then ops-check, ruff and pyright.
+ci-python:
+    {{tt}} ci-python -- sh -c '({{test_cmd}}) && {{ci_check_cmd}}'
