@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # release.yml gates on this workflow, so it has to be callable.
+  workflow_call:
 
 permissions:
   contents: read
