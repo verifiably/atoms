@@ -6,7 +6,7 @@ priority: 2
 size: m
 owner: main
 created: 2026-09-07T14:29:39Z
-updated: 2026-09-07T16:29:27Z
+updated: 2026-09-07T16:58:50Z
 depends: [ops-f1a933]
 tags: [hygiene]
 ---
@@ -26,3 +26,4 @@ Gated on ops-f1a933, which decides the naming scheme: verifiably-atoms is free o
 - 2026-09-07T16:20:32Z (main): Publishing mechanism for the release workflow: PyPI trusted publishing (OIDC), not a long-lived API token. It needs one action outside this repo that only the account owner can take — create a pending publisher on PyPI for verifiably-atoms naming owner verifiably, repository atoms, the release workflow's filename, and the environment if one is used. That does not reserve the name; the name is taken by the first successful publish.
 - 2026-09-07T16:27:15Z (main): First CI run failed, and the prediction that atoms would skip gracefully was wrong: 700 failed, 5264 passed, 10 skipped, 269 errors in 59.4s on both 3.11 and 3.13, all from CapabilityUnavailable for EXT4_IOC_GET_TUNE_SB_PARAM. The ext4_volume and test_volume fixtures do skip, but 969 tests reach the fs layer without going through them and raise instead. Same wall beliefs hit, at roughly 16 percent of the suite rather than 5.
 - 2026-09-07T16:29:27Z (main): Applied the same mechanism beliefs uses, under a stack-wide variable name: VERIFIABLY_UNCERTIFIED_HOST, since the exception both projects convert is raised from atoms and two names for one concept would be worse. beliefs renamed from BELIEFS_UNCERTIFIED_HOST in the same pass. Verified in atoms: closed by default, converts only CapabilityUnavailable under the opt-in, and a stray value does not disarm.
+- 2026-09-07T16:58:50Z (main): The hook only covered the call phase, so the second CI run went 700 failed to 3, and 10 skipped to 707, while all 269 errors survived: those are CapabilityUnavailable raised inside fixtures, which is the setup phase and something pytest_runtest_call never sees. Wrapped setup, call and teardown; verified locally that a fixture-phase raise now converts and an ordinary error still fails. beliefs got the same fix — its capability failures all happen to be call-phase today, but the gap is not worth leaving.

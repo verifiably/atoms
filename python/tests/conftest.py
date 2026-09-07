@@ -15,25 +15,51 @@ from atoms.fs.volume import StorageProfile
 from tests.uncertified_host import uncertified_host
 
 
-@pytest.hookimpl(wrapper=True)
-def pytest_runtest_call(item):
-    """On a declared uncertified host, report a missing capability instead of failing.
+def _report_missing_capability(error: CapabilityUnavailable) -> None:
+    """Turn a missing capability into a skip, but only on a declared uncertified host.
 
-    A runner has no certified ext4 kernel and volume tuple. The volume fixtures already
-    skip when they cannot hand one over, but 969 tests reach the fs layer without going
-    through them and raise instead; this converts those, and only those.
-
-    The skipped set is defined by the capability probe at run time, not by a list anyone
-    maintains, so a new capability-dependent test needs no annotation and the set cannot
-    go stale. Every other failure still fails, so a real regression cannot hide here, and
-    a bug that surfaces *as* `CapabilityUnavailable` is caught on the certified host,
-    where nothing converts.
+    Returns without acting anywhere else, so the caller re-raises and the suite stays
+    closed — which is what the certified host and the pre-push gate need.
     """
+    if uncertified_host(os.environ):
+        pytest.skip(f"certified tuple unavailable on this host: {error}")
+
+
+# Wrapped on all three phases, not just the call. A runner has no certified ext4 kernel
+# and volume tuple; the volume fixtures skip when they cannot hand one over, but many
+# tests reach the fs layer without going through them and raise instead. Those raises
+# land in whichever phase touched the filesystem first: 697 of them in the call, and 269
+# inside fixtures, which is setup and which `pytest_runtest_call` never sees.
+#
+# The skipped set is defined by the capability probe at run time, not by a list anyone
+# maintains, so a new capability-dependent test needs no annotation and the set cannot go
+# stale. Every other failure still fails, so a real regression cannot hide here, and a bug
+# that surfaces *as* `CapabilityUnavailable` is caught on the certified host, where
+# nothing converts.
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_setup(item):
     try:
         return (yield)
     except CapabilityUnavailable as error:
-        if uncertified_host(os.environ):
-            pytest.skip(f"certified tuple unavailable on this host: {error}")
+        _report_missing_capability(error)
+        raise
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_call(item):
+    try:
+        return (yield)
+    except CapabilityUnavailable as error:
+        _report_missing_capability(error)
+        raise
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_teardown(item, nextitem):
+    try:
+        return (yield)
+    except CapabilityUnavailable as error:
+        _report_missing_capability(error)
         raise
 
 
