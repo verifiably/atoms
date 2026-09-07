@@ -6,7 +6,7 @@ priority: 2
 size: m
 owner: main
 created: 2026-09-07T14:29:39Z
-updated: 2026-09-07T16:11:08Z
+updated: 2026-09-07T16:20:32Z
 depends: [ops-f1a933]
 tags: [hygiene]
 ---
@@ -23,3 +23,4 @@ Gated on ops-f1a933, which decides the naming scheme: verifiably-atoms is free o
 
 - 2026-09-07T16:11:08Z (main): CI added first, before any release wiring: .github/workflows/ci.yml runs just ci-python across 3.11 and 3.13, reusing the pins beliefs and nodes already use. atoms is Python-only with no dependencies, so no sibling checkout is needed. ci_check_cmd drops only tasks check, whose binary is not on a runner; ops-check keeps working because its registry lookup is empty when absent. Unlike beliefs, no skip mechanism should be needed — atoms' volume fixtures already return a skip reason instead of raising when no certified volume exists.
 - 2026-09-07T16:11:08Z (main): Bug found by dry-running the recipe before pushing: test_cmd here is a bare 'cd python && ...' with no subshell, so putting it first in a composed command leaked its cd into ops-check and the following cd python. The existing recipes never hit it because they put test_cmd last. Parenthesised in ci-python and noted in the justfile.
+- 2026-09-07T16:20:32Z (main): Publishing mechanism for the release workflow: PyPI trusted publishing (OIDC), not a long-lived API token. It needs one action outside this repo that only the account owner can take — create a pending publisher on PyPI for verifiably-atoms naming owner verifiably, repository atoms, the release workflow's filename, and the environment if one is used. That does not reserve the name; the name is taken by the first successful publish.
