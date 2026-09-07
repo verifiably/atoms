@@ -92,7 +92,9 @@ def test_evidence_configuration_equals_the_matched_entry(bound_volume):
         assert evidence.declared_storage_profile == evidence.matched_entry.storage
 
 
-def test_empty_allowlist_refuses(project_root, held_lock, metadata_root, test_storage_profile):
+def test_empty_allowlist_refuses(
+    project_root, held_lock, metadata_root, test_storage_profile, certified_ext4
+):
     with held_lock(metadata_root) as lock, pytest.raises(
         CapabilityUnavailable, match="allowlist"
     ):
@@ -121,7 +123,7 @@ def test_certified_allowlist_refuses_mismatched_feature_masks():
 
 
 def test_refusal_reclaims_existing_debris_but_writes_nothing_new(
-    project_root, held_lock, metadata_root, test_storage_profile
+    project_root, held_lock, metadata_root, test_storage_profile, certified_ext4
 ):
     # Reclamation precedes the allowlist refusal: if refusal came first, a
     # configuration removed from the allowlist could never have its debris cleared.

@@ -61,7 +61,7 @@ def test_latest_txid_closes_its_sqlite_connection(tmp_path):
     assert references == []
 
 
-def test_clean_and_caught_whole_cell_subprocess_placement(exerciser_child):
+def test_clean_and_caught_whole_cell_subprocess_placement(exerciser_child, certified_ext4):
     """Design §6's whole-cell placement: setup, transaction, and projection in a child.
 
     The clean scenario must reach `COMMITTED` and the caught one `ROLLED_BACK` (erratum

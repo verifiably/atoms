@@ -23,7 +23,7 @@ from atoms.core.effects import (
     ReplaceFile,
     occurrences,
 )
-from atoms.core.errors import SpecValidationError
+from atoms.core.errors import CapabilityUnavailable, SpecValidationError
 from atoms.core.fingerprint import DirectoryState, FileState, PathState
 from atoms.core.spec import TransactionSpec, build_spec
 from atoms.fs.bootstrap import close_layout, ensure_metadata_layout, verified_child_path
@@ -46,6 +46,7 @@ from atoms.fs.volume import (
     build_configuration,
     kernel_identifier,
     read_mountinfo,
+    resolve_ext4_feature_masks,
     resolve_mount_entry,
 )
 
@@ -231,6 +232,31 @@ def ext4_volume_or_skip_reason() -> tuple[Path | None, str]:
             "Set ATOMS_TEST_VOLUME to a directory on ext4."
         )
     return resolved, ""
+
+
+def ext4_feature_masks_or_skip_reason() -> tuple[bool, str]:
+    """Whether this kernel exposes the design §7.4 superblock feature masks.
+
+    Distinct from `ext4_volume_or_skip_reason`: a volume can be ext4 and still refuse
+    `EXT4_IOC_GET_TUNE_SB_PARAM`, which is exactly what a stock kernel on a CI runner
+    does. Most tests that need the masks raise `CapabilityUnavailable` and the conftest
+    hook converts them, but two kinds cannot be reached that way — a test that asserts on
+    a *specific* `CapabilityUnavailable` catches it before the hook sees it, and a test
+    that drives a child process fails in the parent's assertion instead. Those ask for
+    the `certified_ext4` fixture, which consults this.
+    """
+    resolved, reason = ext4_volume_or_skip_reason()
+    if resolved is None:
+        return False, reason
+    probe = resolved if resolved.exists() else resolved.parent
+    fd = os.open(probe, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        resolve_ext4_feature_masks(fd)
+    except CapabilityUnavailable as error:
+        return False, str(error)
+    finally:
+        os.close(fd)
+    return True, ""
 
 
 def descriptor_count() -> int:

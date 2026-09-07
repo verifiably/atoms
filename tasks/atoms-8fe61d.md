@@ -6,7 +6,7 @@ priority: 2
 size: m
 owner: main
 created: 2026-09-07T14:29:39Z
-updated: 2026-09-07T17:01:02Z
+updated: 2026-09-07T17:09:07Z
 depends: [ops-f1a933]
 tags: [hygiene]
 ---
@@ -28,3 +28,4 @@ Gated on ops-f1a933, which decides the naming scheme: verifiably-atoms is free o
 - 2026-09-07T16:29:27Z (main): Applied the same mechanism beliefs uses, under a stack-wide variable name: VERIFIABLY_UNCERTIFIED_HOST, since the exception both projects convert is raised from atoms and two names for one concept would be worse. beliefs renamed from BELIEFS_UNCERTIFIED_HOST in the same pass. Verified in atoms: closed by default, converts only CapabilityUnavailable under the opt-in, and a stray value does not disarm.
 - 2026-09-07T16:58:50Z (main): The hook only covered the call phase, so the second CI run went 700 failed to 3, and 10 skipped to 707, while all 269 errors survived: those are CapabilityUnavailable raised inside fixtures, which is the setup phase and something pytest_runtest_call never sees. Wrapped setup, call and teardown; verified locally that a fixture-phase raise now converts and an ordinary error still fails. beliefs got the same fix — its capability failures all happen to be call-phase today, but the gap is not worth leaving.
 - 2026-09-07T17:01:02Z (main): Three failures survive the hook, and both reasons are principled limits rather than defects. test_fs_binding.py's test_empty_allowlist_refuses and test_refusal_reclaims_existing_debris_but_writes_nothing_new use pytest.raises(CapabilityUnavailable, match=...) to assert a specific capability refusal; on an uncertified host a different CapabilityUnavailable fires first, the test catches it, and what fails is the regex — the exception never reaches the hook. test_exerciser.py's test_clean_and_caught_whole_cell_subprocess_placement runs its work in a child process and asserts on the child's output, so the capability failure happens where the parent's hook cannot see it. Both classes mean those tests genuinely cannot run without the certified tuple and need an explicit guard; a hand-maintained set of three is defensible where 969 was not.
+- 2026-09-07T17:09:07Z (main): Option A implemented: ext4_feature_masks_or_skip_reason in tests/fs_support.py probes EXT4_IOC_GET_TUNE_SB_PARAM directly, and a certified_ext4 fixture skips on its reason. Three tests take it — the two in test_fs_binding.py that assert on a specific CapabilityUnavailable, and the exerciser one that drives a child process. Verified: all three still pass on the certified host, so the guard does not skip where the capability exists, and the helper returns a reason on a tmpfs volume. Every other capability-dependent test stays unannotated and handled by the hook.

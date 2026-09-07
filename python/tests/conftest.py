@@ -66,6 +66,7 @@ def pytest_runtest_teardown(item, nextitem):
 from tests.fs_support import (
     build_test_allowlist,
     casefold_volume_or_reason,
+    ext4_feature_masks_or_skip_reason,
     ext4_volume_or_skip_reason,
     find_distinct_mount,
     make_bound_volume,
@@ -350,6 +351,20 @@ def directory_fd(tmp_path):
     fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     yield fd
     os.close(fd)
+
+
+@pytest.fixture
+def certified_ext4():
+    """Require the §7.4 superblock feature masks, which a stock kernel does not expose.
+
+    For the tests the conftest capability hook cannot reach: one that asserts on a
+    specific `CapabilityUnavailable` catches it first, and one that drives a child
+    process fails in the parent's assertion. Three tests use this; every other
+    capability-dependent test is handled by the hook and needs no annotation.
+    """
+    available, reason = ext4_feature_masks_or_skip_reason()
+    if not available:
+        pytest.skip(reason)
 
 
 @pytest.fixture
