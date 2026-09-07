@@ -1,5 +1,5 @@
 [project]
-name = "atoms-core"
+name = "verifiably-atoms"
 import-names = ["atoms.coordinator", "atoms.core", "atoms.fs", "atoms.store"]
 import-namespaces = ["atoms"]
 version = "0.1.0"

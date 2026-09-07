@@ -1,11 +1,12 @@
 ---
 id: atoms-8fe61d
 title: Publish atoms-core to PyPI
-status: todo
+status: doing
 priority: 2
 size: m
+owner: main
 created: 2026-09-07T14:29:39Z
-updated: 2026-09-07T14:29:49Z
+updated: 2026-09-07T15:58:19Z
 depends: [ops-f1a933]
 tags: [hygiene]
 ---
