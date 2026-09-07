@@ -6,7 +6,7 @@ priority: 2
 size: m
 owner: main
 created: 2026-09-07T14:29:39Z
-updated: 2026-09-07T17:27:19Z
+updated: 2026-09-07T17:48:59Z
 depends: [ops-f1a933]
 tags: [hygiene]
 ---
@@ -31,3 +31,5 @@ Gated on ops-f1a933, which decides the naming scheme: verifiably-atoms is free o
 - 2026-09-07T17:09:07Z (main): Option A implemented: ext4_feature_masks_or_skip_reason in tests/fs_support.py probes EXT4_IOC_GET_TUNE_SB_PARAM directly, and a certified_ext4 fixture skips on its reason. Three tests take it — the two in test_fs_binding.py that assert on a specific CapabilityUnavailable, and the exerciser one that drives a child process. Verified: all three still pass on the certified host, so the guard does not skip where the capability exists, and the helper returns a reason on a tmpfs volume. Every other capability-dependent test stays unannotated and handled by the hook.
 - 2026-09-07T17:27:19Z (main): Release workflow written: gates (reusing ci.yml via workflow_call) then build, verify-artifacts, publish-pypi. Trusted publishing with environment 'release', matching what nodes already uses — not PyPI's example name 'pypi', because the sibling's convention is the one worth matching. Tag prefix is v* rather than nodes' core/v*, since that prefix named the -core suffix the stack has dropped and this repo ships one distribution.
 - 2026-09-07T17:27:19Z (main): Verification before an irreversible upload: verify_python_artifacts.py checks the wheel and sdist contents and metadata, and smoke_install_python.sh installs both into scratch environments and imports from each, the sdist half proving it still rebuilds. Both adapted from nodes rather than copied — atoms is also a namespace package, so the assertions are the same shape with atoms' four typed subpackages. Both were run against a real local build of verifiably_atoms 0.1.0 and pass.
+- 2026-09-07T17:48:59Z (main): Wiring complete and verified 2026-09-07. CI green on the release-workflow commit (5266 passed, 979 skipped, both 3.11 and 3.13), and GitHub parses both workflows as active — CI and Release — so the release definition will not fail at tag time. Pending publisher registered by the user for verifiably-atoms / verifiably / atoms / release.yml / release, and the release environment created with khughitt as required reviewer (prevent_self_review false, since a single maintainer must be able to approve; can_admins_bypass is GitHub's default true, so the gate is a speed bump for an admin rather than a control).
+- 2026-09-07T17:48:59Z (main): Only the publish itself remains: git tag v0.1.0 and push it. That run pauses for reviewer approval, and the upload after it is the irreversible step that takes the name verifiably-atoms at 0.1.0 permanently. Left untagged deliberately — nothing about the wiring expires.
