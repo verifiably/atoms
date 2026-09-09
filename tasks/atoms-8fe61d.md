@@ -1,12 +1,12 @@
 ---
 id: atoms-8fe61d
-title: Publish atoms-core to PyPI
-status: doing
+title: Publish verifiably-atoms to PyPI
+status: done
 priority: 2
 size: m
 owner: main
 created: 2026-09-07T14:29:39Z
-updated: 2026-09-07T17:48:59Z
+updated: 2026-09-09T21:32:30Z
 depends: [ops-f1a933]
 tags: [hygiene]
 ---
@@ -33,3 +33,6 @@ Gated on ops-f1a933, which decides the naming scheme: verifiably-atoms is free o
 - 2026-09-07T17:27:19Z (main): Verification before an irreversible upload: verify_python_artifacts.py checks the wheel and sdist contents and metadata, and smoke_install_python.sh installs both into scratch environments and imports from each, the sdist half proving it still rebuilds. Both adapted from nodes rather than copied — atoms is also a namespace package, so the assertions are the same shape with atoms' four typed subpackages. Both were run against a real local build of verifiably_atoms 0.1.0 and pass.
 - 2026-09-07T17:48:59Z (main): Wiring complete and verified 2026-09-07. CI green on the release-workflow commit (5266 passed, 979 skipped, both 3.11 and 3.13), and GitHub parses both workflows as active — CI and Release — so the release definition will not fail at tag time. Pending publisher registered by the user for verifiably-atoms / verifiably / atoms / release.yml / release, and the release environment created with khughitt as required reviewer (prevent_self_review false, since a single maintainer must be able to approve; can_admins_bypass is GitHub's default true, so the gate is a speed bump for an admin rather than a control).
 - 2026-09-07T17:48:59Z (main): Only the publish itself remains: git tag v0.1.0 and push it. That run pauses for reviewer approval, and the upload after it is the irreversible step that takes the name verifiably-atoms at 0.1.0 permanently. Left untagged deliberately — nothing about the wiring expires.
+- 2026-09-09T21:31:50Z (main): took over session ae621699-131b-4915-8c12-e8a29d79a0cf (owner main, host titan, pid 1867771, worktree /mnt/ssd/Dropbox/atoms, since 2026-09-07T15:58:19Z, age 192811s, stale: pid 1867771 is gone)
+- 2026-09-09T21:32:05Z (main): Title corrected 2026-09-09 from 'Publish atoms-core to PyPI': the -core suffix was dropped by the scheme ops-f1a933 settled, and no package named atoms-core was ever published. Publish verified complete, not merely wired: tag v0.1.0 exists locally and on origin at 0455d1f; PyPI holds verifiably_atoms-0.1.0-py3-none-any.whl and the sdist, uploaded 2026-09-07T18:33:58Z, neither yanked; and the PyPI attestation bundle names publisher GitHub, repository verifiably/atoms, workflow release.yml, environment release, so the upload came through the trusted publisher and the release workflow as designed rather than a manual token. That is roughly 45 minutes after the last note here, which recorded the tag-and-push as the only remaining step; the step ran and the task was never closed.
+- 2026-09-09T21:32:30Z (main): verifiably-atoms 0.1.0 is on PyPI as of 2026-09-07T18:33:58Z, published by the release workflow through the trusted publisher (attestation names verifiably/atoms, release.yml, environment release). All three pieces of scope landed: the CI workflow, the release workflow gating on it, and the publish itself. Closed with --force over the open dependency ops-f1a933, deliberately: this task was gated on it for one stated reason, that it should not claim a PyPI name before the naming scheme was decided. That decision was made 2026-09-07 and is recorded in ops-f1a933's notes (verifiably-<layer>, dropping -core), and the 18:33 publish claimed verifiably-atoms under it, so the gate was satisfied before the work ran. What remains open there is version coupling, release cadence and order, and whether beliefs' ts artifact ships; none bear on a publish that already happened, and holding this open until they settle would misreport the state of the package. Follow-on, not part of this task: beliefs still resolves verifiably-atoms from an editable sibling path in [tool.uv.sources], and swapping that for a released-version bound is the version-coupling question ops-f1a933 has yet to answer.
