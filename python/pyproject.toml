@@ -13,9 +13,9 @@ classifiers = ["Typing :: Typed"]
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/atoms-dev/core"
-Repository = "https://github.com/atoms-dev/core"
-Issues = "https://github.com/atoms-dev/core/issues"
+Homepage = "https://github.com/verifiably/atoms"
+Repository = "https://github.com/verifiably/atoms"
+Issues = "https://github.com/verifiably/atoms/issues"
 
 [build-system]
 requires = ["hatchling>=1.30"]

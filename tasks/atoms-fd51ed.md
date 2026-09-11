@@ -1,11 +1,12 @@
 ---
 id: atoms-fd51ed
 title: "Published repository URLs point at atoms-dev/core, which does not exist"
-status: todo
+status: done
 priority: 2
 size: xs
+owner: fix/atoms-fd51ed-project-urls
 created: 2026-09-09T21:29:50Z
-updated: 2026-09-09T21:29:50Z
+updated: 2026-09-11T12:37:59Z
 depends: []
 tags: [hygiene]
 ---
@@ -17,3 +18,8 @@ nodes had the same shape and does not need this fix, which is worth recording so
 PyPI metadata is immutable per release, so editing pyproject.toml corrects the tree but the published 0.1.0 page keeps the dead links until a further release goes out. Three one-line edits, no behaviour change: this should ride whatever release comes next rather than justify one on its own.
 
 docs/plans/2026-07-23-plan-a1-core-model.md lines 120-122 carry the same URLs. That is a historical record of what was written at the time and should stay as it is.
+
+## Notes
+
+- 2026-09-11T12:37:59Z (fix/atoms-fd51ed-project-urls): Changed the three project URLs to match the verifiably/atoms origin. Built a wheel and parsed its METADATA: Homepage, Repository, and Issues all contain the corrected destinations. Historical plan text and package version remain as scoped; publication waits for the next release.
+- 2026-09-11T12:37:59Z (fix/atoms-fd51ed-project-urls): Corrected all three project URLs and verified the built wheel metadata; ready for the next release.
