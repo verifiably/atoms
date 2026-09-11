@@ -94,6 +94,12 @@ approved effects against project paths.
   …) and refuse only the specific effects a mount cannot satisfy. Linux lands complete
   first; macOS fills in capability-by-capability. No all-or-nothing platform gate.
 
+`atoms.coordinator.commands.read_preimage(..., txid, path, max_bytes=...)`
+returns verified, owned bytes for a settled transaction's registered regular-file
+initial state on its writable source root. Replica metadata carries no transaction
+history. Lease entry may run recovery; an active halt blocks every history read.
+See the [public preimage contract](docs/plans/2026-09-11-public-preimage-read-design.md).
+
 ## Design decisions (settled in the authority design)
 
 1. **Durable metadata → SQLite-in-WAL** (stdlib `sqlite3`, `synchronous=FULL` + macOS

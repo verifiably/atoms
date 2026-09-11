@@ -56,6 +56,7 @@ def test_the_coordinator_command_module_exports_the_approved_public_names():
         "read_lifecycle_state",
         "read_path_state",
         "read_pending_fork_operation",
+        "read_preimage",
         "register_root",
         "replicate_root",
         "resume_fork_root",

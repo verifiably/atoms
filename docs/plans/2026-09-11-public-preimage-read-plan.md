@@ -3,8 +3,8 @@
 > **For agentic workers:** Use `superpowers:executing-plans` to implement this
 > plan inline, task by task. Steps use checkboxes for tracking.
 
-**Status:** Planned, 2026-09-11. No production implementation. Inspected tree:
-`6bc8895` plus the second-review correction to the design's §1.1.
+**Status:** Implemented and verified, 2026-09-11. Starting tree: `9286574`.
+Evidence: [design §9](2026-09-11-public-preimage-read-design.md#9-implementation-evidence).
 
 **Goal:** Return owned, verified bytes for a settled transaction's registered
 regular-file preimage on its writable source root.
@@ -49,6 +49,7 @@ and `tools/tt` gate recipes.
 | `python/src/atoms/coordinator/commands.py` | `read_preimage`, one private buffer reader, imports and `__all__` |
 | `python/tests/test_read_preimage.py` (new) | Public authorization, bytes, corruption, lifecycle and resource checks |
 | `python/tests/test_fs_architecture.py` | Public inventories and clause-1 writable/existing-only lease assertions |
+| `python/tests/test_packaging.py` | The second public-export inventory |
 | `docs/plans/2026-09-11-public-preimage-read-design.md` | Mark implemented with verified evidence in the landing change |
 | `README.md` | Brief source-root historical-read contract and link to the design |
 
@@ -65,7 +66,7 @@ in `conftest.py`, and this task needs no new fixture registration.
 
 ### Task 1: Implement and verify the writable preimage command
 
-**Files:** the five files above, this plan, and CLI-managed task records.
+**Files:** the six files above, this plan, and CLI-managed task records.
 
 **Interfaces:** Consumes the existing lease, validated chain, StoredRecord and
 verified blob descriptor. Produces exactly:
@@ -83,7 +84,7 @@ def read_preimage(
 ) -> bytes:
 ```
 
-- [ ] **1. Start the implementation child and establish the public positive case.**
+- [x] **1. Start the implementation child and establish the public positive case.**
 
 Import the command into the new test module. Use this reusable setup and first
 check; the explicit `registered_paths` is essential because `build_spec` defaults
@@ -128,19 +129,19 @@ Run and confirm failure names the missing public command:
 (cd .worktrees/atoms-38887b && python3 tools/tt preimage-red -- sh -c 'cd python && uv run --frozen pytest tests/test_read_preimage.py -x')
 ```
 
-- [ ] **2. Implement admission, authorization and the owned read.**
+- [x] **2. Implement admission, authorization and the owned read.**
 
 Add `hashlib`, `RegisteredEntry`, `FileState`, `TransactionState`,
 `MetadataStoreInvalid`, `_derive_reconciliation`, `_registration_entry`, and
-`require_valid_identifier` (aliased `_require_valid_identifier`) imports from
-their existing stdlib/Atoms modules. Retain existing import conventions.
+`require_valid_identifier`, `Provenance`, `RootKind`, `BLOBS_PARENT`, and
+`digest_to_leaf` imports from their existing stdlib/Atoms modules. Retain existing import conventions.
 Add `read_preimage` to `__all__`. Use this body for the public signature above:
 
 ```python
     if type(txid) is not str or type(path) is not str or type(max_bytes) is not int:
         raise ProtocolError("txid/path must be exact str and max_bytes exact int")
     try:
-        _require_valid_identifier("txid", txid)
+        require_valid_identifier("txid", txid)
         require_rel_path("preimage path", path)
     except SpecValidationError as caught:
         raise PreconditionRefused(str(caught)) from caught
@@ -179,13 +180,23 @@ Add `read_preimage` to `__all__`. Use this body for the public signature above:
                 raise PreconditionRefused("initial state is not a regular file")
             if state.byte_len > max_bytes:
                 raise PreconditionRefused("preimage exceeds max_bytes")
+            audited = _cast(AuditedBackend, lease._binding.backend)
+            provenance = Provenance(
+                RootKind.METADATA,
+                f"{BLOBS_PARENT}/{digest_to_leaf(state.content_hash)}",
+            )
             fd = lease._store.open_blob(state.content_hash)
+            audited.register(fd, provenance)
             try:
                 payload = _read_preimage_bytes(fd, state)
             finally:
-                os.close(fd)
+                audited.close_fd(fd)
     return payload
 ```
+
+The explicit duplicate-registration refusal deliberately precedes local record
+lookup; it reports `duplicate transaction registration`. Reconciliation retains
+its own check for its other callers.
 
 The `next` selection is justified by whole-entry equality and `read_record`'s
 validated spec. No defensive fallback should turn a broken internal proof into
@@ -193,6 +204,7 @@ unavailable history. The private reader receives an already budget-checked state
 
 ```python
 def _read_preimage_bytes(fd: int, state: FileState) -> bytes:
+    """Bound payload allocation and read one sentinel byte to detect growth."""
     buffer = bytearray()
     remaining = state.byte_len + 1
     while remaining:
@@ -213,7 +225,7 @@ Do not catch lease/recovery, store or I/O exceptions broadly. `open_blob` owns
 closure if it fails before returning; the command owns closure afterward.
 Hash the returned bytes after conversion, not only the earlier store read.
 
-- [ ] **3. Extend authorization and request tests before accepting the implementation.**
+- [x] **3. Extend authorization and request tests before accepting the implementation.**
 
 Use the setup from step 1. Check two removals of the same path with different
 payloads and assert each txid returns its own bytes. Also check replacement
@@ -248,10 +260,13 @@ with pytest.raises(PreconditionRefused):
 The authorization cases also include an unknown txid; a public transaction with
 `registered_paths=()` despite a file in its spec; and registered initial absent,
 directory and symlink states. Use `CreateFileNoClobber` for the absent/postimage
-case and `DeletePath` for the directory/symlink cases. An indexed postimage or
-another transaction's blob must never substitute for the requested preimage.
+case and `DeletePath` for the symlink case. A directory initial state is
+unconstructible through current effects (the compiler also excludes untouched
+surface paths); inject matching chain/record projection at the reader boundary
+for the closed directory refusal, without claiming a public transaction made it.
+An indexed postimage or another transaction's blob must never substitute for the requested preimage.
 
-- [ ] **4. Exercise record, chain and blob corruption at the public boundary.**
+- [x] **4. Exercise record, chain and blob corruption at the public boundary.**
 
 Use settled records produced by step 1. With the real `Store.read_record` result,
 use `dataclasses.replace` only to inject contradictions after the store's own
@@ -271,8 +286,8 @@ guards. Each case must raise the named exception before `Store.open_blob`:
 
 Use real on-disk corruption for the record's indexed blob. Following
 `test_store_blobs.py` and `test_store_records.py`, mutate a copy of the test
-database for absent/wrong-length `blob` rows (disable only the triggers that
-block the deliberate sabotage); assert `MetadataStoreInvalid` from
+database for absent/wrong-length `blob` rows (no trigger change is needed);
+assert `MetadataStoreInvalid` from
 `RULE_BLOB_ROW_PRESENT`/`RULE_BLOB_BYTE_LEN`, before blob open. Never weaken
 production triggers. Tamper the indexed `blobs/sha256/<hex>` leaf: unlink,
 truncate, extend, replace by same-length bytes, symlink, directory and FIFO.
@@ -303,7 +318,7 @@ Parameterize this wrapper with shorter and longer replacements to check EOF and
 sentinel handling. Inject `OSError(errno.EIO, "read failure")` and `MemoryError`
 at `_read_preimage_bytes`; assert propagation and the same descriptor closure.
 
-- [ ] **5. Verify lifecycle, recovery and resource duration using existing fixtures.**
+- [x] **5. Verify lifecycle, recovery and resource duration using existing fixtures.**
 
 Use `_replicate`, `_grant`, `_cold_copy` and `_copy_targets` in
 `test_lifecycle_commands.py`, plus `fabricate_v2_store` in `lifecycle_support.py`.
@@ -318,13 +333,17 @@ For rollback, inject `KeyboardInterrupt` into `execute.delete_path.apply` using
 the public-run pattern in `test_coordinator_run.py`; read the resulting
 ROLLED_BACK txid from its chain settlement and assert its preimage is readable.
 For recovery-on-entry, prepare a real registered active record with
-`test_coordinator_resolve.py::_prepare_registered`, then read older settled
-history and verify the active record was settled and detached first.
+`test_coordinator_resolve.py::_prepare_registered` as the preparation model, then
+read older settled history and verify the active record was settled and detached
+first. That helper always appends genesis, so the new test module's
+`_prepare_after_history` reuses its admission/capture/preparation calls and appends
+only the registration to the existing chain; do not append a second genesis.
 For halts, reuse the assembly-halt construction in
-`test_coordinator_assembly_halt.py` and the committed-halt record construction
-in `test_coordinator_reconcile.py`; assert `TransactionHalted` for both the
-active txid and unrelated settled history. Do not replace the lease in these
-recovery checks: the real gate is the behavior being tested.
+`test_coordinator_assembly_halt.py`; assert `TransactionHalted` for both the
+active txid and unrelated settled history. The pure committed-halt record in
+`test_coordinator_reconcile.py` is not an on-disk fixture: retain its existing
+reconciliation coverage without claiming it exercises public lease entry. Do not
+replace the lease in these recovery checks: the real gate is the behavior being tested.
 
 Wrap the private byte reader to test the actual lock while it reads, then use
 the existing contender after return and after injected errors:
@@ -343,11 +362,12 @@ assert _contend(ingredients[2]) == 0
 assert result == b"first version"
 ```
 
-- [ ] **6. Update architecture inventories and run focused verification.**
+- [x] **6. Update architecture inventories and run focused verification.**
 
 In `test_chain_commands_keep_the_lease_and_approval_proofs_private`, add only
 `read_preimage` to the expected public function and export inventories. Add it
-to clause 1's `_writable_recovery_lease` loop. Extend the existing reader's
+to clause 1's `_writable_recovery_lease` loop. Add the export to
+`test_packaging.py`'s matching public inventory too. Extend the existing reader's
 negative assertion exactly as follows; retain the no-direct-`resolve` check:
 
 ```python
@@ -367,7 +387,7 @@ changed-`consumer_tag` check fails if whole-entry comparison is removed. Restore
 both mutations immediately and rerun their focused checks. These two mutations
 target the command's new trust checks, not existing store implementations.
 
-- [ ] **7. Record implementation, verify the full gate and close the work.**
+- [x] **7. Record implementation, verify the full gate and close the work.**
 
 After the code exists and focused checks pass, mark the design and this plan
 implemented, record exact commands/results, and add this README contract:

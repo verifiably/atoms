@@ -1,13 +1,14 @@
 ---
 id: atoms-38887b
 title: Deliver the public preimage blob-read seam
-status: doing
+status: done
 priority: 2
 size: l
 owner: feat/atoms-38887b-preimage-reader
 created: 2026-08-30T18:18:54Z
-updated: 2026-09-11T14:39:29Z
+updated: 2026-09-11T15:20:05Z
 started: 2026-09-11T14:21:22Z
+completed: 2026-09-11T15:20:05Z
 depends: []
 tags: [migration, beliefs, chain]
 plan: docs/plans/2026-09-11-public-preimage-read-plan.md
@@ -15,13 +16,13 @@ plan: docs/plans/2026-09-11-public-preimage-read-plan.md
 
 Outcome: Atoms exposes the narrow lease-held public command Beliefs needs to read and verify an indexed transaction preimage without exposing Store, Lease, or a private blob descriptor API.
 
-Draft design for review: docs/plans/2026-09-11-public-preimage-read-design.md.
+Approved design: docs/plans/2026-09-11-public-preimage-read-design.md.
 
 Acceptance evidence: Approve an Atoms-local design that fixes authorization, lifecycle, digest, descriptor/bytes ownership, and corruption behavior; implement the command through the existing verified Store.open_blob path under the correct read boundary; add architecture, corruption, lifetime, and consumer-contract tests; run the complete Python gate; and provide the stable seam Beliefs can use to discharge L13 preimage-backed classification.
 
 Sources: docs/plans/2026-07-31-a5a-metadata-store-design.md and its blob tests; docs/plans/2026-08-22-chain-inspection-design.md section 3; docs/2026-08-23-root-lifecycle-commands-design.md section 7; Beliefs adoption ledger and task beliefs-a7df71.
 
-The internal verified blob reader exists. The public contract remains subject to design approval; no new production shape has been admitted.
+The writable-only public contract is approved. Implementation is tracked by atoms-87c2e4; Beliefs owns source-root selection and held-copy matching in beliefs-a7df71.
 
 ## Notes
 
@@ -32,3 +33,4 @@ The internal verified blob reader exists. The public contract remains subject to
 - 2026-09-11T14:34:29Z (feat/atoms-38887b-preimage-reader): Second review verified: replication excludes the non-overlapping source metadata root, mints fresh destination bookkeeping, and lifecycle transitions cannot demote writable stores. Corrected section 1.1, accepted writable-only design under the user approval, removed planning hold, and noted source-root selection on beliefs-a7df71. Proceeding to implementation plan.
 - 2026-09-11T14:39:09Z (feat/atoms-38887b-preimage-reader): Implementation plan written and self-reviewed at docs/plans/2026-09-11-public-preimage-read-plan.md; one complete deliverable tracked by atoms-87c2e4. Reuses existing writable lease, record/coherence and blob verification paths; covers source history, errors, corruption, lifecycle, halts, resources and full gate. No read-only arm or planning approval hold remains.
 - 2026-09-11T14:39:29Z (feat/atoms-38887b-preimage-reader): parked (waiting on agent): Execute the approved writable-only design via child atoms-87c2e4 and docs/plans/2026-09-11-public-preimage-read-plan.md; no lifecycle-scope decision remains.
+- 2026-09-11T15:20:05Z (feat/atoms-38887b-preimage-reader): Delivered the approved writable-source preimage seam and complete validation; Beliefs source selection and L13 consumption remain beliefs-a7df71.

@@ -1223,6 +1223,7 @@ def test_chain_commands_keep_the_lease_and_approval_proofs_private():
         "read_lifecycle_state",
         "read_path_state",
         "read_pending_fork_operation",
+        "read_preimage",
         "register_root",
         "replicate_root",
         "resume_fork_root",
@@ -1236,6 +1237,7 @@ def test_chain_commands_keep_the_lease_and_approval_proofs_private():
         "read_lifecycle_state",
         "read_path_state",
         "read_pending_fork_operation",
+        "read_preimage",
         "replicate_root",
         "resume_fork_root",
         "fork_root",
@@ -1269,17 +1271,17 @@ def test_chain_commands_keep_the_lease_and_approval_proofs_private():
     for name in ("register_root", "read_chain"):
         assert _enters(public[name], "_recovery_lease"), f"{name} skips _recovery_lease"
         assert not _names(public[name], "resolve"), f"{name} names resolve"
-    # The two cooperative mutators, and the writable-arm reader — which must
-    # never enter the create-capable lease: a carrier that vanished after
-    # classification reads root-unresolvable rather than being recreated.
-    for name in ("append_intent", "run_transaction", "read_path_state"):
+    # The cooperative mutators and both readers use existing-only admission.
+    # A vanished carrier must never be recreated during their lease entry.
+    for name in ("append_intent", "run_transaction", "read_path_state", "read_preimage"):
         assert _enters(public[name], "_writable_recovery_lease"), (
             f"{name} skips the writability gate"
         )
         assert not _names(public[name], "resolve"), f"{name} names resolve"
-    assert not _enters(public["read_path_state"], "_recovery_lease"), (
-        "read_path_state entered the create-capable lease"
-    )
+    for name in ("read_path_state", "read_preimage"):
+        assert not _enters(public[name], "_recovery_lease"), (
+            f"{name} entered the create-capable lease"
+        )
 
     # Clause 2: structural inspection interposes between reclamation and resolution,
     # and it is the ONLY public function permitted to do so.

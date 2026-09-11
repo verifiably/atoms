@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import enum
 import errno
+import hashlib
 import os
 import stat as _stat_module
 from collections.abc import Mapping
@@ -35,6 +36,7 @@ from atoms.chain.model import (
     Entry,
     GenesisEntry,
     IntentEntry,
+    RegisteredEntry,
     state_to_json,
 )
 from atoms.chain.read import validate_chain as _validate_chain
@@ -49,7 +51,12 @@ from atoms.coordinator.lifecycle import (
     RootOperationMismatch,
     SourceSnapshotMoved,
 )
-from atoms.coordinator.recover import _registered_root, resolve
+from atoms.coordinator.recover import (
+    _derive_reconciliation,
+    _registered_root,
+    _registration_entry,
+    resolve,
+)
 from atoms.coordinator.root import (
     _claimed_destination_lease as _root_claimed_destination_lease,
 )
@@ -68,17 +75,19 @@ from atoms.core.errors import (
     ProtocolError,
     SpecValidationError,
 )
-from atoms.core.fingerprint import ABSENT, PathState
+from atoms.core.fingerprint import ABSENT, FileState, PathState
+from atoms.core.identifiers import require_valid_identifier
 from atoms.core.paths import require_rel_path
 from atoms.core.recovery.model import (
     ObservedAbsent,
     ObservedDirectory,
     ObservedFile,
     ObservedSymlink,
+    TransactionState,
 )
 from atoms.core.scratch import CHAIN_LEAF
 from atoms.core.spec import TransactionSpec
-from atoms.fs.audit import AuditedBackend
+from atoms.fs.audit import AuditedBackend, Provenance, RootKind
 from atoms.fs.backend import Backend
 from atoms.fs.lock import (
     acquire_existing_project_lock,
@@ -88,7 +97,9 @@ from atoms.fs.lock import (
 from atoms.fs.observe import _UNSUPPORTED as _UNSUPPORTED_ERRNOS
 from atoms.fs.observe import Observation
 from atoms.fs.volume import StorageProfile
+from atoms.store.blobs import BLOBS_PARENT, digest_to_leaf
 from atoms.store.connection import Store
+from atoms.store.errors import MetadataStoreInvalid
 
 __all__ = (
     "AbsentChain",
@@ -123,6 +134,7 @@ __all__ = (
     "read_lifecycle_state",
     "read_path_state",
     "read_pending_fork_operation",
+    "read_preimage",
     "register_root",
     "replicate_root",
     "resume_fork_root",
@@ -735,6 +747,94 @@ def run_transaction(
             (entry.path, entry.state) for entry in compiled.spec.final_surface
         ),
     )
+
+
+def read_preimage(
+    backend: Backend,
+    project_root: str,
+    metadata_root: str,
+    storage: StorageProfile,
+    txid: str,
+    path: str,
+    *,
+    max_bytes: int,
+) -> bytes:
+    """Read a settled registered file preimage on its writable source root.
+
+    Returns owned bytes within max_bytes. Lease entry may recover earlier work;
+    an active halt blocks all history reads, including unrelated transactions.
+    """
+    if type(txid) is not str or type(path) is not str or type(max_bytes) is not int:
+        raise ProtocolError("txid/path must be exact str and max_bytes exact int")
+    try:
+        require_valid_identifier("txid", txid)
+        require_rel_path("preimage path", path)
+    except SpecValidationError as caught:
+        raise PreconditionRefused(str(caught)) from caught
+    if max_bytes < 0:
+        raise PreconditionRefused("max_bytes must be nonnegative")
+    with _writable_recovery_lease(
+        backend, project_root, metadata_root, storage
+    ) as lease, _registered_root(lease) as (_, validated):
+        registrations = [
+            (digest, entry) for digest, entry in validated.entries
+            if type(entry) is RegisteredEntry and entry.txid == txid
+        ]
+        if not registrations:
+            raise PreconditionRefused("transaction is not registered here")
+        if len(registrations) != 1:
+            raise ChainStateInvalid("duplicate transaction registration")
+        registration_digest, registration = registrations[0]
+        if path not in dict(registration.initial):
+            raise PreconditionRefused("path is not in the registered initial surface")
+        record = lease._store.read_record(txid)
+        if record is None:
+            raise PreconditionRefused("transaction history is not retained locally")
+        if record.state not in (TransactionState.COMMITTED, TransactionState.ROLLED_BACK):
+            raise PreconditionRefused("transaction is not terminal")
+        actions = _derive_reconciliation(record, validated)
+        if actions.registration is not None or actions.settlement is not None:
+            raise ChainStateInvalid("terminal history requires reconciliation")
+        if (
+            registration_digest != record.registration_digest
+            or registration != _registration_entry(record.spec, txid)
+        ):
+            raise ChainStateInvalid("registration contradicts the local record")
+        state = next(item.state for item in record.spec.initial_surface if item.path == path)
+        if type(state) is not FileState:
+            raise PreconditionRefused("initial state is not a regular file")
+        if state.byte_len > max_bytes:
+            raise PreconditionRefused("preimage exceeds max_bytes")
+        audited = _cast(AuditedBackend, lease._binding.backend)
+        provenance = Provenance(
+            RootKind.METADATA,
+            f"{BLOBS_PARENT}/{digest_to_leaf(state.content_hash)}",
+        )
+        fd = lease._store.open_blob(state.content_hash)
+        audited.register(fd, provenance)
+        try:
+            payload = _read_preimage_bytes(fd, state)
+        finally:
+            audited.close_fd(fd)
+    return payload
+
+
+def _read_preimage_bytes(fd: int, state: FileState) -> bytes:
+    """Bound payload allocation and read one sentinel byte to detect growth."""
+    buffer = bytearray()
+    remaining = state.byte_len + 1
+    while remaining:
+        chunk = os.read(fd, min(65536, remaining))
+        if not chunk:
+            break
+        buffer.extend(chunk)
+        remaining -= len(chunk)
+    if len(buffer) != state.byte_len:
+        raise MetadataStoreInvalid("preimage length changed during read")
+    payload = bytes(buffer)
+    if "sha256:" + hashlib.sha256(payload).hexdigest() != state.content_hash:
+        raise MetadataStoreInvalid("preimage hash changed during read")
+    return payload
 
 
 def read_chain(

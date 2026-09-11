@@ -1,7 +1,7 @@
 # Public transaction preimage reader
 
-**Status:** Approved design, 2026-09-11; second-review condition incorporated
-in §1.1. Writable-only contract; no implementation.
+**Status:** Implemented, 2026-09-11. The approved writable-only contract and
+third-review descriptor-ownership correction are implemented; verification below.
 **Task:** `atoms-38887b`. **Inspected Atoms base:** `32edc7e`.
 
 **Authority:** [engine design](2026-07-23-recoverable-fs-effect-engine-design.md)
@@ -184,8 +184,10 @@ is admitted by this design, so this observation adds no ledger entry.
 Open the derived digest only through `Store.open_blob`. It already requires
 an indexed, no-follow regular leaf, checks its indexed length and SHA-256,
 rewinds the descriptor, and detaches audit provenance for caller ownership.
-The command becomes that descriptor's sole owner and closes it in `finally`,
-including allocation, read, verification, and cleanup failure paths.
+The command becomes that descriptor's sole owner, immediately re-registers
+metadata provenance, and closes it in `finally` through the audited facade, as
+`stream_blob` and `_observe_scratch` do. This covers allocation, read,
+verification, and cleanup failure paths after registration.
 
 Read at most the expected length plus one sentinel byte, using bounded chunks
 rather than allocating a buffer from an unchecked length. An unexpected length
@@ -228,7 +230,8 @@ raises before selection of any historical transaction.
 
 Expected implementation is limited to the command and its private helper if
 needed in `python/src/atoms/coordinator/commands.py`, the existing architecture
-inventory in `python/tests/test_fs_architecture.py`, and focused public-command
+inventory in `python/tests/test_fs_architecture.py`, the public-export inventory
+in `python/tests/test_packaging.py`, and focused public-command
 tests using the repository's existing fixtures. Reuse `Store.read_record`,
 `Store.open_blob`, `_registered_root`, `_registration_entry`, and
 `_derive_reconciliation`; do not widen the store or add a generic read layer.
@@ -255,7 +258,9 @@ Verification must cover:
 - All non-writable lifecycle states refuse without creating or changing
   metadata/sidecars or project files. An active writable transaction resolves
   before reading; a halt prevents reading unrelated settled history as well
-  as the halted transaction, including a committed halt.
+  as the halted transaction, using a persisted assembly halt. Committed-halt
+  binding remains covered by the existing pure reconciliation test; it is not
+  claimed as an on-disk public-reader fixture.
 - Reads remain under the exclusive lock through the last byte; success and
   injected failures release it. Returned bytes remain usable afterward.
 - The public inventory adds only `read_preimage`; no store, lease, descriptor,
@@ -269,3 +274,32 @@ No per-sub-plan roadmap status test is added. At landing, mark this design
 implemented and update any current user-facing statements that still describe
 the public seam as absent. Do not mark Beliefs' L13 consumption complete merely
 because this Atoms command exists.
+
+## 9. Implementation evidence
+
+`read_preimage` and its private bounded reader are implemented in
+`python/src/atoms/coordinator/commands.py`. The command restores metadata
+provenance on the detached blob descriptor and closes it through the audited
+facade. Both public-export inventories include it. No store or recovery behavior
+was changed, and no deferred obligation was added.
+
+Verification on 2026-09-11:
+
+- 63 public-reader cases cover historical bytes, authorization, coherence,
+  corruption, lifecycle refusal, recovery and audited resource lifetime.
+- The focused reader/architecture/blob/reconciliation run passed 256 tests;
+  packaging plus architecture passed 74 tests after adding the second export
+  inventory entry discovered by the initial full run.
+- Removing the returned-buffer hash or whole-registration check caused its
+  targeted test to fail; both mutations were restored and their checks passed.
+- Independent read-only review found no issues.
+- `PYTEST_ADDOPTS=-rs just gate`: lint/type/task checks passed; **6,301 passed,
+  7 skipped in 473.37 seconds**. All seven skips are in
+  `test_fs_resolve_casefold.py` because `ATOMS_CASEFOLD_VOLUME` is unset.
+  `tasks check` reported zero errors and zero warnings.
+
+The on-disk halt check uses a persisted assembly halt. The existing committed-halt
+reconciliation test remains pure. Directory initial states are not produced by
+current effects; their non-file refusal uses an injected matching chain/record
+projection. Beliefs' source-root selection and L13 classification remain the
+separate `beliefs-a7df71` task.
