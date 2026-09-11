@@ -6,7 +6,8 @@ priority: 2
 size: l
 owner: feat/atoms-38887b-preimage-reader
 created: 2026-08-30T18:18:54Z
-updated: 2026-09-11T12:44:47Z
+updated: 2026-09-11T14:26:56Z
+started: 2026-09-11T14:21:22Z
 depends: []
 tags: [migration, beliefs, chain]
 ---
@@ -25,3 +26,5 @@ The internal verified blob reader exists. The public contract remains subject to
 
 - 2026-09-11T12:43:56Z (feat/atoms-38887b-preimage-reader): Design inspection at 32edc7e: reuse Store.read_record/open_blob and the existing-only writable recovery lease. Beliefs already exposes LogSeam.state_facts, so this seam owes owned bytes rather than another digest accessor. Draft proposes txid + registered path authorization, whole registration/record agreement, terminal history, explicit byte budget, and refusal of non-writable roots. Draft: docs/plans/2026-09-11-public-preimage-read-design.md. No implementation before design approval.
 - 2026-09-11T12:44:47Z (feat/atoms-38887b-preimage-reader): parked (waiting on user): Review and approve docs/plans/2026-09-11-public-preimage-read-design.md; then write the implementation plan and implement the public reader.
+- 2026-09-11T14:26:33Z (feat/atoms-38887b-preimage-reader): Review revisions: settled request errors (wrong types ProtocolError; grammar/negative budget PreconditionRefused), documented stricter registration authorization without changing reconciliation, named read_record coherence checks, clarified halted-root exclusion, retention and architecture assertions. Consumer check at Beliefs dbfea1f confirmed admit_arrival evaluates read-only-serviceable replicas and L13 includes surviving preimages; writable-only retrieval leaves a replica-local gap. Revised design section 1.1 recommends designing that read-only boundary before planning; scope decision pending.
+- 2026-09-11T14:26:56Z (feat/atoms-38887b-preimage-reader): parked (waiting on user, decision): Settle revised design section 1.1: include READ_ONLY_SERVICEABLE preimage retrieval (recommended), or explicitly retain the replica-local consumer gap; then finish the design before writing the plan.
