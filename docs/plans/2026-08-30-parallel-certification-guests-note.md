@@ -1,54 +1,70 @@
-# Parallel certification guests — design note
+# Parallel certification guests
 
-**Status:** proposed note, 2026-08-30. Not an approved design; the A8b design
-gate run is the owning task's first step, and this note is its input, not its
-substitute.
+**Status:** Design approved on 2026-09-11 for `atoms-eabd89`; implementation
+under verification. This refines A8b §7 without changing the authority's
+certification contract.
 
-## Problem
+## Design-gate findings
 
-The A8b certification sweep runs its nine scenarios serially — one QEMU guest
-boot per scenario in a single loop (`tools/certify/__main__.py`,
-`_run_scenarios`) — and the host kernel that de-certifies the tuple updates
-on the order of weekly (7.1.9 → 7.1.10 → 7.1.11 landed 08-27, 08-28, 08-30).
-Recertification is "one command" as designed, but the command is slow and its
-cost is paid on every kernel bump. A post-boot user unit now runs it in the
-background (machine config, `~/.local/bin/atoms-recertify`), which removes
-the blocking; this note is about removing most of the wall time.
+The review against the authority §13.2, A8b §7, and the current runner at
+`2605839` found no new production boundary or deferred obligation. The ledger
+has no open obligations. The existing nine scenarios remain independent.
 
-## Proposal
+The original note overstated the isolation work: data and log images already
+live in unique per-scenario host temporary directories. The common initramfs
+and pinned replay-log build finish before any guest starts; guests read them
+through the existing read-only root share. Guest `/tmp` and `/run`, device
+mappers, and replay clones are private to each VM.
 
-Run the nine scenarios in N concurrent guests instead of one after another.
-Each scenario is already an independent unit: its own guest boot, its own
-dm-log-writes log, its own replay and check. The loop's body becomes a worker;
-results are collected and validated exactly as today, and `record.write` is
-untouched — same per-scenario rows, same totals, same record schema.
+The recorded mount command contains a random guest temporary path today.
+Literal equality across guests therefore requires a fixed guest-private
+mountpoint. Comparing commands after stripping paths would weaken the evidence;
+the approved design instead mounts the workload at `/run/atoms-certify-volume`
+in each guest's private tmpfs and retains the actual command unchanged.
 
-What has to be kept honest:
+## Approved behavior
 
-- **Workspace isolation.** The guest image, log image, and any per-run
-  scratch under `python/.certify/` must be per-scenario copies; today's
-  layout assumes one run at a time. The pinned `replay-log` binary and the
-  fetched xfstests checkout are read-only and shared.
-- **Harness evidence.** `_guest_harness_evidence` is taken from the last
-  scenario's final summary and the record retains one `qemu_command`. Under
-  parallelism "last" is nondeterministic; the design should instead require
-  the evidence tuple (mkfs command, mount command, log format, cache mode) to
-  be **equal across all nine guests** and refuse the record otherwise — a
-  strictly stronger claim than today's.
-- **Host load.** Nine KVM guests at once may oversubscribe; a `--jobs N`
-  bound (default: min(scenarios, cores/2)) rather than unbounded fan-out.
-- **Determinism of refusal.** A failure in any scenario must fail the whole
-  run before a record is written, exactly as today; parallel collection must
-  not turn one guest's fatal row into a swallowed error.
+- Use `ThreadPoolExecutor` around the existing one-scenario guest lifecycle.
+  `run --jobs N` requires a positive integer; omit it to use half the CPUs in
+  the host process's affinity, rounded down with a minimum of one. Cap workers
+  at the selected scenario count. `--jobs 1` selects serial execution.
+- Each worker owns its data/log images until QEMU exits. Build shared inputs
+  before starting the pool. Serialize console writes by line while retaining
+  each guest's independent serial transcript for parsing.
+- Validate every guest's scenario row, exact target configuration, storage
+  profile, and log format. Require literal equality of mkfs argv, mount argv,
+  log format, and QEMU drive cache mode across every guest, including serial
+  runs and runs without `--record`.
+- Observe completed futures to detect failures without waiting for earlier
+  scenarios. Cancel queued work on failure and join running workers before
+  removing the outer workspace. Interruption follows the same ownership rule;
+  waiting for active guests may take until their current scenario finishes.
+- Assemble rows in the declared scenario order, regardless of completion
+  order. Retain the last scenario in that order as the record's QEMU command.
+  Write a record only after the complete matrix passes and all workers exit.
+- Preserve the record schema, exact-tuple matching, nine-scenario matrix,
+  prefix coverage, explicit caps, and manual, non-collected certification.
 
-## Non-goals
+No new Python dependency, scheduler abstraction, record format, or production
+engine change is needed.
 
-- No change to the scenario matrix, the record schema, the allowlist match,
-  or the "certification stays manual and non-collected" rule.
-- No weakening of the exact-tuple match; this is wall time only.
+## Verification
 
-## Verification sketch
+The existing `self-test` checks boot, resolver/replay sanity, and attached-device
+safety; it is not a reduced scenario sweep. Extend the manual `self-check`
+instead: exercise the real thread pool, temporary-image lifetimes, and record
+writer with simulated guests. Check overlap and the jobs bound, canonical
+ordering and retained command, serial/parallel record equality after replacing
+only ephemeral host image paths, and refusal of an invalid middle guest's
+configuration, commands, log/cache mode, fatal/missing row, violations, or
+exception. Exercise concurrent console writes with real subprocesses.
 
-The existing `self-test` runs a reduced pass; add a parallel variant and
-assert its record-equivalent output matches a serial run on the same boot,
-field for field, modulo the retained `qemu_command`'s ordering rule above.
+Run real nine-scenario sweeps with `--jobs 1` and parallel jobs on the same
+clean commit and host boot. Require the same tuple and harness evidence and
+zero violations with exhaustive observed-prefix coverage in each run. Record
+timing and observed counts; physical bio trace counts can differ between runs,
+so equality of those counts is not a certification requirement. The simulated
+runs provide deterministic field-for-field aggregation checks.
+
+Run `just gate`; the certification-tool checks remain manual and outside
+pytest collection. Bank the measured results here after verification.

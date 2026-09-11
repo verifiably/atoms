@@ -35,3 +35,27 @@ If `kernel_identifier` does not match the running kernel, the tuple is simply
 not certified on this host right now — that is the designed refusal, not a bug.
 Either a release window is in progress and the sweep has not finished, or its
 review branch is still open.
+
+## Running the sweep
+
+From `python/` in a clean checkout with the certification prerequisites built:
+
+```sh
+uv run --frozen python -m tools.certify run --all --accel kvm --jobs 3 --record docs/certification
+```
+
+`--jobs` bounds simultaneous guests; each guest reserves 2 GiB of memory plus
+host image and replay overhead. Without the flag, the runner uses half the CPUs
+available to its process, capped at the scenario count and with a minimum of
+one. Use `--jobs 1` for serial execution or choose a smaller bound on a busy
+host. Acceleration remains explicit: omitting `--accel` selects TCG.
+
+Each guest owns separate writable images and private guest scratch. Every guest
+must report identical mkfs/mount commands, log format, and drive cache mode.
+Rows stay in scenario order, and the retained QEMU command belongs to the final
+scenario in that order. A failure cancels queued guests and waits for running
+guests to exit before cleaning their images; no certification record is written.
+
+The manual `uv run --frozen python -m tools.certify self-check` exercises the
+scheduler, evidence refusals, and serial/parallel record equivalence without
+booting guests. `self-test` remains the guest boot/device-safety check.

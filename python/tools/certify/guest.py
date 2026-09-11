@@ -9,10 +9,12 @@ import platform
 import shlex
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
 
+_SERIAL_LOCK = threading.Lock()
 _CHECKOUT = Path(__file__).resolve().parents[3]
 _UNSAFE_CMDLINE_CHARACTERS = frozenset("'\"\\\0")
 
@@ -214,8 +216,9 @@ def _run_streaming(command: list[str], stream: TextIO) -> str:
     try:
         for line in process.stdout:
             lines.append(line)
-            stream.write(line)
-            stream.flush()
+            with _SERIAL_LOCK:
+                stream.write(line)
+                stream.flush()
     except BaseException:
         _terminate_and_reap(process)
         raise

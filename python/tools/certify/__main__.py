@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from datetime import datetime as DateTime
 from pathlib import Path
@@ -220,7 +221,14 @@ def _run_scenarios(
     declared_cap: int | None,
     acceleration: str,
     record_directory: Path | None = None,
+    *,
+    jobs: int | None = None,
 ) -> int:
+    if jobs is not None and (not isinstance(jobs, int) or isinstance(jobs, bool) or jobs <= 0):
+        raise ValueError("--jobs must be a positive integer")
+    if not scenarios:
+        raise ValueError("certification requires at least one scenario")
+    workers = min(len(scenarios), jobs if jobs is not None else max(1, len(os.sched_getaffinity(0)) // 2))
     if trials != 1:
         raise ValueError("certification supports exactly one trial")
     if declared_cap is not None and (
@@ -244,10 +252,8 @@ def _run_scenarios(
     with tempfile.TemporaryDirectory(prefix="atoms-certify-host-") as temporary:
         work = Path(temporary)
         initramfs = _build_guest_initramfs(work)
-        rows: list[dict[str, object]] = []
-        final_result: guest.GuestResult | None = None
-        harness: tuple[tuple[str, ...], tuple[str, ...], str] | None = None
-        for scenario in scenarios:
+
+        def run_scenario(scenario: str) -> tuple[dict[str, object], guest.GuestResult]:
             with tempfile.TemporaryDirectory(prefix=f"{scenario}-", dir=work) as temporary:
                 scenario_work = Path(temporary)
                 data = build_log_image(scenario_work / "data.img", 128)
@@ -294,9 +300,33 @@ def _run_scenarios(
                 _validate_scenario_row(row, scenario, declared_cap)
                 if not result.records:
                     raise guest.GuestRunError("guest omitted its final summary")
-                harness = _guest_harness_evidence(result.records[-1], configuration)
-                rows.append(row)
-                final_result = result
+                return row, result
+
+        results: dict[str, tuple[dict[str, object], guest.GuestResult]] = {}
+        harness: tuple[tuple[str, ...], tuple[str, ...], str, str] | None = None
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {}
+            try:
+                for scenario in scenarios:
+                    futures[pool.submit(run_scenario, scenario)] = scenario
+                for future in as_completed(futures):
+                    scenario = futures[future]
+                    row, result = future.result()
+                    evidence = (
+                        *_guest_harness_evidence(result.records[-1], configuration),
+                        _qemu_cache_mode(result.command),
+                    )
+                    if harness is not None and evidence != harness:
+                        raise guest.GuestRunError(f"{scenario}: guest harness evidence differs across scenarios")
+                    harness = evidence
+                    results[scenario] = row, result
+            except BaseException:
+                for future in futures:
+                    future.cancel()
+                # Running guests own their images until they exit; pool shutdown joins them.
+                raise
+        rows = [results[scenario][0] for scenario in scenarios]
+        final_result = results[scenarios[-1]][1]
         total_marks = sum(_row_count(row, "marks") for row in rows)
         total_prefixes = sum(_row_count(row, "prefixes") for row in rows)
         if output is not None:
@@ -315,13 +345,13 @@ def _run_scenarios(
             if not record_directory.is_dir():
                 raise ValueError(f"--record destination is not a directory: {record_directory}")
             _record_path(record_directory, configuration, certification_date)
-            mkfs_command, mount_command, log_format = harness
+            mkfs_command, mount_command, log_format, cache_mode = harness
             record.write(
                 output,
                 configuration=configuration,
                 storage_id=_STORAGE_ID,
                 qemu_command=final_result.command,
-                cache_mode=_qemu_cache_mode(final_result.command),
+                cache_mode=cache_mode,
                 mkfs_command=mkfs_command,
                 mount_command=mount_command,
                 versions={
@@ -363,11 +393,17 @@ def main() -> int:
     parser.add_argument("--scenario")
     parser.add_argument("--all", action="store_true", dest="all_scenarios")
     parser.add_argument("--trials", type=int, default=1)
+    parser.add_argument(
+        "--jobs", type=int,
+        help="maximum concurrent guests for run (default: half the available CPUs, capped at the scenario count)",
+    )
     parser.add_argument("--target", type=Path, default=_REPOSITORY_ROOT)
     parser.add_argument("--record", type=Path)
     parser.add_argument("--declare-cap", type=int)
     parser.add_argument("--accel", choices=("tcg", "kvm"), default="tcg")
     args = parser.parse_args()
+    if args.jobs is not None and (args.command != "run" or args.jobs <= 0):
+        parser.error("--jobs requires run and a positive integer")
     if args.record is not None and args.command != "run":
         parser.error("--record is accepted only by run")
     if args.command == "target":
@@ -399,6 +435,7 @@ def main() -> int:
             args.declare_cap,
             args.accel,
             record_directory,
+            jobs=args.jobs,
         )
 
     missing = prerequisites.check()

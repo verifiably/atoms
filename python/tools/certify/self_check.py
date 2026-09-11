@@ -5,10 +5,13 @@ from __future__ import annotations
 import contextlib
 import io
 import json
-import os
 import sys
 import tempfile
+import threading
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 from . import guest, guest_init
@@ -254,6 +257,26 @@ def _check_record_boundaries_and_guest_evidence() -> None:
 
 
 def _check_record_lands_only_after_the_complete_matrix() -> None:
+    # Real scheduling, workspaces and record writing; only the expensive guest is fake.
+    for jobs in (1, 3):
+        serial = _check_sweep(jobs)
+        parallel = _check_sweep(jobs, reverse=True)
+        if serial != parallel:
+            raise AssertionError("completion order changed the certification record")
+        for fault in (
+            "configuration", "mkfs_command", "mount_command", "log_format_version",
+            "cache", "fatal", "missing", "violations", "exception",
+        ):
+            _check_sweep(jobs, fault=fault)
+    serial = _check_sweep(1)
+    for jobs in (3, None, 99):
+        if serial != _check_sweep(jobs):
+            raise AssertionError("parallel and serial records differ")
+
+
+def _check_sweep(
+    jobs: int | None, *, reverse: bool = False, fault: str | None = None
+) -> dict[str, object]:
     from atoms.fs.volume import VolumeConfiguration
 
     from . import __main__ as cli
@@ -267,111 +290,221 @@ def _check_record_lands_only_after_the_complete_matrix() -> None:
         durability_features=("compat=0x1", "incompat=0x4", "ro_compat=0x2"),
     )
     encoded_configuration = json.loads(json.dumps(cli.asdict(configuration)))
+    workspaces: dict[str, Path] = {}
+    lock = threading.Lock()
+    expected_jobs = min(9, jobs if jobs is not None else 3)
+    barrier = threading.Barrier(expected_jobs, timeout=5)
+    active = peak = 0
+    finished: list[str] = []
+
     def image(path: Path, _size: int) -> Path:
         path.touch()
         return path
 
-    for corrupt_final in (False, True):
-        calls: list[str] = []
-        workspaces: list[Path] = []
-
-        def run_guest(
-            *_args: object,
-            _calls: list[str] = calls,
-            _corrupt_final: bool = corrupt_final,
-            _workspaces: list[Path] = workspaces,
-            **kwargs: object,
-        ) -> guest.GuestResult:
-            data, log = _args[2:4]
-            assert isinstance(data, Path) and isinstance(log, Path)
-            if any(workspace.exists() for workspace in _workspaces):
-                raise AssertionError("a previous scenario workspace survived into the next guest")
-            scenario_work = data.parent
-            assert log.parent == scenario_work
-            _workspaces.append(scenario_work)
-            arguments = kwargs["guest_arguments"]
-            assert isinstance(arguments, tuple)
-            scenario = arguments[arguments.index("--scenario") + 1]
-            assert isinstance(scenario, str)
-            _calls.append(scenario)
+    def run_guest(*args: object, **kwargs: object) -> guest.GuestResult:
+        nonlocal active, peak
+        data, log = args[2:4]
+        assert isinstance(data, Path) and isinstance(log, Path)
+        arguments = kwargs["guest_arguments"]
+        assert isinstance(arguments, tuple)
+        scenario = arguments[arguments.index("--scenario") + 1]
+        index = cli.CERTIFICATION_SCENARIOS.index(scenario)
+        assert log.parent == data.parent and log != data
+        with lock:
+            if data.parent in workspaces.values():
+                raise AssertionError("guests shared a writable workspace")
+            workspaces[scenario] = data.parent
+            active += 1
+            peak = max(peak, active)
+        try:
+            # First batch must overlap; a serial implementation fails this barrier.
+            if index < expected_jobs:
+                barrier.wait()
+            offset = index % expected_jobs
+            time.sleep(0.005 * (expected_jobs - offset if reverse else offset + 1))
+            if not data.exists() or not log.exists():
+                raise AssertionError("live guest images were removed")
             row: dict[str, object] = {
-                "scenario": scenario,
-                "marks": 1,
-                "prefixes": 2,
-                "violations": 0,
-                "violation_details": [],
-                "declared_cap": None,
+                "scenario": scenario, "marks": 1, "prefixes": 2, "violations": 0,
+                "violation_details": [], "declared_cap": None,
             }
-            final_configuration = encoded_configuration
-            if _corrupt_final and scenario == cli.CERTIFICATION_SCENARIOS[-1]:
-                final_configuration = encoded_configuration | {"kernel_identifier": "wrong"}
-            final = {
-                "configuration": final_configuration,
+            final: dict[str, object] = {
+                "configuration": encoded_configuration,
                 "storage": "flush-honoring-disk.v1",
                 "mkfs_command": ["mkfs.ext4", "-F", "/dev/vda"],
-                "mount_command": ["mount", "/dev/mapper/certify", "/volume"],
+                "mount_command": ["mount", "/dev/mapper/certify", "/run/atoms-certify-volume"],
                 "log_format_version": "1",
             }
-            qemu_command = (
-                "qemu-system-x86_64",
-                "-drive",
-                f"file={data},cache=writeback",
-                "-drive",
-                f"file={log},cache=writeback",
-            )
-            return guest.GuestResult(qemu_command, "", (row, final))
-
-        def write_record(
-            _path: Path,
-            *,
-            _calls: list[str] = calls,
-            _workspaces: list[Path] = workspaces,
-            **evidence: object,
-        ) -> None:
-            _calls.append("write")
-            scenarios = evidence["scenarios"]
-            if not isinstance(scenarios, list) or len(scenarios) != 9:
-                raise AssertionError("record writer did not receive all nine rows")
-            if any(workspace.exists() for workspace in _workspaces):
-                raise AssertionError("a scenario workspace survived until record writing")
-            command = evidence["qemu_command"]
-            if not isinstance(command, tuple) or os.fspath(_workspaces[-1]) not in command[2]:
-                raise AssertionError("final QEMU evidence did not survive workspace cleanup")
-
-        with tempfile.TemporaryDirectory() as temporary:
-            destination = Path(temporary) / "certification"
-            with (
-                patch.object(cli, "_target_configuration", return_value=configuration),
-                patch.object(cli.prerequisites, "check", return_value=[]),
-                patch.object(cli, "_build_guest_initramfs", return_value=Path("/initramfs")),
-                patch.object(cli, "build_log_image", side_effect=image),
-                patch.object(cli.guest, "run", side_effect=run_guest),
-                patch.object(cli.guest, "checkout_commit", return_value="clean-commit"),
-                patch.object(cli.record, "write", side_effect=write_record),
-                patch.object(cli, "_version", return_value="version"),
-                contextlib.redirect_stdout(io.StringIO()),
-            ):
-                try:
-                    cli._run_scenarios(
-                        cli.CERTIFICATION_SCENARIOS,
-                        1,
-                        Path("/target"),
-                        None,
-                        "kvm",
-                        destination,
-                    )
-                except guest.GuestRunError:
-                    if not corrupt_final:
-                        raise
+            cache = "writeback"
+            records: tuple[dict[str, object], ...] = (row, final)
+            # Corrupt a middle guest, so checking only the retained last guest fails.
+            if index == 1 and fault is not None:
+                if fault == "exception":
+                    raise guest.GuestRunError("injected guest failure")
+                if fault == "cache":
+                    cache = "none"
+                elif fault == "fatal":
+                    records = (row, {"fatal": "injected"}, final)
+                elif fault == "missing":
+                    records = (final,)
+                elif fault == "violations":
+                    row["violations"] = 1
                 else:
-                    if corrupt_final:
-                        raise AssertionError("a wrong final guest configuration was accepted")
-            expected = list(cli.CERTIFICATION_SCENARIOS)
-            if corrupt_final:
-                if calls != expected or destination.exists():
-                    raise AssertionError("failed evidence created a record destination")
-            elif calls != [*expected, "write"] or not destination.is_dir():
-                raise AssertionError(f"record was not written last: {calls}")
+                    final[fault] = {
+                        "configuration": encoded_configuration | {"kernel_identifier": "wrong"},
+                        "mkfs_command": ["mkfs.ext4", "-F", "-q", "/dev/vda"],
+                        "mount_command": ["mount", "-o", "sync", "/dev/mapper/certify", "/volume"],
+                        "log_format_version": "2",
+                    }[fault]
+            command = (
+                "qemu-system-x86_64", "-drive", f"file={data},cache={cache}",
+                "-drive", f"file={log},cache={cache}",
+            )
+            return guest.GuestResult(command, "", records)
+        finally:
+            with lock:
+                active -= 1
+                finished.append(scenario)
+
+    writer = cli.record.write
+
+    def write_record(path: Path, **evidence: Any) -> None:
+        if active or any(workspace.exists() for workspace in workspaces.values()):
+            raise AssertionError("record writing preceded guest cleanup")
+        if set(finished) != set(cli.CERTIFICATION_SCENARIOS):
+            raise AssertionError("record writing preceded the complete matrix")
+        command = evidence["qemu_command"]
+        assert isinstance(command, tuple)
+        if str(workspaces[cli.CERTIFICATION_SCENARIOS[-1]]) not in command[2]:
+            raise AssertionError("retained command depended on completion order")
+        writer(path, **evidence)
+
+    with tempfile.TemporaryDirectory() as temporary:
+        destination = Path(temporary) / "certification"
+        with (
+            patch.object(cli.os, "sched_getaffinity", return_value=set(range(6))),
+            patch.object(cli, "_target_configuration", return_value=configuration),
+            patch.object(cli.prerequisites, "check", return_value=[]),
+            patch.object(cli, "_build_guest_initramfs", return_value=Path("/initramfs")),
+            patch.object(cli, "build_log_image", side_effect=image),
+            patch.object(cli.guest, "run", side_effect=run_guest),
+            patch.object(cli.guest, "checkout_commit", return_value="clean-commit"),
+            patch.object(cli.record, "write", side_effect=write_record),
+            patch.object(cli, "_version", return_value="version"),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            try:
+                cli._run_scenarios(
+                    cli.CERTIFICATION_SCENARIOS, 1, Path("/target"), None, "kvm",
+                    destination, jobs=jobs,
+                )
+            except guest.GuestRunError:
+                if fault is None:
+                    raise
+            else:
+                if fault is not None:
+                    raise AssertionError(f"accepted {fault} from a middle guest")
+        if active or any(workspace.exists() for workspace in workspaces.values()):
+            raise AssertionError("sweep returned before guest cleanup")
+        if peak != expected_jobs:
+            raise AssertionError(f"expected {expected_jobs} concurrent guests, observed {peak}")
+        if fault is not None:
+            if destination.exists():
+                raise AssertionError("failed evidence created a record destination")
+            return {}
+        document = json.loads(next(destination.glob("*.json")).read_text())
+        if [row["name"] for row in document["scenarios"]] != list(cli.CERTIFICATION_SCENARIOS):
+            raise AssertionError("scenario order changed")
+        # Only ephemeral host image paths differ between these deterministic fake runs.
+        document["harness"]["qemu_command"] = [
+            part.replace(str(workspaces[cli.CERTIFICATION_SCENARIOS[-1]]), "WORK")
+            for part in document["harness"]["qemu_command"]
+        ]
+        return document
+
+
+def _check_queued_guests_are_cancelled() -> None:
+    from atoms.fs.volume import VolumeConfiguration
+
+    from . import __main__ as cli
+
+    # Hold submitted work pending at the executor boundary; inspect real Future states.
+    futures: list[Future[object]] = [Future() for _ in range(9)]
+    failure = guest.GuestRunError("injected first guest failure")
+    futures[0].set_exception(failure)
+    configuration = VolumeConfiguration(
+        "linux", "linux-4", "test-kernel", "ext4",
+        ("async", "barrier=1", "data=ordered"),
+        ("compat=0x1", "incompat=0x4", "ro_compat=0x2"),
+    )
+    with tempfile.TemporaryDirectory() as temporary:
+        destination = Path(temporary) / "certification"
+        with (
+            patch.object(cli, "ThreadPoolExecutor") as executor,
+            patch.object(cli, "_target_configuration", return_value=configuration),
+            patch.object(cli.prerequisites, "check", return_value=[]),
+            patch.object(cli, "_build_guest_initramfs", return_value=Path("/initramfs")),
+            patch.object(cli.guest, "checkout_commit", return_value="clean-commit"),
+        ):
+            executor.return_value.__enter__.return_value.submit.side_effect = futures
+            try:
+                cli._run_scenarios(
+                    cli.CERTIFICATION_SCENARIOS, 1, Path("/target"), None, "kvm",
+                    destination, jobs=1,
+                )
+            except guest.GuestRunError as caught:
+                assert caught is failure
+            else:
+                raise AssertionError("guest failure did not propagate")
+        assert not destination.exists()
+        if not all(future.cancelled() for future in futures[1:]):
+            raise AssertionError("queued guests were not cancelled")
+
+
+def _check_jobs_validation() -> None:
+    from . import __main__ as cli
+
+    with patch.object(cli, "_target_configuration", side_effect=AssertionError("late refusal")):
+        invalid_jobs: tuple[Any, ...] = (0, -1, True, 1.5)
+        for jobs in invalid_jobs:
+            try:
+                cli._run_scenarios(("minimal-create",), 1, Path("/target"), None, "kvm", jobs=jobs)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"accepted invalid {jobs=}")
+    for argv in (("run", "--all", "--jobs", "0"), ("self-test", "--jobs", "2")):
+        with patch.object(sys, "argv", ["certify", *argv]), contextlib.redirect_stderr(io.StringIO()):
+            try:
+                cli.main()
+            except SystemExit as caught:
+                assert caught.code == 2
+            else:
+                raise AssertionError("invalid --jobs did not fail at argument parsing")
+
+
+def _check_parallel_serial_output() -> None:
+    class Stream(io.StringIO):
+        def __init__(self) -> None:
+            super().__init__()
+            self.writing = threading.Lock()
+
+        def write(self, value: str) -> int:
+            if not self.writing.acquire(blocking=False):
+                raise AssertionError("guest console writes overlapped")
+            try:
+                time.sleep(0.001)
+                return super().write(value)
+            finally:
+                self.writing.release()
+
+    stream = Stream()
+    command = [sys.executable, "-c", "for i in range(20): print(i)"]
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(lambda _: guest._run_streaming(command, stream), range(3)))
+    expected = "".join(f"{i}\n" for i in range(20))
+    assert results == [expected] * 3
+    assert sorted(stream.getvalue().splitlines()) == sorted(expected.splitlines() * 3)
 
 
 def _check_qemu_failure_ownership() -> None:
@@ -438,6 +571,9 @@ def run() -> int:
         ("scenario row types and §9.5 bonus detection", _check_scenario_row_types_and_bonus),
         ("record boundaries and exact guest evidence", _check_record_boundaries_and_guest_evidence),
         ("record lands only after the complete matrix", _check_record_lands_only_after_the_complete_matrix),
+        ("guest failure cancels queued work", _check_queued_guests_are_cancelled),
+        ("positive run-only job bound", _check_jobs_validation),
+        ("parallel guest console lines remain intact", _check_parallel_serial_output),
         ("QEMU failure terminates and reaps", _check_qemu_failure_ownership),
     )
     for name, check in checks:

@@ -581,7 +581,8 @@ def run_scenario(
     ]
     _run(mkfs_command)
 
-    volume = work / "volume"
+    # /run is private tmpfs in each guest; this makes recorded mount argv identical.
+    volume = Path("/run/atoms-certify-volume")
     volume.mkdir()
     sectors = _run(["blockdev", "--getsz", os.fspath(data_device)])
     mapper_name = "certify"
