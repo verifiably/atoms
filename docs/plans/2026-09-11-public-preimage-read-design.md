@@ -1,7 +1,7 @@
 # Public transaction preimage reader
 
-**Status:** Revised draft, 2026-09-11; review corrections incorporated, consumer
-lifecycle scope unresolved (§1.1). No implementation or implementation plan.
+**Status:** Approved design, 2026-09-11; second-review condition incorporated
+in §1.1. Writable-only contract; no implementation.
 **Task:** `atoms-38887b`. **Inspected Atoms base:** `32edc7e`.
 
 **Authority:** [engine design](2026-07-23-recoverable-fs-effect-engine-design.md)
@@ -30,7 +30,7 @@ root descriptor, not a live `Store`, and constructing the latter would require
 additional admission and sidecar rules. No read-only root gains write authority
 merely because this command needs a blob.
 
-### 1.1 Consumer check and remaining scope decision
+### 1.1 Consumer check and source-root selection
 
 Checked Beliefs at `dbfea1f`: `python/src/beliefs/root.py` wires
 `LogSeam.state_facts` to Atoms' `state_to_json`. However,
@@ -40,24 +40,31 @@ calling the same evaluator that classifies committed removals. Both audit and
 arrival accept caller-supplied `history: Mapping[str, bytes]`; current replay
 matches those bytes by claimed path, not by the removed state's digest.
 
-L13 in Beliefs' `docs/designs/2026-08-03-tamper-evident-log-design.md` requires
-classification where historical content resolves through a held copy **or
-surviving preimage bytes**. Thus writable-only retrieval does not by itself
-cover the intended consumer: a serviceable replica can retain preimages that
-this command would refuse to read. Supplied history can cover the held-copy
-arm after Beliefs implements exact state matching, but is not automatic
-retrieval from the replica's local store. The existing `state_facts` accessor
-does not close that gap.
+Engine-produced serviceable roots have no local transaction preimages:
 
-**Recommendation before planning:** extend the design to include retrieval
-from `READ_ONLY_SERVICEABLE` roots. That requires a reviewed read-only record
-and blob boundary under the existing lock, lifecycle and sidecar rules; the
-writable `Store` and recovery lease must not be used on that arm. The detailed
-read-only mechanism is not designed here, and the writable-only contract
-below must not be treated as approval of that extension. Alternatively, retain
-this bounded command and explicitly accept a remaining replica-local retrieval
-gap in the consumer scope. Until that choice is settled, do not write the
-implementation plan or claim the seam suffices to discharge `beliefs-a7df71`.
+- Replication copies the project tree, including its chain. The source metadata
+  root is separate and pairwise non-overlapping with the copy roots
+  (`commands.py::_plan_copy`, `require_nonoverlapping`); it is never copied.
+- Copy step 5 creates a fresh destination store. `_claimed_destination_lease`
+  and `_advance_copy` populate lifecycle/operation bookkeeping, not source
+  transaction records or blob leaves (lifecycle design §9–§10).
+- Cold metadata-less admission grants fresh matching read-only bookkeeping;
+  granting an unserviceable root requires a complete operation on its
+  engine-minted carrier (`grant_read_serviceability`, lifecycle design §7).
+- Nothing leaves writable or read-only-serviceable (lifecycle design's schema
+  rules): a writable store cannot accumulate history and then be demoted into
+  a serviceable replica.
+
+L13's "surviving preimage bytes" arm is therefore served on the **writable
+source root**, through this command. A read-only arm has no engine-produced
+positive case and is not added. `beliefs-a7df71` owns choosing the source root
+when reachable, matching its transaction/path evidence to the inspected
+chain, and classifying from held-copy `history` bytes when the source is not
+reachable. It also owns exact matching against the removed state rather than
+the current path-only predicate. Transporting preimage history into replicas
+would be a separate copy/lifecycle feature, outside this seam. The writable-only
+contract is complete as scoped and ready for implementation planning; Beliefs'
+L13 task remains open until its consumer behavior is implemented and verified.
 
 ## 2. Alternatives considered
 
@@ -229,8 +236,6 @@ In clause 1 of
 `test_chain_commands_keep_the_lease_and_approval_proofs_private`, add
 `read_preimage` to the `_writable_recovery_lease` list and assert that it never
 enters `_recovery_lease`, in addition to updating `__all__` and public inventories.
-These implementation boundaries describe the writable arm only; accepting the
-§1.1 recommendation requires revising them for the read-only mechanism first.
 
 Verification must cover:
 
