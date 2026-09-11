@@ -1,8 +1,8 @@
 # Parallel certification guests
 
-**Status:** Design approved on 2026-09-11 for `atoms-eabd89`; implementation
-under verification. This refines A8b §7 without changing the authority's
-certification contract.
+**Status:** Implemented on 2026-09-11 for `atoms-eabd89`, after design approval
+on the same day. Code landed at `cafad73`; verification is recorded below.
+This refines A8b §7 without changing the authority's certification contract.
 
 ## Design-gate findings
 
@@ -66,5 +66,40 @@ timing and observed counts; physical bio trace counts can differ between runs,
 so equality of those counts is not a certification requirement. The simulated
 runs provide deterministic field-for-field aggregation checks.
 
-Run `just gate`; the certification-tool checks remain manual and outside
-pytest collection. Bank the measured results here after verification.
+The repository gate is `just check` plus `just test`; the certification-tool
+checks remain manual and outside pytest collection.
+
+### Measured results — 2026-09-11
+
+The following checks ran against the implementation at `cafad73` on
+`7.2.2-arch1-1`:
+
+- `just check`: ruff and pyright passed; `tasks check` had zero errors and
+  warnings.
+- `just test`: **6,238 passed, 7 skipped**, 523.35 seconds.
+- The manual `self-check`: **13 checks passed**, including real scheduling,
+  deterministic serial/parallel record equality, every middle-guest refusal
+  listed above, cleanup, pending-future cancellation, and subprocess console
+  output. Removing evidence comparison, concurrency, cancellation, or console
+  serialization in memory caused the corresponding regression check to fail.
+- Two KVM guests concurrently completed the existing `--self-test` workload
+  using one shared initramfs and distinct 8 MiB data/log images. Both reported
+  success, all four image digests were unchanged, and all temporary workspaces
+  were removed. Total time including the shared build: **13.97 seconds**.
+- A real `run --all --accel kvm --jobs 1 --record ...` was deliberately stopped
+  after **29 of 309 minimal-create prefixes**. A second guest started before
+  failure collection canceled the queue; it completed **1 of 329 minimal-replace
+  prefixes** and was also stopped. The driver exited nonzero, created no record
+  directory, and left no certification workspaces. This is partial execution
+  and failure-cleanup evidence, not a successful certification sweep.
+
+The paired full nine-scenario wall-time benchmark is **deferred**: the sampled
+serial replay rate implied several hours for the comparison. No speedup or new
+certification is claimed. A dedicated run can use `--jobs 1` and `--jobs 3` on
+one clean commit and boot, with separate `--record` destinations. Both must
+finish before comparing their tuples, harness evidence, observed coverage,
+and elapsed times.
+
+Local raw logs are retained, untracked, under
+`python/.certify/parallel-validation/` in the implementation checkout. The
+physical checks and manual self-check were timed through `tools/tt`.
