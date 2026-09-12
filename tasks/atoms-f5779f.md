@@ -4,8 +4,9 @@ title: Certify the Beliefs publication path under persistence cuts
 status: todo
 priority: 2
 size: xl
+complexity: high
 created: 2026-08-30T18:19:08Z
-updated: 2026-08-30T20:28:33Z
+updated: 2026-09-12T16:35:05Z
 depends: []
 tags: [migration, beliefs, certification]
 ---
@@ -17,3 +18,7 @@ Acceptance evidence: Approve the Atoms-local cross-repository test design; exten
 Sources: docs/plans/2026-08-14-a8-persistence-cut-and-certification-design.md; docs/plans/2026-08-13-a7-effect-recovery-execution-design.md §16; Beliefs' cut-7 X2 accounting; ~/d/beliefs/docs/designs/2026-08-03-redesign-adoption-ledger.md; and ~/d/beliefs/docs/plans/2026-08-29-implementation-roadmap.md persistence-cut row.
 
 Uncertainty: Beliefs' publication path is implemented and its roadmap assigns the prerequisite to an Atoms design gate, but the cross-repository harness boundary, hardware matrix, and verified owner are not yet designed.
+
+## Notes
+
+- 2026-09-12T16:35:05Z (main): Complexity high: A8 provides engine scenario/cut machinery, while the Beliefs adoption ledger and roadmap still assign X2 consumer-path persistence cuts to an Atoms design gate. Defining the cross-repository publication boundaries, oracle coverage and certification matrix without a second transaction authority remains unresolved design work.
