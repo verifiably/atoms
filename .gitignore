@@ -2,7 +2,8 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .ruff_cache/
-.venv/
+.venv
+.worktrees
 .atoms-test-volume/
 .certify/
 # Fallback test-timing log, written by tools/tt when the shared log is unwritable and
