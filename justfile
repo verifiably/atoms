@@ -5,6 +5,8 @@
 # Every recipe runs through the vendored timing wrapper tools/tt (source of truth: ops
 # bin/tt) so the run is recorded. Design: ops docs/specs/2026-09-04-test-ci-audit-design.md.
 
+set quiet
+
 tt := "python3 tools/tt"
 
 # The three commands, each written once. Recipes and hooks all run these, so a hook can
