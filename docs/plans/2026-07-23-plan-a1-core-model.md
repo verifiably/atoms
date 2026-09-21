@@ -36,7 +36,7 @@ A1 depends on nothing. A2 and A3 depend only on A1's types. A4 onward introduce 
 - **Tooling:** `ruff` line-length 120; `pyright` `typeCheckingMode = "basic"`, `pythonVersion = "3.11"`; `pytest` `addopts = "-q"`, `testpaths = ["tests"]`. All commands run via `uv run` from `python/`.
 - **Content hashes** are strings of the form `sha256:<64 lowercase hex>`. **Modes** are integer permission bits only (e.g. `0o644`), never type bits.
 - **Project-relative paths** (`RelPath`) are POSIX, `/`-separated, no leading slash, no `.`/`..` components. A1 stores them verbatim; resolution/containment is A2/A4's job.
-- No AI-attribution trailers on commits/PRs/comments. Docs use `~/d/` (never `/home/keith/d/` or `/mnt/ssd/Dropbox/`).
+- No AI-attribution trailers on commits/PRs/comments. Docs use `~/d/` (never the absolute home or sync-root path).
 
 ---
 

@@ -1,0 +1,4 @@
+# Path prefixes that may carry this machine's layout (ops-check version 5). The
+# certification records are evidence captured verbatim by the harness: the qemu command
+# line names the checkout the run certified, and rewriting it would falsify the record.
+layout_allowed = ["docs/certification/"]

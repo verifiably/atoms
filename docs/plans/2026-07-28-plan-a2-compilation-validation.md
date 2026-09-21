@@ -26,7 +26,7 @@
 - **A1 is frozen.** Do not modify any existing module under `atoms/core/`. A2 only adds files.
 - **Invalid specifications are refused explicitly with `SpecValidationError`.** Unexpected internal
   exceptions propagate unchanged; `compile_spec` has no blanket exception-normalization wrapper.
-- No AI-attribution trailers on commits/PRs/comments. Docs use `~/d/` (never `/home/keith/` or `/mnt/ssd/`).
+- No AI-attribution trailers on commits/PRs/comments. Docs use `~/d/` (never the absolute home or mount path).
 
 ## Phase-to-task map
 
