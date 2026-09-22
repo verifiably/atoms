@@ -6,7 +6,7 @@ priority: 2
 size: l
 owner: feat/atoms-38887b-preimage-reader
 created: 2026-08-30T18:18:54Z
-updated: 2026-09-11T15:20:05Z
+updated: 2026-09-22T05:28:58Z
 started: 2026-09-11T14:21:22Z
 completed: 2026-09-11T15:20:05Z
 depends: []
@@ -34,3 +34,4 @@ The writable-only public contract is approved. Implementation is tracked by atom
 - 2026-09-11T14:39:09Z (feat/atoms-38887b-preimage-reader): Implementation plan written and self-reviewed at docs/plans/2026-09-11-public-preimage-read-plan.md; one complete deliverable tracked by atoms-87c2e4. Reuses existing writable lease, record/coherence and blob verification paths; covers source history, errors, corruption, lifecycle, halts, resources and full gate. No read-only arm or planning approval hold remains.
 - 2026-09-11T14:39:29Z (feat/atoms-38887b-preimage-reader): parked (waiting on agent): Execute the approved writable-only design via child atoms-87c2e4 and docs/plans/2026-09-11-public-preimage-read-plan.md; no lifecycle-scope decision remains.
 - 2026-09-11T15:20:05Z (feat/atoms-38887b-preimage-reader): Delivered the approved writable-source preimage seam and complete validation; Beliefs source selection and L13 consumption remain beliefs-a7df71.
+- 2026-09-22T05:28:58Z (main): Consumed by beliefs at cut 37 (2026-09-21): the audit reads surviving preimages through LogSeam.read_preimage and classifies by the removed state's digest; L13 closed. beliefs docs/plans/2026-09-21-conformance-cut-37-results.md.
