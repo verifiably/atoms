@@ -82,7 +82,9 @@ Plan B is written only after Plan A's interfaces settle.
   A9 remains this repository's first unimplemented Plan A stage.
 
 Work lives under `python/`. Tests: `just test` runs the suite. `just check` runs the
-seconds-long gate (ruff, pyright, `tasks check`); `just gate` runs both. Every recipe
+seconds-long gate (ruff, pyright, `tasks check`); `just gate` runs both. `just certify`
+runs the certification runner under `host-budget run` with `--jobs "$OPS_WORKERS"`
+([`docs/certification/README.md`](docs/certification/README.md)). Every recipe
 records its run through `tools/tt`, the timing wrapper vendored from the ops repository;
 do not call `pytest` directly. The git hooks in `.githooks/` run the same commands; a fresh
 clone installs them with `git config core.hooksPath .githooks`. Before removing a

@@ -44,6 +44,14 @@ check:
 
 gate: check test
 
+# The certification runner (python/tools/certify) under the host budget: `host-budget run`
+# grants a worker count as OPS_WORKERS, and --jobs bounds the concurrent QEMU guests by it.
+# The single quotes keep $OPS_WORKERS for the shell inside the scope. The runner's own
+# default, half the available CPUs, stays for a direct run without --jobs.
+# The full sweep: `just certify --all --accel kvm --record docs/certification`.
+certify *args:
+    {{tt}} certify -- host-budget run -- sh -c 'cd python && uv run --frozen python -m tools.certify run --jobs "$OPS_WORKERS" "$@"' certify {{args}}
+
 # What the pre-commit hook runs: `check`'s command under its own hook target.
 hook-pre-commit:
     {{tt}} hook-pre-commit -- sh -c '{{check_cmd}}'

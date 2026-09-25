@@ -38,17 +38,24 @@ review branch is still open.
 
 ## Running the sweep
 
-From `python/` in a clean checkout with the certification prerequisites built:
+From the repository root in a clean checkout with the certification
+prerequisites built:
 
 ```sh
-uv run --frozen python -m tools.certify run --all --accel kvm --jobs 3 --record docs/certification
+just certify --all --accel kvm --record docs/certification
 ```
 
+The recipe runs `tools.certify run` from `python/` under ops' `host-budget run`,
+which grants the job a share of the host and exports it as `OPS_WORKERS`; the
+recipe passes that as `--jobs`. Arguments after `certify` go to `run` unchanged.
+
 `--jobs` bounds simultaneous guests; each guest reserves 2 GiB of memory plus
-host image and replay overhead. Without the flag, the runner uses half the CPUs
-available to its process, capped at the scenario count and with a minimum of
-one. Use `--jobs 1` for serial execution or choose a smaller bound on a busy
-host. Acceleration remains explicit: omitting `--accel` selects TCG.
+host image and replay overhead. Run directly from `python/`
+(`uv run --frozen python -m tools.certify run ...`) without the flag, the runner
+uses half the CPUs available to its process, capped at the scenario count and
+with a minimum of one. Pass `--jobs 1` there for serial execution or a smaller
+bound on a busy host. Acceleration remains explicit: omitting `--accel` selects
+TCG.
 
 Each guest owns separate writable images and private guest scratch. Every guest
 must report identical mkfs/mount commands, log format, and drive cache mode.
