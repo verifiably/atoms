@@ -5,9 +5,10 @@ status: doing
 priority: 2
 size: m
 complexity: mid
+process: direct
 owner: test/front-door
 created: 2026-09-04T21:44:54Z
-updated: 2026-09-28T08:34:31Z
+updated: 2026-09-28T08:36:05Z
 depends: [ops-31f038]
 tags: [testing]
 ---
@@ -21,3 +22,4 @@ Piece of ops-65837b (the cross-project audit in the ops hub). 1. Measure: full-s
 - 2026-09-12T16:35:05Z (main): Complexity mid: the ops audit design sections 4.5-5 establish the procedure, and the current justfile already supplies timed testmon selection, fresh-process exclusions, hooks and CI; pytest is already quiet. Remaining baseline/after interpretation, guidance and evidence-directed hygiene require bounded investigation, not a new testing architecture.
 - 2026-09-28T08:34:21Z (main): baseline 2026-09-28 (tt-report --project atoms --since 2026-09-05 --until 2026-09-24; 13 active days, before step 3): test 3 runs median 499.2s p90 524.3s fail 0.33, 25 min total; test-fast 12 runs median 132.1s p90 506.4s fail 0.00 empty 4, 42 min total; check 22 runs median 11.9s p90 14.7s fail 0.23, 5 min total; hook-pre-commit 36 runs median 12.0s p90 15.7s fail 0.03, 8 min total; hook-pre-push 15 runs median 527.0s p90 701.1s fail 0.00, 136 min total; front-door total 3.59 h (17 min per active day), ad-hoc targets 9 min; fast/full by agents 3.67; bypasses 14
 - 2026-09-28T08:34:31Z (main): Baseline window 2026-09-05..09-24 closes the day before ops host-budget worker sizing (09-25), the first timing change after step 1; no step-3 change had landed. Front-door total counts wrapper seconds of test, test-fast, check and both hooks. Next: step 3 (gates to ops design §4.6, the AGENTS.md inner-loop line, hygiene the numbers point at), then an after-window read with tt-report --since/--until.
+- 2026-09-28T08:36:05Z (main): Process direct: ops design §4.6 and §5 steps 3-4 settle the remaining gate, guidance and after-window work; hygiene follows the recorded baseline.
