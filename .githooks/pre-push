@@ -30,4 +30,7 @@ MESSAGE
     exit 1
 fi
 
+# The suite creates sandbox Git repositories; hook variables must not follow it.
+git_local_vars=$(git rev-parse --local-env-vars) || exit 1
+unset $git_local_vars
 exec just hook-pre-push
