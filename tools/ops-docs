@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-# ops-docs version 3
+# ops-docs version 4
 """A project's guide files — README.md for people, AGENTS.md for agents — rendered and
 checked inside one repository.
 
 Vendored from ops bin/ops-docs as tools/ops-docs. `identity.toml` at the repository root
 (and at each subsystem root it names) declares what the project is; this tool renders
 the declared and derived parts into marked regions of the two files and checks the rest
-against the contract. It never writes prose. Design:
-docs/specs/2026-09-22-project-guides-design.md.
+against the contract. It never writes prose.
+Vendored from https://github.com/khughitt/ops (bin/ops-docs); never edit the copy, see tools/README.md.
+Design: ops docs/specs/2026-09-22-project-guides-design.md.
 
 In a family home (a repository holding family.toml), `family publish` writes the
 committed family file into each member as tools/family.toml and re-renders the member's
 guides, and `family check` judges every member's committed copy against the home's.
-Design: docs/specs/2026-10-09-family-guide-templates-design.md.
+Design: ops docs/specs/2026-10-09-family-guide-templates-design.md.
 
 Exit 0 clean, 1 on a stale region or a constraint finding, 2 when it cannot run.
 """
