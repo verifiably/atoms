@@ -1356,14 +1356,10 @@ def test_ledger_entry_nine_is_discharged_after_a8_added_no_entry_point():
 
     Status wording lives in `test_docs_status.py`; what this asserts is the ledger's own
     shape -- entry #9 discharged by A8b, still scoped to A5-A8 -- which no status guard
-    covers.
+    covers. The ledger is the only record of it: the agent guide carries no per-entry
+    status.
     """
     root = Path(__file__).parents[2]
-    agents = (root / "AGENTS.md").read_text(encoding="utf-8")
-    assert "It admits #21, the txid binding, owned by A5." in agents
-    assert "factory half of #9" in agents
-    assert "A8 added no production entry point." in agents
-
     ledger = (root / "docs" / "deferred-obligation-ledger.md").read_text(
         encoding="utf-8"
     )
