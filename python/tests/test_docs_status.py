@@ -43,6 +43,9 @@ SUPERSEDED = "2026-07-20-"
 
 AUTHORITY = PLANS / "2026-07-23-recoverable-fs-effect-engine-design.md"
 
+#: The roadmap index: the reader's copy of `FIRST_UNIMPLEMENTED`, with no `**Status:**` field.
+ROADMAP = PLANS / "README.md"
+
 _LABEL = r"A[1-9](?:[ab](?:-[12])?)?"
 # No ASCII hyphen: it is part of a label (`A4b-2`), never a connector between two.
 _CONNECTOR = r"\s*(?:[–—,]|and)\s*"
@@ -139,7 +142,9 @@ def status_section(text: str) -> str:
 
 
 def live_plan_documents() -> list[Path]:
-    return sorted(path for path in PLANS.glob("*.md") if SUPERSEDED not in path.name)
+    return sorted(
+        path for path in PLANS.glob("*.md") if SUPERSEDED not in path.name and path != ROADMAP
+    )
 
 
 def _documented_stage(path: Path) -> str | None:
@@ -153,10 +158,7 @@ def _documented_stage(path: Path) -> str | None:
 
 def status_regions() -> dict[str, str]:
     """Every live status claim in the repository, keyed by a readable source name."""
-    regions = {
-        "AGENTS.md": status_section((ROOT / "AGENTS.md").read_text(encoding="utf-8")),
-        "README.md": status_section((ROOT / "README.md").read_text(encoding="utf-8")),
-    }
+    regions = {"docs/plans/README.md": status_section(ROADMAP.read_text(encoding="utf-8"))}
     for path in live_plan_documents():
         field = status_field(path.read_text(encoding="utf-8"))
         if field is not None:
@@ -196,20 +198,21 @@ def test_every_design_document_declares_a_status():
 
 
 def test_the_roadmap_boundary_is_stated_where_the_reader_looks_first():
-    """Silence about A7-A9 reads as completeness. Both entry documents must say it."""
-    for name in ("AGENTS.md", "README.md"):
+    """Silence about A7-A9 reads as completeness. The roadmap index, where the reader
+    looks first, must say it."""
+    for name in ("docs/plans/README.md",):
         region = status_regions()[name]
         assert unimplemented_claims(region) == set(UNIMPLEMENTED), name
         assert LAST_IMPLEMENTED in region, name
 
 
 def test_the_entry_documents_list_every_implemented_sub_plan():
-    """The roadmap lists in AGENTS.md and README.md are the reader's map of what exists.
+    """The roadmap index, where the reader looks first, is their map of what exists.
 
-    README groups A4 and A5 as families where AGENTS splits A4a/A4b, so the label a
+    It groups A4 and A5 as families rather than splitting A4a/A4b, so the label a
     bullet carries is expanded rather than matched stage-for-stage.
     """
-    for name in ("AGENTS.md", "README.md"):
+    for name in ("docs/plans/README.md",):
         listed: set[str] = set()
         for label in _BULLET.findall(status_regions()[name]):
             listed.update(_stages_of(label))

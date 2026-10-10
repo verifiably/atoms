@@ -1,0 +1,11 @@
+# What this project is. `tools/ops-docs write` renders it into the identity region of
+# README.md and AGENTS.md; `tools/ops-docs check` refuses a commit while they differ.
+# Design: ops docs/specs/2026-09-22-project-guides-design.md §3.
+name = "atoms"
+aliases = []
+purpose = "A recoverable filesystem effect engine: the crash-safe substrate"
+abstract = """
+Atomic multi-path filesystem mutation with write-ahead journaling, rollback and post-crash recovery, over an OS-neutral capability vocabulary: a write either lands completely or leaves a state that can be classified from durable evidence and safely completed, rolled back or halted. Conceptually the substrate below nodes, which does not yet adopt it directly; beliefs is its direct consumer.
+"""
+authority = ["docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md"]
+subsystems = []

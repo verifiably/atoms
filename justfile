@@ -6,6 +6,7 @@
 # bin/tt) so the run is recorded. Design: ops docs/specs/2026-09-04-test-ci-audit-design.md.
 
 set quiet
+set positional-arguments
 
 tt := "python3 tools/tt"
 
@@ -25,14 +26,21 @@ tt := "python3 tools/tt"
 # certification gate.
 fast_cmd := "cd python && uv run --frozen pytest --testmon --ignore=tests/test_coordinator_kill_matrix.py --ignore=tests/test_persistence_cut_matrix.py --ignore=tests/test_exerciser.py"
 test_cmd := "cd python && uv run --frozen pytest"
-check_cmd := "python3 tools/ops-check && (cd python && uv run --frozen ruff check && uv run --frozen pyright) && tasks check"
+one_cmd := "cd python && uv run --frozen pytest"
+check_cmd := "python3 tools/ops-check && python3 tools/ops-docs check && (cd python && uv run --frozen ruff check && uv run --frozen pyright) && tasks check"
 # The same commands minus `tasks check`, whose binary is not on a runner; ops-check keeps
 # working there because its registry lookup is empty when absent.
-ci_check_cmd := "python3 tools/ops-check && (cd python && uv run --frozen ruff check && uv run --frozen pyright)"
+ci_check_cmd := "python3 tools/ops-check && python3 tools/ops-docs check && (cd python && uv run --frozen ruff check && uv run --frozen pyright)"
 
 # Affected-only: the inner loop. An empty selection is a result, not a failure.
 test-fast:
     {{tt}} test-fast -- sh -c '{{fast_cmd}}'
+
+# One file, one test, or a filter, while working on it. Needs at least one argument;
+# the whole suite is `test`. The sh -c string never holds the arguments, so quotes, $
+# and globs in them reach the runner untouched.
+test-one +args:
+    {{tt}} test-one -- sh -c '{{one_cmd}} "$@" 2>&1' test-one "$@"
 
 # The full suite: the certification gate.
 test:
@@ -43,6 +51,12 @@ check:
     {{tt}} check -- sh -c '{{check_cmd}}'
 
 gate: check test
+
+# Regenerate the identity and family regions in README.md and AGENTS.md from
+# identity.toml and tools/family.toml. The only thing that edits those regions; `check`
+# refuses a commit while they are out of date.
+docs:
+    {{tt}} docs -- python3 tools/ops-docs write
 
 # The certification runner (python/tools/certify) under the host budget: `host-budget run`
 # grants a worker count as OPS_WORKERS, and --jobs bounds the concurrent QEMU guests by it.

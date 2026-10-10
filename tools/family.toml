@@ -1,0 +1,53 @@
+# The verifiably family: its summary, members and README contract. The home is
+# verifiably/docs, where this file lives as family.toml; each member holds a published
+# copy as tools/family.toml, from which ops-docs renders the family region into the
+# member's guides, and the home's pre-push (`tools/ops-docs family check` there) judges
+# every member's copy against the home's. Design: verifiably/docs
+# docs/specs/2026-10-09-readme-template-design.md §3; mechanism: ops
+# docs/specs/2026-10-09-family-guide-templates-design.md.
+name = "verifiably"
+summary = """
+verifiably builds understanding of the world from small, reproducible data analyses:
+each one a precise question asked of real data, recorded so anyone can run it again,
+with the data leading and unverified claims kept out.
+"""
+overview = "https://github.com/verifiably/docs/blob/main/overview.md"
+
+# Members in stack order, bottom up. `name` is the member's identity.toml name; `prefix`
+# its tasks prefix; `label` the layer column of README.md's repository table.
+[[members]]
+name = "atoms"
+prefix = "atoms"
+url = "https://github.com/verifiably/atoms"
+label = "Crash-safe filesystem effects"
+
+[[members]]
+name = "nodes"
+prefix = "nodes"
+url = "https://github.com/verifiably/nodes"
+label = "Generic record and relation storage"
+
+[[members]]
+name = "beliefs"
+prefix = "beliefs"
+url = "https://github.com/verifiably/beliefs"
+label = "The epistemic kernel: claims, runs, verification, belief"
+
+[[members]]
+name = "science"
+prefix = "sci"
+url = "https://github.com/verifiably/science"
+label = "The daily surface: commands for people and agents"
+
+[[members]]
+name = "autonomy"
+prefix = "autonomy"
+url = "https://github.com/verifiably/autonomy"
+label = "Running the daily surface unattended"
+
+# The README contract every member's guides are checked against: the purpose line in
+# italics, then the abstract; then these sections, optional, in this order. No status
+# region. AGENTS.md keeps the default contract.
+[readme]
+lead = ["purpose", "abstract"]
+sections = ["Install", "Usage", "Layout", "Documentation", "License"]
