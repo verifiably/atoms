@@ -1,11 +1,10 @@
 ---
 id: atoms-06c32b
 title: Certification spawns 62 children on every store open; memoize per volume within a process?
-status: idea
+status: dropped
 priority: 2
-reviewed: true
 created: 2026-09-24T03:21:54Z
-updated: 2026-10-14T00:58:08Z
+updated: 2026-10-14T10:20:33Z
 depends: []
 tags: [performance]
 agent: claude-code/claude-opus-5-5
@@ -16,3 +15,7 @@ Observed from science's suite 2026-09-23: building one test world runs certify_s
 ## Notes
 
 - 2026-10-14T00:58:08Z (main): scope: drop; at HEAD 250c320, bind_project_volume still runs certify_sqlite_wal per bind and atoms-257797 already owns the same cache-versus-remount durability decision; proposal: drop this duplicate in favor of atoms-257797, retaining this captured measurement as supporting context.
+- 2026-10-14T10:20:33Z (main): dropped
+  provenance: {"harness_session":"codex:01a137e8-e2c8-7343-b940-03b06f3f9b72","harness_session_source":"CODEX_THREAD_ID"}
+- 2026-10-14T10:20:33Z (main): Approved by user: duplicate of atoms-257797; preserve the captured repeated-certification measurement here as supporting context.
+  provenance: {"harness_session":"codex:01a137e8-e2c8-7343-b940-03b06f3f9b72","harness_session_source":"CODEX_THREAD_ID"}
