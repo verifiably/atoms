@@ -7,7 +7,7 @@ size: s
 complexity: mid
 process: direct
 created: 2026-09-11T12:35:07Z
-updated: 2026-10-14T10:24:17Z
+updated: 2026-10-14T10:24:30Z
 depends: [atoms-eabd89]
 tags: [certification, tooling]
 source: atoms-eabd89
@@ -33,3 +33,4 @@ Follow-up to atoms-eabd89, explicitly deferred to a dedicated run by the user on
 ## Notes
 
 - 2026-09-12T16:35:06Z (main): Complexity low: cafad73 is an ancestor of HEAD and the runner implements bounded parallel guests and evidence validation. The linked note and task specify jobs 1/3, controlled commit/boot/tuple, exhaustive coverage, separate records, trace-count caveat and timing comparison. Remaining work follows an established measurement procedure with explicit checks; hours of runtime do not raise reasoning complexity.
+- 2026-10-14T10:24:30Z (main): scope: rescoped; at HEAD 9391c72, cafad73 is landed, complete paired timings remain absent, and 1deaefd adds host-budget jobs injection; added an end-to-end pilot, granted-concurrency control and tracked-run handling for non-resumable hours-long sweeps; reassessed low to mid for execution constraints, retained P3/s and original benchmark acceptance.
