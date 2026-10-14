@@ -5,8 +5,9 @@ status: todo
 priority: 2
 size: xl
 complexity: high
+process: planned
 created: 2026-08-30T18:18:43Z
-updated: 2026-09-12T16:35:04Z
+updated: 2026-10-14T10:23:22Z
 depends: []
 tags: [migration, macos, plan-a]
 ---
