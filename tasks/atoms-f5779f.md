@@ -7,7 +7,7 @@ size: xl
 complexity: high
 process: planned
 created: 2026-08-30T18:19:08Z
-updated: 2026-10-14T10:23:50Z
+updated: 2026-10-14T10:24:04Z
 depends: []
 tags: [migration, beliefs, certification]
 ---
@@ -27,3 +27,4 @@ Established at Atoms HEAD 9391c72: A8's design deliberately imports no real cons
 ## Notes
 
 - 2026-09-12T16:35:05Z (main): Complexity high: A8 provides engine scenario/cut machinery, while the Beliefs adoption ledger and roadmap still assign X2 consumer-path persistence cuts to an Atoms design gate. Defining the cross-repository publication boundaries, oracle coverage and certification matrix without a second transaction authority remains unresolved design work.
+- 2026-10-14T10:24:04Z (main): scope: rescoped; at HEAD 9391c72, verified A8 drives synthetic consumers and the local engine ledger is discharged; marked the 2026-09-12 consumer/X2 claims as historical, added current consumer-owner/path/boundary verification as the first milestone and both design/plan gates; retained P2/xl/high and original outcome/source material.
