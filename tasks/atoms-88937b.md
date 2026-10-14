@@ -7,7 +7,7 @@ size: s
 complexity: low
 process: direct
 created: 2026-10-09T23:58:47Z
-updated: 2026-10-14T00:58:47Z
+updated: 2026-10-14T00:59:09Z
 depends: []
 tags: []
 agent: claude-code/claude-fable-5-1
@@ -29,3 +29,7 @@ Established at HEAD 250c320: exact equality of configuration and storage selects
 
 Captured observation (preserved):
 Initializing a world root on /mnt/ssd3 refused with CapabilityUnavailable: volume configuration is not on the supplied durability allowlist: ext4 ('async', 'barrier=1', 'commit=5', 'data=ordered') profile='flush-honoring-disk.v1'. findmnt shows the same options for the accepted volume (/mnt/ssd) and the refused one (rw,noatime,data=ordered), so the probe reads something findmnt does not print, and the message does not say which option fails or what would satisfy the profile. Observed 2026-10-09 while creating a disposable science world; worked around by using the other volume.
+
+## Notes
+
+- 2026-10-14T00:59:09Z (main): scope: scoped; at HEAD 250c320, confirmed exact tuple matching and incomplete refusal diagnostics in both binding and lifecycle verification; promoted to P2/s/low/direct with complete observed/certified tuple output, remedy documentation and focused regression checks; original volume mismatch remains unverified.
