@@ -580,6 +580,12 @@ class CertifiedVolume:
     `entry` carries every mount and superblock option, not only the barrier subset
     `configuration` keeps: locking- and mapping-relevant options (`nolock`, `dax`,
     `ro`) are not barrier options. Any remount that changes an option is a new key.
+
+    `mount_id` and `device` are the pair step 2 proves for both roots: the mount ID
+    read from fdinfo and the metadata root's `st_dev`. Neither is redundant with
+    `entry`. The entry is resolved by that mount ID, but its `major:minor` comes from
+    mountinfo and can differ from `st_dev`: a btrfs subvolume reached inside a mount
+    has its own `st_dev`, and keeping it certifies that subvolume separately.
     """
 
     mount_id: int

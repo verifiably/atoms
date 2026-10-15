@@ -23,6 +23,12 @@ host and averaged 71 ms across that loaded run. The cost grows with the number o
 concurrent workers. Science's
 test-latency halt `sci-5937be` depends on this task.
 
+The measurement recorded on `atoms-257797` after implementation counted differently:
+at 8 workers the same 694 tests made 6,912 certifications before the change (one per
+bind, each spawning two children, as a second counter confirmed), taking
+414.5 of 1,193 worker-seconds, and 8 after, taking 0.5 of 689. The figures above are
+the pre-design estimate that motivated this change; the recorded pair is the evidence.
+
 **Decision:** a process that has certified a volume does not certify that same volume
 again. "Same volume" is a key built from facts step 2 and step 3 already resolve on
 every bind (§3). Steps 1–6, the capability probe in step 7, and both reclamations run
@@ -157,9 +163,10 @@ New, in `test_fs_binding.py`:
   `atoms.fs.probe._run_child` across two binds of one project root: 2, then 0.
 - **A second project root on the same mount shares the result.** Same count.
 - **A changed mount entry certifies again.** Patch `atoms.fs.binding.read_mountinfo`
-  to return the same line with one added non-barrier option (`lazytime`). The
-  configuration, and so the allowlist match, is unchanged, but the key differs. Expect
-  two children.
+  to return the same line with one added non-barrier option, `x-atoms-test`. An `x-`
+  option is userspace-only and never reaches the kernel's mountinfo, so it is certainly
+  new on any host, where `lazytime` might already be set. The configuration, and so
+  the allowlist match, is unchanged, but the key differs. Expect two children.
 - **Another mount with the same configuration certifies afresh.** Certify one volume
   by binding it. Then bind again while the volume reports a different mount: patch
   `atoms.fs.binding.read_mount_id` and `atoms.fs.volume.read_mount_id` to return an
