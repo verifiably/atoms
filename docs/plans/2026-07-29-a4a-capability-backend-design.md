@@ -765,7 +765,8 @@ Inside `bind_project_volume`, in this order:
 4. **Reclaim any pre-existing `probe/`**, without creating it if absent.
 5. Match `(configuration, storage)` against the supplied allowlist; refuse on no match.
 6. Ensure the full metadata layout.
-7. Probe capabilities, then certify SQLite-WAL hostability.
+7. Probe capabilities, then certify SQLite-WAL hostability, once per process per
+   volume key ([2026-10-15 design](2026-10-15-wal-certification-cache-design.md)).
 8. Reclaim again, leaving `probe/` empty. This runs in a `finally` around step 7, not after it: a
    SQLite refusal, a subprocess timeout, or an unexpected errno must not leave debris behind, and those
    are precisely the paths that skip a success-only cleanup.

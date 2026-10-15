@@ -1,6 +1,6 @@
 # SQLite-WAL certification once per volume per process
 
-**Status:** Approved, 2026-10-15 (review round 2).
+**Status:** Implemented, 2026-10-15. Approved in review round 2; measurement in §6 recorded on `atoms-257797`.
 **Task:** `atoms-257797`. **Inspected Atoms base:** `8bd158a`.
 
 **Authority:** [engine design](2026-07-23-recoverable-fs-effect-engine-design.md)
