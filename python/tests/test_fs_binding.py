@@ -11,10 +11,18 @@ import pytest
 
 from atoms.core.capabilities import Capability
 from atoms.core.errors import CapabilityUnavailable, ProtocolError
+from atoms.fs import binding as binding_module
+from atoms.fs import probe as probe_module
 from atoms.fs.binding import ProjectBinding, VolumeEvidence, bind_project_volume
 from atoms.fs.bootstrap import close_layout, reclaim_probe_survivors
 from atoms.fs.lock import acquire_project_lock
 from atoms.fs.volume import CERTIFIED_ALLOWLIST, DurabilityAllowlist
+from tests.fs_support import (
+    make_bound_volume,
+    make_fake_backend,
+    make_metadata_root,
+    make_project_root,
+)
 
 _OPTIONAL_CAPABILITIES = tuple(
     capability
@@ -379,11 +387,11 @@ def test_a_certification_failure_still_reclaims_probe_debris(
     # exact shape that skips a success-only cleanup, and the debris it would strand
     # sits in engine-owned space under the lock — where the next lease entry would
     # find it and have to guess whose it was.
-    def refuse(database_path, cleanup=False, **_kwargs):
+    def refuse(volume, database_path, **_kwargs):
         os.close(os.open(database_path, os.O_CREAT | os.O_WRONLY | os.O_CLOEXEC, 0o600))
         raise CapabilityUnavailable("injected certification failure")
 
-    monkeypatch.setattr("atoms.fs.binding.certify_sqlite_wal", refuse)
+    monkeypatch.setattr("atoms.fs.binding.certify_volume", refuse)
     with acquire_project_lock(linux_backend, str(metadata_root)) as lock:
         allowlist = test_allowlist(lock, project_root, test_storage_profile)
         with pytest.raises(CapabilityUnavailable, match="injected"):
@@ -405,14 +413,14 @@ def test_a_descriptor_release_failure_still_reclaims(
     # disk must not become conditional on the one that does not: `close_all(...)`
     # followed by `reclaim_probe_survivors(lock)` in a single finally would skip
     # reclamation on exactly this path.
-    def leaves_debris(database_path, cleanup=False, **_kwargs):
+    def leaves_debris(volume, database_path, **_kwargs):
         os.close(os.open(database_path, os.O_CREAT | os.O_WRONLY | os.O_CLOEXEC, 0o600))
 
     def failing_release(backend, retained):
         close_layout(backend, retained)
         raise OSError(errno.EIO, "injected release failure")
 
-    monkeypatch.setattr("atoms.fs.binding.certify_sqlite_wal", leaves_debris)
+    monkeypatch.setattr("atoms.fs.binding.certify_volume", leaves_debris)
     monkeypatch.setattr("atoms.fs.binding.close_layout", failing_release)
     with acquire_project_lock(linux_backend, str(metadata_root)) as lock:
         allowlist = test_allowlist(lock, project_root, test_storage_profile)
@@ -439,7 +447,7 @@ def test_release_and_reclamation_failures_attempt_both_and_raise_first(
     events = []
     reclaim_calls = 0
 
-    def no_certification(database_path, cleanup=False, **_kwargs):
+    def no_certification(volume, database_path, **_kwargs):
         pass
 
     def failing_release(backend, retained):
@@ -455,7 +463,7 @@ def test_release_and_reclamation_failures_attempt_both_and_raise_first(
             events.append("reclaim")
             raise OSError(errno.EPERM, "injected reclamation failure")
 
-    monkeypatch.setattr("atoms.fs.binding.certify_sqlite_wal", no_certification)
+    monkeypatch.setattr("atoms.fs.binding.certify_volume", no_certification)
     monkeypatch.setattr("atoms.fs.binding.close_layout", failing_release)
     monkeypatch.setattr(
         "atoms.fs.binding.reclaim_probe_survivors", failing_final_reclamation
@@ -482,7 +490,7 @@ def test_a_lone_reclamation_failure_surfaces_after_layout_release(
     events = []
     reclaim_calls = 0
 
-    def no_certification(database_path, cleanup=False, **_kwargs):
+    def no_certification(volume, database_path, **_kwargs):
         pass
 
     def recording_release(backend, retained):
@@ -497,7 +505,7 @@ def test_a_lone_reclamation_failure_surfaces_after_layout_release(
             events.append("reclaim")
             raise OSError(errno.EPERM, "injected reclamation failure")
 
-    monkeypatch.setattr("atoms.fs.binding.certify_sqlite_wal", no_certification)
+    monkeypatch.setattr("atoms.fs.binding.certify_volume", no_certification)
     monkeypatch.setattr("atoms.fs.binding.close_layout", recording_release)
     monkeypatch.setattr(
         "atoms.fs.binding.reclaim_probe_survivors", failing_final_reclamation
@@ -511,3 +519,105 @@ def test_a_lone_reclamation_failure_surfaces_after_layout_release(
 
     assert caught.value.errno == errno.EPERM
     assert events == ["release", "reclaim"]
+
+
+def _count_children(monkeypatch) -> list[str]:
+    """Record the phase of every certification child spawned from here on."""
+    phases: list[str] = []
+    real = probe_module._run_child
+
+    def counting(script, database_path, phase):
+        phases.append(phase)
+        return real(script, database_path, phase)
+
+    monkeypatch.setattr("atoms.fs.probe._run_child", counting)
+    return phases
+
+
+def test_a_second_bind_of_the_same_volume_spawns_no_certification_child(
+    bound_volume, monkeypatch
+):
+    children = _count_children(monkeypatch)
+    with bound_volume():
+        pass
+    assert children == ["contention", "write"]
+    with bound_volume():
+        pass
+    assert children == ["contention", "write"], "a cached volume must not certify again"
+
+
+def test_a_second_project_root_on_the_same_mount_shares_the_result(
+    bound_volume, test_volume, test_storage_profile, monkeypatch
+):
+    children = _count_children(monkeypatch)
+    with bound_volume():
+        pass
+    second = test_volume / "second"
+    second.mkdir()
+    bind_second = make_bound_volume(
+        make_fake_backend(),
+        make_project_root(second),
+        make_metadata_root(second),
+        test_storage_profile,
+    )
+    with bind_second():
+        pass
+    assert children == ["contention", "write"]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        CapabilityUnavailable("injected certification failure"),
+        OSError(errno.EIO, "injected spawn or cleanup failure"),
+        KeyboardInterrupt(),
+    ],
+    ids=["refusal", "oserror", "interrupt"],
+)
+def test_a_failed_certification_is_not_cached(
+    project_root,
+    metadata_root,
+    linux_backend,
+    test_allowlist,
+    test_storage_profile,
+    monkeypatch,
+    failure,
+):
+    calls = []
+
+    def fail(database_path, cleanup=False, **_kwargs):
+        calls.append(database_path)
+        raise failure
+
+    monkeypatch.setattr("atoms.fs.probe.certify_sqlite_wal", fail)
+    for _ in range(2):
+        with acquire_project_lock(linux_backend, str(metadata_root)) as lock:
+            allowlist = test_allowlist(lock, project_root, test_storage_profile)
+            with pytest.raises(type(failure)):
+                bind_project_volume(
+                    str(project_root), lock, allowlist=allowlist, storage=test_storage_profile
+                )
+    assert len(calls) == 2, "a failure must leave the volume uncertified"
+
+
+def test_a_cached_bind_still_reclaims_and_probes(
+    bound_volume, metadata_root, monkeypatch
+):
+    with bound_volume():
+        pass
+    survivor = metadata_root / "probe" / "survivor"
+    survivor.write_bytes(b"debris")
+    probed = []
+    real_probe = binding_module.probe_backend
+
+    def recording_probe(*args, **kwargs):
+        probed.append(True)
+        return real_probe(*args, **kwargs)
+
+    monkeypatch.setattr("atoms.fs.binding.probe_backend", recording_probe)
+    children = _count_children(monkeypatch)
+    with bound_volume():
+        pass
+    assert children == [], "the second bind must be a cache hit"
+    assert probed == [True], "a hit still probes capabilities"
+    assert not survivor.exists(), "a hit still reclaims probe/"

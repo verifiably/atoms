@@ -9,10 +9,18 @@ from pathlib import Path
 import pytest
 
 from atoms.core.errors import CapabilityUnavailable
+from atoms.fs import probe as _probe
 from atoms.fs.linux import LinuxBackend
 from atoms.fs.lock import acquire_project_lock
 from atoms.fs.volume import StorageProfile
 from tests.uncertified_host import uncertified_host
+
+
+@pytest.fixture(autouse=True)
+def _uncached_certification():
+    """Each test certifies its volume afresh, so no test depends on what an
+    earlier test in the same worker certified (design 2026-10-15 §6)."""
+    _probe._CERTIFIED.clear()
 
 
 def _report_missing_capability(error: CapabilityUnavailable) -> None:

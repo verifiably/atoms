@@ -17,7 +17,7 @@ from atoms.fs.bootstrap import (
     verified_child_path,
 )
 from atoms.fs.lock import HeldProjectLock, establish_root
-from atoms.fs.probe import certify_sqlite_wal, probe_backend
+from atoms.fs.probe import CertifiedVolume, certify_volume, probe_backend
 from atoms.fs.volume import (
     AllowlistEntry,
     DurabilityAllowlist,
@@ -241,9 +241,16 @@ def bind_project_volume(
                 metadata_info.st_ino,
                 PROBE_DIRECTORY,
             )
-            certify_sqlite_wal(
+            # Once per process per volume key (2026-10-15 design): admission at
+            # step 5 and the probe above still run on every bind.
+            certify_volume(
+                CertifiedVolume(
+                    mount_id=metadata_mount,
+                    device=metadata_info.st_dev,
+                    entry=entry,
+                    configuration=configuration,
+                ),
                 os.path.join(probe_dir, "certify.db"),
-                cleanup=True,
                 backend=backend,
                 parent_fd=probe_fd,
             )

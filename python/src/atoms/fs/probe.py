@@ -17,6 +17,7 @@ import stat
 import subprocess
 import sys
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from typing import TypeVar
 
 from atoms.core.capabilities import Capability
@@ -24,6 +25,7 @@ from atoms.core.errors import CapabilityUnavailable
 from atoms.fs.backend import UNSUPPORTED_ERRNO, Backend
 from atoms.fs.bootstrap import reclaim_probe_survivors
 from atoms.fs.lock import HeldProjectLock
+from atoms.fs.volume import MountEntry, VolumeConfiguration
 
 
 class ChildExit:
@@ -569,3 +571,45 @@ def certify_sqlite_wal(
         raise
     if cleanup_target is not None:
         _cleanup_sqlite_files(*cleanup_target, database_name)
+
+
+@dataclass(frozen=True, slots=True)
+class CertifiedVolume:
+    """What makes two binds the same volume for WAL hostability (2026-10-15 design §3).
+
+    `entry` carries every mount and superblock option, not only the barrier subset
+    `configuration` keeps: locking- and mapping-relevant options (`nolock`, `dax`,
+    `ro`) are not barrier options. Any remount that changes an option is a new key.
+    """
+
+    mount_id: int
+    device: int
+    entry: MountEntry
+    configuration: VolumeConfiguration
+
+
+# Keys whose certification succeeded in this process. In memory only: nothing here
+# outlives the kernel, SQLite library, and mount that justified it.
+_CERTIFIED: set[CertifiedVolume] = set()
+
+
+def certify_volume(
+    volume: CertifiedVolume,
+    database_path: str,
+    *,
+    backend: Backend,
+    parent_fd: int,
+) -> None:
+    """Certify `volume` unless this process already has (A4a §8.3, §9.1 step 7).
+
+    Only success is recorded: a refusal, a timeout, or any other exception leaves
+    the key out, so a failing volume refuses on every bind. Two threads binding the
+    same new volume may both certify; each runs the full choreography under its own
+    held lock and the add is idempotent, so no lock is taken here.
+    """
+    if volume in _CERTIFIED:
+        return
+    certify_sqlite_wal(
+        database_path, cleanup=True, backend=backend, parent_fd=parent_fd
+    )
+    _CERTIFIED.add(volume)
