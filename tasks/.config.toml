@@ -1,4 +1,5 @@
 prefix = "atoms"
+color = "#7995cd"
 
 [git]
 commit = true
