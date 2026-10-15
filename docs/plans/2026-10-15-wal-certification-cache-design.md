@@ -1,6 +1,6 @@
 # SQLite-WAL certification once per volume per process
 
-**Status:** Draft, 2026-10-15, revised after review round 1.
+**Status:** Approved, 2026-10-15 (review round 2).
 **Task:** `atoms-257797`. **Inspected Atoms base:** `8bd158a`.
 
 **Authority:** [engine design](2026-07-23-recoverable-fs-effect-engine-design.md)
@@ -80,7 +80,8 @@ change the key:
 
 None of these bears on how the filesystem implements POSIX locks or maps the WAL index.
 The device field identifies the backing device, so the source label adds nothing to it.
-A new bind mount or a moved mount also gets a new mount ID, which is in the key anyway.
+A new bind mount gets a new mount ID, and a moved mount keeps its ID but changes its
+mount point. Both fields are in the key.
 The parser is not extended. A future case where one of these fields matters would add
 it to `MountEntry`, and so to the key, in the same change.
 
