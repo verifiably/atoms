@@ -1,15 +1,16 @@
 ---
 id: atoms-03a42e
 title: Reconcile the WAL certification cache design with what shipped
-status: doing
+status: done
 priority: 3
 size: xs
 complexity: low
 process: direct
 owner: docs/wal-cert-reconcile
 created: 2026-10-15T11:02:17Z
-updated: 2026-10-15T11:04:24Z
+updated: 2026-10-15T11:12:10Z
 started: 2026-10-15T11:04:04Z
+completed: 2026-10-15T11:12:10Z
 depends: []
 tags: [performance]
 agent: claude-code/claude-opus-5-5
@@ -22,4 +23,8 @@ Deferred minors from the atoms-257797 final review. (1) docs/plans/2026-10-15-wa
 - 2026-10-15T11:04:04Z (main): started
   provenance: {"harness_session":"claude-code:dac2d27a-5a4a-45b9-b94e-2bedbc03bdd3","harness_session_source":"CLAUDE_CODE_SESSION_ID"}
 - 2026-10-15T11:04:24Z (docs/wal-cert-reconcile): resumed
+  provenance: {"harness_session":"claude-code:dac2d27a-5a4a-45b9-b94e-2bedbc03bdd3","harness_session_source":"CLAUDE_CODE_SESSION_ID"}
+- 2026-10-15T11:12:10Z (docs/wal-cert-reconcile): done
+  provenance: {"harness_session":"claude-code:dac2d27a-5a4a-45b9-b94e-2bedbc03bdd3","harness_session_source":"CLAUDE_CODE_SESSION_ID"}
+- 2026-10-15T11:12:10Z (docs/wal-cert-reconcile): design §1 cites the recorded 6,912 → 8 measurement beside the pre-design estimate; §6 names x-atoms-test with its rationale; CertifiedVolume docstring says why mount_id and device sit beside entry (btrfs subvolume st_dev); test-fast 954 passed, docs status green
   provenance: {"harness_session":"claude-code:dac2d27a-5a4a-45b9-b94e-2bedbc03bdd3","harness_session_source":"CLAUDE_CODE_SESSION_ID"}
