@@ -6,9 +6,9 @@ priority: 3
 size: xs
 complexity: low
 process: direct
-owner: main
+owner: docs/wal-cert-reconcile
 created: 2026-10-15T11:02:17Z
-updated: 2026-10-15T11:04:04Z
+updated: 2026-10-15T11:04:24Z
 started: 2026-10-15T11:04:04Z
 depends: []
 tags: [performance]
@@ -20,4 +20,6 @@ Deferred minors from the atoms-257797 final review. (1) docs/plans/2026-10-15-wa
 ## Notes
 
 - 2026-10-15T11:04:04Z (main): started
+  provenance: {"harness_session":"claude-code:dac2d27a-5a4a-45b9-b94e-2bedbc03bdd3","harness_session_source":"CLAUDE_CODE_SESSION_ID"}
+- 2026-10-15T11:04:24Z (docs/wal-cert-reconcile): resumed
   provenance: {"harness_session":"claude-code:dac2d27a-5a4a-45b9-b94e-2bedbc03bdd3","harness_session_source":"CLAUDE_CODE_SESSION_ID"}
