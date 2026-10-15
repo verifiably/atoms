@@ -10,6 +10,8 @@
 
 **Spec:** `docs/plans/2026-10-15-wal-certification-cache-design.md` (approved, review round 2).
 
+**Status:** Approved for Native execution, 2026-10-15 (review round 2), with one fresh whole-branch review after the last task.
+
 ## Global Constraints
 
 - Only the SQLite-WAL choreography is skipped on a hit; steps 1–6, `probe_backend`, and both `reclaim_probe_survivors` calls run on every bind.
@@ -340,7 +342,7 @@ Expected: all pass.
 Temporarily move `_CERTIFIED.add(volume)` above the `certify_sqlite_wal(...)` call.
 
 Run: `just test-one tests/test_fs_binding.py -k not_cached -q`
-Expected: 3 failed on "a failure must leave the volume uncertified".
+Expected: 3 failed, each with `DID NOT RAISE` on the second bind: the key was recorded before the injected failure, so that bind is a cache hit and never reaches the final call-count assertion.
 
 Restore the order, so that `git diff python/src/atoms/fs/probe.py` against Step 7's version is empty, and rerun the same command. Expected: 3 passed.
 
