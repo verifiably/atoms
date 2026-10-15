@@ -1,6 +1,6 @@
 # SQLite-WAL certification once per volume per process
 
-**Status:** Draft, 2026-10-15, for review.
+**Status:** Draft, 2026-10-15, revised after review round 1.
 **Task:** `atoms-257797`. **Inspected Atoms base:** `8bd158a`.
 
 **Authority:** [engine design](2026-07-23-recoverable-fs-effect-engine-design.md)
@@ -59,14 +59,30 @@ step 5 before certification is reached.
 class CertifiedVolume:
     mount_id: int                      # step 2, from /proc/self/fdinfo
     device: int                        # st_dev of the metadata root
-    entry: MountEntry                  # the full mountinfo line, all options
+    entry: MountEntry                  # parsed mount identity, complete option tuples
     configuration: VolumeConfiguration # step 3: kernel, backend revision, barrier, features
 ```
 
-`entry` is the whole `MountEntry`, not only the barrier options the configuration keeps.
-Options that bear on locking or memory mapping (for example `nolock`, `local_lock`,
-`dax`, or `ro` after `errors=remount-ro`) are not barrier options and would be invisible
-to a key built from `VolumeConfiguration` alone.
+`entry` is the parsed `MountEntry`: mount ID, device (`major:minor`), mount point,
+filesystem type, and the complete mount-option and superblock-option tuples. It holds
+every option, not only the barrier options the configuration keeps. Options that bear
+on locking or memory mapping (for example `nolock`, `local_lock`, `dax`, or `ro` after
+`errors=remount-ro`) are not barrier options and would be invisible to a key built
+from `VolumeConfiguration` alone.
+
+`parse_mountinfo` discards four mountinfo fields, so a change confined to them does not
+change the key:
+
+- **Parent mount ID:** where the mount sits in the tree.
+- **Root within the filesystem:** which directory a bind mount exposes.
+- **Optional propagation fields:** `shared:`, `master:`, `unbindable`.
+- **Mount source:** a label such as `/dev/sda1`.
+
+None of these bears on how the filesystem implements POSIX locks or maps the WAL index.
+The device field identifies the backing device, so the source label adds nothing to it.
+A new bind mount or a moved mount also gets a new mount ID, which is in the key anyway.
+The parser is not extended. A future case where one of these fields matters would add
+it to `MountEntry`, and so to the key, in the same change.
 
 A mount ID can be reused after an unmount. A reused ID matches only if the new mount
 has the same device, the same mount point, the same options, and the same
@@ -143,6 +159,19 @@ New, in `test_fs_binding.py`:
   to return the same line with one added non-barrier option (`lazytime`). The
   configuration, and so the allowlist match, is unchanged, but the key differs. Expect
   two children.
+- **Another mount with the same configuration certifies afresh.** Certify one volume
+  by binding it. Then bind again while the volume reports a different mount: patch
+  `atoms.fs.binding.read_mount_id` and `atoms.fs.volume.read_mount_id` to return an
+  unused ID, and `atoms.fs.binding.read_mountinfo` to return the real text with the
+  matched entry's ID rewritten to it. The configuration and the allowlist match are
+  unchanged. Require two certification children on the second bind. A real second
+  mount needs privileges the suite does not have; the simulation exercises the same
+  key field a real one would change.
+- **A populated cache never bypasses admission.** Warm the cache by binding a volume
+  with the test allowlist. Then bind the same project root with an empty
+  `DurabilityAllowlist`. Require `CapabilityUnavailable` from step 5, zero
+  certification children, and no `probe/` entries afterwards. Admission precedes the
+  cache lookup, so a warm cache can skip only certification.
 - **A refusal is not cached.** Inject a refusing `certify_sqlite_wal` and bind twice.
   Both binds refuse, and the refusing function runs both times.
 - **A hit still reclaims and still probes.** Leave debris in `probe/` before a cached
