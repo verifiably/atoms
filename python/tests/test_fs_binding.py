@@ -13,6 +13,7 @@ from atoms.core.capabilities import Capability
 from atoms.core.errors import CapabilityUnavailable, ProtocolError
 from atoms.fs import binding as binding_module
 from atoms.fs import probe as probe_module
+from atoms.fs import volume as volume_module
 from atoms.fs.binding import ProjectBinding, VolumeEvidence, bind_project_volume
 from atoms.fs.bootstrap import close_layout, reclaim_probe_survivors
 from atoms.fs.lock import acquire_project_lock
@@ -621,3 +622,129 @@ def test_a_cached_bind_still_reclaims_and_probes(
     assert children == [], "the second bind must be a cache hit"
     assert probed == [True], "a hit still probes capabilities"
     assert not survivor.exists(), "a hit still reclaims probe/"
+
+
+def _rewrite_entry(text: str, mount_id: int, *, new_id: int | None = None, extra_option: str | None = None) -> str:
+    """The real mountinfo text with one entry's ID or mount options changed."""
+    lines = []
+    for line in text.splitlines():
+        fields = line.split()
+        if fields and fields[0] == str(mount_id):
+            if new_id is not None:
+                fields[0] = str(new_id)
+            if extra_option is not None:
+                fields[5] = f"{fields[5]},{extra_option}"
+            line = " ".join(fields)
+        lines.append(line)
+    return "\n".join(lines) + "\n"
+
+
+def _bind_once(linux_backend, project_root, metadata_root, allowlist, storage):
+    with acquire_project_lock(linux_backend, str(metadata_root)) as lock, bind_project_volume(
+        str(project_root), lock, allowlist=allowlist, storage=storage
+    ) as binding:
+        return binding.evidence.mount_id
+
+
+def _allowlist_for(linux_backend, project_root, metadata_root, test_allowlist, storage):
+    with acquire_project_lock(linux_backend, str(metadata_root)) as lock:
+        return test_allowlist(lock, project_root, storage)
+
+
+def test_another_mount_with_the_same_configuration_certifies_afresh(
+    project_root,
+    metadata_root,
+    linux_backend,
+    test_allowlist,
+    test_storage_profile,
+    monkeypatch,
+):
+    # A real second mount needs privileges the suite lacks; this changes the same key
+    # field one would. The allowlist is built before patching, from the real mount.
+    allowlist = _allowlist_for(
+        linux_backend, project_root, metadata_root, test_allowlist, test_storage_profile
+    )
+    children = _count_children(monkeypatch)
+    real_id = _bind_once(
+        linux_backend, project_root, metadata_root, allowlist, test_storage_profile
+    )
+    assert children == ["contention", "write"]
+
+    text = volume_module.read_mountinfo()
+    other = max(entry.mount_id for entry in volume_module.parse_mountinfo(text)) + 1
+    rewritten = _rewrite_entry(text, real_id, new_id=other)
+    monkeypatch.setattr("atoms.fs.binding.read_mount_id", lambda fd: other)
+    monkeypatch.setattr("atoms.fs.volume.read_mount_id", lambda fd: other)
+    monkeypatch.setattr("atoms.fs.binding.read_mountinfo", lambda: rewritten)
+
+    assert _bind_once(
+        linux_backend, project_root, metadata_root, allowlist, test_storage_profile
+    ) == other
+    assert children == ["contention", "write"] * 2, "a different mount must certify"
+
+
+def test_a_changed_mount_option_certifies_afresh(
+    project_root,
+    metadata_root,
+    linux_backend,
+    test_allowlist,
+    test_storage_profile,
+    monkeypatch,
+):
+    # `x-` options are userspace-only and never reach the kernel's mountinfo, so the
+    # added option is certainly new, and it is in no barrier table, so the
+    # configuration and the allowlist match are unchanged.
+    allowlist = _allowlist_for(
+        linux_backend, project_root, metadata_root, test_allowlist, test_storage_profile
+    )
+    children = _count_children(monkeypatch)
+    real_id = _bind_once(
+        linux_backend, project_root, metadata_root, allowlist, test_storage_profile
+    )
+    rewritten = _rewrite_entry(
+        volume_module.read_mountinfo(), real_id, extra_option="x-atoms-test"
+    )
+    monkeypatch.setattr("atoms.fs.binding.read_mountinfo", lambda: rewritten)
+
+    _bind_once(linux_backend, project_root, metadata_root, allowlist, test_storage_profile)
+    assert children == ["contention", "write"] * 2, "a changed option must certify"
+
+
+def test_a_warm_cache_never_bypasses_the_allowlist(
+    project_root,
+    metadata_root,
+    linux_backend,
+    test_allowlist,
+    test_storage_profile,
+    monkeypatch,
+):
+    allowlist = _allowlist_for(
+        linux_backend, project_root, metadata_root, test_allowlist, test_storage_profile
+    )
+    _bind_once(linux_backend, project_root, metadata_root, allowlist, test_storage_profile)
+    assert probe_module._CERTIFIED, "the first bind must have warmed the cache"
+
+    probed = []
+    real_probe = binding_module.probe_backend
+
+    def recording_probe(*args, **kwargs):
+        probed.append(True)
+        return real_probe(*args, **kwargs)
+
+    monkeypatch.setattr("atoms.fs.binding.probe_backend", recording_probe)
+    children = _count_children(monkeypatch)
+    with acquire_project_lock(linux_backend, str(metadata_root)) as lock:
+        with pytest.raises(CapabilityUnavailable, match="durability allowlist"):
+            bind_project_volume(
+                str(project_root),
+                lock,
+                allowlist=DurabilityAllowlist(),
+                storage=test_storage_profile,
+            )
+        probe_fd = lock.backend.open_child_directory(lock.metadata_root_fd, "probe")
+        try:
+            assert os.listdir(probe_fd) == []
+        finally:
+            os.close(probe_fd)
+    assert children == [], "a refused bind must spawn no certification child"
+    assert probed == [], "admission must refuse before the probe and the cache are reached"
