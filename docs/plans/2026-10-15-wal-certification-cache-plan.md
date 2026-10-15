@@ -47,7 +47,102 @@
   - `certify_volume(volume: CertifiedVolume, database_path: str, *, backend: Backend, parent_fd: int) -> None`
 - Produces, in `python/tests/test_fs_binding.py`: helper `_count_children(monkeypatch) -> list[str]` (phases of every `_run_child` call), used again by Task 2.
 
-- [ ] **Step 1: Clear the cache before every test**
+- [ ] **Step 1: Add the key, an empty set, and a pass-through `certify_volume`**
+
+This step changes no behaviour: `certify_volume` still certifies on every call, so the tests written in Step 5 can be seen failing on their assertions before the cache exists.
+
+In `python/src/atoms/fs/probe.py`, add to the imports:
+
+```python
+from dataclasses import dataclass
+```
+
+and, beside the existing `atoms.fs` imports:
+
+```python
+from atoms.fs.volume import MountEntry, VolumeConfiguration
+```
+
+Append at the end of the module:
+
+```python
+@dataclass(frozen=True, slots=True)
+class CertifiedVolume:
+    """What makes two binds the same volume for WAL hostability (2026-10-15 design §3).
+
+    `entry` carries every mount and superblock option, not only the barrier subset
+    `configuration` keeps: locking- and mapping-relevant options (`nolock`, `dax`,
+    `ro`) are not barrier options. Any remount that changes an option is a new key.
+    """
+
+    mount_id: int
+    device: int
+    entry: MountEntry
+    configuration: VolumeConfiguration
+
+
+# Keys whose certification succeeded in this process. In memory only: nothing here
+# outlives the kernel, SQLite library, and mount that justified it.
+_CERTIFIED: set[CertifiedVolume] = set()
+
+
+def certify_volume(
+    volume: CertifiedVolume,
+    database_path: str,
+    *,
+    backend: Backend,
+    parent_fd: int,
+) -> None:
+    """Certify `volume` (A4a §8.3, §9.1 step 7). Unconditional until Step 7."""
+    certify_sqlite_wal(
+        database_path, cleanup=True, backend=backend, parent_fd=parent_fd
+    )
+```
+
+- [ ] **Step 2: Call it from binding step 7**
+
+In `python/src/atoms/fs/binding.py`, change the import
+
+```python
+from atoms.fs.probe import certify_sqlite_wal, probe_backend
+```
+
+to
+
+```python
+from atoms.fs.probe import CertifiedVolume, certify_volume, probe_backend
+```
+
+and replace the step 7 certification call
+
+```python
+            certify_sqlite_wal(
+                os.path.join(probe_dir, "certify.db"),
+                cleanup=True,
+                backend=backend,
+                parent_fd=probe_fd,
+            )
+```
+
+with
+
+```python
+            # Once per process per volume key (2026-10-15 design): admission at
+            # step 5 and the probe above still run on every bind.
+            certify_volume(
+                CertifiedVolume(
+                    mount_id=metadata_mount,
+                    device=metadata_info.st_dev,
+                    entry=entry,
+                    configuration=configuration,
+                ),
+                os.path.join(probe_dir, "certify.db"),
+                backend=backend,
+                parent_fd=probe_fd,
+            )
+```
+
+- [ ] **Step 3: Clear the cache before every test**
 
 Add to `python/tests/conftest.py`, after the imports:
 
@@ -62,9 +157,30 @@ def _uncached_certification():
     _probe._CERTIFIED.clear()
 ```
 
-Every test errors in setup until Step 5 adds `_CERTIFIED`; that is expected.
+- [ ] **Step 4: Move the four existing injection tests to the new seam**
 
-- [ ] **Step 2: Write the failing tests**
+In `python/tests/test_fs_binding.py`, the tests
+`test_a_certification_failure_still_reclaims_probe_debris`,
+`test_a_descriptor_release_failure_still_reclaims`,
+`test_release_and_reclamation_failures_attempt_both_and_raise_first`, and
+`test_a_lone_reclamation_failure_surfaces_after_layout_release` patch
+`atoms.fs.binding.certify_sqlite_wal`. Since Step 2 binding no longer imports that name,
+so `monkeypatch.setattr` would raise `AttributeError`. In each:
+
+- change the target string `"atoms.fs.binding.certify_sqlite_wal"` to `"atoms.fs.binding.certify_volume"`;
+- change the fake's signature from `(database_path, cleanup=False, **_kwargs)` to `(volume, database_path, **_kwargs)`. The bodies stay as they are; they already use `database_path`.
+
+For example, `refuse` becomes:
+
+```python
+    def refuse(volume, database_path, **_kwargs):
+        os.close(os.open(database_path, os.O_CREAT | os.O_WRONLY | os.O_CLOEXEC, 0o600))
+        raise CapabilityUnavailable("injected certification failure")
+
+    monkeypatch.setattr("atoms.fs.binding.certify_volume", refuse)
+```
+
+- [ ] **Step 5: Write the new tests**
 
 Add to the imports of `python/tests/test_fs_binding.py`:
 
@@ -185,78 +301,22 @@ def test_a_cached_bind_still_reclaims_and_probes(
 
 Add `from atoms.fs import binding as binding_module` to the same import block.
 
-- [ ] **Step 3: Move the four existing injection tests to the new seam**
-
-In `python/tests/test_fs_binding.py`, the tests
-`test_a_certification_failure_still_reclaims_probe_debris`,
-`test_a_descriptor_release_failure_still_reclaims`,
-`test_release_and_reclamation_failures_attempt_both_and_raise_first`, and
-`test_a_lone_reclamation_failure_surfaces_after_layout_release` patch
-`atoms.fs.binding.certify_sqlite_wal`. After Step 6 binding no longer imports that name,
-so `monkeypatch.setattr` would raise `AttributeError`. In each:
-
-- change the target string `"atoms.fs.binding.certify_sqlite_wal"` to `"atoms.fs.binding.certify_volume"`;
-- change the fake's signature from `(database_path, cleanup=False, **_kwargs)` to `(volume, database_path, **_kwargs)`. The bodies stay as they are; they already use `database_path`.
-
-For example, `refuse` becomes:
-
-```python
-    def refuse(volume, database_path, **_kwargs):
-        os.close(os.open(database_path, os.O_CREAT | os.O_WRONLY | os.O_CLOEXEC, 0o600))
-        raise CapabilityUnavailable("injected certification failure")
-
-    monkeypatch.setattr("atoms.fs.binding.certify_volume", refuse)
-```
-
-- [ ] **Step 4: Run the new tests to verify they fail**
+- [ ] **Step 6: Run them against the unconditional path (RED)**
 
 Run: `just test-one tests/test_fs_binding.py -q`
-Expected: every test errors in setup with `AttributeError: module 'atoms.fs.probe' has no attribute '_CERTIFIED'` (from the autouse fixture).
+Expected: exactly three failures, each on its assertion, not in setup:
 
-- [ ] **Step 5: Add the key, the set and `certify_volume` to `probe.py`**
+- `test_a_second_bind_of_the_same_volume_spawns_no_certification_child`: "a cached volume must not certify again", with four phases recorded.
+- `test_a_second_project_root_on_the_same_mount_shares_the_result`: the phase list has four entries.
+- `test_a_cached_bind_still_reclaims_and_probes`: "the second bind must be a cache hit".
 
-In `python/src/atoms/fs/probe.py`, add to the imports:
+Everything else passes, including the four moved injection tests and the three `test_a_failed_certification_is_not_cached` cases. Those hold on an uncached path too; Step 8 shows they can fail. Any error in setup, or a failure elsewhere, means the tests are not measuring repeated certification: fix that before Step 7.
 
-```python
-from dataclasses import dataclass
-```
+- [ ] **Step 7: Add the lookup and the record (GREEN)**
 
-and, beside the existing `atoms.fs` imports:
-
-```python
-from atoms.fs.volume import MountEntry, VolumeConfiguration
-```
-
-Append at the end of the module:
+Replace the body of `certify_volume` in `python/src/atoms/fs/probe.py`:
 
 ```python
-@dataclass(frozen=True, slots=True)
-class CertifiedVolume:
-    """What makes two binds the same volume for WAL hostability (2026-10-15 design §3).
-
-    `entry` carries every mount and superblock option, not only the barrier subset
-    `configuration` keeps: locking- and mapping-relevant options (`nolock`, `dax`,
-    `ro`) are not barrier options. Any remount that changes an option is a new key.
-    """
-
-    mount_id: int
-    device: int
-    entry: MountEntry
-    configuration: VolumeConfiguration
-
-
-# Keys whose certification succeeded in this process. In memory only: nothing here
-# outlives the kernel, SQLite library, and mount that justified it.
-_CERTIFIED: set[CertifiedVolume] = set()
-
-
-def certify_volume(
-    volume: CertifiedVolume,
-    database_path: str,
-    *,
-    backend: Backend,
-    parent_fd: int,
-) -> None:
     """Certify `volume` unless this process already has (A4a §8.3, §9.1 step 7).
 
     Only success is recorded: a refusal, a timeout, or any other exception leaves
@@ -272,60 +332,29 @@ def certify_volume(
     _CERTIFIED.add(volume)
 ```
 
-- [ ] **Step 6: Call it from binding step 7**
+Run: `just test-one tests/test_fs_binding.py -q`
+Expected: all pass.
 
-In `python/src/atoms/fs/binding.py`, change the import
+- [ ] **Step 8: Prove the not-cached tests can fail**
 
-```python
-from atoms.fs.probe import certify_sqlite_wal, probe_backend
-```
+Temporarily move `_CERTIFIED.add(volume)` above the `certify_sqlite_wal(...)` call.
 
-to
+Run: `just test-one tests/test_fs_binding.py -k not_cached -q`
+Expected: 3 failed on "a failure must leave the volume uncertified".
 
-```python
-from atoms.fs.probe import CertifiedVolume, certify_volume, probe_backend
-```
+Restore the order, so that `git diff python/src/atoms/fs/probe.py` against Step 7's version is empty, and rerun the same command. Expected: 3 passed.
 
-and replace the step 7 certification call
-
-```python
-            certify_sqlite_wal(
-                os.path.join(probe_dir, "certify.db"),
-                cleanup=True,
-                backend=backend,
-                parent_fd=probe_fd,
-            )
-```
-
-with
-
-```python
-            # Once per process per volume key (2026-10-15 design): admission at
-            # step 5 and the probe above still run on every bind.
-            certify_volume(
-                CertifiedVolume(
-                    mount_id=metadata_mount,
-                    device=metadata_info.st_dev,
-                    entry=entry,
-                    configuration=configuration,
-                ),
-                os.path.join(probe_dir, "certify.db"),
-                backend=backend,
-                parent_fd=probe_fd,
-            )
-```
-
-- [ ] **Step 7: Run the binding and probe tests**
+- [ ] **Step 9: Run the binding and probe tests**
 
 Run: `just test-one tests/test_fs_binding.py tests/test_fs_probe.py tests/test_fs_architecture.py -q`
 Expected: all pass (tests that need a certified volume skip only on a declared uncertified host).
 
-- [ ] **Step 8: Run the fast suite**
+- [ ] **Step 10: Run the fast suite**
 
 Run: `just test-fast`
 Expected: pass. A fresh worktree has no testmon DB, so this runs the whole fast set once.
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 11: Commit**
 
 ```bash
 git add python/src/atoms/fs/probe.py python/src/atoms/fs/binding.py python/tests/conftest.py python/tests/test_fs_binding.py
@@ -541,13 +570,15 @@ In `docs/plans/2026-10-15-wal-certification-cache-design.md`, replace the status
 **Status:** Implemented, 2026-10-15. Approved in review round 2; measurement in §6 recorded on `atoms-257797`.
 ```
 
-- [ ] **Step 3: Measure in Science's suite, before and after, back to back**
+- [ ] **Step 3: Measure in Science's suite, before and after, at a fixed worker count**
 
-Write this plugin to a scratch directory outside both repositories (for example `$(mktemp -d)/certtime.py`), and set `PLUGIN_DIR` to that directory:
+The cost being measured is interpreter contention, which moves with concurrency. Science's `test-one` runs under `host-budget`, which re-grants workers on every invocation, so `-n auto` could give the two runs different worker counts. Both runs therefore pass `-n 8` (the count Science's justfile names as its sweet spot). Each worker records the count it ran under, its cgroup CPU limit, and the atoms module it actually imported. The summary refuses a pair that differs in any of these.
+
+Make a scratch directory outside both repositories and set `PLUGIN_DIR` to it (for example `PLUGIN_DIR=$(mktemp -d)`). Write `$PLUGIN_DIR/certtime.py`:
 
 ```python
-"""pytest plugin: worker time spent in atoms' WAL certification."""
-import os, time
+"""pytest plugin: worker time spent in atoms' WAL certification, and the run's shape."""
+import json, os, time
 from atoms.fs import binding, probe
 
 _acc = {"cert": 0.0, "n": 0}
@@ -566,33 +597,98 @@ probe.certify_sqlite_wal = _timed
 if hasattr(binding, "certify_sqlite_wal"):
     binding.certify_sqlite_wal = _timed
 
+def _cpu_max():
+    try:
+        path = open("/proc/self/cgroup").read().strip().split("::", 1)[1]
+        return open(f"/sys/fs/cgroup{path}/cpu.max").read().strip()
+    except (OSError, IndexError):
+        return "unavailable"
+
 def pytest_sessionfinish(session):
-    out = os.environ["CERTTIME_OUT"]
-    with open(out, "a") as f:
-        f.write(f"{os.environ.get('PYTEST_XDIST_WORKER', 'main')} "
-                f"wall {time.perf_counter() - _t0:.1f} cert {_acc['cert']:.1f} n {_acc['n']}\n")
+    record = {
+        "worker": os.environ.get("PYTEST_XDIST_WORKER", "controller"),
+        "workers": int(os.environ.get("PYTEST_XDIST_WORKER_COUNT", "0")),
+        "probe_file": probe.__file__,
+        "cpu_max": _cpu_max(),
+        "wall": round(time.perf_counter() - _t0, 2),
+        "cert": round(_acc["cert"], 2),
+        "n": _acc["n"],
+    }
+    with open(os.environ["CERTTIME_OUT"], "a") as f:
+        f.write(json.dumps(record) + "\n")
 ```
 
-From Science's main checkout, run the full suite twice, back to back. Before, against main's atoms:
+Write `$PLUGIN_DIR/summarize.py`:
+
+```python
+"""Compare a before/after pair; exit 1 if the runs are not comparable."""
+import json, sys
+
+def load(path, expect_prefix):
+    rows = [json.loads(line) for line in open(path)]
+    workers = [r for r in rows if r["worker"] != "controller"]
+    problems = []
+    if not workers:
+        problems.append(f"{path}: no worker rows")
+    counts = {r["workers"] for r in workers}
+    if counts != {len(workers)}:
+        problems.append(f"{path}: {len(workers)} worker rows but reported counts {sorted(counts)}")
+    wrong = sorted({r["probe_file"] for r in workers if not r["probe_file"].startswith(expect_prefix)})
+    if wrong:
+        problems.append(f"{path}: atoms imported from {wrong}, expected under {expect_prefix}")
+    summary = {
+        "workers": len(workers),
+        "cpu_max": sorted({r["cpu_max"] for r in workers}),
+        "worker_s": round(sum(r["wall"] for r in workers), 1),
+        "cert_s": round(sum(r["cert"] for r in workers), 1),
+        "n": sum(r["n"] for r in workers),
+    }
+    return summary, problems
+
+before, p1 = load(sys.argv[1], sys.argv[3])
+after, p2 = load(sys.argv[2], sys.argv[4])
+problems = p1 + p2
+for key in ("workers", "cpu_max"):
+    if before[key] != after[key]:
+        problems.append(f"{key} differs: before {before[key]}, after {after[key]}")
+print(json.dumps({"before": before, "after": after}, indent=1))
+for problem in problems:
+    print("NOT COMPARABLE:", problem)
+sys.exit(1 if problems else 0)
+```
+
+Set the two expected import roots. `MAIN_SRC` is where Science's editable install points, read without an override. `ATOMS_WT` is this worktree's absolute path (`git rev-parse --show-toplevel` inside it). From Science's `python/`:
 
 ```bash
-CERTTIME_OUT=$PLUGIN_DIR/before.log PYTHONPATH=$PLUGIN_DIR just test-one tests -p certtime -n auto --dist worksteal -q
+MAIN_SRC=$(uv run --no-sync python -c "import atoms, pathlib; print(pathlib.Path(atoms.__path__[0]).parent)")
 ```
 
-After, against this worktree's atoms. Set `ATOMS_WT` to the absolute path of this worktree (`git rev-parse --show-toplevel` run inside it); `PYTHONPATH` precedes Science's editable install of atoms:
+`$MAIN_SRC` must not be under `$ATOMS_WT`. If it is, the pair cannot distinguish the two and the step stops here.
+
+**Pilot first.** From Science's main checkout, run one world-heavy module through both commands and the summary:
 
 ```bash
-CERTTIME_OUT=$PLUGIN_DIR/after.log PYTHONPATH=$ATOMS_WT/python/src:$PLUGIN_DIR just test-one tests -p certtime -n auto --dist worksteal -q
+CERTTIME_OUT=$PLUGIN_DIR/pilot-before.log PYTHONPATH=$PLUGIN_DIR just test-one tests/test_cmd_spec.py -p certtime -n 8 --dist worksteal -q
+CERTTIME_OUT=$PLUGIN_DIR/pilot-after.log PYTHONPATH=$ATOMS_WT/python/src:$PLUGIN_DIR just test-one tests/test_cmd_spec.py -p certtime -n 8 --dist worksteal -q
+python3 $PLUGIN_DIR/summarize.py $PLUGIN_DIR/pilot-before.log $PLUGIN_DIR/pilot-after.log "$MAIN_SRC" "$ATOMS_WT/python/src"
 ```
 
-Confirm the override took effect: `PYTHONPATH=$ATOMS_WT/python/src uv run --no-sync python -c "import atoms.fs.probe as p; print(p.__file__)"`, run from Science's `python/`, must print a path under `$ATOMS_WT`.
+Expected: exit 0, 8 workers in both, the same `cpu_max`, and `n` lower after than before. On a non-zero exit, fix the cause it names before the full pair. The likely causes are a missing `PYTHONPATH` entry or a worker count other than 8.
 
-Sum `wall`, `cert` and `n` over workers in each log. Expected: `after` has `n` near the worker count times the number of distinct volumes (one or two each), against roughly 3,300 `before`. The `cert` share should fall from about 37% to near zero. Record `cat /proc/loadavg` before each run.
+**Full pair, back to back.** Record `cat /proc/loadavg` before each run.
+
+```bash
+CERTTIME_OUT=$PLUGIN_DIR/before.log PYTHONPATH=$PLUGIN_DIR just test-one tests -p certtime -n 8 --dist worksteal -q
+CERTTIME_OUT=$PLUGIN_DIR/after.log PYTHONPATH=$ATOMS_WT/python/src:$PLUGIN_DIR just test-one tests -p certtime -n 8 --dist worksteal -q
+python3 $PLUGIN_DIR/summarize.py $PLUGIN_DIR/before.log $PLUGIN_DIR/after.log "$MAIN_SRC" "$ATOMS_WT/python/src"
+```
+
+Expected: exit 0. `after.n` should be about the worker count times the number of distinct volumes a worker binds (one or two each), against roughly 3,300 before. The `cert_s` share of `worker_s` should fall from about a third to near zero. A non-zero exit means the pair is not evidence; rerun it rather than recording it.
 
 - [ ] **Step 4: Record the measurement on the task**
 
 ```bash
-tasks note atoms-257797 "measured <date>: science full suite before: <passed> in <s> s, cert <s> of <worker-s> worker-s over <n> certifications (load <x>); after: <passed> in <s> s, cert <s> of <worker-s> over <n> (load <x>)"
+tasks note atoms-257797 "measured <date>, science full suite at -n 8 (cpu_max <v>): before <passed> in <s> s, cert <s> of <worker-s> worker-s over <n> certifications (load <x>); after <passed> in <s> s, cert <s> of <worker-s> over <n> (load <x>); summarize exit 0"
 ```
 
 Fill each `<…>` with the observed values. A missing figure is a failed step, not an omission.
