@@ -8,7 +8,7 @@ complexity: low
 process: direct
 owner: main
 created: 2026-10-16T16:31:48Z
-updated: 2026-10-16T18:23:21Z
+updated: 2026-10-16T18:24:43Z
 started: 2026-10-16T18:23:21Z
 depends: [ops-e5b39c]
 tags: []
@@ -22,3 +22,4 @@ Rewrite this repository's t <t@t> commits (from the 2026-10-07 global-config lea
 
 - 2026-10-16T18:23:21Z (main): started
   provenance: {"harness_session":"codex:01a145f3-539b-7c11-8300-e8ce409af6ff","harness_session_source":"CODEX_THREAD_ID"}
+- 2026-10-16T18:24:43Z (main): Direct history maintenance under ops-e5b39c pilot notes: user confirmed Europa idle; Titan has main plus merged docs/certification-readme, tag v0.1.0, no stashes or other worktrees, 72 t@t commits. Rewrite all refs in one isolated mirror outside Dropbox, bundle backup first, preserve trees/topology/messages, swap refs with old-value guards, attach changed-entry SHA map to this task so append-only historical references remain resolvable, run pre-push gate, push main with explicit lease. No repository code changes or code worktree needed. Europa index is stale; verifying actual file hashes and preserving index before any swap.
