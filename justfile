@@ -23,10 +23,10 @@ tt := "python3 tools/tt"
 # docs/specs/2026-09-24-host-budget-design.md). A CI runner has no host-budget, so the
 # workflow sets the count explicitly, and `ci-python` refuses to run without one.
 # test-fast also leaves out the three fresh-process suites (the SIGKILL matrix, the
-# persistence-cut matrix, the exerciser): they were ~400 of the serial suite's ~500 s and
-# depend on nearly every source module, so with them in, any source edit reselected
-# them and the loop ran 291-506s (measured 2026-09-05, atoms-83ae5c); without them the
-# whole in-process suite is 106s and a single module's tests take seconds. testmon's
+# persistence-cut matrix, the exerciser): on 2026-09-05 (atoms-83ae5c) they were ~400 of
+# the serial suite's ~500 s and depended on nearly every source module, so with them in,
+# any source edit reselected them and the loop ran 291-506s; without them the whole
+# in-process suite was 106s and a single module's tests took seconds. testmon's
 # tracing also sees only the parent process, so a change to code the children alone
 # run (tests/execute_child.py, tests/coordinator_child.py) selects nothing. Both
 # omissions are deterministic and named here; `just test` runs everything and is the
