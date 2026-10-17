@@ -7,7 +7,7 @@ size: s
 complexity: mid
 process: direct
 created: 2026-10-17T23:27:35Z
-updated: 2026-10-17T23:27:50Z
+updated: 2026-10-17T23:28:06Z
 depends: [ops-ab03a7]
 tags: [testing]
 agent: claude-code
@@ -18,3 +18,7 @@ Why: test-fast is still serial. On main, warm testmon selections of 4978 and 499
 Change: once ops-ab03a7 records a fast_cmd form that keeps testmon's selection safe under xdist (workers there can collect different tests), apply it to fast_cmd and run test-fast under host-budget run, as test and hook-pre-push do since a2020d2. If ops-ab03a7 recommends serial testmon, re-scope this task instead of forcing workers.
 
 Check: a warm run after a core-module edit (the atoms-83ae5c probe: one module-level statement in fs/lookup.py) selects about the same tests as serially and finishes under 90 s; a no-change run selects 0; repeated runs never show xdist's 'Different tests were collected'. Related: atoms-4fb428 (cold test-fast runs are not recorded as widened, so they inflate the window).
+
+## Notes
+
+- 2026-10-17T23:28:06Z (main): concerns: atoms-286555 extension — the same xdist remedy for test-fast, which the halt's fix left serial
