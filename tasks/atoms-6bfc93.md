@@ -8,7 +8,7 @@ complexity: low
 process: direct
 owner: crew
 created: 2026-10-08T15:55:23Z
-updated: 2026-10-17T21:48:09Z
+updated: 2026-10-17T21:49:09Z
 started: 2026-10-17T21:31:46Z
 depends: []
 tags: []
@@ -26,3 +26,4 @@ Check: one `just test-one <a known test>` run; the last line of the timing log h
 - 2026-10-17T21:38:36Z (crew): crew: attempt 01M55WEAE4Q6CP72KNEBQH8N64 started — kind code-xs, worker openrouter/deepseek/deepseek-v4-flash-0731, worktree .worktrees/crew-ebqh8n64
 - 2026-10-17T21:47:56Z (crew): crew: attempt 01M55WEAE4Q6CP72KNEBQH8N64 — verdict not-passed (worker openrouter/deepseek/deepseek-v4-flash-0731, reviewer openrouter/openai/gpt-6.1-sol); report /home/keith/.local/state/crew/attempts/01M55WEAE4Q6CP72KNEBQH8N64/attempt-report.md
 - 2026-10-17T21:48:09Z (crew): parked (waiting on user, review): review crew attempt 01M55WEAE4Q6CP72KNEBQH8N64 (verdict not-passed): branch crew/atoms-6bfc93-ebqh8n64 in .worktrees/crew-ebqh8n64; merge and close, or discard
+- 2026-10-17T21:49:09Z (crew): resumed
