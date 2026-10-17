@@ -16,9 +16,11 @@ Member of the verifiably family (https://github.com/verifiably/docs/blob/main/ov
 `just test-one <pytest args>` runs one test (paths relative to `python/`);
 `just test-fast` is the inner loop (testmon, excluding the kill-matrix,
 persistence-cut and exerciser suites); `just test` is the full suite, which the
-pre-push hook runs, including the suites the fast loop excludes. Capability-dependent
-tests are proven only on the certified ext4 tuple, which the pre-push gate uses and
-`docs/certification/` records. On a fresh clone, `git config core.hooksPath .githooks`.
+pre-push hook runs, including the suites the fast loop excludes. It runs on xdist
+workers sized by `host-budget` (ops), so no test may depend on another test's process
+or order. Capability-dependent tests are proven only on the certified ext4 tuple,
+which the pre-push gate uses and `docs/certification/` records. On a fresh clone,
+`git config core.hooksPath .githooks`.
 
 ## Layout
 
