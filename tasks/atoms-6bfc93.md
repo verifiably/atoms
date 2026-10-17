@@ -8,7 +8,7 @@ complexity: low
 process: direct
 owner: crew
 created: 2026-10-08T15:55:23Z
-updated: 2026-10-17T22:04:12Z
+updated: 2026-10-17T23:28:54Z
 started: 2026-10-17T21:31:46Z
 depends: []
 tags: []
@@ -30,3 +30,4 @@ Check: one `just test-one <a known test>` run; the last line of the timing log h
 - 2026-10-17T21:56:03Z (crew): crew: attempt 01M55XE4E4V59KA6J0WJHS040Y started — kind code-xs, worker openrouter/anthropic/claude-sonnet-5.5, worktree .worktrees/crew-wjhs040y
 - 2026-10-17T22:04:00Z (crew): crew: attempt 01M55XE4E4V59KA6J0WJHS040Y — verdict passed (worker openrouter/anthropic/claude-sonnet-5.5, reviewer openrouter/openai/gpt-6.1-sol); report /home/keith/.local/state/crew/attempts/01M55XE4E4V59KA6J0WJHS040Y/attempt-report.md
 - 2026-10-17T22:04:12Z (crew): parked (waiting on user, review): review crew attempt 01M55XE4E4V59KA6J0WJHS040Y (verdict passed): branch crew/atoms-6bfc93-wjhs040y in .worktrees/crew-wjhs040y; merge and close, or discard
+- 2026-10-17T23:28:54Z (main): main's justfile changed at a2020d2 (atoms-286555): test_cmd now appends -n auto --dist worksteal, and test, hook-pre-push and ci-python changed shape; the crew branches were cut from 28d1721, so merging one may conflict on those lines. The junitxml form works under xdist (spec §4.3), so a rebase only needs the lines re-applied.
