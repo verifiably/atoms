@@ -42,4 +42,5 @@ dev = [
     "ruff>=0.15.7",
     "pyright>=1.1.390",
     "pytest-testmon>=2.2.0",
+    "pytest-xdist>=3.6",
 ]

@@ -13,19 +13,27 @@ tt := "python3 tools/tt"
 # The three commands, each written once. Recipes and hooks all run these, so a hook can
 # never drift from the gate it is supposed to be. Avoid single quotes inside them.
 # The package lives under python/; `uv run --frozen` syncs the dev group from the lock
-# file (pytest, pytest-testmon, ruff, pyright) and never rewrites it from a hook.
-# testmon keeps its selection data in python/.testmondata, per checkout and ignored.
+# file (pytest, pytest-testmon, pytest-xdist, ruff, pyright) and never rewrites it from a
+# hook. testmon keeps its selection data in python/.testmondata, per checkout and ignored.
+# The full suite runs on xdist workers: serially it took a median 383 s, and 8 workers
+# with work-stealing took it to 133 s with no fixture change (the development host,
+# 2026-10-17, atoms-286555); the exerciser's ~80 s SIGKILL arm is now the critical path.
+# The worker count is the host's budget: local runs go through `host-budget run` (ops),
+# which sets PYTEST_XDIST_AUTO_NUM_WORKERS for `-n auto` (design: ops
+# docs/specs/2026-09-24-host-budget-design.md). A CI runner has no host-budget, so the
+# workflow sets the count explicitly, and `ci-python` refuses to run without one.
 # test-fast also leaves out the three fresh-process suites (the SIGKILL matrix, the
-# persistence-cut matrix, the exerciser): they are ~400 of the suite's ~500 seconds and
-# depend on nearly every source module, so with them in, any source edit reselected
-# them and the loop ran 291-506s (measured 2026-09-05, atoms-83ae5c); without them the
-# whole in-process suite is 106s and a single module's tests take seconds. testmon's
+# persistence-cut matrix, the exerciser): on 2026-09-05 (atoms-83ae5c) they were ~400 of
+# the serial suite's ~500 s and depended on nearly every source module, so with them in,
+# any source edit reselected them and the loop ran 291-506s; without them the whole
+# in-process suite was 106s and a single module's tests took seconds. testmon's
 # tracing also sees only the parent process, so a change to code the children alone
 # run (tests/execute_child.py, tests/coordinator_child.py) selects nothing. Both
 # omissions are deterministic and named here; `just test` runs everything and is the
 # certification gate.
 fast_cmd := "cd python && uv run --frozen pytest --testmon --ignore=tests/test_coordinator_kill_matrix.py --ignore=tests/test_persistence_cut_matrix.py --ignore=tests/test_exerciser.py"
-test_cmd := "cd python && uv run --frozen pytest"
+xdist := "-n auto --dist worksteal"
+test_cmd := "cd python && uv run --frozen pytest " + xdist
 one_cmd := "cd python && uv run --frozen pytest"
 check_cmd := "python3 tools/ops-check && python3 tools/ops-docs check && (cd python && uv run --frozen ruff check && uv run --frozen pyright) && tasks check"
 # The same commands minus `tasks check`, whose binary is not on a runner; ops-check keeps
@@ -44,7 +52,7 @@ test-one +args:
 
 # The full suite: the certification gate.
 test:
-    {{tt}} test -- sh -c '{{test_cmd}}'
+    {{tt}} test -- host-budget run -- sh -c '{{test_cmd}}'
 
 # Seconds, not minutes: lint, typecheck, task-record check.
 check:
@@ -72,7 +80,7 @@ hook-pre-commit:
 
 # What the pre-push hook runs: the same commands as `gate`, under one hook target.
 hook-pre-push:
-    {{tt}} hook-pre-push -- sh -c '{{check_cmd}} && {{test_cmd}}'
+    {{tt}} hook-pre-push -- host-budget run -- sh -c '{{check_cmd}} && {{test_cmd}}'
 
 # CI runs the recipe rather than `just gate` so the whole job is one recorded number and
 # cannot drift from the local gate (design section 4.6). The full suite, not the fast
@@ -84,6 +92,10 @@ hook-pre-push:
 # leaks into whatever follows, and ops-check would be looked for under python/. The other
 # recipes never hit this only because they put test_cmd last.
 #
+# The worker count must be given: the workflow sets it for the runner, and a local
+# reproduction takes the host's budget with `host-budget run -- just ci-python`. Without
+# it `-n auto` would guess from the CPU count, so the recipe stops before the suite starts.
+#
 # The full suite, then ops-check, ruff and pyright.
 ci-python:
-    {{tt}} ci-python -- sh -c '({{test_cmd}}) && {{ci_check_cmd}}'
+    {{tt}} ci-python -- sh -c ': "${PYTEST_XDIST_AUTO_NUM_WORKERS:?set by the CI job, or run as host-budget run -- just ci-python}" && ({{test_cmd}}) && {{ci_check_cmd}}'

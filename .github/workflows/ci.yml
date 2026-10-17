@@ -17,6 +17,10 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.13"]
+    # A runner has no host-budget: bound the suite's xdist workers to the standard
+    # runner's 4 vCPUs (ops host-budget design). `just ci-python` refuses without it.
+    env:
+      PYTEST_XDIST_AUTO_NUM_WORKERS: "4"
     defaults:
       run:
         working-directory: python
