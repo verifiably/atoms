@@ -20,10 +20,10 @@ tt := "python3 tools/tt"
 # 2026-10-17, atoms-286555); the exerciser's ~80 s SIGKILL arm is now the critical path.
 # The worker count is the host's budget: local runs go through `host-budget run` (ops),
 # which sets PYTEST_XDIST_AUTO_NUM_WORKERS for `-n auto` (design: ops
-# docs/specs/2026-09-24-host-budget-design.md). A CI runner has no host-budget, so there
-# `-n auto` takes the runner's CPU count.
+# docs/specs/2026-09-24-host-budget-design.md). A CI runner has no host-budget, so the
+# workflow sets the count explicitly, and `ci-python` refuses to run without one.
 # test-fast also leaves out the three fresh-process suites (the SIGKILL matrix, the
-# persistence-cut matrix, the exerciser): they are ~400 of the suite's ~500 seconds and
+# persistence-cut matrix, the exerciser): they were ~400 of the serial suite's ~500 s and
 # depend on nearly every source module, so with them in, any source edit reselected
 # them and the loop ran 291-506s (measured 2026-09-05, atoms-83ae5c); without them the
 # whole in-process suite is 106s and a single module's tests take seconds. testmon's
@@ -92,6 +92,10 @@ hook-pre-push:
 # leaks into whatever follows, and ops-check would be looked for under python/. The other
 # recipes never hit this only because they put test_cmd last.
 #
+# The worker count must be given: the workflow sets it for the runner, and a local
+# reproduction takes the host's budget with `host-budget run -- just ci-python`. Without
+# it `-n auto` would guess from the CPU count, so the recipe stops before the suite starts.
+#
 # The full suite, then ops-check, ruff and pyright.
 ci-python:
-    {{tt}} ci-python -- sh -c '({{test_cmd}}) && {{ci_check_cmd}}'
+    {{tt}} ci-python -- sh -c ': "${PYTEST_XDIST_AUTO_NUM_WORKERS:?set by the CI job, or run as host-budget run -- just ci-python}" && ({{test_cmd}}) && {{ci_check_cmd}}'
