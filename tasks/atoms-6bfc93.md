@@ -1,14 +1,14 @@
 ---
 id: atoms-6bfc93
 title: Record per-test durations with tt version 6
-status: doing
+status: todo
 priority: 3
 size: xs
 complexity: low
 process: direct
 owner: main
 created: 2026-10-08T15:55:23Z
-updated: 2026-10-18T00:28:33Z
+updated: 2026-10-18T00:28:53Z
 started: 2026-10-17T21:31:46Z
 depends: []
 tags: []
