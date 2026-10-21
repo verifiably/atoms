@@ -2,12 +2,12 @@
 id: atoms-4368ba
 title: python/README.md (the PyPI readme) names a machine path and the old package name
 status: todo
-priority: 3
+priority: 2
 size: xs
 complexity: low
 process: direct
 created: 2026-10-10T12:10:50Z
-updated: 2026-10-10T12:10:50Z
+updated: 2026-10-21T20:05:46Z
 depends: []
 tags: [docs]
 agent: claude-code/claude-opus-5-5
