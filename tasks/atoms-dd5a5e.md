@@ -1,15 +1,17 @@
 ---
 id: atoms-dd5a5e
 title: "Explain why atoms exists against what a newcomer knows, not against proto-science's code history"
-status: doing
+status: done
 priority: 2
 size: s
 complexity: mid
 process: direct
 owner: docs/dd5a5e-newcomer-problem
 created: 2026-10-24T17:35:06Z
-updated: 2026-10-24T18:45:50Z
+updated: 2026-10-24T18:46:05Z
 started: 2026-10-24T18:06:00Z
+completed: 2026-10-24T18:46:05Z
+closed: 2026-10-24T18:46:05Z
 depends: []
 tags: [docs]
 source: vdocs-e4318e
@@ -29,3 +31,7 @@ Found by the second guided tour (vdocs-e4318e, 2026-10-24). The authority design
 - 2026-10-24T18:39:07Z (docs/dd5a5e-newcomer-problem): minor (deferred): the abstract no longer says atoms sits conceptually below nodes (nodes does not yet adopt it); the 400-char bound left no room, the family nav shows the layer order, and design §1/§12.2 keep the claim
 - 2026-10-24T18:42:35Z (docs/dd5a5e-newcomer-problem): review: impl round 2 — verdict: revise; findings: Important 1, Minor 1; reviewer: claude-code/claude-fable-5-1
 - 2026-10-24T18:45:50Z (docs/dd5a5e-newcomer-problem): review: impl round 3 — verdict: accept; findings: none; reviewer: claude-code/claude-fable-5-1
+- 2026-10-24T18:46:05Z (docs/dd5a5e-newcomer-problem): done
+  provenance: {"harness_session":"claude-code:0e2eed92-cf40-40a1-aac6-b06ac9f3c1ce","harness_session_source":"CLAUDE_CODE_SESSION_ID"}
+- 2026-10-24T18:46:05Z (docs/dd5a5e-newcomer-problem): README abstract (identity.toml) and design §2 state the problem against what a program writing many files meets, not the predecessor's code; both name the scope: one host, cooperating processes, Dropbox across hosts a non-guarantee (§3.2); three review rounds (revise, revise, accept); the dropped nodes clause is the deferred minor
+  provenance: {"harness_session":"claude-code:0e2eed92-cf40-40a1-aac6-b06ac9f3c1ce","harness_session_source":"CLAUDE_CODE_SESSION_ID"}
