@@ -8,7 +8,7 @@ complexity: mid
 process: direct
 owner: docs/dd5a5e-newcomer-problem
 created: 2026-10-24T17:35:06Z
-updated: 2026-10-24T18:42:35Z
+updated: 2026-10-24T18:45:50Z
 started: 2026-10-24T18:06:00Z
 depends: []
 tags: [docs]
@@ -28,3 +28,4 @@ Found by the second guided tour (vdocs-e4318e, 2026-10-24). The authority design
 - 2026-10-24T18:34:26Z (docs/dd5a5e-newcomer-problem): review: impl round 1 — verdict: revise; findings: Important 2, Minor 5; reviewer: claude-code/claude-fable-5-1
 - 2026-10-24T18:39:07Z (docs/dd5a5e-newcomer-problem): minor (deferred): the abstract no longer says atoms sits conceptually below nodes (nodes does not yet adopt it); the 400-char bound left no room, the family nav shows the layer order, and design §1/§12.2 keep the claim
 - 2026-10-24T18:42:35Z (docs/dd5a5e-newcomer-problem): review: impl round 2 — verdict: revise; findings: Important 1, Minor 1; reviewer: claude-code/claude-fable-5-1
+- 2026-10-24T18:45:50Z (docs/dd5a5e-newcomer-problem): review: impl round 3 — verdict: accept; findings: none; reviewer: claude-code/claude-fable-5-1
