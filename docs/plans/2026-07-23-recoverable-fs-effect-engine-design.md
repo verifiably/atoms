@@ -61,16 +61,17 @@ together, and code written around that gap fails in the same few ways:
   half-finished work, safe to complete or undo, or someone else's, which it must not touch.
 
 Each program that meets these failures answers them on its own: it fixes an order for its writes,
-keeps an in-memory list of the files it has changed so far, and writes an undo routine, and all
-three are lost with the process. A durability layer added afterwards (a journal that survives the
+keeps an in-memory list of the files it has changed so far, and writes an undo routine; the list,
+the only account of what has landed, dies with the process. A durability layer added afterwards (a journal that survives the
 process) then becomes a *second* account of what was written, beside the in-memory list, and the
 two can disagree. That split is the defect this engine removes: one durable journal and one executor
 own every write from the start. Shared file-writing helpers alone are never the transaction
 boundary.
 
 The engine's scope is one host and cooperating processes. An advisory lock serializes the writers
-on a machine that go through the engine; a sync client such as Dropbox is the outside writer of the
-second bullet, detected and refused, never a coordinator. Two hosts applying changes to one synced
+on a machine that go through the engine. A sync client such as Dropbox is the outside writer the
+second failure above describes, which the engine does not coordinate: where the disk shows its
+change, the transaction refuses or halts rather than overwrite it. Two hosts applying changes to one synced
 tree is a stated non-guarantee (§3.2).
 
 ## 3. Guarantees and non-guarantees
