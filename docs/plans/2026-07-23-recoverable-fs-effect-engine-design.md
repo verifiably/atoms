@@ -1706,6 +1706,17 @@ is not an engine transaction. The consumer completes and freezes its output mani
 compiles the spec from that settled surface, so the lease's write phase — and the lock hold — remains
 a publication, never a computation.
 
+**A language-neutral execution seam (future extension, not built here).** This engine is
+Python-only, while portable `nodes` holds normative Python/TypeScript parity, so direct `nodes`
+adoption (§12.2, §14) waits on a seam that a caller in either language can reach. The plausible shape
+is a serialized `TransactionSpec` handed to an out-of-process executor that runs this engine: the
+caller submits the public input (§4.1) and the executor process compiles and approves it itself, so
+`CompiledSpec` and `ProjectApprovedSpec` stay engine-internal and never cross the process boundary,
+and no second engine implementation is written. That serialization is the engine's own wire form of
+the spec, not a consumer's saved-plan format, which stays outside this design (§4.1). The seam needs
+its own design, and nothing in this document commits to building it; whether any `nodes` consumer
+other than Beliefs' composition root needs it is an open question.
+
 **Tamper-evident mutation log (future obligation, not built here).** Beliefs' epistemic-kernel and
 computation-reproducibility designs name this engine as the eventual owner of a general tamper-evident
 mutation log: every mutation durably registered *before* it is applied, in a sequence whose *removal
