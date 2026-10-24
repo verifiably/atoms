@@ -47,21 +47,31 @@ The default recovery policy is conventional write-ahead-log policy, qualified by
 
 ## 2. Problem
 
-A consumer performs coordinated changes across multiple files and directories — writing a corpus of
-entities and rebuilt indexes, publishing an archived tree, importing records. Between the moment
-intent is frozen and the moment every change is durable, independent events intervene:
+A program that keeps its records as files (this design calls it a *consumer*) usually changes many
+of them in one step: writing a corpus of entities and the indexes rebuilt over them, publishing an
+archived tree, importing a batch of records. The filesystem offers no way to make those changes land
+together, and code written around that gap fails in the same few ways:
 
-- another process (a sync client, a concurrent tool) can modify a path after intent is frozen or
-  after capture;
-- a Python exception can occur after some effects have landed;
-- the process can be killed between a mutating syscall and its durability step;
-- power loss can retain either side of a publication boundary;
-- a later invocation must distinguish this transaction's work from an unrelated writer's work.
+- a crash, a kill or a Python exception part-way through leaves some files new and some old, and
+  nothing on disk says which;
+- a sync client or another tool changes a file between the moment the program decided what to
+  write and the moment it writes, and the program overwrites that change without noticing;
+- power loss keeps one side of a rename or a write and loses the other;
+- a later run finds an unexpected file and cannot tell whether it is the interrupted step's own
+  half-finished work, safe to complete or undo, or someone else's, which it must not touch.
 
-Without a single durable executor, each consumer re-implements ordering, ownership tracking, and
-rollback, and a later durability layer becomes a *second* execution authority beside an in-memory
-tracker. That split is the defect this engine removes: the journal and executor own execution from
-the start. Shared primitives alone are not the transaction boundary.
+Each program that meets these failures answers them on its own: it fixes an order for its writes,
+keeps an in-memory list of the files it has changed so far, and writes an undo routine, and all
+three are lost with the process. A durability layer added afterwards (a journal that survives the
+process) then becomes a *second* account of what was written, beside the in-memory list, and the
+two can disagree. That split is the defect this engine removes: one durable journal and one executor
+own every write from the start. Shared file-writing helpers alone are never the transaction
+boundary.
+
+The engine's scope is one host and cooperating processes. An advisory lock serializes the writers
+on a machine that go through the engine; a sync client such as Dropbox is the outside writer of the
+second bullet, detected and refused, never a coordinator. Two hosts applying changes to one synced
+tree is a stated non-guarantee (§3.2).
 
 ## 3. Guarantees and non-guarantees
 

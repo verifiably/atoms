@@ -5,7 +5,7 @@ name = "atoms"
 aliases = []
 purpose = "A recoverable filesystem effect engine: the crash-safe substrate"
 abstract = """
-Atomic multi-path filesystem mutation with write-ahead journaling, rollback and post-crash recovery, over an OS-neutral capability vocabulary: a write either lands completely or leaves a state that can be classified from durable evidence and safely completed, rolled back or halted. Conceptually the substrate below nodes, which does not yet adopt it directly; beliefs is its direct consumer.
+Changes many files on disk as one unit, for programs that keep their records as files. It writes down what it is about to do before touching anything, so after a crash, a kill or another program writing mid-way it can tell from the disk alone which changes were its own, then finish or undo them, or halt and keep the evidence. One host and cooperating processes only; beliefs is its consumer.
 """
 authority = ["docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md"]
 subsystems = []
