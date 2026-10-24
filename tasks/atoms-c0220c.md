@@ -6,9 +6,9 @@ priority: 3
 size: xs
 complexity: low
 process: direct
-owner: main
+owner: docs/section15-execution-seam
 created: 2026-10-24T19:01:37Z
-updated: 2026-10-24T19:05:14Z
+updated: 2026-10-24T19:05:43Z
 started: 2026-10-24T19:05:14Z
 depends: []
 tags: [docs]
@@ -21,4 +21,6 @@ Found by the second guided tour (vdocs-e4318e, 2026-10-24). docs/plans/2026-07-2
 ## Notes
 
 - 2026-10-24T19:05:14Z (main): started
+  provenance: {"harness_session":"claude-code:0d5ee316-6a93-4242-8ffb-3b30103c5067","harness_session_source":"CLAUDE_CODE_SESSION_ID"}
+- 2026-10-24T19:05:43Z (docs/section15-execution-seam): resumed
   provenance: {"harness_session":"claude-code:0d5ee316-6a93-4242-8ffb-3b30103c5067","harness_session_source":"CLAUDE_CODE_SESSION_ID"}
