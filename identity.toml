@@ -5,7 +5,7 @@ name = "atoms"
 aliases = []
 purpose = "A recoverable filesystem effect engine: the crash-safe substrate"
 abstract = """
-Applies a change to many files on disk as one step that is finished, undone or halted, never left half-done, for programs that keep their records as files. It writes down what it will do before touching anything, so after a crash, a kill or another program writing to the same files it can tell from the disk alone which changes were its own. One host and cooperating processes; used by beliefs.
+Applies a change to many files on disk as one step that is finished, undone or halted, never silently half-done, for programs that keep their records as files. It writes down what it will do before touching anything, so after a crash, a kill or another program writing to the same files it can tell from the disk alone which changes were its own. One host and cooperating processes; used by beliefs.
 """
 authority = ["docs/plans/2026-07-23-recoverable-fs-effect-engine-design.md"]
 subsystems = []
