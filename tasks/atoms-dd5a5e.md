@@ -8,7 +8,7 @@ complexity: mid
 process: direct
 owner: docs/dd5a5e-newcomer-problem
 created: 2026-10-24T17:35:06Z
-updated: 2026-10-24T18:09:27Z
+updated: 2026-10-24T18:13:15Z
 started: 2026-10-24T18:06:00Z
 depends: []
 tags: [docs]
@@ -24,3 +24,4 @@ Found by the second guided tour (vdocs-e4318e, 2026-10-24). The authority design
   provenance: {"harness_session":"claude-code:0e2eed92-cf40-40a1-aac6-b06ac9f3c1ce","harness_session_source":"CLAUDE_CODE_SESSION_ID"}
 - 2026-10-24T18:09:27Z (docs/dd5a5e-newcomer-problem): resumed
   provenance: {"harness_session":"claude-code:0e2eed92-cf40-40a1-aac6-b06ac9f3c1ce","harness_session_source":"CLAUDE_CODE_SESSION_ID"}
+- 2026-10-24T18:13:15Z (docs/dd5a5e-newcomer-problem): baseline 2026-10-24 (just test, worktree .worktrees/dd5a5e-newcomer-problem at c177e8a): 6310 passed, 7 skipped, 149.54 s
