@@ -7,15 +7,16 @@ and project approval, SQLite-WAL metadata store, recovery-resolve lease, coheren
 observation mechanism; A7 adds the audited facade, chain, effect/recovery executor, and public
 transaction command; A8 adds the synthetic exerciser, persistence-cut model, and durability
 certification); A9 (macOS backend) remains unimplemented.
-**Repository:** `atoms` (`~/d/atoms`) — Python-first physical durability substrate below `nodes`
+**Repository:** `atoms` — Python-first, domain-neutral physical durability substrate; Beliefs composes it with `nodes` (§12)
 **Supersedes:** the science-framed [`2026-07-20-recoverable-fs-effect-engine-design.md`](2026-07-20-recoverable-fs-effect-engine-design.md), retained as the historical, review-hardened record.
 
 > This is the authority design for `atoms` as a standalone engine. It recenters the 2026-07-20
 > design — which was written to converge Beliefs' archive/import/supersede/cohort families onto one
 > executor — on the engine's own contract. Two things change from that document. First, framing: the
 > engine's public boundary is a validated `TransactionSpec`; how a consumer produces one (compiling
-> from a saved plan, authenticating it) is the consumer's concern, out of engine scope. Consumers are
-> now `nodes` and Beliefs, adopted later (§12, §14). Second, the durable metadata store is **SQLite in
+> from a saved plan, authenticating it) is the consumer's concern, out of engine scope. Its
+> production consumer is Beliefs, whose composition root composes it with `nodes`; `nodes` itself
+> does not depend on it (§12, §14; amended 2026-10-26). Second, the durable metadata store is **SQLite in
 > WAL mode** (§7), replacing the hand-rolled directory-of-JSON write-ahead log. The capability
 > vocabulary (§5.5), coherent capture (§6), the per-effect contracts (§9), restartable materialization
 > (§10), and the recovery classifier (§8.4, §13.1) are carried near-verbatim from the reviewed design;
@@ -29,8 +30,13 @@ mutation of a set of filesystem paths.
 A consumer describes intent as a validated, internal `TransactionSpec` over a closed set of typed
 effects. A single engine exclusively owns filesystem mutation, write-ahead journaling, durability,
 rollback, recovery, and scratch paths. The engine is domain-neutral: it names no knowledge kinds and
-embeds no consumer's plan format. It sits **below** `nodes` (the logical knowledge substrate) and is
-consumed by `nodes` and Beliefs alike (§12).
+embeds no consumer's plan format, and any program that keeps its state as files can use it. It is
+not a layer of `nodes` (the logical knowledge substrate): `nodes` decides what a corpus write is and
+runs it through an executor it is handed, and this engine decides how a set of paths changes
+durably. Beliefs' composition root joins the two by handing `nodes` an engine-backed executor (§12);
+neither library depends on the other. *(amended 2026-10-26: this paragraph said the engine sits
+below `nodes` and is consumed by `nodes` and Beliefs alike, a package chain the shipped composition
+does not have.)*
 
 The filesystem does not provide atomic visibility across multiple paths. The engine therefore does
 not claim ACID transactions. Its contract is:
@@ -160,6 +166,10 @@ engine prepares the durable record → executes effects → commits or rolls bac
     ↓
 consumer receives a durable terminal outcome
 ```
+
+A consumer is any caller that builds a `TransactionSpec`; the engine names none. In the shipped
+composition the caller is Beliefs' composition root, which compiles one `nodes` write plan into one
+spec (§12.2) *(amended 2026-10-26)*.
 
 ### 4.1 The consumer boundary
 
@@ -1328,7 +1338,7 @@ a halt.
 
 The engine's consumer submission boundary is a `TransactionSpec`; its mutation boundary is a
 `ProjectApprovedSpec` plus the recovery-resolve lease (§5.4). It ships with no consumer-specific
-compilation baked in. Two vehicles exercise and adopt it.
+compilation baked in. Two vehicles exercise and adopt it: the in-repo exerciser and Beliefs.
 
 ### 12.1 Synthetic exerciser (the vertical slice)
 
@@ -1340,27 +1350,38 @@ dependency. To keep it from drifting from real needs, its effect surface is shap
 documented shapes of the deferred real consumers (§12.2) — corpus writes and archive/import moves —
 without importing either.
 
-### 12.2 Deferred production consumers
+### 12.2 Production consumers
 
 Real adoption is Plan B (§14), one consumer at a time, each on its own clock and each responsible for
 producing and authenticating its own frozen intent (§4.1). Beliefs' substrate-consolidation design
 (Beliefs `2026-08-02-substrate-consolidation-design.md`) rules that durability and concurrency belong
-to this engine and that no interim transaction layer is built anywhere else; it also surfaces a
-constraint this section previously ignored: `nodes` holds normative Python/TypeScript parity while
-this engine is Python-only, so portable `nodes` should not depend on it until a language-neutral
-execution seam exists (a serialized spec plus out-of-process executor is the plausible shape, §15).
+to this engine and that no interim transaction layer is built anywhere else. `nodes` holds normative
+Python/TypeScript parity while this engine is Python-only, so `nodes` does not depend on it: `nodes`
+exposes a write-plan executor interface with a best-effort default, and a consumer that wants durable
+`nodes` writes supplies an engine-backed executor through it.
 
-- **Beliefs' composition root** — the likely first production consumer: Beliefs' Python composition
-  root combines `nodes` and this engine ("Beliefs as a `nodes` profile over `atoms`"), so corpus
-  writes flow through that root rather than through a `nodes`-internal adapter. Under Beliefs' world
+- **Beliefs' composition root** — the first production consumer, implemented (Beliefs' conformance
+  cut 4): Beliefs' Python composition root (`beliefs/root.py`, the one Beliefs module that imports
+  this engine) combines `nodes` and this engine ("Beliefs as a `nodes` profile over `atoms`"). Its
+  `DurableExecutor` compiles each `nodes` write plan into one `TransactionSpec`, and `open_corpus`
+  hands it to the `nodes` corpus, so corpus writes flow through that root rather than through a
+  `nodes`-internal adapter. Under Beliefs' world
   model the write unit is a **corpus root**: the consumer keys the engine root — and therefore the
   lock and metadata root — on the corpus, not on a "project" that merely contributes to one.
 - **Beliefs' plan families** — archive, import, cohort-import, and supersede, whose mutation shapes
   the engine was originally derived from. Each family keeps its planner and saved-plan authentication
   and compiles, after authentication, into a `TransactionSpec`. This adoption, and the deletion of
   Beliefs' existing execution dialects, is Beliefs' own hard cut — outside this repo's authority.
-- **`nodes` directly** — deferred behind the language-neutral seam above; adopting this engine from
-  portable `nodes` before that seam exists would break parity or force a second engine implementation.
+  The family adapters, as recast by the 2026-08-19 amendment below, landed as Beliefs' conformance
+  cut 5.
+- **`nodes` directly** — not planned. `nodes` is a complete logical substrate without this engine,
+  and adopting it from portable `nodes` would break parity or force a second engine implementation.
+  A shared or cross-language integration (§15) is a possible response to a demonstrated consumer
+  need, not a prerequisite for `nodes`.
+
+*(amended 2026-10-26: this section was titled "Deferred production consumers" and placed direct
+`nodes` adoption behind a language-neutral seam, as if it were the eventual route; Beliefs' adapter
+over the `nodes` executor interface is the route that shipped.)*
 
 No consumer adoption may redefine the engine protocol, add a feature flag, or introduce a runtime
 transaction-dialect choice.
@@ -1662,7 +1683,8 @@ trap removal), split 2026-08-13 at plan time on the design's §1 layering.
 
 Written only after Plan A's interfaces settle, and it must not redefine the engine protocol. One
 consumer at a time, in the order §12.2 records (Beliefs' composition root, then Beliefs' plan
-families; direct `nodes` adoption waits on a language-neutral execution seam):
+families; no direct `nodes` adoption is planned). Item 1 and item 2 as recast by the 2026-08-19
+amendment below have landed in Beliefs, as its conformance cuts 4 and 5 *(amended 2026-10-26)*:
 
 1. Beliefs composition-root corpus-write adapter and its acceptance suite.
 2. Beliefs family adapters (supersede first, then archive, then import/cohort), each keeping its
@@ -1706,16 +1728,18 @@ is not an engine transaction. The consumer completes and freezes its output mani
 compiles the spec from that settled surface, so the lease's write phase — and the lock hold — remains
 a publication, never a computation.
 
-**A language-neutral execution seam (future extension, not built here).** This engine is
-Python-only, while portable `nodes` holds normative Python/TypeScript parity, so direct `nodes`
-adoption (§12.2, §14) waits on a seam that a caller in either language can reach. The plausible shape
+**A language-neutral execution seam (possible extension, not planned).** This engine is
+Python-only, while portable `nodes` holds normative Python/TypeScript parity. `nodes` does not need
+the engine: Beliefs reaches it through the `nodes` executor interface (§12.2). A caller that needs
+the engine from another language, or a shared integration beyond Beliefs, would need a seam that a
+caller in either language can reach; it answers a demonstrated consumer need and is not a
+prerequisite for `nodes` *(amended 2026-10-26)*. The plausible shape
 is a serialized `TransactionSpec` handed to an out-of-process executor that runs this engine: the
 caller submits the public input (§4.1) and the executor process compiles and approves it itself, so
 `CompiledSpec` and `ProjectApprovedSpec` stay engine-internal and never cross the process boundary,
 and no second engine implementation is written. That serialization is the engine's own wire form of
 the spec, not a consumer's saved-plan format, which stays outside this design (§4.1). The seam needs
-its own design, and nothing in this document commits to building it; whether any `nodes` consumer
-other than Beliefs' composition root needs it is an open question.
+its own design, and nothing in this document commits to building it.
 
 **Tamper-evident mutation log (future obligation, not built here).** Beliefs' epistemic-kernel and
 computation-reproducibility designs name this engine as the eventual owner of a general tamper-evident
