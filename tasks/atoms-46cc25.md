@@ -6,9 +6,9 @@ priority: 2
 size: xs
 complexity: low
 process: direct
-owner: main
+owner: docs/package-and-role-descriptions
 created: 2026-10-25T17:14:09Z
-updated: 2026-10-26T14:42:53Z
+updated: 2026-10-26T14:43:53Z
 started: 2026-10-26T14:42:53Z
 depends: []
 tags: [docs]
@@ -23,4 +23,6 @@ Found by the second guided tour (vdocs-e4318e, 2026-10-25). README.md Layout lis
 - 2026-10-25T17:14:09Z (add): created
   provenance: {"harness_session":"claude-code:1b29140b-c89c-4277-9bf0-a637ec403f80","harness_session_source":"CLAUDE_CODE_SESSION_ID"}
 - 2026-10-26T14:42:53Z (main): started
+  provenance: {"harness_session":"claude-code:076a9c9c-5e81-4baf-b4e0-c2f63f16aa10","harness_session_source":"CLAUDE_CODE_SESSION_ID"}
+- 2026-10-26T14:43:53Z (docs/package-and-role-descriptions): resumed
   provenance: {"harness_session":"claude-code:076a9c9c-5e81-4baf-b4e0-c2f63f16aa10","harness_session_source":"CLAUDE_CODE_SESSION_ID"}
