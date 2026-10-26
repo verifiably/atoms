@@ -8,7 +8,7 @@ complexity: low
 process: direct
 owner: docs/package-and-role-descriptions
 created: 2026-10-25T17:14:22Z
-updated: 2026-10-26T14:58:57Z
+updated: 2026-10-26T15:00:15Z
 started: 2026-10-26T14:43:22Z
 completed: 2026-10-26T14:58:57Z
 closed: 2026-10-26T14:58:57Z
@@ -55,3 +55,4 @@ Found by the second guided tour (vdocs-e4318e, 2026-10-25): the learner asked wh
   provenance: {"harness_session":"claude-code:076a9c9c-5e81-4baf-b4e0-c2f63f16aa10","harness_session_source":"CLAUDE_CODE_SESSION_ID"}
 - 2026-10-26T14:58:57Z (docs/package-and-role-descriptions): identity abstract drops 'as one step' and states partial visibility, domain-neutral scope, one host and certified filesystems; README Usage explains non-ACID recovery outcomes and the beliefs -> nodes/atoms dependency diagram; authority header, intro, sections 1, 4, 12.2, 14 and 15 recast nodes as independent with Beliefs' adapter as the shipped route (cuts 4 and 5), direct nodes adoption not planned
   provenance: {"harness_session":"claude-code:076a9c9c-5e81-4baf-b4e0-c2f63f16aa10","harness_session_source":"CLAUDE_CODE_SESSION_ID"}
+- 2026-10-26T15:00:15Z (docs/package-and-role-descriptions): baseline: just test at worktree creation ran 6310 passed, 7 skipped; after edits just check, ops-docs check, just test-one tests/test_docs_status.py (8 passed) and just test-fast (6213 passed, 7 skipped) all green
