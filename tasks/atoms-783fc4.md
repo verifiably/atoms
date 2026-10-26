@@ -6,9 +6,9 @@ priority: 3
 size: s
 complexity: low
 process: direct
-owner: main
+owner: docs/package-and-role-descriptions
 created: 2026-10-25T17:14:22Z
-updated: 2026-10-26T14:43:22Z
+updated: 2026-10-26T14:44:23Z
 started: 2026-10-26T14:43:22Z
 depends: []
 tags: [docs]
@@ -46,4 +46,6 @@ Found by the second guided tour (vdocs-e4318e, 2026-10-25): the learner asked wh
 - 2026-10-26T01:30:21Z (main): scope: rescoped; expanded the existing P3 task from xs to s/low/direct for the agreed atoms/nodes/beliefs role explanation, identity-generated guide wording and authority sections 1/4/12/14/15, retaining its original non-ACID visibility correction and source. Now established against atoms 051bca5, nodes 31c375a and beliefs 741fea1: nodes' executor hook already supports Beliefs' atoms-backed adapter; a mandatory nodes->atoms import chain or TypeScript removal is not required. The 400-character/three-sentence identity limit is in tools/ops-docs, so the fuller relationship explanation belongs in README Usage. origin: filing matched in claude-code:1b29140b-c89c-4277-9bf0-a637ec403f80, add call line 547 and full created result line 548 at 2026-10-25T17:14:22Z; human line 508 asked about intermediate visibility, and the wording repair was the agent's follow-up. This session's explicit user request adds the role/relationship documentation ask, so origin=mixed. No older origin_session is recorded. Priority retained, original capture preserved, no dependency on the Mindful assessment and no new brief or speculative implementation task.
   provenance: {"harness_session":"codex:01a16f4e-dd98-7340-b434-196e04adfade","harness_session_source":"CODEX_THREAD_ID"}
 - 2026-10-26T14:43:22Z (main): started
+  provenance: {"harness_session":"claude-code:076a9c9c-5e81-4baf-b4e0-c2f63f16aa10","harness_session_source":"CLAUDE_CODE_SESSION_ID"}
+- 2026-10-26T14:44:23Z (docs/package-and-role-descriptions): resumed
   provenance: {"harness_session":"claude-code:076a9c9c-5e81-4baf-b4e0-c2f63f16aa10","harness_session_source":"CLAUDE_CODE_SESSION_ID"}
