@@ -8,7 +8,7 @@ complexity: low
 process: direct
 owner: docs/package-and-role-descriptions
 created: 2026-10-25T17:14:09Z
-updated: 2026-10-26T14:57:48Z
+updated: 2026-10-26T14:59:42Z
 started: 2026-10-26T14:42:53Z
 completed: 2026-10-26T14:57:48Z
 closed: 2026-10-26T14:57:48Z
@@ -32,3 +32,4 @@ Found by the second guided tour (vdocs-e4318e, 2026-10-25). README.md Layout lis
   provenance: {"harness_session":"claude-code:076a9c9c-5e81-4baf-b4e0-c2f63f16aa10","harness_session_source":"CLAUDE_CODE_SESSION_ID"}
 - 2026-10-26T14:57:48Z (docs/package-and-role-descriptions): README layout lists atoms.chain and coordinator.commands; pyproject description drops 'pure model' and import-names adds atoms.chain; coordinator docstring names commands as the public surface
   provenance: {"harness_session":"claude-code:076a9c9c-5e81-4baf-b4e0-c2f63f16aa10","harness_session_source":"CLAUDE_CODE_SESSION_ID"}
+- 2026-10-26T14:59:42Z (docs/package-and-role-descriptions): baseline: just test at worktree creation ran 6310 passed, 7 skipped; after edits just check, ops-docs check, just test-one tests/test_docs_status.py (8 passed) and just test-fast (6213 passed, 7 skipped) all green
