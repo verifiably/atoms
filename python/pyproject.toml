@@ -1,9 +1,9 @@
 [project]
 name = "verifiably-atoms"
-import-names = ["atoms.coordinator", "atoms.core", "atoms.fs", "atoms.store"]
+import-names = ["atoms.chain", "atoms.coordinator", "atoms.core", "atoms.fs", "atoms.store"]
 import-namespaces = ["atoms"]
 version = "0.1.0"
-description = "Atoms core: a recoverable filesystem effect engine (pure model)"
+description = "A recoverable filesystem effect engine: the crash-safe substrate"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]

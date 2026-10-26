@@ -74,7 +74,9 @@ returns the bytes a registered path held before a settled transaction.
 
 - `python/` — the package: `atoms.core` (the pure model), `atoms.fs` (capability
   backend, volume binding, project approval), `atoms.store` (the SQLite-in-WAL
-  metadata store), `atoms.coordinator` (lease, admission, preparation, executors).
+  metadata store), `atoms.chain` (the tamper-evident project-local history),
+  `atoms.coordinator` (lease, admission, preparation, executors, and the public
+  `commands`).
 - `docs/plans/` — the authority design and the Plan A sub-plans, with their roadmap
   index; `docs/certification/` — the crash-certification records;
   `docs/deferred-obligation-ledger.md` — what a trust boundary admits but does not yet
