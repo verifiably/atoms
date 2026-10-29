@@ -1,18 +1,21 @@
 ---
 id: atoms-07954a
 title: Resolve existing tilde-layout findings before checker rollout
-status: doing
+status: done
 priority: 2
 size: m
 complexity: mid
 process: direct
 owner: fix/atoms-07954a
 created: 2026-10-22T19:06:10Z
-updated: 2026-10-29T20:50:56Z
+updated: 2026-10-29T20:51:10Z
 started: 2026-10-29T20:26:35Z
+completed: 2026-10-29T20:51:10Z
+closed: 2026-10-29T20:51:10Z
 depends: []
 tags: []
 source: ops-295f8d
+model: claude-opus-5-5
 agent: codex
 ---
 
@@ -54,3 +57,7 @@ Reported files:
 - 2026-10-29T20:50:40Z (fix/atoms-07954a): resumed
   provenance: {"harness_session":"claude-code:0abf3f61-62e6-4a09-a944-9063cc887bf3","harness_session_source":"CLAUDE_CODE_SESSION_ID"}
 - 2026-10-29T20:50:56Z (fix/atoms-07954a): review: impl round 1 — verdict: accept; findings: none; reviewer: claude-code/claude-opus-5-5
+- 2026-10-29T20:51:10Z (fix/atoms-07954a): done
+  provenance: {"harness_session":"claude-code:0abf3f61-62e6-4a09-a944-9063cc887bf3","harness_session_source":"CLAUDE_CODE_SESSION_ID"}
+- 2026-10-29T20:51:10Z (fix/atoms-07954a): Reworded 33 checkout aliases across two designs and 11 plans to repository-relative paths and checkout placeholders; allowed the tasks-migration ledger (recorded audit evidence) by exact-file entry; fast-forwarded into main; candidate exits 0 on main; just check passed; baseline just test 6310 passed
+  provenance: {"harness_session":"claude-code:0abf3f61-62e6-4a09-a944-9063cc887bf3","harness_session_source":"CLAUDE_CODE_SESSION_ID"}
