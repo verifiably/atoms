@@ -1,4 +1,9 @@
 # Path prefixes that may carry this machine's layout (ops-check version 5). The
 # certification records are evidence captured verbatim by the harness: the qemu command
 # line names the checkout the run certified, and rewriting it would falsify the record.
-layout_allowed = ["docs/certification/"]
+layout_allowed = [
+  "docs/certification/",
+  # The tasks-migration ledger is historical evidence: its worktree inventory, reviewed
+  # task bodies and recorded verification commands name the checkouts the audit ran in.
+  "docs/plans/2026-08-30-atoms-tasks-migration.md",
+]
