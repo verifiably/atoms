@@ -1,13 +1,15 @@
 ---
 id: atoms-07954a
 title: Resolve existing tilde-layout findings before checker rollout
-status: todo
+status: doing
 priority: 2
 size: m
 complexity: mid
 process: direct
+owner: main
 created: 2026-10-22T19:06:10Z
-updated: 2026-10-22T19:06:10Z
+updated: 2026-10-29T20:26:35Z
+started: 2026-10-29T20:26:35Z
 depends: []
 tags: []
 source: ops-295f8d
@@ -38,3 +40,8 @@ Reported files:
 - docs/plans/2026-08-02-plan-a5b-recovery-lease.md: first reported line 73; 2 reported finding(s)
 - docs/plans/2026-08-07-plan-a6-coherent-capture.md: first reported line 85; 1 reported finding(s)
 - docs/plans/2026-08-30-atoms-tasks-migration.md: first reported line 0; 12 reported finding(s)
+
+## Notes
+
+- 2026-10-29T20:26:35Z (main): started
+  provenance: {"harness_session":"claude-code:0abf3f61-62e6-4a09-a944-9063cc887bf3","harness_session_source":"CLAUDE_CODE_SESSION_ID"}
