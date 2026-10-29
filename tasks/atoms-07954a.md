@@ -8,7 +8,7 @@ complexity: mid
 process: direct
 owner: fix/atoms-07954a
 created: 2026-10-22T19:06:10Z
-updated: 2026-10-29T20:27:36Z
+updated: 2026-10-29T20:43:37Z
 started: 2026-10-29T20:26:35Z
 depends: []
 tags: []
@@ -47,3 +47,4 @@ Reported files:
   provenance: {"harness_session":"claude-code:0abf3f61-62e6-4a09-a944-9063cc887bf3","harness_session_source":"CLAUDE_CODE_SESSION_ID"}
 - 2026-10-29T20:27:36Z (fix/atoms-07954a): resumed
   provenance: {"harness_session":"claude-code:0abf3f61-62e6-4a09-a944-9063cc887bf3","harness_session_source":"CLAUDE_CODE_SESSION_ID"}
+- 2026-10-29T20:43:37Z (fix/atoms-07954a): dispositions: docs/2026-08-23-root-lifecycle-commands-design.md:7,103,1024,1055 — reworded (beliefs authority to <beliefs checkout>/..., own paths repository-relative); docs/2026-08-24-holdings-read-and-evidence-commands-design.md:15 — reworded (<beliefs checkout>/...); docs/plans/2026-07-23-plan-a1-core-model.md:35,39,50,189,196,1967 — reworded (nodes paths to <nodes checkout>/..., docs convention to <checkout>/, LICENSE repository-relative, quoted README line to <atoms checkout>/README.md); docs/plans/2026-07-28-plan-a2-compilation-validation.md:29 — reworded (docs convention to <checkout>/); docs/plans/2026-07-28-plan-a3-recovery-reference-model.md:52, docs/plans/2026-07-29-plan-a4a-capability-backend.md:59, docs/plans/2026-08-07-plan-a6-coherent-capture.md:85 — reworded (docs-path convention to <atoms checkout>/...); docs/plans/2026-07-30-a4b1-path-resolution-design.md:108,110,113,750,751,761,764,765 — reworded (module layout repository-relative with column realignment of 109,111,112; casefold setup snippet and prose to <atoms checkout> and its sibling <atoms checkout>/../atoms-test-volumes/, 764-765 rewrapped); docs/plans/2026-07-30-plan-a4b1-path-resolution.md:28,56,3261, docs/plans/2026-07-31-plan-a4b2-project-approval.md:51,82, docs/plans/2026-08-01-plan-a5a-metadata-store.md:33,100, docs/plans/2026-08-02-plan-a5b-recovery-lease.md:73,138 — reworded (Work from python/; docs-path convention to <atoms checkout>/...; saved-plan path repository-relative); docs/plans/2026-07-31-a4b2-project-approval-design.md:141 — reworded (python/src/atoms/fs/); docs/plans/2026-08-30-atoms-tasks-migration.md:34-39,102,158,159,181,182,204,213,214,216,217,220-222,224,225,230 — allowed: exact-file layout_allowed entry, historical evidence ledger (worktree inventory, reviewed task bodies, recorded verification commands name the audited checkouts)
