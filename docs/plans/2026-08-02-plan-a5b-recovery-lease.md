@@ -70,7 +70,7 @@ The four measured plans, verbatim:
 
 ## Global Constraints
 
-- Work from `~/d/atoms/python`. Gates are `uv run pytest`, `uv run ruff check`, `uv run pyright`.
+- Work from `python/`. Gates are `uv run pytest`, `uv run ruff check`, `uv run pyright`.
 - **Ruff's default rule set is much broader than `E4/E7/E9/F`** — isort (`I001`), bugbear,
   flake8-simplify, bandit (`S`), `RUF012`, blind-except (`BLE001`). Run `uv run ruff check <file>`
   right after creating each file rather than only at the task gate.
@@ -135,7 +135,7 @@ The four measured plans, verbatim:
   lands. Until Task 9, a task's `uv run pytest -q` gate is clean **when the failures are a subset of
   these three** — check the names, not just the count, and report any other failure rather than
   absorbing it into this allowance. Do not touch either guard file before Task 9.
-- Filepaths in docs and comments use `~/d/atoms/...`.
+- Filepaths in docs and comments use `<atoms checkout>/...`.
 - Conventional commits. No AI-attribution trailer or footer.
 
 ---

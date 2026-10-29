@@ -56,7 +56,7 @@ A4a mutates only engine-owned `metadata_root`, never project paths.
   test before production edits. Task 7 adds characterization and architecture locks over behavior already
   delivered by Tasks 1–6; its named checkpoint must pass and any failure is a deviation to fix, not a
   fictitious RED state.
-- **Commits:** no AI-attribution trailers. Documentation paths use `~/d/atoms/...`, never host-specific
+- **Commits:** no AI-attribution trailers. Documentation paths use `<atoms checkout>/...`, never host-specific
   absolute paths.
 
 ## File map

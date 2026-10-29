@@ -25,7 +25,7 @@ Where this plan and either document disagree, the design wins over this plan and
 
 ## Global Constraints
 
-- Work from `~/d/atoms/python`. Gates are `uv run pytest`, `uv run ruff check`, `uv run pyright`.
+- Work from `python/`. Gates are `uv run pytest`, `uv run ruff check`, `uv run pyright`.
 - **Ruff is pinned at 0.16.0 and its default rule set is much broader than `E4/E7/E9/F`** — measured on
   this checkout it includes isort (`I001`), bugbear (`B017`, `B018`, …), flake8-simplify (`SIM117`),
   bandit (`S`), and blind-except (`BLE001`), alongside `F401`/`F811`/`F821`. The code blocks below are
@@ -53,7 +53,7 @@ Where this plan and either document disagree, the design wins over this plan and
 - Neither new module may import `atoms.core.compiler`, `atoms.core.spec`, or `atoms.core.recovery`.
 - Neither `PathResolver` nor `read_lookup_constraints` is exported from `atoms.fs`.
 - The `Backend` protocol gains no method; `BACKEND_REVISION` is unchanged.
-- Filepaths in docs and comments use `~/d/atoms/...`.
+- Filepaths in docs and comments use `<atoms checkout>/...`.
 - Conventional commits. No AI-attribution trailer or footer.
 
 ---
@@ -3258,7 +3258,7 @@ call.
 
 ## Execution Handoff
 
-Plan complete and saved to `~/d/atoms/docs/plans/2026-07-30-plan-a4b1-path-resolution.md`. Two
+Plan complete and saved to `docs/plans/2026-07-30-plan-a4b1-path-resolution.md`. Two
 execution options:
 
 **1. Subagent-Driven (recommended)** — a fresh subagent per task, review between tasks, fast iteration.

@@ -12,7 +12,7 @@ ancestor of both its local `main` and tracked `origin/main` at the
 2026-08-30 audit.
 
 **Authority:**
-`~/d/beliefs/docs/designs/2026-08-24-world-index-holdings-design.md`
+`<beliefs checkout>/docs/designs/2026-08-24-world-index-holdings-design.md`
 §2 (the atoms seam), at Beliefs commit `b231e08` — the §2.2 corrections
 this design's discoveries forced, and §4.1's engine-raise disposition, are
 part of the authority, not ahead of it.

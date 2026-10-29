@@ -48,7 +48,7 @@ the pure/IO boundary and performs no project-space write.
 
 ## Global Constraints
 
-- Work from `~/d/atoms/python`. Gates are `uv run pytest`, `uv run ruff check`, `uv run pyright`.
+- Work from `python/`. Gates are `uv run pytest`, `uv run ruff check`, `uv run pyright`.
 - **Ruff is pinned at 0.16.0 and its default rule set is much broader than `E4/E7/E9/F`** — on this
   checkout it includes isort (`I001`), bugbear (`B017`, `B018`, …), flake8-simplify (`SIM117`),
   bandit (`S`), `RUF012`, and blind-except (`BLE001`), alongside `F401`/`F811`/`F821`. The code below
@@ -79,7 +79,7 @@ the pure/IO boundary and performs no project-space write.
 - `resolve.py` and `lookup.py` must continue to import none of `atoms.core.compiler`,
   `atoms.core.spec`, or `atoms.core.recovery`. The new modules may import all three.
 - Non-casefold ext4 is the only approvable lookup proof, inherited unchanged from A4b-1.
-- Filepaths in docs and comments use `~/d/atoms/...`.
+- Filepaths in docs and comments use `<atoms checkout>/...`.
 - Conventional commits. No AI-attribution trailer or footer.
 
 ---

@@ -4,7 +4,7 @@
 (findings landed through `6555e46`); the implementation landed on
 `design/root-lifecycle` with the full suite and gates green.
 
-**Authority:** `~/d/beliefs/docs/superpowers/specs/2026-08-23-world-index-root-lifecycle-design.md`
+**Authority:** `<beliefs checkout>/docs/superpowers/specs/2026-08-23-world-index-root-lifecycle-design.md`
 §2–§4.
 
 **Directly inherits:** the current coordinator command/lease surfaces and the
@@ -100,7 +100,7 @@ closed directory/regular-file/symlink vocabulary.
 
 ## 3. Seam review
 
-`~/d/atoms/docs/deferred-obligation-ledger.md` has no open obligations. This
+`docs/deferred-obligation-ledger.md` has no open obligations. This
 design adds none:
 
 | Admitted shape | Closed disposition |
@@ -1021,7 +1021,7 @@ class RootOperationInvalid(AtomsError):
 
 ## 16. Verification
 
-One focused `~/d/atoms/python/tests/test_lifecycle_commands.py` covers:
+One focused `python/tests/test_lifecycle_commands.py` covers:
 
 - fresh register writable; interrupted exact retry grants; bare matching
   genesis never grants;
@@ -1052,7 +1052,7 @@ the writability gate and no-write reads to `_existing_read_only_lease`,
 dependency direction
 `coordinator -> {store, fs, chain, core}`, and public exports.
 
-Implementation gate, from `~/d/atoms/python`:
+Implementation gate, from `python/`:
 
 ```text
 uv run --frozen pytest

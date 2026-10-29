@@ -105,12 +105,12 @@ admits nothing, so no ledger entry tracks them; §2.2 records them as non-scope 
 ### 4.1 Module layout
 
 ```
-~/d/atoms/python/src/atoms/fs/lookup.py     LookupProof, DirectoryConstraints,
-                                            read_lookup_constraints, inherited_constraints
-~/d/atoms/python/src/atoms/fs/resolve.py    FilesystemIdentity, DirectoryFacts, EntryKind,
-                                            AbsentFrontier, PresentFrontier, ResolvedHop,
-                                            ResolvedPrefix, PathResolver
-~/d/atoms/python/src/atoms/core/errors.py   ProjectApprovalRefused (added)
+python/src/atoms/fs/lookup.py     LookupProof, DirectoryConstraints,
+                                  read_lookup_constraints, inherited_constraints
+python/src/atoms/fs/resolve.py    FilesystemIdentity, DirectoryFacts, EntryKind,
+                                  AbsentFrontier, PresentFrontier, ResolvedHop,
+                                  ResolvedPrefix, PathResolver
+python/src/atoms/core/errors.py   ProjectApprovalRefused (added)
 ```
 
 `lookup.py` owns every type it returns. `DirectoryConstraints` cannot live in `resolve.py` while
@@ -747,8 +747,8 @@ skipping — an explicit opt-in that silently does nothing is worse than no opt-
 One-time setup. `mkfs` is unprivileged; only the mount is not:
 
 ```bash
-IMG=~/d/atoms-test-volumes/casefold.img
-MNT=~/d/atoms-test-volumes/casefold
+IMG=<atoms checkout>/../atoms-test-volumes/casefold.img
+MNT=<atoms checkout>/../atoms-test-volumes/casefold
 
 mkdir -p "$(dirname "$IMG")" "$MNT"
 truncate -s 256M "$IMG"
@@ -758,11 +758,11 @@ sudo mount -o loop "$IMG" "$MNT"            # privileged
 sudo chown "$USER" "$MNT"                   # privileged
 
 export ATOMS_CASEFOLD_VOLUME="$MNT"
-cd ~/d/atoms/python && uv run pytest
+cd <atoms checkout>/python && uv run pytest
 ```
 
-`~/d/atoms-test-volumes/` is a sibling of the repository, not a directory inside it, so no test
-artifact can land in `~/d/atoms/`.
+`<atoms checkout>/../atoms-test-volumes/` is a sibling of the repository, not a directory inside
+it, so no test artifact can land in `<atoms checkout>/`.
 
 The suite creates `plain/` and `folded/` **inside a project root on that volume**, sets
 `chattr +F folded/` while it is empty, and asserts, through a `PathResolver` bound to it:

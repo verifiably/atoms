@@ -49,7 +49,7 @@ against project paths.
   never allocate `EntryIdentity`; they only retain, move, compare, or project observation tokens.
 - **Ordering:** compiled effect order is authoritative. `dependencies` never schedule recovery.
 - **Mutation discipline:** use TDD for every task. Run the named failing test before production edits.
-- **Commits:** no AI-attribution trailers. Documentation paths use `~/d/atoms/...`, never host-specific
+- **Commits:** no AI-attribution trailers. Documentation paths use `<atoms checkout>/...`, never host-specific
   absolute paths.
 
 ## File map

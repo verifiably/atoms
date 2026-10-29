@@ -30,7 +30,7 @@ over both.
 
 ## Global Constraints
 
-- Work from `~/d/atoms/python`. Gates are `uv run pytest`, `uv run ruff check`, `uv run pyright`.
+- Work from `python/`. Gates are `uv run pytest`, `uv run ruff check`, `uv run pyright`.
 - **Ruff's default rule set is much broader than `E4/E7/E9/F`** — isort (`I001`), bugbear, flake8-simplify,
   bandit (`S`), `RUF012`, blind-except (`BLE001`). The code below is written to pass it as given. Run
   `uv run ruff check <file>` right after creating each file rather than only at the task gate.
@@ -97,7 +97,7 @@ over both.
   `CapabilityUnavailable`.
 - **Every operation gates on `binding.backend` before each barrier**, including before each mutating
   syscall. The only exemptions are `ROLLBACK`, `Store.close`, and `Workspace.close` (design §5.4).
-- Filepaths in docs and comments use `~/d/atoms/...`.
+- Filepaths in docs and comments use `<atoms checkout>/...`.
 - Conventional commits. No AI-attribution trailer or footer.
 
 ---

@@ -32,11 +32,11 @@ A1 depends on nothing. A2 and A3 depend only on A1's types. A4 onward introduce 
 - **Python floor:** `requires-python = ">=3.11"` (matches `nodes`). Copy verbatim into `pyproject.toml`.
 - **No third-party runtime dependency in `atoms.core`.** Stdlib only. Dev deps (`pytest`, `ruff`, `pyright`) are the only dependencies.
 - **Distribution/import identity:** distribution name `atoms-core`; import namespace `atoms` (PEP 420 namespace — no `src/atoms/__init__.py`); import package `atoms.core`. Mirrors `nodes-core` / `nodes.core`.
-- **Layout:** all package work lives under `python/` (`python/pyproject.toml`, `python/src/atoms/core/`, `python/tests/`), mirroring `~/d/nodes/python/`.
+- **Layout:** all package work lives under `python/` (`python/pyproject.toml`, `python/src/atoms/core/`, `python/tests/`), mirroring `<nodes checkout>/python/`.
 - **Tooling:** `ruff` line-length 120; `pyright` `typeCheckingMode = "basic"`, `pythonVersion = "3.11"`; `pytest` `addopts = "-q"`, `testpaths = ["tests"]`. All commands run via `uv run` from `python/`.
 - **Content hashes** are strings of the form `sha256:<64 lowercase hex>`. **Modes** are integer permission bits only (e.g. `0o644`), never type bits.
 - **Project-relative paths** (`RelPath`) are POSIX, `/`-separated, no leading slash, no `.`/`..` components. A1 stores them verbatim; resolution/containment is A2/A4's job.
-- No AI-attribution trailers on commits/PRs/comments. Docs use `~/d/` (never the absolute home or sync-root path).
+- No AI-attribution trailers on commits/PRs/comments. Docs use `<checkout>/` (never the absolute home or sync-root path).
 
 ---
 
@@ -47,7 +47,7 @@ Scaffolding for the whole `python/` subtree is folded here because every later t
 **Files:**
 - Create: `python/pyproject.toml`
 - Create: `python/README.md`
-- Create: `python/LICENSE` (copy of `~/d/atoms/LICENSE`)
+- Create: `python/LICENSE` (copy of `LICENSE`)
 - Create: `python/src/atoms/core/__init__.py`
 - Create: `python/src/atoms/core/py.typed` (empty PEP 561 marker)
 - Create: `python/src/atoms/core/errors.py`
@@ -186,14 +186,14 @@ class TransactionHalted(AtomsError):
     """State is unattributable; the engine preserves the record and evidence."""
 ```
 
-`python/src/atoms/core/py.typed`: an **empty** file. PEP 561 requires this marker for a package to ship inline type information; the `Typing :: Typed` classifier is a promise the marker fulfills. Combined with `core-metadata-version = "2.5"` (which lets Hatchling emit the `Import-Name`/`Import-Namespace` metadata-2.5 fields) and `license-files = ["LICENSE"]`, this makes the distribution mirror `nodes-core` exactly (see `~/d/nodes/python/pyproject.toml` and `~/d/nodes/python/src/nodes/core/py.typed`).
+`python/src/atoms/core/py.typed`: an **empty** file. PEP 561 requires this marker for a package to ship inline type information; the `Typing :: Typed` classifier is a promise the marker fulfills. Combined with `core-metadata-version = "2.5"` (which lets Hatchling emit the `Import-Name`/`Import-Namespace` metadata-2.5 fields) and `license-files = ["LICENSE"]`, this makes the distribution mirror `nodes-core` exactly (see `<nodes checkout>/python/pyproject.toml` and `<nodes checkout>/python/src/nodes/core/py.typed`).
 
 `python/README.md` (required by `pyproject.toml`'s `readme` field, which resolves relative to `python/`):
 
 ```markdown
 # atoms-core
 
-Pure model for the atoms recoverable filesystem effect engine. See `~/d/atoms/README.md`.
+Pure model for the atoms recoverable filesystem effect engine. See `<atoms checkout>/README.md`.
 ```
 
 `python/LICENSE`: copy the repository-root license so `license-files = ["LICENSE"]` resolves within `python/` (nodes keeps the same file in both places). Run from the repo root: `cp LICENSE python/LICENSE`.
@@ -1964,7 +1964,7 @@ git commit -m "feat(core): strict canonical decoder with round-trip and fail-ear
 - §5.3 repeated-path timelines — the `Occurrence` view (Task 4) is the data A2's continuity check consumes; the *check itself* is A2. Flagged, not silently dropped.
 - §5.5 capability vocabulary as data, always-required trio, per-variant additions incl. Delete file/symlink branch — Task 5. ✔ Empirical probing is A4.
 - §7.2 / §13.3 durable canonical format — Task 7 (deterministic encode; set-like fields sorted in the serializer so equal content yields equal bytes even for a directly-constructed spec; golden-byte fixture over every variant/state + non-ASCII) and **Task 8** (a complete type-safe decode boundary reconstructing the spec from `spec_json` for fresh-process recovery: exact scalar/container typing incl. bool-vs-int, effect↔state compatibility, malformed-JSON/UTF-8 trapping, round-trip identity, and the guarantee that only `SpecValidationError` escapes — with adversarial tests at each nesting level). ✔
-- PEP 561 typed-distribution parity with `nodes-core` — Task 1: the `py.typed` marker, `core-metadata-version = "2.5"`, and `license-files` are proven to ship by **building the wheel and inspecting its ZIP + METADATA** (Step 4b), not merely by the editable-install source check; all verified against `~/d/nodes/python`. ✔
+- PEP 561 typed-distribution parity with `nodes-core` — Task 1: the `py.typed` marker, `core-metadata-version = "2.5"`, and `license-files` are proven to ship by **building the wheel and inspecting its ZIP + METADATA** (Step 4b), not merely by the editable-install source check; all verified against `<nodes checkout>/python`. ✔
 - **Deferred by design, not omitted:** filesystem-identity metadata-root containment and ancestor-resolution checks (§5.4), all compilation validation (§5.4), and the recovery classifier (§8.4/§13.1) belong to A2/A3/A4 and are listed in the program table above.
 
 **Placeholder scan:** none — every code step carries complete source. The one golden fixture is generated by an explicit committed command (Task 7 Step 4), not left as a blank. ✔

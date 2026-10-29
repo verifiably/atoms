@@ -82,7 +82,7 @@ implementation, stop and report it — do not adapt around it silently.**
 - **`atoms/fs/observe.py` may import `atoms.core.recovery.model` and no other `core.recovery` module.**
 - **Every commit leaves `uv run pytest` green.** No task commits a test whose subject does not exist.
 - Exact-type checks, not `isinstance`, at trust boundaries — the house `_require_exact` pattern.
-- Docs use `~/d/atoms/...` for filepaths.
+- Docs use `<atoms checkout>/...` for filepaths.
 - Conventional commits. **No AI-attribution trailer or footer.**
 - Gates, all from `python/`: `uv run pytest`, `uv run ruff check`, `uv run pyright` — the three
   `AGENTS.md` names. **`ruff format` is not a gate here.** `line-length` is configured at 120 but

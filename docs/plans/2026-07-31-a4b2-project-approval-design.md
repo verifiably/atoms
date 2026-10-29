@@ -138,7 +138,7 @@ and Btrfs; that admits nothing and §2.2 records it as non-scope.
 
 ### 4.1 Module layout
 
-Three new modules under `~/d/atoms/python/src/atoms/fs/`:
+Three new modules under `python/src/atoms/fs/`:
 
 | Module | Holds | Sees a filesystem |
 | --- | --- | --- |
