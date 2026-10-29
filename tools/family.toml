@@ -28,6 +28,12 @@ url = "https://github.com/verifiably/nodes"
 label = "Generic record and relation storage"
 
 [[members]]
+name = "refs"
+prefix = "refs"
+url = "https://github.com/verifiably/refs"
+label = "External references pinned to vocabulary releases"
+
+[[members]]
 name = "beliefs"
 prefix = "beliefs"
 url = "https://github.com/verifiably/beliefs"
