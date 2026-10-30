@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# ops-docs version 5
+# ops-docs version 6
 """A project's guide files — README.md for people, AGENTS.md for agents — rendered and
 checked inside one repository.
 
@@ -994,18 +994,30 @@ def rendered(root, ident, name, text, run=subprocess.run, subsystem=False,
     return out
 
 
-def _report(found, diffs, brief):
+def _report(found, diffs, brief, documents=()):
+    repairs = []
+    if documents:
+        repairs.append("edit the named documents: choose reference types under "
+                       "https://github.com/khughitt/ops/blob/main/docs/document-types.md "
+                       "and add or repair their Type marker and required content; "
+                       "on decision records remove the document-types declaration "
+                       "(a plain Type label may remain)")
+    if found or diffs:
+        command = shlex.join([sys.executable, str(pathlib.Path(__file__).resolve()), "write"])
+        repairs.append(f"run `{command}` for generated guide regions")
+    repair = "; ".join(repairs)
+    found = [*found, *documents]
     if brief:
         summary = "; ".join(found[:3]) if found else "a guide region is out of date"
         if len(found) > 3:
             summary += f" (+{len(found) - 3} more)"
-        sys.stderr.write(f"ops-docs: {summary} — run `just docs`\n")
+        sys.stderr.write(f"ops-docs: {summary} — {repair}\n")
         return 1
     for problem in found:
         sys.stderr.write(f"ops-docs: {problem}\n")
     for diff in diffs:
         sys.stderr.writelines(diff)
-    sys.stderr.write("ops-docs: run `just docs` to apply\n")
+    sys.stderr.write(f"ops-docs: {repair}\n")
     return 1
 
 
@@ -1145,10 +1157,10 @@ def main(argv, env, cwd, run=subprocess.run):
                 diffs.append(difflib.unified_diff(text.splitlines(keepends=True), current.splitlines(keepends=True),
                                                   fromfile=label, tofile=f"ops-docs render {label}"))
         found.extend(f"{prefix}{problem}" for problem in claude_problems(base))
-    found.extend(documents_findings(root, ident))
-    if not found and not diffs:
+    documents = documents_findings(root, ident)
+    if not found and not diffs and not documents:
         return 0
-    return _report(found, diffs, brief)
+    return _report(found, diffs, brief, documents)
 
 
 if __name__ == "__main__":
