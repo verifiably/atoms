@@ -26,15 +26,19 @@ which the pre-push gate uses and `docs/certification/` records. On a fresh clone
 
 - `python/src/atoms/` — `core`, `fs`, `store`, `coordinator`; `python/tests/` — the
   suites, including the status guard `test_docs_status.py`.
-- `docs/plans/` — the authority design, the sub-plans, and `README.md`, the roadmap
-  index; `docs/deferred-obligation-ledger.md`; `docs/certification/`.
+- `docs/plans/` — the authority design, the A-series sub-plans, and `README.md`, the
+  roadmap index; `docs/deferred-obligation-ledger.md`; `docs/certification/`.
+- Task records and new design specs, implementation plans, briefs and handoffs live in
+  the project's records directory, committed in the records repository, never in this
+  tree. Documents this tree already tracks stay here and are revised in place.
 
 ## Rules
 
-- Authority order: the authority design, then the sub-plans under `docs/plans/` that
-  refine it (where they disagree, the design wins). The 2026-07-20 design and roadmap
-  are superseded, kept only as the record of the review that hardened the contracts;
-  their `Package: science` framing is pre-extraction rationale.
+- Authority order: the authority design, then the sub-plans that refine it, whether
+  this tree keeps them under `docs/plans/` or the records directory holds them; where
+  they disagree, the design wins. The 2026-07-20 design and roadmap are superseded,
+  kept only as the record of the review that hardened the contracts; their
+  `Package: science` framing is pre-extraction rationale.
 - The roadmap is one fact, `FIRST_UNIMPLEMENTED` in `python/tests/test_docs_status.py`,
   and `docs/plans/README.md` is the reader's copy of it. Landing a sub-plan moves the
   boundary there; the guard then names every document that still disagrees. Never add

@@ -106,10 +106,11 @@ returns the bytes a registered path held before a settled transaction.
   metadata store), `atoms.chain` (the tamper-evident project-local history),
   `atoms.coordinator` (lease, admission, preparation, executors, and the public
   `commands`).
-- `docs/plans/` — the authority design and the Plan A sub-plans, with their roadmap
-  index; `docs/certification/` — the crash-certification records;
-  `docs/deferred-obligation-ledger.md` — what a trust boundary admits but does not yet
-  execute.
+- `docs/plans/` — the authority design and the Plan A sub-plans kept in this tree,
+  with their roadmap index (task records and newer working documents live in the
+  project's records repository); `docs/certification/` — the crash-certification
+  records; `docs/deferred-obligation-ledger.md` — what a trust boundary admits but
+  does not yet execute.
 
 ## Documentation
 
