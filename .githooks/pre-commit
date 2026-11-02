@@ -1,4 +1,4 @@
 #!/bin/sh
-# Installed by `git config core.hooksPath .githooks`. Seconds only; the suite runs at
-# push. The recipe is the gate `just check` runs, recorded under its own target.
+# Installed by `git config core.hooksPath .githooks`. Seconds only: timed hygiene, then
+# the broad code checks (ruff, pyright) under their own target, which .tt.toml may skip.
 exec just hook-pre-commit

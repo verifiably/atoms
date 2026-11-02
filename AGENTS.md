@@ -13,7 +13,8 @@ Member of the verifiably family (https://github.com/verifiably/docs/blob/main/ov
 ## Gates
 
 Test execution policy comes from `.tt.toml` at the checkout's top level, read by the
-vendored `tools/tt`; it is absent today, so policy is enabled and every target runs.
+vendored `tools/tt`. It sets `automatic_broad = false`: the broad targets below are
+skipped locally unless forced, and hosted CI is the routine broad verification.
 `just test-one <pytest args>` is the focused route (paths relative to `python/`).
 `just check-hygiene` (ops-check, ops-docs check, `tasks check`) always runs. The broad
 targets, which a policy may skip and record as skipped, never passed, are
@@ -22,10 +23,13 @@ excludes; it forwards pytest arguments, as in `just test -rs`), `test-fast` (tes
 excluding the kill-matrix, persistence-cut and exerciser suites) and `ci-python`.
 `just check` runs hygiene then `check-code`, and `just gate` runs `check` then `test`.
 Force broad work deliberately with `just test-full [pytest args]` or
-`TT_FORCE=1 just check`. The pre-commit hook runs hygiene then `check-code`; the
-pre-push hook runs hygiene, `check-code` and `test`, and its timers cover hygiene only
-(earlier `hook-*` timings also covered the code checks and suite, so the series are
-not comparable). Hosted CI (`.github/workflows/ci.yml`) runs `just ci-python`, forced,
+`TT_FORCE=1 just check`. The pre-commit hook runs hygiene then `check-code`. The
+pre-push hook takes `hook-pre-push-fast` (hygiene, `check-code`, `test-fast`) when the
+push goes to `origin` and every pushed ref matches `ci_suite_refs` (`refs/heads/*`,
+`refs/tags/v*`), and `hook-pre-push` (hygiene, `check-code`, `test`) otherwise, warning
+when policy skips that suite. Either way only hygiene runs unforced. Hook timers cover
+hygiene only (earlier `hook-*` timings also covered the code checks and suite, so the
+series are not comparable). Hosted CI (`.github/workflows/ci.yml`) runs `just ci-python`, forced,
 on every pushed branch and, through `release.yml`, on release tags, and checks its
 JUnit against pytest's collection. The suite runs on xdist workers sized by
 `host-budget` (ops), so no test may depend on another test's process or order.
@@ -36,7 +40,12 @@ Known coverage gaps:
   run on that host (the pre-push gate while local policy is enabled; `just test-full`
   there once it is off), as `docs/certification/` records. Hosted runs exercise that
   code on the runner's uncertified kernel and volume and skip only what the runner
-  cannot supply; no hosted pass is certified-tuple evidence. Changing or diagnosing
+  cannot supply; no hosted pass is certified-tuple evidence. The accepted hosted run
+  (2026-11-02, 6324 tests in 101 modules) skips 10: the 7 casefold-volume tests in
+  `test_fs_resolve_casefold.py` (`ATOMS_CASEFOLD_VOLUME` unset, which the certified host
+  also skips) and 3 bind-mount tests in `test_fs_binding.py` and
+  `test_fs_resolve_conformance.py` (no user or mount namespaces on the runner). All are
+  capability omissions; none is a portability gap. Changing or diagnosing
   capability behaviour runs the relevant focused tests, or a forced suite, on the
   certified host.
 - Recertification: a `chore/recertify-<kernel>` branch is merged only after

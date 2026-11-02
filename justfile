@@ -51,9 +51,10 @@ ci_check_cmd := "python3 tools/ops-check && python3 tools/ops-docs check && (" +
 
 # Remote refs whose push makes CI run the full suite, as space-separated fnmatch globs
 # (`*` crosses `/`). The pre-push hook takes hook-pre-push-fast only when a push goes to
-# ci_remote and every pushed ref matches. Empty until hosted CI is verified and local
-# policy is turned off (atoms-f1aced Task 8 sets "refs/heads/* refs/tags/v*").
-ci_suite_refs := ""
+# ci_remote and every pushed ref matches. ci.yml runs on every branch push, and release.yml
+# runs it through its gates job on every v* tag push. Setting this back to "" (with
+# automatic_broad = true in .tt.toml) restores the full local gate at every push.
+ci_suite_refs := "refs/heads/* refs/tags/v*"
 ci_remote := "origin"
 
 # Affected-only: the inner loop. An empty selection is a result, not a failure.
