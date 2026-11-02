@@ -1,25 +1,43 @@
 name: CI
 
+# Every branch push runs the complete suite, so a local tt policy may skip it
+# (AGENTS.md, Gates). A same-repository PR's head is already a pushed branch, so its job
+# is skipped by the condition below; a fork PR still runs. Tag pushes run it through
+# release.yml's call.
 on:
   push:
-    branches: [main]
+    branches: ["**"]
   pull_request:
+  workflow_dispatch:
   # release.yml gates on this workflow, so it has to be callable.
   workflow_call:
 
 permissions:
   contents: read
 
+# One suite per ref: a newer push cancels the older run, which leaves that revision
+# unverified, not passed. Called from release.yml, github.workflow is `Release`: the
+# group then differs from release's own and from branch runs, and is never cancelled.
+concurrency:
+  group: atoms-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.workflow == 'CI' }}
+
 jobs:
   python:
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    # About ten times the observed two-minute job: bounds a hung SIGKILL-matrix child.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.13"]
     # A runner has no host-budget: bound the suite's xdist workers to the standard
     # runner's 4 vCPUs (ops host-budget design). `just ci-python` refuses without it.
+    # Hosted verification is deliberate: force every tt wrapper, nested ones included,
+    # past a checkout policy that would skip it locally.
     env:
+      TT_FORCE: "1"
       PYTEST_XDIST_AUTO_NUM_WORKERS: "4"
     defaults:
       run:
@@ -32,10 +50,47 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
       - run: uv sync --frozen
+      # The revision, the runner's image, kernel and workspace filesystem, and the
+      # tracked test modules, beside the JUnit, so a hosted result (and any change in its
+      # skip set) can be attributed later.
+      - name: Prepare coverage evidence
+        run: |
+          evidence_dir="$RUNNER_TEMP/atoms-python-coverage"
+          mkdir -p "$evidence_dir"
+          echo "ATOMS_CI_EVIDENCE_DIR=$evidence_dir" >> "$GITHUB_ENV"
+          {
+            echo "atoms $(git rev-parse HEAD)"
+            echo "image $ImageOS $ImageVersion"
+            echo "kernel $(uname -r)"
+            echo "workspace-fs $(stat -f -c %T .)"
+            git ls-files 'tests/test_*.py'
+          } > "$evidence_dir/module-inventory.txt"
+      # pytest's own per-module counts, which the JUnit report must match. Even at -qq
+      # pytest appends a warnings summary when collection warns (an import-time
+      # deprecation, say), which the checker would reject as a malformed count line;
+      # --disable-warnings drops only that summary, not the filters or the selection.
+      - name: Collect
+        env:
+          VERIFIABLY_UNCERTIFIED_HOST: "1"
+        run: uv run --frozen pytest --collect-only -qq --disable-warnings > "$ATOMS_CI_EVIDENCE_DIR/collected.txt"
       # The full suite, then ops-check, ruff and pyright, through the recipe that records
-      # them. Tests needing a certified volume skip themselves here; a runner has none.
+      # them. The workspace is ext4, so capability-dependent tests run here on an
+      # uncertified kernel and volume; only those needing what the runner cannot supply
+      # report the missing capability as a skip instead of failing (AGENTS.md).
       - run: just ci-python
         env:
-          # A runner has no certified ext4 kernel and volume tuple; the capability-dependent
-          # tests report the missing capability as a skip instead of failing (AGENTS.md).
           VERIFIABLY_UNCERTIFIED_HOST: "1"
+      - name: Require coverage evidence
+        if: always()
+        run: |
+          test -s "${ATOMS_CI_EVIDENCE_DIR:?}/module-inventory.txt"
+          test -s "$ATOMS_CI_EVIDENCE_DIR/collected.txt"
+          test -s "$ATOMS_CI_EVIDENCE_DIR/pytest.xml"
+          python3 ../.github/scripts/check_ci_coverage.py "$ATOMS_CI_EVIDENCE_DIR/collected.txt" "$ATOMS_CI_EVIDENCE_DIR/pytest.xml"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: python-${{ matrix.python-version }}-coverage
+          path: ${{ env.ATOMS_CI_EVIDENCE_DIR }}
+          retention-days: 30
+          if-no-files-found: error

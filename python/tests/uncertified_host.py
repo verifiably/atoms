@@ -14,8 +14,8 @@ def uncertified_host(environ: "os._Environ[str] | dict[str, str]") -> bool:
     """Whether this host has declared it cannot supply the certified tuple.
 
     Opt-in, and set in one place: the CI workflow. Anywhere it is unset — a
-    developer machine, the pre-push gate, the certified host — the suite runs
-    closed and `CapabilityUnavailable` is a failure. Only an explicit "1"
+    developer machine, the certified host, or any local suite run — the suite
+    runs closed and `CapabilityUnavailable` is a failure. Only an explicit "1"
     counts, so an empty or stray value cannot quietly disarm the gate.
     """
     return environ.get(UNCERTIFIED_HOST_VAR, "") == "1"

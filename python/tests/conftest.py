@@ -27,17 +27,21 @@ def _report_missing_capability(error: CapabilityUnavailable) -> None:
     """Turn a missing capability into a skip, but only on a declared uncertified host.
 
     Returns without acting anywhere else, so the caller re-raises and the suite stays
-    closed — which is what the certified host and the pre-push gate need.
+    closed — which is what a developer machine, the certified host, or any local suite
+    run needs.
     """
     if uncertified_host(os.environ):
         pytest.skip(f"certified tuple unavailable on this host: {error}")
 
 
-# Wrapped on all three phases, not just the call. A runner has no certified ext4 kernel
-# and volume tuple; the volume fixtures skip when they cannot hand one over, but many
-# tests reach the fs layer without going through them and raise instead. Those raises
-# land in whichever phase touched the filesystem first: 697 of them in the call, and 269
-# inside fixtures, which is setup and which `pytest_runtest_call` never sees.
+# Wrapped on all three phases, not just the call. A declared uncertified host lacks the
+# certified ext4 kernel and volume tuple; the volume fixtures skip when they cannot hand
+# one over, but many tests reach the fs layer without going through them and raise
+# instead. Those raises land in whichever phase touched the filesystem first, the call
+# or a fixture (setup, which `pytest_runtest_call` never sees). When this was written a
+# runner without a usable test volume raised 697 in the call and 269 in fixtures. Today's
+# hosted runner has an ext4 workspace, so those tests run there on its uncertified tuple
+# and only the few needing what it cannot supply at all skip.
 #
 # The skipped set is defined by the capability probe at run time, not by a list anyone
 # maintains, so a new capability-dependent test needs no annotation and the set cannot go
