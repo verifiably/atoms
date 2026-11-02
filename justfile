@@ -35,10 +35,20 @@ fast_cmd := "cd python && uv run --frozen pytest --testmon --ignore=tests/test_c
 xdist := "-n auto --dist worksteal"
 test_cmd := "cd python && uv run --frozen pytest " + xdist
 one_cmd := "cd python && uv run --frozen pytest"
-check_cmd := "python3 tools/ops-check && python3 tools/ops-docs check && (cd python && uv run --frozen ruff check && uv run --frozen pyright) && tasks check"
-# The same commands minus `tasks check`, whose binary is not on a runner; ops-check keeps
-# working there because its registry lookup is empty when absent.
-ci_check_cmd := "python3 tools/ops-check && python3 tools/ops-docs check && (cd python && uv run --frozen ruff check && uv run --frozen pyright)"
+# Hygiene always runs; the code checks (ruff, pyright) are a broad target that tt policy
+# governs. They are kept apart so a policy skip never suppresses hygiene.
+check_hygiene_cmd := "python3 tools/ops-check && python3 tools/ops-docs check && tasks check"
+check_code_cmd := "cd python && uv run --frozen ruff check && uv run --frozen pyright"
+# Hygiene minus `tasks check`, whose binary is not on a runner, then the code checks;
+# ops-check keeps working there because its registry lookup is empty when absent.
+ci_check_cmd := "python3 tools/ops-check && python3 tools/ops-docs check && (" + check_code_cmd + ")"
+
+# Remote refs whose push makes CI run the full suite, as space-separated fnmatch globs
+# (`*` crosses `/`). The pre-push hook takes hook-pre-push-fast only when a push goes to
+# ci_remote and every pushed ref matches. Empty until hosted CI is verified and local
+# policy is turned off (atoms-f1aced Task 8 sets "refs/heads/* refs/tags/v*").
+ci_suite_refs := ""
+ci_remote := "origin"
 
 # Affected-only: the inner loop. An empty selection is a result, not a failure.
 test-fast:
@@ -50,15 +60,32 @@ test-fast:
 test-one +args:
     {{tt}} test-one -- sh -c '{{one_cmd}} "$@" 2>&1' test-one "$@"
 
-# The full suite: the certification gate.
-test:
-    {{tt}} test -- host-budget run -- sh -c '{{test_cmd}}'
+# The full suite. Arguments are forwarded to pytest after the default selection, each
+# one intact (`just test -rs`, `just test -k "a and b"`); with none it runs everything.
+test *args:
+    {{tt}} test -- host-budget run -- sh -c '{{test_cmd}} "$@"' test "$@"
 
-# Seconds, not minutes: lint, typecheck, task-record check.
+# Deliberate broad verification, whatever .tt.toml says; the inner `test` is the only
+# timing record. Takes the same arguments as `test`.
+test-full *args:
+    TT_FORCE=1 just test "$@"
+
+# Seconds: ops-check, ops-docs check, task-record check. Always runs.
+check-hygiene:
+    {{tt}} check-hygiene -- sh -c '{{check_hygiene_cmd}}'
+
+# Seconds: ruff and pyright. A broad target.
+check-code:
+    {{tt}} check-code -- sh -c '{{check_code_cmd}}'
+
+# Sequential, so a hygiene failure stops before the code checks.
 check:
-    {{tt}} check -- sh -c '{{check_cmd}}'
+    just check-hygiene
+    just check-code
 
-gate: check test
+gate:
+    just check
+    just test
 
 # Regenerate the identity and family regions in README.md and AGENTS.md from
 # identity.toml and tools/family.toml. The only thing that edits those regions; `check`
@@ -74,13 +101,24 @@ docs:
 certify *args:
     {{tt}} certify -- host-budget run -- sh -c 'cd python && uv run --frozen python -m tools.certify run --jobs "$OPS_WORKERS" "$@"' certify {{args}}
 
-# What the pre-commit hook runs: `check`'s command under its own hook target.
+# Hook timers cover the mandatory hygiene only; the broad children record their own runs
+# (or policy skips) under their own targets.
 hook-pre-commit:
-    {{tt}} hook-pre-commit -- sh -c '{{check_cmd}}'
+    {{tt}} hook-pre-commit -- sh -c '{{check_hygiene_cmd}}'
+    just check-code
 
-# What the pre-push hook runs: the same commands as `gate`, under one hook target.
+# What the pre-push hook runs: hygiene, then the same children as `gate`.
 hook-pre-push:
-    {{tt}} hook-pre-push -- host-budget run -- sh -c '{{check_cmd}} && {{test_cmd}}'
+    {{tt}} hook-pre-push -- sh -c '{{check_hygiene_cmd}}'
+    just check-code
+    just test
+
+# What the pre-push hook runs when CI runs the full suite for every pushed ref: the
+# testmon loop stands in as the push selection.
+hook-pre-push-fast:
+    {{tt}} hook-pre-push-fast -- sh -c '{{check_hygiene_cmd}}'
+    just check-code
+    just test-fast
 
 # CI runs the recipe rather than `just gate` so the whole job is one recorded number and
 # cannot drift from the local gate (design section 4.6). The full suite, not the fast
