@@ -1,9 +1,15 @@
-# Front door for tests. Inner loop: `just test-fast` (affected-only via pytest-testmon).
-# Full suite: `just test`. Gates: `just check` at pre-commit, `just gate` at pre-push.
-# The git hooks in .githooks/ call `hook-pre-commit` and `hook-pre-push`, which run the
-# very same commands under their own target names so the report can price the hooks.
+# Front door for tests. Focused: `just test-one <pytest args>`. Inner loop: `just
+# test-fast` (affected-only via pytest-testmon). Full suite: `just test [pytest args]`;
+# `just test-full` forces it past policy. Gates: `just check` (check-hygiene, then
+# check-code) and `just gate` (check, then test).
+# Execution policy comes from .tt.toml (absent: enabled). Broad targets (test,
+# test-fast, check-code, ci-python) may be skipped by it and are recorded as skipped;
+# check-hygiene always runs. Hosted CI runs the forced suite on every pushed branch.
+# The git hooks in .githooks/ call the `hook-*` recipes, which time the hygiene under
+# their own target names and then run the broad children, each recorded on its own.
 # Every recipe runs through the vendored timing wrapper tools/tt (source of truth: ops
-# bin/tt) so the run is recorded. Design: ops docs/specs/2026-09-04-test-ci-audit-design.md.
+# bin/tt) so the run is recorded. Design: ops docs/specs/2026-09-04-test-ci-audit-design.md,
+# docs/specs/2026-10-29-test-execution-policy-design.md.
 
 set quiet
 set positional-arguments
@@ -29,8 +35,8 @@ tt := "python3 tools/tt"
 # in-process suite was 106s and a single module's tests took seconds. testmon's
 # tracing also sees only the parent process, so a change to code the children alone
 # run (tests/execute_child.py, tests/coordinator_child.py) selects nothing. Both
-# omissions are deterministic and named here; `just test` runs everything and is the
-# certification gate.
+# omissions are deterministic and named here; `just test` runs everything, and on the
+# certified host it is the certification-tuple suite run (AGENTS.md, Gates).
 fast_cmd := "cd python && uv run --frozen pytest --testmon --ignore=tests/test_coordinator_kill_matrix.py --ignore=tests/test_persistence_cut_matrix.py --ignore=tests/test_exerciser.py"
 xdist := "-n auto --dist worksteal"
 test_cmd := "cd python && uv run --frozen pytest " + xdist

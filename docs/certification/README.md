@@ -29,6 +29,14 @@ The two packages are always released as a pair. DKMS modules build against the
 headers, so a kernel and headers at different versions break every module build
 until they match again; a pacman hook refuses to let the pair diverge silently.
 
+## Reviewing a recertification branch
+
+Merge a `chore/recertify-<kernel>` branch only after `just test-full` passes on the
+newly certified host. The recertification itself runs the QEMU sweep and three
+focused test modules; the full suite on the new tuple used to come from the pre-push
+gate, which no longer runs it once local test policy turns broad checks off
+(AGENTS.md, Gates). The run takes a few minutes.
+
 ## Reading a stale allowlist
 
 If `kernel_identifier` does not match the running kernel, the tuple is simply

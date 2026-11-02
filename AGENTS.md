@@ -12,15 +12,38 @@ Member of the verifiably family (https://github.com/verifiably/docs/blob/main/ov
 
 ## Gates
 
-`just check` runs ops-check, ops-docs check, ruff, pyright and `tasks check`;
-`just test-one <pytest args>` runs one test (paths relative to `python/`);
-`just test-fast` is the inner loop (testmon, excluding the kill-matrix,
-persistence-cut and exerciser suites); `just test` is the full suite, which the
-pre-push hook runs, including the suites the fast loop excludes. It runs on xdist
-workers sized by `host-budget` (ops), so no test may depend on another test's process
-or order. Capability-dependent tests are proven only on the certified ext4 tuple,
-which the pre-push gate uses and `docs/certification/` records. On a fresh clone,
-`git config core.hooksPath .githooks`.
+Test execution policy comes from `.tt.toml` at the checkout's top level, read by the
+vendored `tools/tt`; it is absent today, so policy is enabled and every target runs.
+`just test-one <pytest args>` is the focused route (paths relative to `python/`).
+`just check-hygiene` (ops-check, ops-docs check, `tasks check`) always runs. The broad
+targets, which a policy may skip and record as skipped, never passed, are
+`check-code` (ruff, pyright), `test` (the full suite, including the suites the fast loop
+excludes; it forwards pytest arguments, as in `just test -rs`), `test-fast` (testmon,
+excluding the kill-matrix, persistence-cut and exerciser suites) and `ci-python`.
+`just check` runs hygiene then `check-code`, and `just gate` runs `check` then `test`.
+Force broad work deliberately with `just test-full [pytest args]` or
+`TT_FORCE=1 just check`. The pre-commit hook runs hygiene then `check-code`; the
+pre-push hook runs hygiene, `check-code` and `test`, and its timers cover hygiene only
+(earlier `hook-*` timings also covered the code checks and suite, so the series are
+not comparable). Hosted CI (`.github/workflows/ci.yml`) runs `just ci-python`, forced,
+on every pushed branch and, through `release.yml`, on release tags, and checks its
+JUnit against pytest's collection. The suite runs on xdist workers sized by
+`host-budget` (ops), so no test may depend on another test's process or order.
+
+Known coverage gaps:
+
+- Capability-dependent tests are proven only on the certified ext4 tuple, by a suite
+  run on that host (the pre-push gate while local policy is enabled; `just test-full`
+  there once it is off), as `docs/certification/` records. Hosted runs exercise that
+  code on the runner's uncertified kernel and volume and skip only what the runner
+  cannot supply; no hosted pass is certified-tuple evidence. Changing or diagnosing
+  capability behaviour runs the relevant focused tests, or a forced suite, on the
+  certified host.
+- Recertification: a `chore/recertify-<kernel>` branch is merged only after
+  `just test-full` passes on the newly certified host (`docs/certification/`).
+- `just certify` never runs on hosted runners.
+
+On a fresh clone, `git config core.hooksPath .githooks`.
 
 ## Layout
 
