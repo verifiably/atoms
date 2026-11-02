@@ -65,11 +65,14 @@ jobs:
             echo "workspace-fs $(stat -f -c %T .)"
             git ls-files 'tests/test_*.py'
           } > "$evidence_dir/module-inventory.txt"
-      # pytest's own per-module counts, which the JUnit report must match.
+      # pytest's own per-module counts, which the JUnit report must match. Even at -qq
+      # pytest appends a warnings summary when collection warns (an import-time
+      # deprecation, say), which the checker would reject as a malformed count line;
+      # --disable-warnings drops only that summary, not the filters or the selection.
       - name: Collect
         env:
           VERIFIABLY_UNCERTIFIED_HOST: "1"
-        run: uv run --frozen pytest --collect-only -qq > "$ATOMS_CI_EVIDENCE_DIR/collected.txt"
+        run: uv run --frozen pytest --collect-only -qq --disable-warnings > "$ATOMS_CI_EVIDENCE_DIR/collected.txt"
       # The full suite, then ops-check, ruff and pyright, through the recipe that records
       # them. The workspace is ext4, so capability-dependent tests run here on an
       # uncertified kernel and volume; only those needing what the runner cannot supply
