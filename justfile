@@ -120,20 +120,29 @@ hook-pre-push-fast:
     just check-code
     just test-fast
 
+# Hosted evidence: ci-python writes its JUnit into ATOMS_CI_EVIDENCE_DIR, which ci.yml
+# prepares, checks against pytest's collection and uploads. The directory must be an
+# absolute path, so the report cannot land relative to python/ by accident; anything
+# else stops the recipe with exit 2 before the suite starts.
+ci_evidence_cmd := "case \"${ATOMS_CI_EVIDENCE_DIR:-}\" in /*) ;; *) echo \"ATOMS_CI_EVIDENCE_DIR must be set to an absolute path\" >&2; exit 2;; esac"
+# The full suite with each skip's reason in the log (-rs) and every testcase in the JUnit.
+ci_test_cmd := "cd python && uv run --frozen pytest " + xdist + " -rs --junitxml=\"$ATOMS_CI_EVIDENCE_DIR/pytest.xml\""
+
 # CI runs the recipe rather than `just gate` so the whole job is one recorded number and
 # cannot drift from the local gate (design section 4.6). The full suite, not the fast
-# loop: `just test` is the certification gate. Capability-dependent tests skip themselves
-# on a runner — the volume fixtures return a reason instead of a volume — so this is
-# expected to be green with a large skip count, not a failure.
+# loop. A hosted runner is an uncertified host: its workspace sits on ext4, so the
+# capability-dependent tests run there against the runner's kernel and volume, and only
+# the few needing what the runner cannot supply at all (the certified tuple, a landed
+# certification record, a capability the kernel lacks) skip with their reason. A hosted
+# pass is never certified-tuple evidence (AGENTS.md, Gates).
 #
-# test_cmd is parenthesised because it is a bare `cd python && ...`: unwrapped, its cd
-# leaks into whatever follows, and ops-check would be looked for under python/. The other
-# recipes never hit this only because they put test_cmd last.
+# ci_test_cmd is parenthesised because it is a bare `cd python && ...`: unwrapped, its cd
+# leaks into whatever follows, and ops-check would be looked for under python/.
 #
 # The worker count must be given: the workflow sets it for the runner, and a local
 # reproduction takes the host's budget with `host-budget run -- just ci-python`. Without
 # it `-n auto` would guess from the CPU count, so the recipe stops before the suite starts.
 #
-# The full suite, then ops-check, ruff and pyright.
+# The evidence guard, the full suite, then ops-check, ruff and pyright.
 ci-python:
-    {{tt}} ci-python -- sh -c ': "${PYTEST_XDIST_AUTO_NUM_WORKERS:?set by the CI job, or run as host-budget run -- just ci-python}" && ({{test_cmd}}) && {{ci_check_cmd}}'
+    {{tt}} ci-python -- sh -c ': "${PYTEST_XDIST_AUTO_NUM_WORKERS:?set by the CI job, or run as host-budget run -- just ci-python}" && {{ci_evidence_cmd}} && ({{ci_test_cmd}}) && {{ci_check_cmd}}'
