@@ -9,7 +9,7 @@
 # their own target names and then run the broad children, each recorded on its own.
 # Every recipe runs through the vendored timing wrapper tools/tt (source of truth: ops
 # bin/tt) so the run is recorded. Design: ops docs/specs/2026-09-04-test-ci-audit-design.md,
-# docs/specs/2026-10-29-test-execution-policy-design.md.
+# ops docs/specs/2026-10-29-test-execution-policy-design.md.
 
 set quiet
 set positional-arguments
@@ -104,7 +104,7 @@ docs:
 # grants a worker count as OPS_WORKERS, and --jobs bounds the concurrent QEMU guests by it.
 # The single quotes keep $OPS_WORKERS for the shell inside the scope. The runner's own
 # default, half the available CPUs, stays for a direct run without --jobs.
-# The full sweep: `just certify --all --accel kvm --record docs/certification`.
+# The full sweep: `RECORDS_DIR="$(tasks where | jq -er '.project.records // empty')" && just certify --all --accel kvm --record "$RECORDS_DIR/docs/certification"`.
 certify *args:
     {{tt}} certify -- host-budget run -- sh -c 'cd python && uv run --frozen python -m tools.certify run --jobs "$OPS_WORKERS" "$@"' certify {{args}}
 

@@ -57,7 +57,7 @@ On a fresh clone, `git config core.hooksPath .githooks`.
 ## Layout
 
 - `python/src/atoms/` — `core`, `fs`, `store`, `coordinator`; `python/tests/` — the
-  suites, including the status guard `test_docs_status.py`.
+  suites.
 - `docs/plans/` — the authority design, the A-series sub-plans, and `README.md`, the
   roadmap index; `docs/deferred-obligation-ledger.md`; `docs/certification/`.
 - Task records and new design specs, implementation plans, briefs and handoffs live in
@@ -71,11 +71,6 @@ On a fresh clone, `git config core.hooksPath .githooks`.
   they disagree, the design wins. The 2026-07-20 design and roadmap are superseded,
   kept only as the record of the review that hardened the contracts; their
   `Package: science` framing is pre-extraction rationale.
-- The roadmap is one fact, `FIRST_UNIMPLEMENTED` in `python/tests/test_docs_status.py`,
-  and `docs/plans/README.md` is the reader's copy of it. Landing a sub-plan moves the
-  boundary there; the guard then names every document that still disagrees. Never add
-  a per-sub-plan status test: four existed, and two pinned claims the next sub-plan
-  falsified.
 - `docs/deferred-obligation-ledger.md` tracks every shape a trust boundary admits but
   does not execute, with the sub-plan that owes it. Add an entry in the commit that
   creates the admission; remove one only when its owner lands and its suite covers it.

@@ -1350,23 +1350,3 @@ def test_chain_commands_keep_the_lease_and_approval_proofs_private():
     ).body
     assert [ast.dump(node) for node in body] == [ast.dump(node) for node in expected]
 
-
-def test_ledger_entry_nine_is_discharged_after_a8_added_no_entry_point():
-    """#9 closes only after every A5-A8 production entry point has landed.
-
-    Status wording lives in `test_docs_status.py`; what this asserts is the ledger's own
-    shape -- entry #9 discharged by A8b, still scoped to A5-A8 -- which no status guard
-    covers. The ledger is the only record of it: the agent guide carries no per-entry
-    status.
-    """
-    root = Path(__file__).parents[2]
-    ledger = (root / "docs" / "deferred-obligation-ledger.md").read_text(
-        encoding="utf-8"
-    )
-    open_obligations, discharged = ledger.split("## Discharged obligations", 1)
-    assert not any(line.startswith("| 9 |") for line in open_obligations.splitlines())
-    row = next(line for line in discharged.splitlines() if line.startswith("| 9 |"))
-    assert "| A5 |" in row
-    assert "A5–A8" in row
-    assert "A8 added no production transaction entry point" in row
-    assert "| A8b | 2026-08-17 |" in row

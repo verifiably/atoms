@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
 import sys
+from collections.abc import Mapping
 from datetime import date as Date
 from pathlib import Path
 
@@ -11,7 +14,6 @@ import pytest
 from atoms.fs.volume import CERTIFIED_ALLOWLIST, VolumeConfiguration
 
 ROOT = Path(__file__).parents[2]
-CERTIFICATION = ROOT / "docs" / "certification"
 CERTIFICATION_SCENARIOS = (
     "minimal-create",
     "minimal-replace",
@@ -356,30 +358,242 @@ def test_collected_check_rejects_evidence_that_cannot_prove_zero_violations(
         _assert_record_schema(document)
 
 
-def test_certification_record_matches_the_production_allowlist() -> None:
-    records = sorted(CERTIFICATION.glob("*.json"))
-    if not records:
-        pytest.skip("no certification record has landed")
+def _resolve_certification_ref(
+    certification_ref: str,
+    *,
+    root: Path = ROOT,
+    env: Mapping[str, str] | None = None,
+) -> Path | None:
+    effective_env = os.environ if env is None else env
+    explicit_dir = effective_env.get("ATOMS_CERTIFICATION_DIR")
+    if explicit_dir:
+        return Path(explicit_dir) / Path(certification_ref).name
 
-    assert len(CERTIFIED_ALLOWLIST.entries) == 1
-    entry = next(iter(CERTIFIED_ALLOWLIST.entries))
-    record = ROOT / entry.certification_ref
-    assert record in records
+    if (root / "docs" / "certification").is_dir():
+        return root / certification_ref
 
-    encoded = record.read_text(encoding="utf-8")
-    document = json.loads(encoded)
-    assert encoded == json.dumps(
-        document, ensure_ascii=True, separators=(",", ":"), sort_keys=True
-    ) + "\n"
-    _assert_record_schema(document)
+    tasks_bin = shutil.which("tasks", path=effective_env.get("PATH"))
+    if tasks_bin is None:
+        return None
 
-    configuration = document["configuration"]
-    assert entry.configuration == VolumeConfiguration(
-        backend_id=configuration["backend_id"],
-        backend_revision=configuration["backend_revision"],
-        kernel_identifier=configuration["kernel_identifier"],
-        filesystem_type=configuration["filesystem_type"],
-        barrier_options=tuple(configuration["barrier_options"]),
-        durability_features=tuple(configuration["durability_features"]),
+    proc = subprocess.run(
+        [tasks_bin, "where", "--json"],
+        cwd=root,
+        env=dict(effective_env),
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
     )
-    assert entry.storage.profile_id == document["storage"]["profile_id"]
+    if proc.returncode != 0:
+        try:
+            err_payload = json.loads(proc.stderr)
+        except json.JSONDecodeError:
+            err_payload = None
+        if isinstance(err_payload, dict):
+            err_obj = err_payload.get("error")
+            if isinstance(err_obj, dict):
+                kind = err_obj.get("kind")
+                detail = err_obj.get("detail")
+                if kind == "records_unpaired" or (
+                    kind == "config"
+                    and isinstance(detail, str)
+                    and "not on this machine" in detail
+                ):
+                    return None
+        raise RuntimeError(
+            f"tasks where failed ({proc.returncode}): "
+            f"{proc.stderr.strip() or proc.stdout.strip()}"
+        )
+
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"tasks where returned invalid JSON: {proc.stdout!r}"
+        ) from exc
+    if type(payload) is not dict:
+        raise RuntimeError(
+            f"tasks where returned non-object JSON: {proc.stdout!r}"
+        )
+    project = payload.get("project")
+    if project is None:
+        return None
+    if type(project) is not dict:
+        raise RuntimeError(
+            f"tasks where returned invalid project field: {proc.stdout!r}"
+        )
+    records = project.get("records")
+    if records is None or records == "":
+        return None
+    if type(records) is not str:
+        raise RuntimeError(
+            f"tasks where returned invalid project.records field: {proc.stdout!r}"
+        )
+    records_path = Path(records)
+    if records_path.is_dir():
+        return records_path / certification_ref
+    return None
+
+
+def test_certification_record_matches_the_production_allowlist() -> None:
+    assert len(CERTIFIED_ALLOWLIST.entries) == 1
+    for entry in CERTIFIED_ALLOWLIST.entries:
+        record = _resolve_certification_ref(entry.certification_ref)
+        if record is None:
+            pytest.skip(
+                f"certification record {entry.certification_ref} is not present in this checkout "
+                "(private records unavailable)"
+            )
+
+        encoded = record.read_text(encoding="utf-8")
+        document = json.loads(encoded)
+        assert encoded == json.dumps(
+            document, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+        ) + "\n"
+        _assert_record_schema(document)
+
+        configuration = document["configuration"]
+        assert entry.configuration == VolumeConfiguration(
+            backend_id=configuration["backend_id"],
+            backend_revision=configuration["backend_revision"],
+            kernel_identifier=configuration["kernel_identifier"],
+            filesystem_type=configuration["filesystem_type"],
+            barrier_options=tuple(configuration["barrier_options"]),
+            durability_features=tuple(configuration["durability_features"]),
+        )
+        assert entry.storage.profile_id == document["storage"]["profile_id"]
+
+
+def _write_tasks_stub(bin_dir: Path, body: str) -> None:
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    stub = bin_dir / "tasks"
+    stub.write_text("#!/bin/sh\n" + body + "\n", encoding="utf-8")
+    stub.chmod(0o755)
+
+
+def test_resolve_certification_ref_uses_explicit_env_dir_when_file_exists(
+    tmp_path: Path,
+) -> None:
+    env_dir = tmp_path / "cert"
+    env_dir.mkdir()
+    ref = "docs/certification/2026-09-03-ext4-linux-7.2.2-arch1-1.json"
+    expected = env_dir / Path(ref).name
+    expected.write_text("{}\n", encoding="utf-8")
+
+    resolved = _resolve_certification_ref(
+        ref,
+        root=tmp_path / "root",
+        env={"ATOMS_CERTIFICATION_DIR": str(env_dir), "PATH": ""},
+    )
+    assert resolved == expected
+
+
+def test_resolve_certification_ref_returns_missing_path_under_explicit_env_dir_so_caller_fails(
+    tmp_path: Path,
+) -> None:
+    env_dir = tmp_path / "cert"
+    env_dir.mkdir()
+    ref = "docs/certification/2026-09-03-ext4-linux-7.2.2-arch1-1.json"
+
+    resolved = _resolve_certification_ref(
+        ref,
+        root=tmp_path / "root",
+        env={"ATOMS_CERTIFICATION_DIR": str(env_dir), "PATH": ""},
+    )
+    assert resolved == env_dir / Path(ref).name
+    assert resolved is not None
+    with pytest.raises(FileNotFoundError):
+        resolved.read_text(encoding="utf-8")
+
+
+def test_resolve_certification_ref_returns_missing_path_under_discovered_records_dir_so_caller_fails(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    records_dir = tmp_path / "records" / "atoms"
+    records_dir.mkdir(parents=True)
+    bin_dir = tmp_path / "bin"
+    payload = json.dumps({"project": {"records": str(records_dir)}})
+    _write_tasks_stub(bin_dir, f"printf '%s\\n' '{payload}'")
+    ref = "docs/certification/2026-09-03-ext4-linux-7.2.2-arch1-1.json"
+
+    resolved = _resolve_certification_ref(
+        ref,
+        root=root,
+        env={"PATH": str(bin_dir)},
+    )
+    assert resolved == records_dir / ref
+    assert resolved is not None
+    with pytest.raises(FileNotFoundError):
+        resolved.read_text(encoding="utf-8")
+
+
+def test_resolve_certification_ref_returns_none_when_records_unavailable(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    ref = "docs/certification/2026-09-03-ext4-linux-7.2.2-arch1-1.json"
+
+    assert _resolve_certification_ref(ref, root=root, env={"PATH": ""}) is None
+
+    for idx, payload in enumerate(
+        (
+            {"project": None},
+            {"project": {"records": None}},
+            {"project": {"records": str(tmp_path / "missing-records")}},
+        )
+    ):
+        bin_dir = tmp_path / f"bin-{idx}"
+        _write_tasks_stub(bin_dir, f"printf '%s\\n' '{json.dumps(payload)}'")
+        assert (
+            _resolve_certification_ref(ref, root=root, env={"PATH": str(bin_dir)})
+            is None
+        )
+
+
+def test_resolve_certification_ref_ignores_ambient_pretty_format(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    records_dir = tmp_path / "records" / "atoms"
+    records_dir.mkdir(parents=True)
+    bin_dir = tmp_path / "bin"
+    payload = json.dumps({"project": {"records": str(records_dir)}})
+    _write_tasks_stub(
+        bin_dir,
+        'case "$*" in *--json*) printf \'%s\\n\' \''
+        + payload
+        + "' ;; *) printf 'pretty output\\n' ;; esac",
+    )
+    ref = "docs/certification/2026-09-03-ext4-linux-7.2.2-arch1-1.json"
+
+    resolved = _resolve_certification_ref(
+        ref,
+        root=root,
+        env={"PATH": str(bin_dir), "TASKS_FORMAT": "pretty"},
+    )
+    assert resolved == records_dir / ref
+
+
+def test_resolve_certification_ref_raises_on_corrupt_tasks_output(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    ref = "docs/certification/2026-09-03-ext4-linux-7.2.2-arch1-1.json"
+
+    bin_bad_json = tmp_path / "bin-bad-json"
+    _write_tasks_stub(bin_bad_json, "printf 'not-json\\n'")
+    with pytest.raises(RuntimeError, match="tasks where"):
+        _resolve_certification_ref(ref, root=root, env={"PATH": str(bin_bad_json)})
+
+    bin_err = tmp_path / "bin-err"
+    err_payload = json.dumps({"error": {"kind": "config", "detail": "TOML parse error"}})
+    _write_tasks_stub(bin_err, f"printf '%s\\n' '{err_payload}' >&2; exit 1")
+    with pytest.raises(RuntimeError, match="tasks where"):
+        _resolve_certification_ref(ref, root=root, env={"PATH": str(bin_err)})
+
