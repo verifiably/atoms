@@ -49,7 +49,7 @@ and mount configuration for both `project_root` and `metadata_root` and construc
   contract `"completed FLUSH makes all previously completed writes durable; a completed FUA write is durable at completion"`.
 - `CERTIFIED_ALLOWLIST` (`atoms.fs.volume`) pairs each accepted
   `(VolumeConfiguration, StorageProfile)` tuple with its `certification_ref`
-  (`"docs/certification/<date>-ext4-linux-<kernel>.json"`). Any mismatch on kernel release,
+  (`<date>-ext4-linux-<kernel>.json`). Any mismatch on kernel release,
   filesystem type, mount barrier options, ext4 feature masks, or storage profile raises
   `CapabilityUnavailable` before the coordinator opens `atoms.db` or mutates `project_root`.
 
@@ -105,8 +105,8 @@ For every replayed FLUSH/FUA prefix across all nine scenarios, the harness runs
 
 The resulting canonical JSON evidence file (`record_version = 1`, integer counts only,
 `zero_violations = true`, verified by `python/tests/test_certification_record.py` against
-`CERTIFIED_ALLOWLIST`) is stored in the project's records repository under
-`records/atoms/docs/certification/<date>-ext4-linux-<kernel>.json`:
+`CERTIFIED_ALLOWLIST`) is stored in the project's `records` repository
+(`<date>-ext4-linux-<kernel>.json`):
 
 | Top-level JSON field | Type and schema constraint |
 |---|---|
