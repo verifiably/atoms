@@ -43,11 +43,11 @@ test_cmd := "cd python && uv run --frozen pytest " + xdist
 one_cmd := "cd python && uv run --frozen pytest"
 # Hygiene always runs; the code checks (ruff, pyright) are a broad target that tt policy
 # governs. They are kept apart so a policy skip never suppresses hygiene.
-check_hygiene_cmd := "python3 tools/ops-check && python3 tools/ops-docs check && tasks check"
+check_hygiene_cmd := "python3 tools/ops-check && python3 tools/ops-docs check && tasks check && python3 python/tools/check_doc_links.py"
 check_code_cmd := "cd python && uv run --frozen ruff check && uv run --frozen pyright"
 # Hygiene minus `tasks check`, whose binary is not on a runner, then the code checks;
 # ops-check keeps working there because its registry lookup is empty when absent.
-ci_check_cmd := "python3 tools/ops-check && python3 tools/ops-docs check && (" + check_code_cmd + ")"
+ci_check_cmd := "python3 tools/ops-check && python3 tools/ops-docs check && python3 python/tools/check_doc_links.py && (" + check_code_cmd + ")"
 
 # Remote refs whose push makes CI run the full suite, as space-separated fnmatch globs
 # (`*` crosses `/`). The pre-push hook takes hook-pre-push-fast only when a push goes to

@@ -16,7 +16,8 @@ Test execution policy comes from `.tt.toml` at the checkout's top level, read by
 vendored `tools/tt`. It sets `automatic_broad = false`: the broad targets below are
 skipped locally unless forced, and hosted CI is the routine broad verification.
 `just test-one <pytest args>` is the focused route (paths relative to `python/`).
-`just check-hygiene` (ops-check, ops-docs check, `tasks check`) always runs. The broad targets, which a policy may
+`just check-hygiene` (ops-check, ops-docs check, `tasks check`, and
+`python/tools/check_doc_links.py`) always runs. The broad targets, which a policy may
 skip and record as skipped, never passed, are `check-code` (ruff, pyright), `test` (the
 full suite, including the suites the fast loop excludes; it forwards pytest arguments, as
 in `just test -rs`), `test-fast` (testmon, excluding the kill-matrix, persistence-cut and
@@ -58,7 +59,7 @@ On a fresh clone, `git config core.hooksPath .githooks`.
 ## Layout
 
 - `python/src/atoms/` — `core`, `fs`, `store`, `chain`, `coordinator`; `python/tests/` —
-  the suites; `python/tools/certify/` — the crash-certification harness.
+  the suites; `python/tools/` — `certify` and `check_doc_links.py`.
 - `docs/` — public reference documentation: `records.md` (data model), `protocol.md`
   (protocol), `durability.md` (standard), and `development.md` (guide).
 - Task records, design specs, implementation plans, briefs, handoffs, and crash
