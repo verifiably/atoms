@@ -9,3 +9,6 @@ A change to many files on disk ends finished, undone or halted with evidence kep
 """
 authority = ["docs/records.md", "docs/protocol.md", "docs/durability.md"]
 subsystems = []
+
+[documents]
+standard = 1
