@@ -1,7 +1,7 @@
-"""Rooted project approval (A4b-2 design §6).
+"""Rooted project approval (path resolution and project approval-2 the specification).
 
 approve_for_project is the sole public construction authority for ProjectApprovedSpec.
-No except clause in this module encloses a resolver call: ledger #20 is categorical, and
+No except clause in this module encloses a resolver call: the boundary contract is categorical, and
 the correct count is zero rather than "no blanket handler".
 """
 
@@ -65,7 +65,7 @@ class ProjectContext:
 
 @dataclass(frozen=True, slots=True, init=False)
 class ProjectApprovedSpec:
-    """A4's factory-issued rooted proof.
+    """the filesystem layer's factory-issued rooted proof.
 
     Guarded exactly like CompiledSpec, VolumeEvidence, and RecoverySnapshot: an explicit
     __init__ demanding the module-private token, so ordinary construction AND
@@ -189,7 +189,7 @@ def _proof_directory_paths(resolved: ResolvedTopology) -> tuple[tuple[str, Topol
 
 
 def encode_approval_evidence(approved: ProjectApprovedSpec) -> str:
-    """Canonical A7 recovery evidence, with one stable key per directory node."""
+    """Canonical the effect executor recovery evidence, with one stable key per directory node."""
     _require_exact(approved, ProjectApprovedSpec, "approved")
     directories: list[dict[str, object]] = []
     paths = {node: path for path, node in approved.directory_paths}
@@ -453,7 +453,7 @@ def _approve(
 def approve_for_project(
     compiled: CompiledSpec, context: ProjectContext
 ) -> ProjectApprovedSpec:
-    """Prove the rooted rules and issue the proof A5-A8 accept."""
+    """Prove the rooted rules and issue the proof the engine layers accept."""
 
     return _approve(compiled, context, None)
 

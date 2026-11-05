@@ -1,8 +1,8 @@
-"""The coherent observation mechanism (design §6).
+"""The coherent observation mechanism.
 
 One `Observation` is one pass and owns one token universe. It produces the primitive
-facts A3 consumes and never a verdict: this module may import `atoms.core.recovery.model`
-and no other `core.recovery` module, which is how ledger #13's "may not pre-classify them
+facts the recovery model consumes and never a verdict: this module may import `atoms.core.recovery.model`
+and no other `core.recovery` module, which is how the boundary contract "may not pre-classify them
 into a recovery outcome" becomes a mechanical property rather than a review promise. An
 architecture test asserts the whitelist over every form the import can take: a direct
 `from atoms.core.recovery import ...`, a plain `import atoms.core.recovery`, a
@@ -39,8 +39,8 @@ from atoms.fs.lock import close_all
 
 _READ_CHUNK = 1 << 20
 
-# Errnos with a defined domain meaning after approval (design §9.1). Everything else
-# propagates with its own class and traceback -- A5a's rule for SQLite result codes,
+# Errnos with a defined domain meaning after approval. Everything else
+# propagates with its own class and traceback -- the metadata store's rule for SQLite result codes,
 # applied to errno. Reads, writes, and flushes raise EIO, ENOSPC, EROFS and more, and
 # none of those is external state contradicting the frozen spec.
 _NAMESPACE_CONTRADICTIONS = frozenset(
@@ -76,7 +76,7 @@ class Observation:
     `(st_dev, st_ino)` identifies an entry uniquely only while its inode stays
     allocated. Recording the key and closing the descriptor would let an unlink and a
     create recycle that inode and map two sequentially distinct entries onto one token --
-    an identity equality A3 would believe. The retained descriptor makes the reuse
+    an identity equality the recovery model would believe. The retained descriptor makes the reuse
     impossible rather than unlikely.
 
     Every descriptor this class opens is either handed to `_pin` -- which owns it from
@@ -145,7 +145,7 @@ class Observation:
         return pinned
 
     def build_relation(self, staged_fd: int, planned_fd: int) -> FileBuildRelation:
-        """Compare a staged object with the planned blob (design §6.3).
+        """Compare a staged object with the planned blob.
 
         The planned blob arrives as an OPEN DESCRIPTOR supplied by the caller, never a
         digest this module resolves: that is both the coherence rule and what keeps
@@ -277,7 +277,7 @@ class Observation:
                 ) from caught
             raise
         # No descriptor and no identity: O_NOFOLLOW fails by design on a symlink leaf,
-        # so there is nothing to be coherent about (design §6.2).
+        # so there is nothing to be coherent about.
         return ObservedSymlink(
             state=SymlinkState(target=target, mode=stat.S_IMODE(info.st_mode))
         )

@@ -1,4 +1,4 @@
-"""The closed effect set and a uniform per-path occurrence view (design §5.2)."""
+"""The closed effect set and a uniform per-path occurrence view."""
 
 from __future__ import annotations
 

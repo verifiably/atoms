@@ -479,7 +479,7 @@ def _recover_cell(volume: Path) -> dict[str, object]:
         elif captured:
             plan = captured[0][1]
             if projection != _model_projection(*captured[0]):
-                failures.append("durable projection disagrees with A3 fixed point")
+                failures.append("durable projection disagrees with recovery fixed point")
             if type(plan) is HaltPlan:
                 assert record is not None
                 if record.halt_diagnostic != plan.diagnostic:
@@ -732,7 +732,7 @@ def run_scenario(
                         finally:
                             target.unlink(missing_ok=True)
     if classified == 0:
-        violations.append("no replay prefix reached A3 classification")
+        violations.append("no replay prefix reached recovery classification")
     return (
         {
             "scenario": name,

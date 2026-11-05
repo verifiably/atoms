@@ -1,4 +1,4 @@
-"""Explicit platform and architecture selection (design §5.3)."""
+"""Explicit platform and architecture selection."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from atoms.core.errors import CapabilityUnavailable
 from atoms.fs.backend import Backend
 
 BACKEND_REVISION = "linux-4"
-"""Atoms backend contract revision (design §6.2).
+"""Atoms backend contract revision.
 
 Bump this deliberately when the backend's syscall selection, flag set, or durability ordering
 changes. Bumping de-certifies every allowlist entry naming the old revision, which is intended:

@@ -76,7 +76,7 @@ def validate_chain(
 ) -> ValidatedChain:
     """Validate every durable entry and classify the fixed staging survivor.
 
-    The raising disposition of `atoms.chain.inspect`'s core (design §4.6): this
+    The raising disposition of `atoms.chain.inspect`'s core: this
     computes no defect of its own, so the taxonomy the inspecting commands report and
     the taxonomy the mutating paths refuse cannot fork. `_planned` runs first,
     preserving the current ordering of `ProtocolError` against `ChainStateInvalid`.

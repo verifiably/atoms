@@ -1,4 +1,4 @@
-"""The lease value and the protocol that runs over it (design §5)."""
+"""The lease value and the protocol that runs over it."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ class Lease:
     """Borrowed resources, not owned ones.
 
     `_recovery_lease` closes both in reverse acquisition order; a `Lease` that outlives
-    its `with` block therefore references spent objects, and every A5a call through it
+    its `with` block therefore references spent objects, and every the metadata store call through it
     refuses. The escape is caught by the layer below rather than by a flag here.
     """
 
@@ -22,7 +22,7 @@ class Lease:
 
 
 def _reclaim_orphans(store: Store) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Ledger #23: reclaim authority §7.3's pre-COMMIT leaves under the held lock.
+    """the boundary contract: reclaim the specification pre-COMMIT leaves under the held lock.
 
     A workspace is orphan exactly when no `transaction_record` row names its txid, and
     `list_unindexed_blobs` already means "no `blob` row" -- so nothing a durable record

@@ -1,4 +1,4 @@
-"""Per-txid scratch namespaces under the engine-owned metadata root (design §8.3)."""
+"""Per-txid scratch namespaces under the engine-owned metadata root."""
 
 from __future__ import annotations
 
@@ -324,13 +324,13 @@ def remove_workspace(store: Store, workspace: Workspace) -> None:
                 info = os.stat(name, dir_fd=staging_fd, follow_symlinks=False)
                 if not stat.S_ISREG(info.st_mode):
                     raise MetadataStoreInvalid(
-                        f"staging/{txid}/{name} is not a regular file; A6's capture "
+                        f"staging/{txid}/{name} is not a regular file; preimage capture "
                         "writes regular files and nothing else"
                     )
         if workspace._work_fd is not None and os.listdir(workspace._work_fd):
             raise ProtocolError(
-                f"work/{txid}/ is not empty; authority §9.5 classifies its contents by "
-                "inode against the live filesystem, and that judgment is A7's"
+                f"work/{txid}/ is not empty; recovery classifies work-directory contents by "
+                "inode against the live filesystem before workspace cleanup"
             )
 
         if workspace._staging_fd is not None:

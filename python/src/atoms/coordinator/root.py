@@ -1,4 +1,4 @@
-"""The production composition root and the lease's resource stack (design §4.1, §5.1)."""
+"""The production composition root and the lease's resource stack."""
 
 from __future__ import annotations
 
@@ -39,12 +39,12 @@ def _project_lease(
     metadata_root: str,
     storage: StorageProfile,
 ) -> Iterator[Lease]:
-    """Design §5.1's entry order up to, but not including, resolution.
+    """Contract:  entry order up to, but not including, resolution.
 
     `CERTIFIED_ALLOWLIST` is named only in this module and reaches the one
-    `bind_project_volume` call through `_leased_stack`. It is empty until A8b
+    `bind_project_volume` call through `_leased_stack`. It is empty until crash certification
     crash-certifies a configuration tuple, so this path refuses every real volume today.
-    That is the intended fail-closed behaviour, and it is why ledger #18 is proved by an
+    That is the intended fail-closed behaviour, and it is why the boundary contract is proved by an
     architecture assertion over this call rather than by an end-to-end run.
 
     The `Lease` this yields is one `resolve` has NOT run over, which weakens that
@@ -53,7 +53,7 @@ def _project_lease(
     public function permitted to name this manager or `resolve`: structural inspection
     must interpose between reclamation and resolution, and nothing else may.
 
-    Reclamation stays above the split because ledger #17 and #23 require it at EVERY
+    Reclamation stays above the split because the boundary contract and #23 require it at EVERY
     lease entry, and neither step reads or writes the chain -- an orphan is unreferenced
     by definition. `resolve` is the opposite: it interprets the chain and can append to
     it, which is exactly what must not happen over damage.
@@ -73,10 +73,10 @@ def _leased_stack(
 
     The one production call site that names `bind_project_volume`, shared by
     the creating entry (`_project_lease`) and the gated one
-    (`_writable_recovery_lease`) so ledger #18's single-call-site assertion
+    (`_writable_recovery_lease`) so the boundary contract single-call-site assertion
     stays a fact about this module rather than two copies of a shape.
     """
-    # Ledger #17 requires reclamation at EVERY lease entry. bind_project_volume
+    # the boundary contract requires reclamation at EVERY lease entry. bind_project_volume
     # reclaims at its own step 4, which it reaches only after checks that can
     # refuse first (binding.py:169-172), so the lease calls it directly.
     reclaim_probe_survivors(lock)
@@ -126,7 +126,7 @@ def _writable_recovery_lease(
     metadata_root: str,
     storage: StorageProfile,
 ) -> Iterator[Lease]:
-    """The gated mutator entry (lifecycle design §7).
+    """The gated mutator entry.
 
     One shared writability gate: classify under the held metadata lock with
     reads alone, refuse without the writable grant, and only then activate the
@@ -172,10 +172,10 @@ def _recovery_lease(
     metadata_root: str,
     storage: StorageProfile,
 ) -> Iterator[Lease]:
-    """Design §5.1's entry order, exactly: the project lease plus resolution.
+    """Contract:  entry order, exactly: the project lease plus resolution.
 
     Keeps its name, its signature, and its meaning -- "recovery has resolved before this
-    yields" -- so `read_chain` design §8's recovery-barrier property is preserved.
+    yields" -- so `read_chain` the specification recovery-barrier property is preserved.
     """
     with _project_lease(backend, project_root, metadata_root, storage) as lease:
         resolve(lease._binding, lease._store)

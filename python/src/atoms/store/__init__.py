@@ -1,4 +1,4 @@
-"""A5a — the durable metadata store (design §4.1).
+"""the metadata store — the durable metadata store.
 
 The public surface is exactly the five names below. `_StoreTransaction` is obtained only
 by entering `Store.transaction()` and is deliberately absent.

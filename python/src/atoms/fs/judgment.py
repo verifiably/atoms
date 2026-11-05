@@ -1,4 +1,4 @@
-"""Pure judgment over a resolution table and its topology (A4b-2 design §6.3).
+"""Pure judgment over a resolution table and its topology (path resolution and project approval-2 the specification).
 
 No filesystem access, no descriptor, no syscall. Every function here takes values the
 resolution and construction phases already produced and either returns or raises. Every
@@ -33,7 +33,7 @@ def require_ancestors_legal(
     """Every component past the frontier is a directory this transaction creates first.
 
     Two routes reach the same rule. A missing component simply does not exist yet. A
-    component that exists as a file or symlink is the authority §6 case where absence is
+    component that exists as a file or symlink is the the specification case where absence is
     inferred from the ancestor's verified state rather than probed; it is admitted only
     when the timeline removes it and creates a directory in its place.
 
@@ -149,7 +149,7 @@ def _require_removed_before_creation(
 ) -> None:
     """A blocking non-directory must be removed, then re-created as a directory.
 
-    This is design §5.2's one bounded exception to "approval does not compare live state
+    This is the specification one bounded exception to "approval does not compare live state
     against a declared precondition": resolution stopped here, so the topology cannot be
     built without deciding whether this path becomes a directory, and the observation is
     already in hand.
@@ -172,7 +172,7 @@ def require_endpoints_distinct(resolved: ResolvedTopology) -> None:
     """No two declared paths name one entry under their parent's actual policy.
 
     Covers paths declared ABSENT, where identity comparison does not apply and is
-    therefore not what is compared. Authority §5.4 gives the reason mutation-time
+    therefore not what is compared. Contract:  gives the reason mutation-time
     no-clobber is not a substitute: `create x`, `delete x`, `create y` can make every
     no-clobber operation succeed while x and y aliasing leaves the declared final states
     unsatisfiable.
@@ -206,9 +206,9 @@ def _require_name_fits(
 def bind_scratch(
     compiled: CompiledSpec, txid: str, resolved: ResolvedTopology
 ) -> tuple[ApprovedScratch, ...]:
-    """Instantiate the complete scratch set and prove it pairwise distinct (ledger #11).
+    """Instantiate the complete scratch set and prove it pairwise distinct.
 
-    Placement matches A3's _validate_topology exactly — WORK under the work root, every
+    Placement matches the recovery model's _validate_topology exactly — WORK under the work root, every
     other role beside its effect's persistent path, with MoveNoClobber anchored to its
     source — so instantiation and topology construction cannot drift apart.
     """

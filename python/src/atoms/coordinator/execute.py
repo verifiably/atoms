@@ -91,7 +91,7 @@ def _apply_effect(
         except BaseException:
             backend.close_fd(fd)
             raise
-        # §9.5's descendant handoff, forward. `adopt` owns `fd` from here, so a failure
+        # the specification descendant handoff, forward. `adopt` owns `fd` from here, so a failure
         # below must NOT close it -- the table does. Until this runs, a planned directory
         # nested directly inside this one has no stop and its own CreateDirectory cannot
         # adopt; the children are looked up through the descriptor this effect retained

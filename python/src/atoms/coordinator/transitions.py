@@ -1,4 +1,4 @@
-"""A3 transition persistence in plan order (design §8)."""
+"""the recovery model transition persistence in plan order."""
 
 from __future__ import annotations
 
@@ -61,7 +61,7 @@ def _require_projection_matches(
 ) -> None:
     """Compare every durable field with the plan prefix reduced to `start`."""
     # Chain bindings and assembly evidence are enforced at their owning seams; they are
-    # deliberately outside A3's transition projection.
+    # deliberately outside the recovery model's transition projection.
     snapshot = plan.bound_snapshot
     if snapshot.compiled != approved.compiled:
         raise ProtocolError(

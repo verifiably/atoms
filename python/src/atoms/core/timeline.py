@@ -1,4 +1,4 @@
-"""Repeated-path timelines and the continuity rule (design §5.3)."""
+"""Repeated-path timelines and the continuity rule."""
 
 from __future__ import annotations
 

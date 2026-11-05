@@ -1,7 +1,7 @@
-"""Anchored rooted path resolution (A4b-1 design §6).
+"""Anchored rooted path resolution (path resolution and project approval-1 the specification).
 
 Observation only. Nothing here sees a CompiledSpec, builds a topology, or writes to
-project space; A4b-2 composes these observations into the approval proof.
+project space; path resolution and project approval-2 composes these observations into the approval proof.
 """
 
 from __future__ import annotations
@@ -50,7 +50,7 @@ class DirectoryFacts:
 
 @dataclass(frozen=True, slots=True)
 class ChildObservation:
-    """One open parent answers both questions design §6.4 asks of it.
+    """One open parent answers both questions the specification asks of it.
 
     `DirectoryConstraints` already bundles `lookup_proof` and `name_max`, so a single
     comparison against an approved directory covers identity, `LookupProof`, and
@@ -198,7 +198,7 @@ class PathResolver:
 
     def __init__(self, binding: ProjectBinding) -> None:
         # Both live resources precede `evidence`, a detached value whose property
-        # performs no liveness check (design §6.1).
+        # performs no liveness check.
         _backend = binding.backend
         root_fd = binding.project_root_fd
         evidence = binding.evidence
@@ -227,7 +227,7 @@ class PathResolver:
                 "no declared path could avoid the metadata namespace"
             )
         # Seeds the memo rather than a dedicated field. resolve() re-observes the root
-        # through the same path as every other hop (§6.5), so a stored copy would only
+        # through the same path as every other hop, so a stored copy would only
         # be a second, unchecked answer.
         self._facts_by_identity: dict[FilesystemIdentity, DirectoryFacts] = {
             identity: DirectoryFacts(identity, constraints)
@@ -237,16 +237,16 @@ class PathResolver:
     def work_base_facts(self) -> DirectoryFacts:
         """Facts for the existing metadata_root/work base.
 
-        NOT A3's logical WorkRoot: authority §7 places effect-time staging in
-        work/<txid>/, which does not exist at approval time. A4b-2 derives that
+        NOT the recovery model's logical WorkRoot: the specification places effect-time staging in
+        work/<txid>/, which does not exist at approval time. path resolution and project approval-2 derives that
         directory's constraints from these through inherited_constraints.
 
         Unlike _facts_for, this memo DOES skip re-observation on a hit. work/ is
         engine-owned space created by ensure_metadata_layout under the exclusive
         project lock still held here; no cooperating process mutates it during the
-        lease. Authority §3.2 places a noncooperating writer inside the metadata tree
+        lease. Contract:  places a noncooperating writer inside the metadata tree
         outside the guarantee, so this method does not claim to detect a post-cache
-        flag change. A5 still re-resolves before relying on the approved facts.
+        flag change. the metadata store still re-resolves before relying on the approved facts.
         """
         backend = self._binding.backend  # liveness BEFORE the memo, so a cached
         parent_fd = self._binding.metadata_root_fd  # result still fails after closure
@@ -286,7 +286,7 @@ class PathResolver:
     def resolve(self, rel_path: str) -> ResolvedPrefix:
         """Observe the deepest existing directory prefix of one declared path.
 
-        Accepts declared persistent paths only. A4b-2 resolves a scratch parent and
+        Accepts declared persistent paths only. path resolution and project approval-2 resolves a scratch parent and
         validates generated leaf names against that parent's approved name_max.
         """
         backend = self._binding.backend
@@ -396,8 +396,8 @@ class PathResolver:
         FS_CASEFOLD_FL can be set on an empty directory without changing its inode, so
         a cache hit that skipped read_lookup_constraints could report EXACT_BYTES for a
         lookup that already happened under casefold semantics — a wrong answer produced
-        inside one approval, which is a window ledger #19 does not cover. The memo's
-        jobs are to hand back one DirectoryFacts object per identity, so A4b-2 can
+        inside one approval, which is a window the boundary contract does not cover. The memo's
+        jobs are to hand back one DirectoryFacts object per identity, so path resolution and project approval-2 can
         compare by object, and to notice disagreement.
         """
         identity = _identity(os.fstat(fd))
@@ -534,7 +534,7 @@ def observe_child(
 def observe_work_child(binding: ProjectBinding, leaf: str) -> ChildObservation:
     """Observe one named child of engine-owned `metadata_root/work`.
 
-    Ledger #19's mechanism for the `WorkRoot` branch: the returned parent facts are the
+    the boundary contract mechanism for the `WorkRoot` branch: the returned parent facts are the
     same pair `PathResolver.work_base_facts()` recorded in `ApprovedWorkBase`, so the
     coordinator compares like with like. A separate entry point from `observe_child`
     because this is the metadata namespace, where project containment does not apply.

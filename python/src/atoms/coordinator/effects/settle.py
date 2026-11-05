@@ -1,4 +1,4 @@
-"""A3-authorized recovery filesystem mutations."""
+"""the recovery model-authorized recovery filesystem mutations."""
 
 from __future__ import annotations
 
@@ -88,7 +88,7 @@ def apply_transform(
         cell = _CELLS[(step.variant, step.settlement)]
     except KeyError as caught:
         raise ProtocolError(
-            f"A3 does not emit {step.variant.value} × {step.settlement.value}"
+            f"recovery planner does not emit {step.variant.value} × {step.settlement.value}"
         ) from caught
     effect = _effect(approved, step.effect_id)
     backend = cast(AuditedBackend, lease._binding.backend)
@@ -155,7 +155,7 @@ def apply_transform(
             )
             parents = (site.destination_fd,)
         else:
-            raise ProtocolError("move repair transform has an unrecognized A3 tuple")
+            raise ProtocolError("move repair transform has an unrecognized recovery tuple")
     elif cell == "mkdir_remove" and type(effect) is CreateDirectory and type(site) is MkdirSite:
         run_determinate(
             "rmdir_child",

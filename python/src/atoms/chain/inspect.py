@@ -1,8 +1,8 @@
-"""One typed validation core for project-local chain evidence (design §4).
+"""One typed validation core for project-local chain evidence.
 
 `validate_chain` is not a second validator: it is the *raising disposition* of this
 core. Two passes over a chain directory and a third over the linearized result produce
-at most one `ChainDefect`, and it is the first in §4.4's pinned traversal order. The
+at most one `ChainDefect`, and it is the first in the specification pinned traversal order. The
 inspecting commands return it; the raising paths raise `ChainStateInvalid` carrying its
 `detail`. There is exactly one place a defect is recognized and exactly one place its
 wording is minted -- which is what keeps a chain from being simultaneously appendable
@@ -75,7 +75,7 @@ class WellFormedChain:
     `pending`'s invariant differs by mode. In **registered** mode every digest in
     `pending` is the digest of an entry of `entries`. In **detached** mode a staged
     registration may contribute one pair whose digest names non-durable bytes, so a
-    detached `pending` digest need not occur in `entries` (design §4.5, §8).
+    detached `pending` digest need not occur in `entries`.
     """
 
     genesis_digest: str
@@ -113,7 +113,7 @@ def foreign_leaf(name: str) -> ChainDefect:
     )
 
 
-#: The reserved chain name occupied by something that is not a directory (design §6.2).
+#: The reserved chain name occupied by something that is not a directory.
 OCCUPIED_CHAIN_LEAF = ChainDefect(
     DefectKind.FOREIGN_LEAF,
     CHAIN_LEAF,
@@ -125,7 +125,7 @@ def read_leaf(backend: AuditedBackend, chain_fd: int, name: str) -> bytes | None
     """The bytes of a readable no-follow regular leaf, or `None` for anything else.
 
     The three `None` conditions are the whole of what "a readable entry leaf" means to
-    the engine, so the staging exemption's boundary (§8) is this predicate rather than
+    the engine, so the staging exemption's boundary is this predicate rather than
     a second notion of readability.
     """
 
@@ -166,7 +166,7 @@ def scan_chain_directory(
     for name in names:
         if name == STAGING_LEAF:
             # Bookkeeping only when it IS a staged envelope: a directory or a symlink
-            # squatting on the reserved name is a foreign object (design §4.4 step 1).
+            # squatting on the reserved name is a foreign object.
             staged = read_leaf(backend, chain_fd, name)
             if staged is None:
                 return foreign_leaf(name)
@@ -226,7 +226,7 @@ def validate_scan(scan: ChainScan) -> WellFormedChain | AbsentChain:
 def _linearize(
     found: tuple[tuple[str, str | None, Entry, bytes], ...],
 ) -> tuple[tuple[tuple[str, Entry], ...], str] | ChainDefect:
-    """Pass 2 -- linkage, in §4.4 steps 6 to 10's order.
+    """Pass 2 -- linkage, in the specification's order.
 
     Every step reads the scan's ROWS, not a digest-keyed map: a scanned directory has
     one row per name, but an injected scan need not, and deriving genesis membership
@@ -285,7 +285,7 @@ def _linearize(
         current = following[0]
     if visited != set(by_digest):
         # Naming a member of the disconnected component is the operator's entry point
-        # into the orphan; the lowest keeps the choice deterministic (design §4.4).
+        # into the orphan; the lowest keeps the choice deterministic.
         lowest = min(set(by_digest) - visited)
         return ChainDefect(
             DefectKind.ORPHAN_HISTORY,
@@ -300,7 +300,7 @@ def fulfills_fault(
 ) -> str | None:
     """`missing`, `non-ancestor`, `non-intent`, or `None` for an admissible referent.
 
-    One predicate at two indices (design §11.2): pass 3 calls it with the referencing
+    One predicate at two indices: pass 3 calls it with the referencing
     registration's own index, and `run_transaction`'s referent gate calls it with
     `len(entries)` -- the index the registration it is about to append will occupy, so
     "index below the referencing entry's" *is* membership there.
@@ -318,7 +318,7 @@ def fulfills_fault(
 
 
 def committed_fulfillments(entries: tuple[tuple[str, Entry], ...]) -> frozenset[str]:
-    """The intents a committed settlement has already fulfilled (design §11.2).
+    """The intents a committed settlement has already fulfilled.
 
     The submission gate's duplicate check runs against this set, at a strictly earlier
     state than pass 3's settlement-time check -- two states, two checks, no shared
@@ -394,7 +394,7 @@ def _inspect_entry_classes(
                 continue
             # Checked at the SECOND SETTLEMENT, not the second registration: at the
             # registration the outcome is not yet known, so reporting there would need
-            # a forward reference (design §4.3).
+            # a forward reference.
             if registration.fulfills in fulfilled:
                 return ChainDefect(
                     DefectKind.DUPLICATE_FULFILLMENT,
@@ -409,7 +409,7 @@ def _inspect_entry_classes(
 def _pending_of(
     entries: tuple[tuple[str, Entry], ...],
 ) -> tuple[tuple[str, str], ...]:
-    """Design §4.5: every registration no settlement anywhere in the chain settles.
+    """Contract: every registration no settlement anywhere in the chain settles.
 
     A ROLLED_BACK settlement settles -- a decided outcome is not evidence-starved. Only
     the *absence* of a settlement is.
@@ -424,7 +424,7 @@ def _pending_of(
 
 
 def staged_pending(scan: ChainScan, chain: WellFormedChain) -> WellFormedChain:
-    """Design §8's detached rule: staged registration evidence stays in `pending`.
+    """Contract:  detached rule: staged registration evidence stays in `pending`.
 
     It errs toward reporting *more* pending, which is the safe direction: the
     consequence of a pending report is a refusal and the consequence of a missed one is

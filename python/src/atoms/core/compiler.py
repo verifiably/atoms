@@ -1,13 +1,13 @@
-"""A2's filesystem-independent compilation proof (design §5.4).
+"""the spec compiler's filesystem-independent compilation proof.
 
-``compile_spec`` explicitly validates A2's lexical/model rules and returns a frozen
-``CompiledSpec``. A3 may consume that proof; A4 consumes it and produces the distinct
-``ProjectApprovedSpec`` required by A5-A8. Filesystem-dependent checks — root and
+``compile_spec`` explicitly validates the spec compiler's lexical/model rules and returns a frozen
+``CompiledSpec``. the recovery model may consume that proof; the filesystem layer consumes it and produces the distinct
+``ProjectApprovedSpec`` required by the engine layers. Filesystem-dependent checks — root and
 metadata-root identity, ancestor traversal, lookup policy, capability availability, and
-live preconditions — remain A4's.
+live preconditions — remain the filesystem layer's.
 
 Invalid specifications are refused with ``SpecValidationError``. Unexpected internal
-exceptions propagate unchanged. Only the four precedence edges named by the A2 design are
+exceptions propagate unchanged. Only the four precedence edges named by the the spec compiler design are
 stable; the numbering of independent validation phases is not a general error-order contract.
 """
 
@@ -93,7 +93,7 @@ _COMPILED_SPEC_CONSTRUCTION_TOKEN = object()
 
 @dataclass(frozen=True, slots=True, init=False)
 class CompiledSpec:
-    """A2's factory-issued proof of filesystem-independent specification rules."""
+    """the spec compiler's factory-issued proof of filesystem-independent specification rules."""
 
     spec: TransactionSpec
     timelines: tuple[PathTimeline, ...]
@@ -185,7 +185,7 @@ def _require_state_structure(state: Any, what: str) -> None:
 
 
 def _phase1_structure(spec: TransactionSpec) -> None:
-    """Exhaustively type and initialize-check the closed A1 model."""
+    """Exhaustively type and initialize-check the closed the core model model."""
     _require(
         type(spec) is TransactionSpec,
         f"spec must be a TransactionSpec, got {_type_name(spec)}",
@@ -562,7 +562,7 @@ def _canonicalize(spec: TransactionSpec) -> TransactionSpec:
 
 
 def compile_spec(spec: TransactionSpec) -> CompiledSpec:
-    """Validate ``spec`` and return A2's frozen filesystem-independent proof."""
+    """Validate ``spec`` and return the spec compiler's frozen filesystem-independent proof."""
     _phase1_structure(spec)
     _phase2_fingerprints(spec)
     _phase3_path_grammar(spec)

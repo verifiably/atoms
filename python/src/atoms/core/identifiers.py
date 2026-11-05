@@ -1,9 +1,9 @@
 """Bounded safe-identifier grammar for names interpolated into path components.
 
 A stable effect ID (consumer-supplied) and the engine's txid/role are woven into a
-single scratch-leaf component (design §5.1). Restricting them to a bounded ASCII
+single scratch-leaf component. Restricting them to a bounded ASCII
 grammar makes that leaf a well-formed single component and turns a malformed ID into a
-compile-time refusal (design §5.4) rather than a `*at` syscall failure at mutation time.
+compile-time refusal rather than a `*at` syscall failure at mutation time.
 """
 
 from __future__ import annotations

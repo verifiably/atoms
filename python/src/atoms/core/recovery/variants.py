@@ -192,7 +192,7 @@ def _effect_paths(effect: Effect) -> tuple[str, ...]:
     if effect_type is MoveNoClobber:
         move = cast(MoveNoClobber, effect)
         return (move.source, move.destination)
-    raise ProtocolError("effect variant is outside A3's closed set")
+    raise ProtocolError("effect variant is outside the recovery model's closed set")
 
 
 def _joint(snapshot: RecoverySnapshot, effect: Effect) -> JointObservation:
@@ -303,7 +303,7 @@ def _transform(
     try:
         variant = _EFFECT_VARIANT[type(effect)]
     except KeyError as exc:
-        raise ProtocolError("effect variant is outside A3's closed set") from exc
+        raise ProtocolError("effect variant is outside the recovery model's closed set") from exc
     result_after = JointObservation(
         persistent=_replace_persistent(observed, persistent),
         scratch=_replace_scratch(observed, scratch),
@@ -1342,7 +1342,7 @@ def classify_committed_cleanup(
     if effect_type in {CreateFileNoClobber, CreateDirectory}:
         return _halt(observed, observed)
     if effect_type not in {ReplaceFile, DeletePath, MoveNoClobber}:
-        raise ProtocolError("effect variant is outside A3's closed set")
+        raise ProtocolError("effect variant is outside the recovery model's closed set")
     if _entry_state(scratch) != _expected_retained_scratch_state(effect):
         return _halt(observed, observed)
 
@@ -1473,5 +1473,5 @@ def classify_effect(
     try:
         classifier = _CLASSIFIERS[type(effect)]
     except KeyError as exc:
-        raise ProtocolError("effect variant is outside A3's closed set") from exc
+        raise ProtocolError("effect variant is outside the recovery model's closed set") from exc
     return classifier(snapshot, effect, frontiers)

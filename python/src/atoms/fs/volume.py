@@ -1,4 +1,4 @@
-"""Mount identity, durability configuration, and the certified allowlist (design §6)."""
+"""Mount identity, durability configuration, and the certified allowlist."""
 
 from __future__ import annotations
 
@@ -118,8 +118,9 @@ CERTIFIED_ALLOWLIST = DurabilityAllowlist(
         }
     )
 )
-"""Populated by the A8 certification run; see the named record. Recertification
-after a kernel or backend-revision change: python -m tools.certify run --all."""
+"""Populated by the crash-certification run (records live under docs/certification/
+in the project's records repository). Recertification after a kernel or
+backend-revision change: python -m tools.certify run --all."""
 
 
 # Per-filesystem barrier-relevant options: the exact mountinfo field each is read
@@ -297,7 +298,7 @@ def _select(name: str, source: str, absent: str, entry: MountEntry) -> str:
 
 
 def resolve_ext4_feature_masks(directory_fd: int) -> FeatureMasks:
-    """Read all ext4 superblock feature masks (design §7.4)."""
+    """Read all ext4 superblock feature masks."""
     buffer = bytearray(_EXT4_TUNE_SB_PARAMS_SIZE)
     try:
         fcntl.ioctl(directory_fd, _EXT4_IOC_GET_TUNE_SB_PARAM, buffer)

@@ -1,4 +1,4 @@
-"""Metadata layout, probe reclamation, and verified pathnames (design §7.2, §7.3, §9.4)."""
+"""Metadata layout, probe reclamation, and verified pathnames."""
 
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ def _open_or_create_child(backend, parent_fd: int, name: str) -> int:
 
 
 def close_layout(backend, retained: dict[str, int]) -> None:
-    """Release retained layout descriptors in reverse opening order (design §7.2, §9.3).
+    """Release retained layout descriptors in reverse opening order.
 
     `retained` is insertion-ordered by METADATA_LAYOUT, so `values()` is *opening*
     order and must be reversed. Reverse order is the rule for nested descriptors: a
@@ -117,7 +117,7 @@ def reclaim_probe_survivors(lock: HeldProjectLock) -> None:
     Under the held lock there can be no live probe but our own, so no attempt is
     made to distinguish a live probe from debris. `probe/` itself is different:
     a symlink or non-directory there is refused rather than unlinked, because
-    A4a should not destroy something it did not create, and because metadata_root
+    the capability backend should not destroy something it did not create, and because metadata_root
     is engine-owned space whose invariant is already broken if that occurs.
     """
     backend = lock.backend
@@ -150,7 +150,7 @@ def verified_child_path(
     SQLite is the authority's one path-addressed exception: sqlite3.connect opens
     by pathname through its own VFS, so no descriptor can participate. This is the
     verify-then-open the authority requires, performed at the moment of use rather
-    than trusted from bootstrap. Both the SQLite probe and A5 go through it.
+    than trusted from bootstrap. Both the SQLite probe and the metadata store go through it.
     """
     if (
         not name

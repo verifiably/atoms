@@ -1,4 +1,4 @@
-"""The approved value types and the resolved topology (A4b-2 design §7, §8).
+"""The approved value types and the resolved topology (path resolution and project approval-2 the specification, the specification).
 
 Pure. No filesystem access, no descriptor, no syscall. Every name comparison routes
 through lookup_equivalence_key rather than comparing raw components, so widening the
@@ -78,7 +78,7 @@ class ApprovedScratch:
 class ApprovedWorkBase:
     """The observed facts of physical metadata_root/work.
 
-    Retained rather than consumed: ledger #19 requires A5 to re-resolve this namespace
+    Retained rather than consumed: the boundary contract requires the metadata store to re-resolve this namespace
     under the held lock before creating work/<txid>, and a re-resolution with no
     approved baseline is a fresh observation authorizing itself.
     """
@@ -131,7 +131,7 @@ def build_topology(
     filesystem_type: str,
     work_constraints: DirectoryConstraints | None,
 ) -> ResolvedTopology:
-    """Build A3's production topology plus the node-keyed fact table.
+    """Build the recovery model's production topology plus the node-keyed fact table.
 
     Runs before every judgment and judges nothing itself. It decides only which
     directories exist and which of them are the same directory; ancestor legality,
@@ -203,7 +203,7 @@ def _facts_by_prefix(
     """Attribute observed or derived facts to every directory candidate.
 
     A candidate is every proper prefix of a declared path plus every CreateDirectory
-    endpoint. The second half is what makes design §5.4's case representable: `A` is
+    endpoint. The second half is what makes the specification case representable: `A` is
     nobody's lexical prefix, so without it there is no directory for `a` to merge into.
 
     A candidate some path resolved through is existing; one no path resolved through is
@@ -374,9 +374,9 @@ def _scratch_edges(
 def require_resolved_surface_and_ordering(
     compiled: CompiledSpec, resolved: ResolvedTopology
 ) -> None:
-    """Re-derive A2's surface and ordering rules from resolved parentage.
+    """Re-derive the spec compiler's surface and ordering rules from resolved parentage.
 
-    Authority §5.4 forbids reusing A2's lexical verdict, and gives the reason: on an
+    Contract:  forbids reusing the spec compiler's lexical verdict, and gives the reason: on an
     insensitive parent, declared `A` and declared descendant `a/x` do not collide as
     endpoints yet `A` is genuinely the ancestor of `a/x`.
     """
@@ -398,9 +398,9 @@ def require_resolved_surface_and_ordering(
             ancestor = parent_by_node.get(node)
             while ancestor is not None:
                 blocker = states.get(ancestor)
-                # An ABSENT ancestor blocks exactly as a file does: A2's phase 12 sets its
+                # An ABSENT ancestor blocks exactly as a file does: the spec compiler's phase 12 sets its
                 # trie constraint from any declared state that is not a DirectoryState,
-                # absence included, so omitting it here would admit what A2 refuses.
+                # absence included, so omitting it here would admit what the spec compiler refuses.
                 if (
                     blocker is not None
                     and not isinstance(blocker, DirectoryState)

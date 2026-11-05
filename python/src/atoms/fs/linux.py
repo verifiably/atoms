@@ -1,4 +1,4 @@
-"""Linux implementation of the capability protocol (design §5.1, §5.4)."""
+"""Linux implementation of the capability protocol."""
 
 from __future__ import annotations
 

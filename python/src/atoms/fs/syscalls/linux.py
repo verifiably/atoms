@@ -1,4 +1,4 @@
-"""ctypes bindings for the Linux syscalls the stdlib does not expose (design §5.2)."""
+"""ctypes bindings for the Linux syscalls the stdlib does not expose."""
 
 from __future__ import annotations
 

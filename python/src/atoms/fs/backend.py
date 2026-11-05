@@ -1,7 +1,7 @@
-"""The semantic filesystem capability protocol (design §5.1).
+"""The semantic filesystem capability protocol.
 
 The surface is determined by what must be *probed*, not by anticipation of later
-stages: exactly one operation set per design §5.5 capability, and every method is
+stages: exactly one operation set per the specification capability, and every method is
 called by the probe that reports it. There is deliberately no supplied_capabilities
 method — a backend that reported its own capabilities would make the evidence
 circular, when the probe exists precisely to establish what the backend cannot be
@@ -27,7 +27,7 @@ from typing import Protocol
 #
 # The table lives here, beside the protocol, because it has two consumers: probe.py
 # reports absence from it, and lock.py converts the "traversal" and "lock" entries to
-# CapabilityUnavailable on the bootstrap path (design §10). probe.py imports lock.py,
+# CapabilityUnavailable on the bootstrap path. probe.py imports lock.py,
 # so defining it there would force either a cycle or a second copy that drifts.
 #
 # Primary manual bases, recorded per operation rather than inferred:
@@ -136,7 +136,7 @@ class Backend(Protocol):
 
     # symlink_fingerprint
     def symlink_fingerprint(self, parent_fd: int, name: str) -> tuple[os.stat_result, str]:
-        """lstat + readlink. Deliberately NOT descriptor-coherent (design §5.1)."""
+        """lstat + readlink. Deliberately NOT descriptor-coherent."""
         ...
 
     # advisory_project_lock

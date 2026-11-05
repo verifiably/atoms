@@ -1,7 +1,7 @@
-"""Project-relative path grammar and Unicode name-equivalence (design §5.4, A2 phases 3-4).
+"""Project-relative path grammar and Unicode name-equivalence.
 
 Purely lexical: nothing here consults a filesystem. Resolution, containment, and
-volume-specific name folding are A4's (design §6).
+volume-specific name folding are the filesystem layer's.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ def require_rel_path(kind: str, value: str) -> str:
     """Return ``value`` if it is a well-formed project-relative path, else raise.
 
     The caller guarantees ``value`` is a ``str``; compiler phase 1 is the type gate, so
-    this function performs no defensive type check (design §6).
+    this function performs no defensive type check.
     """
     if not value:
         raise SpecValidationError(f"{kind} may not be empty")
@@ -45,5 +45,5 @@ def require_rel_path(kind: str, value: str) -> str:
 
 
 def portability_equivalence_key(value: str) -> str:
-    """Return A2's fixed Unicode portability key for a path or effect ID."""
+    """Return the spec compiler's fixed Unicode portability key for a path or effect ID."""
     return unicodedata.normalize("NFC", unicodedata.normalize("NFC", value).casefold())

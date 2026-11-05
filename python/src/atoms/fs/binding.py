@@ -1,4 +1,4 @@
-"""Project volume binding: the live resource and its frozen evidence (design §9)."""
+"""Project volume binding: the live resource and its frozen evidence."""
 
 from __future__ import annotations
 
@@ -187,7 +187,7 @@ def bind_project_volume(
 ) -> ProjectBinding:
     """Bind one project volume. The allowlist parameter is required and keyword-only.
 
-    Steps 1-5 are read-only beyond the bootstrap design §5.5 permits, so a
+    Steps 1-5 are read-only beyond the bootstrap the specification permits, so a
     non-allowlisted volume is refused before the probe writes anything. Reclamation
     at step 4 nevertheless precedes that refusal, so pre-existing attributable
     debris is still removed from a configuration that is no longer certified.
@@ -255,20 +255,20 @@ def bind_project_volume(
                 parent_fd=probe_fd,
             )
         finally:
-            # Design §9.1 step 8 runs in a finally, not on the success path. A SQLite
+            # Contract:  runs in a finally, not on the success path. A SQLite
             # refusal, a subprocess timeout, or an unexpected errno are exactly the
             # paths that skip a success-only cleanup, and each would strand debris in
             # engine-owned space. If reclamation itself fails while another exception
             # is unwinding, that failure surfaces with the original as its __context__:
             # a broken metadata_root is worth reporting, and the next lease entry
-            # (ledger #17) reclaims again under the same held lock.
+            # reclaims again under the same held lock.
             #
             # Reclamation sits in the OUTER finally so a failing descriptor release
             # cannot skip it — releasing and reclaiming are independent obligations,
             # and the one that leaves state on disk is the one that must not be
             # conditional on the other. close_layout likewise attempts every
             # descriptor rather than abandoning the rest after the first failure, and
-            # releases them in reverse opening order per design §9.3.
+            # releases them in reverse opening order per the specification.
             try:
                 close_layout(backend, retained)
             except OSError as first:

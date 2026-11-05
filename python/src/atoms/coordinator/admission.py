@@ -1,4 +1,4 @@
-"""The transaction admission gate (design §6)."""
+"""The transaction admission gate."""
 
 from __future__ import annotations
 
@@ -24,13 +24,13 @@ from atoms.fs.topology import (
     ApprovedPlannedDirectory,
 )
 
-#: Design §6.3. A constant so a test can drive the loop to exhaustion; an unbounded
+#: Contract: . A constant so a test can drive the loop to exhaustion; an unbounded
 #: loop would have no reachable refusal to test.
 SCRATCH_ATTEMPTS = 3
 
 
 def new_txid() -> str:
-    """Thirty-two hex characters satisfy A1's `^[A-Za-z0-9_-]{1,64}$`.
+    """Thirty-two hex characters satisfy the core model's `^[A-Za-z0-9_-]{1,64}$`.
 
     The coordinator owns generation because it is the only layer that can know a
     regeneration is needed; the consumer never holds one.
@@ -39,7 +39,7 @@ def new_txid() -> str:
 
 
 def _require_admitted(lease: Lease, approved: ProjectApprovedSpec) -> None:
-    """Ledger #9's enforcement half, in one place.
+    """the boundary contract enforcement half, in one place.
 
     Every post-approval transaction-stage entry point opens with this call, and Task 9's
     architecture guard asserts that it is each one's first statement. Stated once rather
@@ -48,7 +48,7 @@ def _require_admitted(lease: Lease, approved: ProjectApprovedSpec) -> None:
     if type(approved) is not ProjectApprovedSpec:
         raise ProtocolError(
             f"expected exactly ProjectApprovedSpec, got {type(approved).__name__}; a "
-            "raw TransactionSpec, CompiledSpec, or synthetic A3 snapshot carries no "
+            "raw TransactionSpec, CompiledSpec, or synthetic recovery snapshot carries no "
             "rooted project proof"
         )
     if approved.binding is not lease._binding:
@@ -61,9 +61,9 @@ def _require_admitted(lease: Lease, approved: ProjectApprovedSpec) -> None:
 
 
 def admit(lease: Lease, compiled: CompiledSpec) -> ProjectApprovedSpec:
-    """Design §6.3.
+    """Contract: .
 
-    Approval lives inside the loop because ledger #21 says regeneration voids the
+    Approval lives inside the loop because the boundary contract says regeneration voids the
     proof: each attempt produces a wholly fresh one, and names are never substituted
     into an existing proof.
     """
@@ -89,7 +89,7 @@ def admit(lease: Lease, compiled: CompiledSpec) -> ProjectApprovedSpec:
 
 
 def _parent_paths(approved: ProjectApprovedSpec) -> dict[TopologyNode, str]:
-    """Design §6.4's node-to-path table, for the project-space branches only.
+    """Contract:  node-to-path table, for the project-space branches only.
 
     Every scratch leaf shares its target's parent, and that target is itself an
     `ApprovedPath`, so the second assignment is what makes this table total: a parent
@@ -126,7 +126,7 @@ def _approved_path_for(approved: ProjectApprovedSpec, path: str) -> ApprovedPath
 def _require_matches_approval(
     observed: ChildObservation, entry: object, label: str
 ) -> None:
-    """Ledger #19: the proof is the expected baseline, never current authority."""
+    """the boundary contract: the proof is the expected baseline, never current authority."""
     if type(entry) is not ApprovedExistingDirectory:
         raise ProtocolError(
             f"parent {label!r} is not approved as an existing directory; the proof "
@@ -164,12 +164,12 @@ def _require_planned_absent(
     directories: dict[TopologyNode, object],
     node: TopologyNode,
 ) -> None:
-    """Design §6.4 branch two.
+    """Contract:  branch two.
 
     An `ApprovedPlannedDirectory` carries constraints but no identity, because the
     directory did not exist when the proof was issued. If it exists now there is
     nothing to compare it against, so this refuses rather than observing it as a
-    parent -- UNLESS the timeline itself declares an occupant there (design §8.2): a
+    parent -- UNLESS the timeline itself declares an occupant there: a
     present entry that the proof's own first declared state already accounts for is the
     proof being right, not drift, and capture verifies it coherently against that same
     declared state through a descriptor. It observes the planned directory only as a
@@ -192,7 +192,7 @@ def _require_planned_absent(
     if observed.present:
         first_state = _declared_first_state(approved, path)
         if first_state is not None and type(first_state) is not AbsentState:
-            # Design §8.2. The timeline declares an occupant here and A4b already
+            # Contract: . The timeline declares an occupant here and path resolution and project approval already
             # approved that state against disk, so presence is the proof being right.
             # Capture verifies the blocker against this same first declared state,
             # through a descriptor; admission holds only a presence bit and must not
@@ -206,7 +206,7 @@ def _require_planned_absent(
 
 
 def _observe_work_slot(lease: Lease, approved: ProjectApprovedSpec) -> bool:
-    """Ledger #19 for metadata space: re-resolve `work/` against `approved.work_base`.
+    """the boundary contract for metadata space: re-resolve `work/` against `approved.work_base`.
 
     Returns whether `work/<txid>` is present. Identity or constraint drift raises
     instead: a moved work base is not something a fresh txid would fix, so it must not
@@ -246,7 +246,7 @@ def _require_work_slot_free(lease: Lease, approved: ProjectApprovedSpec) -> None
 
 
 def _occupied_scratch(lease: Lease, approved: ProjectApprovedSpec) -> tuple[str, ...]:
-    """Design §6.4. The proof is the expected baseline and never current authority."""
+    """Contract: . The proof is the expected baseline and never current authority."""
     mapping = _parent_paths(approved)
     directories: dict[TopologyNode, object] = {
         entry.node: entry for entry in approved.directories
@@ -282,10 +282,10 @@ def _occupied_scratch(lease: Lease, approved: ProjectApprovedSpec) -> tuple[str,
 
 @contextlib.contextmanager
 def _translated_resolution() -> Iterator[None]:
-    """Design §6.4.
+    """Contract: .
 
     `resolve.py` raises `ProjectApprovalRefused` and `CapabilityUnavailable` -- correct
-    at approval time, wrong afterwards. A post-approval divergence is drift, and §9
+    at approval time, wrong afterwards. A post-approval divergence is drift, and the specification
     requires `PreconditionRefused`. Stated categorically over the refusal types the
     resolver declares, so it cannot drift as `resolve.py` grows, and it never wraps
     `approve_for_project`, whose refusals are genuine. `PreconditionRefused` and

@@ -1,4 +1,4 @@
-"""Semantic filesystem capability vocabulary (design §5.5), expressed as data."""
+"""Semantic filesystem capability vocabulary, expressed as data."""
 
 from __future__ import annotations
 

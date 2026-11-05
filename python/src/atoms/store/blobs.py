@@ -1,4 +1,4 @@
-"""Content-addressed blobs under the engine-owned metadata root (design §7.2, §8)."""
+"""Content-addressed blobs under the engine-owned metadata root."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ _COMMIT_SQL = "COMMIT"
 
 @dataclass(frozen=True, slots=True)
 class StagedBlob:
-    """One entry of a promotion manifest. Deliberately unguarded (design §7.1)."""
+    """One entry of a promotion manifest. Deliberately unguarded."""
 
     name: str
     digest: str
@@ -42,7 +42,7 @@ class StagedBlob:
 
 
 def require_digest(value: object) -> str:
-    """Design §5.5: exact str, then the grammar."""
+    """Contract: exact str, then the grammar."""
     if type(value) is not str:
         raise ProtocolError(f"a digest must be exactly str, got {type(value).__name__}")
     if DIGEST_PATTERN.fullmatch(value) is None:

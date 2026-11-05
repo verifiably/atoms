@@ -217,7 +217,7 @@ class _OutsideVocabulary(PreconditionRefused):
     """Module-private: `_capture_path` observed an entry outside the closed
     path-state vocabulary. A subclass so existing callers keep catching
     `PreconditionRefused` unchanged while `read_path_state` can classify the
-    refusal without message inspection (holdings read design §3)."""
+    refusal without message inspection (holdings read the specification)."""
 
 
 def _capture_path(
@@ -245,7 +245,7 @@ def _capture_path(
         if type(observed) is ObservedAbsent:
             return ABSENT
         if type(observed) not in (ObservedFile, ObservedDirectory, ObservedSymlink):
-            # The PathState vocabulary is closed by authority §6: an unrepresentable or
+            # The PathState vocabulary is closed by the specification: an unrepresentable or
             # unreadable entry is refused, never coerced to ABSENT and never widened.
             raise _OutsideVocabulary(
                 f"{path!r} was observed as {type(observed).__name__}, which is outside "
@@ -257,7 +257,7 @@ def _capture_path(
 
 
 def _require_capture_paths(value: object) -> tuple[str, ...]:
-    """Design §9.2. Sortedness is `registered_surface`'s requirement, not capture's."""
+    """Contract: . Sortedness is `registered_surface`'s requirement, not capture's."""
 
     if type(value) is not tuple or any(type(path) is not str for path in value):
         raise PreconditionRefused("paths must be an exact tuple of exact strings")
@@ -274,7 +274,7 @@ def _require_capture_paths(value: object) -> tuple[str, ...]:
 
 
 def _require_no_pending(entries: tuple[tuple[str, Entry], ...]) -> None:
-    """Design §10: an unsettled chain is not a chain you may mutate.
+    """Contract: an unsettled chain is not a chain you may mutate.
 
     Post-recovery this is honest: a durable registration always had a durable record
     before it, so a registration still unsettled after resolution has no record left to
@@ -292,7 +292,7 @@ def _require_no_pending(entries: tuple[tuple[str, Entry], ...]) -> None:
 def _require_admissible_fulfills(
     entries: tuple[tuple[str, Entry], ...], fulfills: str | None
 ) -> None:
-    """Design §11.2's two independent submission checks, before any record exists.
+    """Contract:  two independent submission checks, before any record exists.
 
     The referent check is the core's own predicate at the index the registration is
     about to occupy, so "membership in the validated chain" and the inspection's
@@ -330,7 +330,7 @@ def _inspect_under(
     raises where this must classify, so it stays exactly as it is for the three
     mutators and `read_chain`. A record that contradicts the chain keeps raising --
     that is a claim about the metadata store, which detached mode by construction
-    cannot see, so giving it a taxonomy row would fork the taxonomy (design §12).
+    cannot see, so giving it a taxonomy row would fork the taxonomy.
     """
 
     try:
@@ -354,7 +354,7 @@ def _inspect_under(
     scan = _cast(ChainScan, scanned)
     if after_resolution and scan.staged is not None:
         # `resolve` adjudicates every survivor; one that outlives it is the existing
-        # engine-internal impossibility, not a fifteenth defect (design §8).
+        # engine-internal impossibility, not a fifteenth defect.
         raise ChainStateInvalid("chain staging appeared after lease resolution")
     result = _inspect_scan(scan)
     if type(result) is AbsentChain and store.read_active() is not None:
@@ -367,7 +367,7 @@ def _inspect_under(
 def _inspect_detached(
     backend: AuditedBackend, project_root_fd: int
 ) -> ChainInspection:
-    """The same table under strictly less evidence: no store to consult (design §7.2)."""
+    """The same table under strictly less evidence: no store to consult."""
 
     try:
         chain_fd = backend.open_child_directory(project_root_fd, CHAIN_LEAF)
@@ -692,7 +692,7 @@ def read_lifecycle_state(
     """The closed five-value lifecycle union, validated while reading.
 
     Never creates or upgrades a root, metadata directory, lock, database,
-    schema, row, or WAL (lifecycle design §7).
+    schema, row, or WAL.
     """
     return _lifecycle_view(backend, root, metadata_root, storage).state
 
@@ -857,7 +857,7 @@ def read_chain(
         LifecycleState.READ_ONLY_UNSERVICEABLE,
     ):
         # The non-writable read: quiescent, coherent under the held lock,
-        # never activating recovery (lifecycle design §7).
+        # never activating recovery.
         if view.schema_version == 2:
             raise PreconditionRefused(
                 "a pre-lifecycle version-2 store cannot be read coherently; "
@@ -912,7 +912,7 @@ def inspect_chain(
     metadata_root: str,
     storage: StorageProfile,
 ) -> ChainInspection:
-    """Render a structural verdict about a registered root's chain (design §6.2).
+    """Render a structural verdict about a registered root's chain.
 
     Lock, reclaim probe survivors, bind, open store, reclaim orphans, **inspect**;
     malformed returns without resolving, because recovery must never run over damage.
@@ -1032,7 +1032,7 @@ def capture_states(
         audited.close_fd(root_fd)
 
 
-# --- The lease-held single-path read (holdings read/evidence design §3–§4) ---
+# --- The lease-held single-path read (holdings read/evidence the specification–the specification) ---
 
 
 class NotAttemptedReason(enum.StrEnum):
@@ -1076,7 +1076,7 @@ def _observe_path(
     Routine failures translate; non-routine failures propagate whatever their
     position, under `translated_lookup`'s exact errno classification — the raw
     ancestor opens and descriptor cleanup in `_capture_path` sit outside its
-    wrappers, so the classification is applied here as well (design §3).
+    wrappers, so the classification is applied here as well.
     """
     try:
         with Observation(backend) as observation:
@@ -1108,7 +1108,7 @@ def read_path_state(
     storage: StorageProfile,
     path: str,
 ) -> PathReadResult:
-    """Observe exactly one named path under the held boundary (design §3).
+    """Observe exactly one named path under the held boundary.
 
     Never creates or upgrades a root, metadata directory, lock, database,
     schema, row, or WAL. The normative translation table in the design decides
@@ -1278,7 +1278,7 @@ class _CopySource:
 def _quiescent_read_only_root(backend, root: str, metadata_root: str):
     """A held existing metadata lock plus a detached-audited validated chain.
 
-    The non-writable read path (lifecycle design §7): no probe, reclamation,
+    The non-writable read path: no probe, reclamation,
     recovery, writable open, or sidecar write. Any state that would need
     recovery refuses instead.
     """
@@ -1856,7 +1856,7 @@ def _plan_copy(
     # The source spellings canonicalize without requiring existence: a
     # tree-durable or complete retry never opens the source, and a moved or
     # missing source must not block the suffix destination evidence can
-    # finish (design §9). The paths that DO need the source raise their own
+    # finish. The paths that DO need the source raise their own
     # OSError when they open it.
     source_canonical, _ = _lifecycle.canonical_absent_ok(backend, source_root)
     source_metadata_canonical, _ = _lifecycle.canonical_absent_ok(
@@ -2064,7 +2064,7 @@ def grant_read_serviceability(
     metadata_root: str,
     storage: StorageProfile,
 ) -> None:
-    """Structural read admission (lifecycle design §12): no verdict channel,
+    """Structural read admission: no verdict channel,
     no attestation, no writable grant, and no write when already granted."""
     root_fd, _root_canonical, _ = establish_root(backend, root, create=False)
     backend.close_fd(root_fd)
@@ -2119,7 +2119,7 @@ def migrate_root_to_lifecycle_v3(
     storage: StorageProfile,
 ) -> None:
     """The version-exact operator act: invoking it is the attestation that
-    this host is the pre-lifecycle minting host (lifecycle design §13)."""
+    this host is the pre-lifecycle minting host."""
     root_fd, root_canonical, _ = establish_root(backend, root, create=False)
     backend.close_fd(root_fd)
     view = _lifecycle_view(backend, root, metadata_root, storage)

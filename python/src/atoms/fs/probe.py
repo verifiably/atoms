@@ -1,4 +1,4 @@
-"""Empirical capability probing (design §8).
+"""Empirical capability probing.
 
 These are FUNCTIONAL probes, not conformance tests. They establish that an
 operation is present and behaves correctly on this volume right now; they cannot
@@ -29,7 +29,7 @@ from atoms.fs.volume import MountEntry, VolumeConfiguration
 
 
 class ChildExit:
-    """Exit codes the §8.3 certification children use to report a specific verdict.
+    """Exit codes the the specification certification children use to report a specific verdict.
 
     Named rather than literal so a later reordering cannot silently remap "refused
     with the wrong result code" onto "read the wrong value" — two very different
@@ -64,7 +64,7 @@ def _refused_with(backend: Backend, expected: int, open_attempt) -> bool:
     A guard is proved by the exact errno it refuses with, never by "some OSError
     happened". Accepting any error here would let a volume failing for an unrelated
     reason — EBADF from a descriptor bug, EIO from failing media — report the guard
-    as working, which is design §10's propagation rule read backwards. Anything
+    as working, which is the specification propagation rule read backwards. Anything
     other than `expected` therefore propagates.
 
     `open_attempt` returns a descriptor when the guard fails to refuse; it is closed
@@ -349,7 +349,7 @@ def probe_backend(
         reclaim_probe_survivors(lock)
 
 
-# Design §8.3 steps 4-5: read the parent's committed state concurrently with the
+# Contract: -5: read the parent's committed state concurrently with the
 # parent's held write lock, then require the write lock to refuse. busy_timeout is 0
 # so the refusal is immediate rather than a wait.
 _CHILD_CONTENDER = f"""
@@ -372,7 +372,7 @@ except sqlite3.OperationalError as caught:
 sys.exit({ChildExit.ACQUIRED_WHILE_HELD})
 """
 
-# Design §8.3 step 7, run only after the parent has committed. A SEPARATE invocation:
+# Contract: , run only after the parent has committed. A SEPARATE invocation:
 # the parent cannot wait for a child that is itself waiting for the parent's commit.
 _CHILD_WRITER = f"""
 import sqlite3, sys
@@ -398,10 +398,10 @@ def _run_child(
 ) -> subprocess.CompletedProcess:
     """Run one certification child under a bounded timeout.
 
-    A child that does not finish is a REFUSAL, not an escaping error. Design §8.3 puts
+    A child that does not finish is a REFUSAL, not an escaping error. Contract:  puts
     every certification failure under CapabilityUnavailable, and a TimeoutExpired
     reaching the caller would put the one failure mode a broken-locking volume is most
-    likely to produce outside the §10 contract — handing A5 a third exception type to
+    likely to produce outside the the specification contract — handing the metadata store a third exception type to
     know about for no gain. Only TimeoutExpired is caught: an OSError from spawning the
     interpreter is a bug in this process, not a verdict about the volume.
 
@@ -537,7 +537,7 @@ def certify_sqlite_wal(
     backend: Backend | None = None,
     parent_fd: int | None = None,
 ) -> None:
-    """Certify the volume can host the SQLite-WAL metadata store (design §8.3).
+    """Certify the volume can host the SQLite-WAL metadata store.
 
     Opening a database and selecting WAL mode is insufficient: WAL can operate
     without shared memory when SQLite runs in exclusive locking mode. The second
@@ -575,7 +575,7 @@ def certify_sqlite_wal(
 
 @dataclass(frozen=True, slots=True)
 class CertifiedVolume:
-    """What makes two binds the same volume for WAL hostability (2026-10-15 design §3).
+    """What makes two binds the same volume for WAL hostability (2026-10-15 the specification).
 
     `entry` carries every mount and superblock option, not only the barrier subset
     `configuration` keeps: locking- and mapping-relevant options (`nolock`, `dax`,
@@ -606,7 +606,7 @@ def certify_volume(
     backend: Backend,
     parent_fd: int,
 ) -> None:
-    """Certify `volume` unless this process already has (A4a §8.3, §9.1 step 7).
+    """Certify `volume` unless this process already has.
 
     Only success is recorded: a refusal, a timeout, or any other exception leaves
     the key out, so a failing volume refuses on every bind. Two threads binding the

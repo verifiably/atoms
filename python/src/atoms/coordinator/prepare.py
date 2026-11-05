@@ -1,4 +1,4 @@
-"""Authority §7.3 steps 2-4 (design §7)."""
+"""Contract: -4."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from atoms.store.workspace import Workspace
 
 
 def open_workspace(lease: Lease, approved: ProjectApprovedSpec) -> Workspace:
-    """Ledger #19: re-resolve the work base before creating anything under it."""
+    """the boundary contract: re-resolve the work base before creating anything under it."""
     _require_admitted(lease, approved)
     if approved.work_base is not None:
         _require_work_slot_free(lease, approved)
@@ -24,13 +24,12 @@ def prepare_transaction(
     workspace: Workspace,
     manifest: tuple[StagedBlob, ...],
 ) -> None:
-    """Apply the gate set, then authority §7.3 steps 2-4 in one transaction."""
+    """Apply the gate set, then the specification-4 in one transaction."""
     _require_admitted(lease, approved)
     if workspace.txid != approved.txid:
         raise ProtocolError(
             f"workspace txid {workspace.txid!r} does not match the proof's "
-            f"{approved.txid!r}; ledger #21 forbids executing a proof under any other "
-            "txid"
+            f"{approved.txid!r}; executing a proof under any other txid is forbidden"
         )
 
     with lease._store.transaction() as txn:

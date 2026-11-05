@@ -1,4 +1,4 @@
-"""Root establishment and the advisory project lock (design §5.4, §7.1)."""
+"""Root establishment and the advisory project lock."""
 
 from __future__ import annotations
 
@@ -59,7 +59,7 @@ def _guarded_spelling(path: str) -> str:
 
 
 def _guarded_open(backend: Backend, path: str) -> int:
-    """open_root, converting an unavailable guarded walk per design §10.
+    """open_root, converting an unavailable guarded walk per the specification.
 
     Reads the shared backend table rather than a local copy, so a kernel without
     openat2 surfaces identically here and in the probe.
@@ -257,7 +257,7 @@ def try_acquire_project_lock(
 ) -> HeldProjectLock | None:
     """Create-if-needed acquisition that never blocks: None when busy.
 
-    The copy commands' destination discipline (lifecycle design §9): the
+    The copy commands' destination discipline: the
     source lock is held blocking, the destination lock is only ever tried,
     so an opposite-direction pair cannot wait on each other.
     """

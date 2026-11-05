@@ -1,4 +1,4 @@
-"""Path-state fingerprints — the declared/observed state of a single path (design §6)."""
+"""Path-state fingerprints — the declared/observed state of a single path."""
 
 from __future__ import annotations
 

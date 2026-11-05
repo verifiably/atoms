@@ -1,4 +1,4 @@
-"""The held, re-validated descriptor table (design §5).
+"""The held, re-validated descriptor table.
 
 `RecoveryTopology.parents` is a rooted tree, so the table is a walk of it: each directory
 node is opened from its parent's held descriptor with ONE `open_child_directory` call,
@@ -10,16 +10,15 @@ The walk is not one pass. `_build_descriptor_table` is the initial descent, and 
 at every planned directory -- including, by inheritance, one whose parent is itself
 planned, which it cannot even look up. Two resumption points pick the walk back up once
 such a directory gains a descriptor, both through `_register_planned_children`: recovery,
-via `_resume_descent`, and forward execution, where A7's `_apply_effect` adopts the
-descriptor a `CreateDirectory` effect retained (§9.5's descendant handoff). A planned
+via `_resume_descent`, and forward execution, where the effect executor's `_apply_effect` adopts the
+descriptor a `CreateDirectory` effect retained (the specification descendant handoff). A planned
 directory's `WalkStop` is therefore born either in the descent or at the moment its
 parent becomes reachable, never anywhere else.
 
 The tree gives structure, not spelling: `TopologyDirectory(node_id)` carries no name, so
 the walk builds its own node-to-path table, `_directory_paths`, by climbing
 `approved.topology.parents` from each declared path up to a node it has already
-recorded. A5b's `_parent_paths` looks similar but is scoped to admission's own job
-(design §6.4): it maps only declared paths and their direct parent, not every
+recorded. the recovery lease's `_parent_paths` looks similar but is scoped to admission's own job: it maps only declared paths and their direct parent, not every
 undeclared intermediate directory `approved.directories` also names. Borrowing it here
 left the walk unable to name an ordinary undeclared ancestor directory at all.
 
@@ -29,7 +28,7 @@ first declared state. No errno is ever mapped to a kind: ENOTDIR does not distin
 regular file from a socket, FIFO, or device node.
 
 An approved-EXISTING directory that no longer opens is drift, not a stop -- a
-`TopologyDirectory` has no declared state for §8 to rule against -- so it refuses through
+`TopologyDirectory` has no declared state for the specification to rule against -- so it refuses through
 the narrow errno translation, and an undefined errno such as EIO propagates as itself.
 """
 
@@ -60,7 +59,7 @@ class WalkStop:
 
     `observed` is an `ObservedAbsent` when nothing occupies the name, and the real
     observed entry otherwise. Neither is adjudicated here: capture verifies both against
-    the timeline's first declared state (design §8).
+    the timeline's first declared state.
     """
 
     node: TopologyNode
@@ -73,9 +72,9 @@ class WalkStop:
 class DescriptorTable:
     """A live resource. Borrows the roots; owns only what it opened.
 
-    It outlives capture: §6 requires the engine to hold a descriptor to the project root
-    for the transaction's lifetime, and §9.5 hands each published directory's descriptor
-    down to its descendants. A table that died at capture's return would force A7 to
+    It outlives capture: the specification requires the engine to hold a descriptor to the project root
+    for the transaction's lifetime, and the specification hands each published directory's descriptor
+    down to its descendants. A table that died at capture's return would force the effect executor to
     re-resolve, reopening the race the whole section exists to close.
     """
 
@@ -192,7 +191,7 @@ def _build_descriptor_table(
     backend = binding.backend
     paths = _directory_paths(approved)
     # One map, both kinds. Every descriptor-bearing node has an approved record in
-    # `approved.directories`, including WorkRoot: A4b builds the topology with
+    # `approved.directories`, including WorkRoot: path resolution and project approval builds the topology with
     # ApprovedPlannedDirectory(WorkRoot(), inherited_constraints(work_base.constraints,
     # filesystem_type)) (`approval.py:155`, `topology.py:180`). `approved.work_base`
     # describes metadata_root/work -- the PARENT of work/<txid>, which is what
@@ -229,7 +228,7 @@ def _build_descriptor_table(
                 # A parent may lack a descriptor for exactly one reason: it stopped.
                 # `_walk_order` is shallowest-first, so any other absence is a walk-order
                 # defect, and calling it a stop would manufacture an absence inference
-                # out of a bug -- §8's whole basis is a *verified* blocker.
+                # out of a bug -- the specification whole basis is a *verified* blocker.
                 if parent not in stopped_nodes:
                     raise ProtocolError(
                         f"{node!r} was reached before its parent {parent!r} was opened "
@@ -239,7 +238,7 @@ def _build_descriptor_table(
                 continue
             component = _component(paths, parent, node)
             if node in planned:
-                # Looked up, not assumed. An occupied planned name must reach §8.2.
+                # Looked up, not assumed. An occupied planned name must reach the specification.
                 observed = observation.observe(
                     parent_fd, component, modeled=_modeled_children(paths, node)
                 )
@@ -254,15 +253,15 @@ def _build_descriptor_table(
                 )
                 # BOTH outcomes stop the walk. Absent, nothing is below it; occupied by
                 # a file or symlink, nothing is below it either -- neither holds
-                # directory entries, which is the whole basis of §8.2's inference. A
+                # directory entries, which is the whole basis of the specification inference. A
                 # planned node left unstopped would leave its descendants neither
                 # resolvable nor unreachable, and capture would raise ProtocolError on
-                # the very case §8.2 exists to accept.
+                # the very case the specification exists to accept.
                 stopped_nodes.add(node)
                 continue
             # An approved-EXISTING directory that no longer opens is drift, not a stop.
             # There is no declared state for a TopologyDirectory to be adjudicated
-            # against, so §8's branches could never rule on it; it refuses here.
+            # against, so the specification branches could never rule on it; it refuses here.
             try:
                 with translated_lookup(f"opening {component!r} for {node!r}"):
                     fd = backend.open_child_directory(parent_fd, component)
@@ -302,7 +301,7 @@ def _register_planned_children(
     marks it stopped-by-inheritance and moves on -- so nothing ever recorded a `WalkStop`
     for it, and `DescriptorTable.adopt` refuses any node that is not a stop. The stop can
     therefore only be born the moment its parent gains a descriptor, which is exactly
-    what §9.5's "handed to any descendant effect as that descendant's parent descriptor"
+    what the specification "handed to any descendant effect as that descendant's parent descriptor"
     describes. Both directions use this: recovery, through `_resume_descent`, and forward
     execution, right after `CreateDirectory` publishes and its descriptor is adopted.
 
@@ -399,8 +398,8 @@ def _directory_paths(approved: ProjectApprovedSpec) -> dict[TopologyNode, str]:
     edge is `TopologyParent(WorkRoot(), ProjectRoot())`, and no declared path is ever
     parented by it).
 
-    A5b's `_parent_paths` looks like this table but is not one: it maps only declared
-    paths and their direct parent (design §6.4's scope), so an intermediate directory
+    the recovery lease's `_parent_paths` looks like this table but is not one: it maps only declared
+    paths and their direct parent (the specification scope), so an intermediate directory
     that is nobody's own declared path -- an ordinary undeclared ancestor -- has no
     entry there. `approved.directories` names every directory prefix regardless, so
     this climbs `approved.topology.parents` from each declared path's parent up to a

@@ -1,4 +1,4 @@
-"""Authority §7.3 step 1 -- coherent capture (design §7, §8, §9).
+"""Contract: coherent capture.
 
 Everything here happens BEFORE the durable record exists, so no path halts. Errnos with a
 defined domain meaning translate (`translated_lookup`); every other OSError propagates
@@ -40,10 +40,10 @@ _READ_CHUNK = 1 << 20
 
 
 class PayloadSource(Protocol):
-    """The consumer's planned-postimage bytes (design §7.1).
+    """The consumer's planned-postimage bytes.
 
-    Authority §4.1 forbids the engine from reaching back into consumer plan formats and
-    §4.2 reserves staging-path derivation to the engine, so the bytes arrive
+    Contract:  forbids the engine from reaching back into consumer plan formats and
+    the specification reserves staging-path derivation to the engine, so the bytes arrive
     content-addressed: two effects writing identical content are supplied once, and the
     consumer never learns a staging path.
 
@@ -87,7 +87,7 @@ def capture_initial_surface(
     workspace: Workspace,
     payloads: PayloadSource,
 ) -> Captured:
-    """Authority §7.3 step 1 (design §7)."""
+    """Contract: ."""
     _require_admitted(lease, approved)
     # The workspace is authenticated before anything is written into it. `promote_staging`
     # already makes exactly these two checks (`blobs.py:332-335`), but it runs inside
@@ -134,7 +134,7 @@ def capture_initial_surface(
 def require_one_length_per_digest(
     pairs: tuple[tuple[str, int], ...],
 ) -> dict[str, int]:
-    """One byte_len per digest, checked BEFORE anything is written (design §7.2).
+    """One byte_len per digest, checked BEFORE anything is written.
 
     `compile_spec` validates each byte_len's range and the empty-hash correspondence but
     never cross-checks that one content_hash carries one byte_len -- measured. The staging
@@ -156,7 +156,7 @@ def require_one_length_per_digest(
 
 
 def _verify_stops(table: DescriptorTable, approved: ProjectApprovedSpec) -> None:
-    """Justify the absence of everything beneath each stop (design §8).
+    """Justify the absence of everything beneath each stop.
 
     Two routes, two branches, both selected by the DECLARED state and never by an errno.
     Conflating them would silently grant a symlink the file branch's coherence.
@@ -164,17 +164,17 @@ def _verify_stops(table: DescriptorTable, approved: ProjectApprovedSpec) -> None
     declared = _first_states(approved)
     for stop in table.stops:
         if type(stop.observed) is ObservedAbsent:
-            # §8.1: the planned directory's name is genuinely free.
+            # the specification: the planned directory's name is genuinely free.
             continue
         expected = declared.get(stop.path)
         if type(expected) is FileState:
-            # §8.2, descriptor-coherent: type, mode, and hash all from one descriptor.
+            # the specification, descriptor-coherent: type, mode, and hash all from one descriptor.
             # Stronger than the negative lookup it replaces.
             _require_declared(stop, ObservedFile, expected)
         elif type(expected) is SymlinkState:
-            # §8.2, NOT descriptor-coherent: lstat + readlink, no descriptor, no
+            # the specification, NOT descriptor-coherent: lstat + readlink, no descriptor, no
             # identity. The absence inference holds because a symlink holds no entries;
-            # the identity contract is deferred to A7's destructive transfer.
+            # the identity contract is deferred to the effect executor's destructive transfer.
             _require_declared(stop, ObservedSymlink, expected)
         else:
             raise PreconditionRefused(
@@ -217,7 +217,7 @@ def _stage_preimages(
         modeled = _modeled_children(paths, PersistentNode(path_entry.path))
         parent = path_entry.parent_node
         if table.is_unreachable(parent):
-            continue  # §8 already justified the absence of everything below the stop.
+            continue  # the specification already justified the absence of everything below the stop.
         parent_fd = table.fd_for(parent)
         expected = declared[path_entry.path]
         if type(expected) is FileState and expected.content_hash not in seen:
@@ -299,7 +299,7 @@ def _stage_payloads(
 def _require_staging_matches(
     workspace: Workspace, manifest: list[StagedBlob]
 ) -> None:
-    """On success, staging holds EXACTLY the manifest (design §7.4, criterion 10)."""
+    """On success, staging holds EXACTLY the manifest."""
     present = set(os.listdir(workspace.staging_fd))
     expected = {entry.name for entry in manifest}
     if present != expected:
@@ -315,9 +315,9 @@ def _open_sink(backend, workspace: Workspace, name: str) -> int:
         return backend.create_exclusive(workspace.staging_fd, name, 0o600)
     except FileExistsError as caught:
         raise PreconditionRefused(
-            f"staging/{workspace.txid}/{name} is already occupied; authority §11 names "
-            "pre-existing external occupancy of an engine-derived scratch leaf a clean "
-            "refusal, and it need not be concurrent"
+            f"staging/{workspace.txid}/{name} is already occupied; pre-existing external "
+            "occupancy of an engine-derived scratch leaf is refused cleanly and need not "
+            "be concurrent"
         ) from caught
 
 

@@ -1,4 +1,4 @@
-"""Typed record read/write and the durable encoding of A3's halt diagnostic (design §6.4, §7)."""
+"""Typed record read/write and the durable encoding of the recovery model's halt diagnostic."""
 
 from __future__ import annotations
 
@@ -95,8 +95,8 @@ def _entry_obj(entry: DiagnosticEntry) -> dict[str, Any]:
 
 
 def encode_diagnostic(diagnostic: HaltDiagnostic) -> str:
-    """Explicit, field by field. Nothing here reflects over the dataclass, so a field A3
-    adds does not silently become durable (ledger #12)."""
+    """Explicit, field by field. Nothing here reflects over the dataclass, so a field the recovery model
+    adds does not silently become durable."""
     return json.dumps(
         {
             "pre_halt_state": diagnostic.pre_halt_state.value,
@@ -152,8 +152,8 @@ def _text(obj: dict[str, Any], key: str) -> str:
     `halt_diagnostic` is a bare TEXT column -- no CHECK, nothing SQLite verifies -- so
     the decoder is the whole boundary for it, and a decoder that copies a field through
     unexamined builds a `HaltDiagnostic` whose `effect_id` is an int. That is not
-    corruption A5b can see: it type-checks, it round-trips, and it fails somewhere much
-    later in A3.
+    corruption the recovery lease can see: it type-checks, it round-trips, and it fails somewhere much
+    later in the recovery model.
     """
     value = obj[key]
     if type(value) is not str:
@@ -177,7 +177,7 @@ def _flag(obj: dict[str, Any], key: str) -> bool:
 
 
 def _optional_text(obj: dict[str, Any], key: str) -> str | None:
-    """A field A3 declares as `str | None`. Null is a *value* here, not a missing field.
+    """A field the recovery model declares as `str | None`. Null is a *value* here, not a missing field.
 
     `HaltDiagnostic.effect_id` is `str | None` and `DiagnosticEntry.has_unmodeled_child`
     is `bool | None` (`atoms/core/recovery/model.py`). Routing either through the
@@ -353,17 +353,17 @@ DELETE_ACTIVE = "DELETE FROM active"
 
 
 def require_identifier(label: str, value: object) -> str:
-    """Design §5.5, in two steps and in this order.
+    """Contract: , in two steps and in this order.
 
     `require_valid_identifier` raises SpecValidationError for '../x' and a raw TypeError
     for 3, None, and b'tx' -- measured for all four -- because it hands its argument
     straight to a compiled pattern. A TypeError from inside a validator is
-    indistinguishable from a bug in A5a's own code, and it is the response to the exact
-    input a hostile caller supplies. So A5a reuses A1's *predicate* and supplies its own
+    indistinguishable from a bug in the metadata store's own code, and it is the response to the exact
+    input a hostile caller supplies. So the metadata store reuses the core model's *predicate* and supplies its own
     refusal.
 
     Step 1 is what makes step 2 total: is_valid_identifier is only safe to call once the
-    argument is known to be a str. Exact type, per the A4b precedent at approval.py:96 --
+    argument is known to be a str. Exact type, per the path resolution and project approval precedent at approval.py:96 --
     a str subclass passes an isinstance gate and can then behave differently at the
     syscall.
     """
@@ -391,10 +391,10 @@ def require_member(label: str, value: Enum, enum_type: type[Enum]) -> str:
 
     Reading `.value` first is what made this necessary: `set_transaction_state(txid,
     "applied")` raised `AttributeError: 'str' object has no attribute 'value'` before any
-    check ran, and §9's table is explicit that a wrong exact type is `ProtocolError` --
+    check ran, and the specification table is explicit that a wrong exact type is `ProtocolError` --
     caller misuse -- not a stray attribute error from inside the store. `type(...) is not`
     rather than `isinstance`, matching every other exact-type gate here: a subclass of
-    `TransactionState` is not one of A3's members, and `IntEnum`-style coercions are
+    `TransactionState` is not one of the recovery model's members, and `IntEnum`-style coercions are
     exactly what STRICT columns exist to refuse.
 
     Returning the value rather than the member is what keeps the call site one line and
@@ -477,12 +477,12 @@ def referenced_digests(spec: TransactionSpec) -> tuple[tuple[str, int], ...]:
     Both surfaces AND every effect occurrence. An intermediate postimage -- the B of
     `ReplaceFile(p, A->B)` followed by `ReplaceFile(p, B->C)` -- appears in neither
     surface, so a surfaces-only scan made `connection.py`'s barrier refuse a promoted B
-    as unreferenced while A7 still needed the bytes.
+    as unreferenced while the effect executor still needed the bytes.
 
     Pairs, not digests: `compile_spec` validates each byte_len's range and the empty-hash
     correspondence but never cross-checks that one content_hash carries one byte_len, so
     a spec may declare the same digest at two lengths. Collapsing here would erase the
-    contradiction capture refuses on (A6 design §7.2).
+    contradiction capture refuses on (Contract: ).
     """
     states = [
         entry.state
@@ -544,7 +544,7 @@ def coherence_findings(connection: Any, txid: str) -> tuple[str, ...]:
     try:
         compile_spec(spec)
     except SpecValidationError as caught:
-        findings.append(_finding(RULE_SPEC_COMPILES, f"spec_json is a spec A2 would refuse: {caught}"))
+        findings.append(_finding(RULE_SPEC_COMPILES, f"spec_json is a spec compile_spec refuses: {caught}"))
     with translated("reading effect rows for coherence"):
         effect_rows = tuple(connection.execute(SELECT_EFFECTS, (txid,)))
     stored = {
@@ -655,7 +655,7 @@ def load_record(connection: Any, txid: str) -> StoredRecord | None:
     )
 
 
-# --- Root lifecycle and root-creation operation rows (design 2026-08-23 §5) ---
+# --- Root lifecycle and root-creation operation rows ---
 
 _HEX_LOWER = frozenset("0123456789abcdef")
 

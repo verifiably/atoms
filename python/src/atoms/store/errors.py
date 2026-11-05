@@ -1,4 +1,4 @@
-"""The one refusal A5a adds, and the narrow translation that produces it (design §9)."""
+"""The one refusal the metadata store adds, and the narrow translation that produces it."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ class MetadataStoreInvalid(AtomsError):
     Corruption and forward incompatibility share one type because they share one correct
     response -- stop and preserve evidence -- and the message distinguishes them. Raised
     by the store layer, never as a substitute for ProtocolError, which tells a caller to
-    fix its call (authority §11).
+    fix its call.
     """
 
 

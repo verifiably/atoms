@@ -183,9 +183,9 @@ def _check_scenario_row_types_and_bonus() -> None:
         else:
             raise AssertionError(f"boolean {field} was accepted")
     if not guest_init._same_inode_95({(1, 2)}, {(1, 2)}):
-        raise AssertionError("the §9.5 same-inode tuple was missed")
+        raise AssertionError("the work-directory same-inode tuple was missed")
     if guest_init._same_inode_95({(1, 2)}, {(1, 3)}):
-        raise AssertionError("different directory inodes were tagged as §9.5")
+        raise AssertionError("different directory inodes were tagged as same-inode work-directory state")
 
 
 def _check_record_boundaries_and_guest_evidence() -> None:
@@ -568,7 +568,7 @@ def run() -> int:
         ("mapper creation rolls back after node failure", _check_mapper_rollback),
         ("scenario selection and declared prefix cap", _check_scenario_selection_and_cap),
         ("acceleration argv and serial parsing", _check_acceleration_and_serial_parsing),
-        ("scenario row types and §9.5 bonus detection", _check_scenario_row_types_and_bonus),
+        ("scenario row types and same-inode work-directory detection", _check_scenario_row_types_and_bonus),
         ("record boundaries and exact guest evidence", _check_record_boundaries_and_guest_evidence),
         ("record lands only after the complete matrix", _check_record_lands_only_after_the_complete_matrix),
         ("guest failure cancels queued work", _check_queued_guests_are_cancelled),

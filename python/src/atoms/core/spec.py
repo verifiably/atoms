@@ -1,4 +1,4 @@
-"""The internal TransactionSpec and its canonicalizing builder (design §5.1)."""
+"""The internal TransactionSpec and its canonicalizing builder."""
 
 from __future__ import annotations
 
@@ -88,7 +88,7 @@ def build_spec(
     """Construct a spec in canonical form.
 
     Imposes deterministic ordering only; it does not validate (that is compilation
-    validation, design §5.4).
+    validation, the specification).
     """
     deps = tuple(sorted(Dependency(before=before, after=after) for before, after in dependencies))
     return TransactionSpec(

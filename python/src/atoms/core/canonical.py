@@ -1,4 +1,4 @@
-"""Deterministic canonical serialization of a TransactionSpec (design §13.3, §7.2)."""
+"""Deterministic canonical serialization of a TransactionSpec."""
 
 from __future__ import annotations
 
@@ -130,7 +130,7 @@ def canonical_obj(spec: TransactionSpec) -> dict[str, Any]:
     # Set-like fields (surfaces keyed by path; dependencies) are sorted here so canonical
     # bytes are a pure function of content, independent of a spec's tuple order — even a
     # spec built directly, bypassing build_spec. `effects` is an ordered sequence (its
-    # order is semantic, design §5.2) and is emitted as-is.
+    # order is semantic, the specification) and is emitted as-is.
     initial = sorted(spec.initial_surface, key=lambda e: e.path)
     final = sorted(spec.final_surface, key=lambda e: e.path)
     deps = sorted(spec.dependencies, key=lambda d: (d.before, d.after))

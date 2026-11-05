@@ -1,6 +1,6 @@
 """Root lifecycle: fail-closed writer state, binding, and creation evidence.
 
-Design 2026-08-23 (docs/2026-08-23-root-lifecycle-commands-design.md, approved
+Design 2026-08-23 (docs/protocol.md#root-lifecycle, approved
 at `b1469f4`). Writability is a durable grant in the host's own `atoms.db`,
 bound to the stable machine identity and the canonical root path; the closed
 `LifecycleState` union is what every consumer reads, and every cooperative
@@ -105,7 +105,7 @@ class RootOperationInvalid(AtomsError):
     """Durable operation evidence and destination tree cannot be reconciled."""
 
 
-# --- Stable machine identity and canonical paths (design §4.2) ---
+# --- Stable machine identity and canonical paths ---
 
 
 def _read_machine_identity() -> str:
@@ -151,7 +151,7 @@ def _require_storage(storage: object) -> StorageProfile:
     return storage
 
 
-# --- The one canonical serializer (design §5.1) ---
+# --- The one canonical serializer ---
 
 
 def _validate_canonical_value(value: object, label: str) -> None:
@@ -269,7 +269,7 @@ class OperationRequest:
         )
 
 
-# --- The root-local claim (design §5.1) ---
+# --- The root-local claim ---
 
 
 def encode_claim(operation_id: str, request: OperationRequest) -> bytes:
@@ -402,7 +402,7 @@ def remove_root_claim(
     backend.flush_directory(root_fd)
 
 
-# --- Snapshot proof (design §5.2) ---
+# --- Snapshot proof ---
 
 
 def _state_of_entry(
@@ -506,7 +506,7 @@ def tree_snapshot(
     return OperationRequest.of(obj)
 
 
-# --- Read-only classification (design §7) ---
+# --- Read-only classification ---
 
 _RO_PRAGMAS = (
     ("application_id", "PRAGMA application_id"),
@@ -781,7 +781,7 @@ def read_state(
             backend.close_fd(root_fd)
 
 
-# --- Completion seam (design §5) ---
+# --- Completion seam ---
 
 
 def _complete_root_operation(store: object, *, final_state: str) -> None:
@@ -797,7 +797,7 @@ def _complete_root_operation(store: object, *, final_state: str) -> None:
         txn.set_root_operation_phase("complete")
 
 
-# --- Copy requests and boundary validation (design §5.1, §6.1) ---
+# --- Copy requests and boundary validation ---
 
 
 def replicate_request(
@@ -952,7 +952,7 @@ def require_nonoverlapping(paths: dict[str, str]) -> None:
                 )
 
 
-# --- Claim publication and the copy pipeline seams (design §5.1, §9) ---
+# --- Claim publication and the copy pipeline seams ---
 
 
 def _publish_claimed_destination(
@@ -1223,7 +1223,7 @@ def _copy_tree(
                 dest_backend.close_fd(fd)
 
 
-# --- Serviceability transition and the v2 migration (design §12, §13) ---
+# --- Serviceability transition and the v2 migration ---
 
 
 def _open_writable_store(metadata_root_path: str) -> sqlite3.Connection:

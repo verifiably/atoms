@@ -1,4 +1,4 @@
-"""Per-directory lookup constraints (A4b-1 design §5).
+"""Per-directory lookup constraints (path resolution and project approval-1 the specification).
 
 Linux and ext4 only, deliberately. FS_IOC_GETFLAGS reports *that* an ext4 directory
 casefolds but never *which* Unicode version governs the comparison: the encoding lives

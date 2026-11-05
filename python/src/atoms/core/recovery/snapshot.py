@@ -161,7 +161,7 @@ def required_scratch_role(effect: object) -> ScratchRole:
     try:
         return _ROLE_BY_EFFECT[type(effect)]
     except KeyError as exc:
-        raise ProtocolError("compiled effect variant is outside A3's closed set") from exc
+        raise ProtocolError("compiled effect variant is outside the recovery model's closed set") from exc
 
 
 def persistent_map(snapshot: RecoverySnapshot) -> dict[str, ObservedEntry]:

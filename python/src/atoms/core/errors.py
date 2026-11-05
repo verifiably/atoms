@@ -1,4 +1,4 @@
-"""Engine error hierarchy (design §11)."""
+"""Engine error hierarchy."""
 
 
 class AtomsError(Exception):
@@ -10,11 +10,11 @@ class ProtocolError(AtomsError):
 
 
 class SpecValidationError(AtomsError):
-    """A TransactionSpec failed compilation validation (design §5.4)."""
+    """A TransactionSpec failed compilation validation."""
 
 
 class ProjectApprovalRefused(AtomsError):
-    """The rooted project proof failed (design §5.4).
+    """The rooted project proof failed.
 
     Distinct from SpecValidationError because the two proof stages are deliberately
     non-substitutable: a caller must not be able to catch one type and treat a
@@ -27,7 +27,7 @@ class PreconditionRefused(AtomsError):
 
     Concurrent drift is one case. Pre-existing external occupancy of an
     engine-derived scratch leaf is another, and need not be concurrent — such a
-    leaf may predate this attempt (design §11).
+    leaf may predate this attempt.
     """
 
 

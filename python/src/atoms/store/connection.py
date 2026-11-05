@@ -1,4 +1,4 @@
-"""Opening the store: creation, reopen, the pinned profile, and liveness (design §5)."""
+"""Opening the store: creation, reopen, the pinned profile, and liveness."""
 
 from __future__ import annotations
 
@@ -107,7 +107,7 @@ _CONNECTION_PRAGMAS: tuple[tuple[str, str, str, object], ...] = (
 
 
 def gate(binding: ProjectBinding) -> None:
-    """The liveness gate (design §5.4).
+    """The liveness gate.
 
     A connection that outlives its binding or its lock is a connection writing to a volume
     nothing holds. `binding.backend` calls `_require_active`, which raises ProtocolError
@@ -128,7 +128,7 @@ def require_platform(binding: ProjectBinding) -> None:
     if not os.path.isdir("/proc/self/fd"):
         raise CapabilityUnavailable(
             "/proc/self/fd is required to repair a database whose mode the umask reduced "
-            "below readability (design §5.2 step 2); there is no path-based fallback"
+            "below readability; there is no path-based fallback"
         )
     del binding
 
@@ -169,7 +169,7 @@ def _preflight_entries(binding: ProjectBinding, *, require_absent: bool) -> dict
 
 
 def publish_entry(binding: ProjectBinding, fd: int) -> None:
-    """Design §5.1 step 3 -- make the mode exact and the directory entry durable.
+    """Contract: make the mode exact and the directory entry durable.
 
     SQLite did not create this entry, so nothing in its durability contract promises the
     entry survives power loss: a record could be durable inside a file the directory does
@@ -193,7 +193,7 @@ def install_authorizer(connection: sqlite3.Connection) -> None:
 
 
 def apply_connection_profile(connection: sqlite3.Connection) -> None:
-    """The connection-local half of design §5.3, read back one at a time.
+    """The connection-local half of the specification, read back one at a time.
 
     foreign_keys is per-connection and off by default, and journal_mode and foreign_keys
     both fail silently rather than raising -- a store running without them is a store
@@ -244,7 +244,7 @@ def _connect(binding: ProjectBinding) -> sqlite3.Connection:
 
 
 def create_store(binding: ProjectBinding) -> sqlite3.Connection:
-    """Design §5.1. Returns a connection to a completed store."""
+    """Contract: . Returns a connection to a completed store."""
     require_platform(binding)
     _preflight_entries(binding, require_absent=True)
 
@@ -273,12 +273,12 @@ def _rollback_quietly(connection: sqlite3.Connection) -> None:
     """Close whatever SQLite transaction is still open. **The package's one swallow.**
 
     Every explicit transaction in the package ends through this on its failing path --
-    initialization here, the write transaction and the read transaction in §7.4, and
-    §7.3's reclamation -- so "every exit closes the SQLite transaction" is one function
+    initialization here, the write transaction and the read transaction in the specification, and
+    the specification reclamation -- so "every exit closes the SQLite transaction" is one function
     rather than four copies of a shape, and the COMMIT is inside the guarded region at
     all four sites.
 
-    It returns instead of raising. Design §7.7 is explicit that the exit "rolls back
+    It returns instead of raising. Contract:  is explicit that the exit "rolls back
     whatever is still open on *any* failing path and re-raises the original exception,
     never masking it with the rollback's own", and the caller's bare `raise` is what
     leaves. There is nothing else it could do: the transaction is lost either way, and
@@ -301,7 +301,7 @@ def _rollback_quietly(connection: sqlite3.Connection) -> None:
 
 
 def initialize_schema(binding: ProjectBinding, connection: sqlite3.Connection) -> None:
-    """Design §5.1 step 5 -- one explicit transaction, gated immediately before COMMIT.
+    """Contract: one explicit transaction, gated immediately before COMMIT.
 
     The COMMIT is inside the `try`, not after it: a COMMIT that fails leaves the
     transaction open (measured), and `create_store` would then close a connection with a
@@ -329,7 +329,7 @@ class Verdict(Enum):
 
 
 def repair_unpublished(binding: ProjectBinding) -> None:
-    """Design §5.2 step 2 -- re-run §5.1 step 3 before SQLite is involved at all.
+    """Contract: re-run the specification before SQLite is involved at all.
 
     Ordering this after classification made it unreachable: at 0o400 SQLite falls back to
     a read-only open, so the classification reads succeed and the first write of the
@@ -344,7 +344,7 @@ def repair_unpublished(binding: ProjectBinding) -> None:
 
     The gate sits **immediately before the chmod**, not before the O_PATH open. The open
     is not a mutation, and gating in front of it would prove the lease was held when the
-    repair began rather than when it changed a mode -- §5.4's exact complaint about a
+    repair began rather than when it changed a mode -- the specification exact complaint about a
     single gate at the front of an operation, in miniature.
     """
     backend = binding.backend
@@ -384,7 +384,7 @@ def _catalog(connection: sqlite3.Connection) -> frozenset[tuple[str, str, str, s
 
 
 def classify(connection: sqlite3.Connection) -> Verdict:
-    """Identity, version, and schema -- from reads alone (design §5.2 step 4)."""
+    """Identity, version, and schema -- from reads alone."""
     with translated("reading application_id"):
         application_id = connection.execute(_READ_APPLICATION_ID).fetchone()[0]
     with translated("reading user_version"):
@@ -428,7 +428,7 @@ def classify(connection: sqlite3.Connection) -> Verdict:
 
 
 def open_database(binding: ProjectBinding) -> sqlite3.Connection:
-    """Design §5.2, steps 1 through 6."""
+    """Contract: , steps 1 through 6."""
     require_platform(binding)
     seen = _preflight_entries(binding, require_absent=False)
     if DATABASE_NAME not in seen:
@@ -475,7 +475,7 @@ _STORE_TOKEN = object()
 
 
 class _StoreTransaction:
-    """The only object that can write a record row (design §7.1).
+    """The only object that can write a record row.
 
     Every method verifies that this object is the store's current active transaction and
     that it is not spent. A retained object must not be able to write into a later
@@ -788,10 +788,10 @@ class _StoreTransaction:
 
 
 class Store:
-    """The durable metadata store as a mechanism (design §7).
+    """The durable metadata store as a mechanism.
 
     Owns the connection and closes it in close(). Borrows the binding's metadata_root
-    descriptor and never closes it -- that stays A4a's.
+    descriptor and never closes it -- that stays the capability backend's.
     """
 
     __slots__ = (
@@ -825,8 +825,8 @@ class Store:
     def _require_no_transaction(self) -> None:
         if self._active_transaction is not None:
             raise ProtocolError(
-                "a write transaction is already open on this store; A5b chooses one "
-                "barrier per lease step, and a nested BEGIN would mean two callers each "
+                "a write transaction is already open on this store; each lease step "
+                "uses one barrier, and a nested BEGIN would mean two callers each "
                 "believe they own the boundary"
             )
 
@@ -889,7 +889,7 @@ class Store:
             # Re-assert ownership *before* the barrier reads anything. A body that
             # called `store.close()` gets here with the connection already closed, and
             # without this the first thing to notice would be the COMMIT, raising
-            # `sqlite3.ProgrammingError` -- which §7.8 says a caller must never have to
+            # `sqlite3.ProgrammingError` -- which the specification says a caller must never have to
             # interpret. `_require_current` names the real condition instead.
             txn._require_current()
             txn._run_barrier()
@@ -912,7 +912,7 @@ class Store:
             self._active_transaction = None
 
     def close(self) -> None:
-        """Idempotent, and exempt from the liveness gate (design §7.8).
+        """Idempotent, and exempt from the liveness gate.
 
         A store whose binding died must still be closable: gating close would strand the
         connection it holds, which is the opposite of what the gate is for.
@@ -964,7 +964,7 @@ class Store:
 
 
 def open_store(binding: ProjectBinding) -> Store:
-    """Create the store if `atoms.db` is absent, otherwise reopen it (design §5)."""
+    """Create the store if `atoms.db` is absent, otherwise reopen it."""
     require_platform(binding)
     try:
         os.stat(DATABASE_NAME, dir_fd=binding.metadata_root_fd, follow_symlinks=False)

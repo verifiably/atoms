@@ -452,7 +452,7 @@ class AuditedBackend:
                 return TargetClass.CHAIN_BOOKKEEPING, path
             if path == ROOT_CLAIM_LEAF:
                 # The fixed root-creation claim is engine bookkeeping at the
-                # root itself (lifecycle design §5.1).
+                # root itself.
                 return TargetClass.ENGINE_SCRATCH, path
             if is_scratch_leaf(leaf):
                 return TargetClass.ENGINE_SCRATCH, path

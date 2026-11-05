@@ -1,4 +1,4 @@
-"""Reserved scratch grammar (design §5.1).
+"""Reserved scratch grammar.
 
 The discriminating sigil is the exact leaf prefix ``.#~`` — three ASCII punctuation
 bytes, none of which has a case or NFC/NFD variant. Engine-reserved leaves begin with
@@ -15,7 +15,7 @@ from atoms.core.identifiers import is_valid_identifier, require_valid_identifier
 SCRATCH_SIGIL = ".#~"
 CHAIN_LEAF = ".#~chain"
 ROOT_CLAIM_LEAF = ".#~root-claim"
-"""The fixed root-creation claim (lifecycle design §5.1): temporary engine
+"""The fixed root-creation claim: temporary engine
 bookkeeping at the root, published no-clobber, removed before completion."""
 SCRATCH_ROLES: frozenset[str] = frozenset({"staging", "tombstone", "anchor", "work"})
 
@@ -45,8 +45,7 @@ def aliases_scratch_sigil(leaf: str) -> bool:
     """True iff any case- or NFC/NFD-normalized form of ``leaf`` begins with the sigil.
 
     Because the sigil is letter-free, this must agree with :func:`is_engine_reserved_leaf` on
-    every input; the agreement is the property that proves the letter-free choice sound
-    (design §13.3).
+    every input; the agreement is the property that proves the letter-free choice sound.
     """
     forms = {
         leaf,
