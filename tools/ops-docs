@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# ops-docs version 6
+# ops-docs version 7
 """A project's guide files — README.md for people, AGENTS.md for agents — rendered and
 checked inside one repository.
 
@@ -8,18 +8,18 @@ Vendored from ops bin/ops-docs as tools/ops-docs. `identity.toml` at the reposit
 the declared and derived parts into marked regions of the two files and checks the rest
 against the contract. It never writes prose.
 Vendored from https://github.com/khughitt/ops (bin/ops-docs); never edit the copy, see tools/README.md.
-Design: ops docs/specs/2026-09-22-project-guides-design.md.
+Reference: ops docs/project-guides.md.
 
 In a family home (a repository holding family.toml), `family publish` writes the
 committed family file into each member as tools/family.toml and re-renders the member's
 guides, and `family check` judges every member's committed copy against the home's.
-Design: ops docs/specs/2026-10-09-family-guide-templates-design.md.
+Reference: ops docs/project-guides.md.
 
 A project declaring `[documents]` in identity.toml also has its public reference
 documents' type markers, standard version, required headings and record exclusions
 checked; a project that does not declare it is untouched. A marker qualifier may not
 contain a digit, the tool's test for "never a version". Design:
-ops docs/specs/2026-10-28-public-document-types-design.md.
+ops docs/document-types.md.
 
 Exit 0 clean, 1 on a stale region or a constraint finding, 2 when it cannot run.
 """
@@ -242,7 +242,7 @@ def inside(top, path):
 
 
 def identity_problems(root, ident, nested=False, top=None):
-    """Every §3 violation for the file at `root`, one line each. Empty means valid.
+    """Every identity-contract violation for the file at `root`, one line each. Empty means valid.
 
     Containment is checked here, on every file the tool will later read or write, and
     a violation blocks every command: `write` renders into these paths, so a guide that
@@ -929,7 +929,7 @@ def _string_list(ident, key, found):
 
 def insert_identity(text, global_scope=False):
     """`text` with empty identity markers at their contracted place: right after the H1.
-    A global guide (§4, *The global file*) is exempt from the H1; without one the region
+    A global guide (agents.scope=global) is exempt from the H1; without one the region
     opens the file."""
     if find_region(text, IDENTITY_START, IDENTITY_END) is not None:
         return text
