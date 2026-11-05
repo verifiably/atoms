@@ -1,4 +1,4 @@
-"""Shared fixtures for the A2 compiler tests."""
+"""Shared fixtures for the the spec compiler compiler tests."""
 
 from __future__ import annotations
 

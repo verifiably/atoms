@@ -1,4 +1,4 @@
-"""A5b tier 4 -- transition persistence: prefix validation, barriers, the cursor."""
+"""the recovery lease tier 4 -- transition persistence: prefix validation, barriers, the cursor."""
 
 from __future__ import annotations
 

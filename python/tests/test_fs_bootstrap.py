@@ -36,7 +36,7 @@ def test_layout_returns_one_owned_descriptor_per_component(held_lock, metadata_r
 def test_layout_descriptors_are_released_in_reverse_opening_order(
     held_lock, metadata_root, monkeypatch
 ):
-    # Design §7.2 and §9.3: nested descriptors are released child-before-parent, so no
+    # Contract:  and the specification: nested descriptors are released child-before-parent, so no
     # release depends on one already gone. `retained` is insertion-ordered by
     # METADATA_LAYOUT, which makes values() OPENING order — passing it straight to
     # close_all reverses nothing and reads as correct, which is why the order is
@@ -204,7 +204,7 @@ def test_reclamation_refuses_a_symlink_at_probe_itself(
 ):
     # Reclamation runs before layout creation, so it, not the EEXIST path,
     # meets an anomalous probe/ first. It refuses rather than unlinking a leaf
-    # A4a did not create.
+    # the capability backend did not create.
     elsewhere = test_volume / "elsewhere"
     elsewhere.mkdir()
     with held_lock(metadata_root) as lock:

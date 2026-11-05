@@ -1,8 +1,8 @@
-"""Data-declared exerciser scenarios (design §6): spec builder, seed world, payloads.
+"""Data-declared exerciser scenarios: spec builder, seed world, payloads.
 
 Scenario surfaces are shaped to the documented consumer shapes — corpus writes and
 archive/import moves — without importing any consumer. `family` is a coverage
-assertion only; A3 remains the matrix's oracle.
+assertion only; the recovery model remains the matrix's oracle.
 """
 
 from __future__ import annotations
@@ -78,7 +78,7 @@ def _seed_corpus_write(project: Path) -> None:
 
 
 def _corpus_write_spec() -> TransactionSpec:
-    """Two nested new directories + two creates beneath them + a replace (§12.1).
+    """Two nested new directories + two creates beneath them + a replace.
 
     Regression pointer: both `CreateDirectory` effects are freshly created and directly
     nested, the shape that forward execution could not run until
@@ -153,7 +153,7 @@ def _seed_caught_rollback_move(project: Path) -> None:
 
 def _caught_rollback_move_spec() -> TransactionSpec:
     """A move that lands, then a second effect that fails -- forces rollback to
-    re-move the landed move (`JournalState.UNDO_STARTED` reverse traffic, design §9.4).
+    re-move the landed move (`JournalState.UNDO_STARTED` reverse traffic, the specification).
     """
     return build_spec(
         consumer_tag="test",
@@ -243,8 +243,7 @@ def setup_clean(entry: Scenario, ingredients, monkeypatch) -> None:
 
     Split out of `run_clean` so a caller that wants to record durability units (the
     persistence-cut model, `tests/persistence_model.py`) can seed and register with the
-    plain backend, then swap in a recording backend for the transaction alone: design
-    §4.1 makes bootstrap publication seed-owned, so it must never appear as recorded
+    plain backend, then swap in a recording backend for the transaction alone: the specification makes bootstrap publication seed-owned, so it must never appear as recorded
     entry-unit enumeration.
     """
     from atoms.coordinator.commands import register_root
@@ -311,12 +310,12 @@ def serialize_projection(projection: tuple | None) -> dict | None:
     journals, active)` -- `tests/persistence_model.py`'s `_inspect` and
     `_model_projection` both build it, and so does `_durable_projection` below. A tuple
     of enums, `HaltDiagnostic` dataclasses and `EffectJournalState`s does not survive a
-    pipe, and design §8's placement axis compares an in-process cell against the same
+    pipe, and the specification placement axis compares an in-process cell against the same
     cell recovered in a **fresh process**, so this is the one shape that crosses.
 
-    Every field is spelled out; nothing reflects over the dataclasses, so a field A3
+    Every field is spelled out; nothing reflects over the dataclasses, so a field the recovery model
     grows does not silently start or stop being compared across the placement boundary
-    (ledger #12's rule, applied to the test-side serialization).
+    (the boundary contract rule, applied to the test-side serialization).
 
     The halt diagnostic goes through production's own `encode_diagnostic`, which is what
     the store itself persists: **token-free** by construction (slots, paths, content

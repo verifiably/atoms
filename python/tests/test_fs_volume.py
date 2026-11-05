@@ -307,7 +307,7 @@ def test_mask_options_are_canonical_hex():
 
 
 def test_the_mkfs_fixture_pair_is_two_sided(tmp_path):
-    """Design §7.4: fast_commit is compat 0x400, orphan_file compat 0x1000.
+    """Contract: fast_commit is compat 0x400, orphan_file compat 0x1000.
 
     The images are built without root and parsed at the superblock offsets the
     first spike pinned; the in-guest half re-reads them through the ioctl under

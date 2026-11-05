@@ -1,4 +1,4 @@
-"""The typed chain-inspection core and its two public commands (design §4, §6-§8).
+"""The typed chain-inspection core and its two public commands.
 
 Every directory-constructible defect is asserted **twice**: once as `MalformedChain`
 through `inspect_chain_detached`, and once as `ChainStateInvalid` through
@@ -130,7 +130,7 @@ def _both_surfaces(chain: Chain, kind: DefectKind, subject: str | None) -> Chain
 
 
 # --------------------------------------------------------------------------- #
-# The directory-constructible fabrications (design §14.1).
+# The directory-constructible fabrications.
 # --------------------------------------------------------------------------- #
 
 
@@ -159,7 +159,7 @@ def test_a_digest_named_directory_is_a_foreign_leaf(chain: Chain) -> None:
 def test_a_staging_leaf_that_is_not_a_readable_regular_file_is_foreign(
     chain: Chain, spelling: str
 ) -> None:
-    """Design §8's ratified carve-out scope: the exemption covers nothing else."""
+    """Contract:  ratified carve-out scope: the exemption covers nothing else."""
     chain.put(None, GenesisEntry(b"root", ()))
     occupant = chain.directory / STAGING_LEAF
     if spelling == "directory":
@@ -270,7 +270,7 @@ def test_a_fulfills_naming_a_non_intent_entry_is_unresolved(chain: Chain) -> Non
 
 
 def test_a_second_committed_fulfillment_names_the_second_settlement(chain: Chain) -> None:
-    """Design §4.4: the subject is the settlement, never either registration.
+    """Contract: the subject is the settlement, never either registration.
 
     The two registrations are deliberately non-adjacent, so an implementation that
     named a registration would report a different string.
@@ -287,7 +287,7 @@ def test_a_second_committed_fulfillment_names_the_second_settlement(chain: Chain
 
 
 def test_only_genesis_count_carries_no_subject(chain: Chain) -> None:
-    """Design acceptance §17.3: `subject is None` for exactly one kind."""
+    """Design acceptance the specification: `subject is None` for exactly one kind."""
     chain.put(None, GenesisEntry(b"root", ()))
     chain.put(None, GenesisEntry(b"other root", ()))
 
@@ -299,7 +299,7 @@ def test_only_genesis_count_carries_no_subject(chain: Chain) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# The three classes no directory can spell (design §14.2), through the pure core.
+# The three classes no directory can spell, through the pure core.
 # --------------------------------------------------------------------------- #
 
 
@@ -338,7 +338,7 @@ def test_a_cycle_is_reported_at_the_revisited_digest() -> None:
 
 
 def test_an_orphan_history_names_the_lowest_unvisited_digest() -> None:
-    """Design §4.4 step 10, ruled 2026-08-22: the lowest, not an arbitrary member."""
+    """Contract: , ruled 2026-08-22: the lowest, not an arbitrary member."""
     genesis = "0" * 64
     low, middle, high = "5" * 64, "7" * 64, "9" * 64
     scan = _injected(
@@ -365,7 +365,7 @@ def test_a_fulfills_naming_a_later_entry_is_a_non_ancestor() -> None:
 
 
 def test_inspect_scan_needs_no_backend_and_no_descriptor() -> None:
-    """Design §17.1: the second pass is pure, which is what makes injection honest."""
+    """Contract: the second pass is pure, which is what makes injection honest."""
     genesis = "0" * 64
 
     result = inspect_scan(_injected(_row(genesis, None, GenesisEntry(b"root", ()))))
@@ -375,7 +375,7 @@ def test_inspect_scan_needs_no_backend_and_no_descriptor() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Determinism (design §17.4).
+# Determinism.
 # --------------------------------------------------------------------------- #
 
 
@@ -481,7 +481,7 @@ def test_a_readable_regular_staging_leaf_is_never_a_defect(chain: Chain) -> None
 def test_a_staged_registration_joins_detached_pending_without_joining_entries(
     chain: Chain,
 ) -> None:
-    """Design §8, ratified 2026-08-22: the weaker detached invariant, pinned.
+    """Contract: , ratified 2026-08-22: the weaker detached invariant, pinned.
 
     A later implementation that quietly restored "every pending digest is an entry's"
     would turn this red.
@@ -557,7 +557,7 @@ def _authority_deriving_methods() -> dict[str, ast.FunctionDef]:
 
 
 def test_the_detached_facade_refuses_every_mutation() -> None:
-    """Design §7.1: read-only is a property of the facade, not of caller care.
+    """Contract: read-only is a property of the facade, not of caller care.
 
     The method list is derived from the source rather than transcribed, so a mutating
     method added later without the guard turns this red instead of slipping through.
@@ -603,7 +603,7 @@ def test_the_inspection_arms_are_frozen_and_inert(chain: Chain) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Registered mode (design §6, §14.3).
+# Registered mode.
 # --------------------------------------------------------------------------- #
 
 
@@ -633,7 +633,7 @@ def test_inspect_chain_agrees_with_read_chain_on_a_healthy_root(
 def test_inspect_chain_returns_malformed_without_running_recovery(
     coordinator_on, monkeypatch
 ) -> None:
-    """Design §6.2: recovery never runs over damage, asserted rather than narrated."""
+    """Contract: recovery never runs over damage, asserted rather than narrated."""
     from atoms.coordinator import commands
 
     ingredients = coordinator_on()
@@ -708,7 +708,7 @@ def test_inspect_chain_reports_an_occupied_chain_leaf_as_a_foreign_leaf(
 def test_an_empty_chain_directory_splits_on_the_live_record(
     coordinator_on, leased, monkeypatch
 ) -> None:
-    """Design §6.2's last two rows, pinned as a pair rather than one of them alone."""
+    """Contract:  last two rows, pinned as a pair rather than one of them alone."""
     from tests.store_support import APPROVAL_EVIDENCE, one_effect_spec
 
     ingredients = coordinator_on()

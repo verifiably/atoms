@@ -1,4 +1,4 @@
-"""Tier 3 -- creation and reopen (design §11.3)."""
+"""Tier 3 -- creation and reopen."""
 
 from __future__ import annotations
 
@@ -55,7 +55,7 @@ def test_a_second_concurrent_creation_raises_rather_than_reinitializing(store_on
 def test_creation_refuses_a_sidecar_surviving_without_the_database(store_on, sidecar):
     """O_EXCL covers atoms.db alone. Without this preflight, creation is the only path
     with no sidecar check while reopen has one -- and a planted -journal symlink is
-    silently unlinked by the first WAL transition, measured (design §5.1 step 1)."""
+    silently unlinked by the first WAL transition, measured."""
     with store_on() as binding:
         fd = os.open(sidecar, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600,
                      dir_fd=binding.metadata_root_fd)
@@ -106,7 +106,7 @@ def test_an_old_sqlite_refuses_with_capability_unavailable(store_on, monkeypatch
 
 def test_a_temp_store_zero_build_refuses_with_capability_unavailable(store_on, monkeypatch):
     """temp_store=MEMORY is inert under TEMP_STORE=0 and the read-back still reports
-    success, so the compile option is the only evidence (design §5.3)."""
+    success, so the compile option is the only evidence."""
     import atoms.store.connection as connection_module
 
     monkeypatch.setattr(connection_module, "_compile_options", lambda _c: frozenset({"TEMP_STORE=0"}))
@@ -118,7 +118,7 @@ def test_a_temp_store_zero_build_refuses_with_capability_unavailable(store_on, m
 
 def test_the_ddl_transaction_is_atomic(store_on, monkeypatch):
     """A cut inside step 5 must leave (0, 0, empty) -- never a partial schema with a
-    committed application_id, which is what executescript produces (design §5.1 step 5)."""
+    committed application_id, which is what executescript produces."""
     import atoms.store.connection as connection_module
 
     real = connection_module._execute_schema
@@ -169,7 +169,7 @@ def test_the_gate_refuses_a_released_lock_under_a_live_binding(store_on):
 
 
 def _cut_after_creating(binding, *, umask: int) -> None:
-    """Reproduce §5.1's cut between step 2 and step 3: the file exists, unpublished."""
+    """Reproduce the specification cut between step 2 and step 3: the file exists, unpublished."""
     previous = os.umask(umask)
     try:
         fd = os.open(
@@ -203,7 +203,7 @@ def test_the_unpublished_cut_resumes_to_the_exact_mode(store_on, umask):
     """0o277 leaves 0o400 and 0o777 leaves 0o000, and they fail differently: at 0o400
     SQLite falls back to a read-only open so classification succeeds and the first write
     raises 'attempt to write a readonly database'; at 0o000 nothing opens at all. Only
-    the second distinguishes §5.2 step 2's O_PATH route from a plain fchmod."""
+    the second distinguishes the specification's O_PATH route from a plain fchmod."""
     with store_on() as binding:
         _cut_after_creating(binding, umask=umask)
         connection = reopen_store(binding)
@@ -270,7 +270,7 @@ def test_a_completed_store_has_its_journal_mode_queried_and_never_set(store_on, 
 
 def test_a_non_empty_delete_mode_database_is_refused_and_stays_in_delete_mode(store_on):
     """The assertion that would have caught the original defect: reopen must not convert
-    a database while deciding whether to refuse it (design §5.2 step 3)."""
+    a database while deciding whether to refuse it."""
     with store_on() as binding:
         raw = raw_connect(binding)
         try:
@@ -384,14 +384,14 @@ def test_a_check_violating_row_refuses_at_reopen(store_on):
     `TransactionState(state_value)` would raise a raw `ValueError` on a value outside the
     enum, and translating that in every reader would be handling for a state the store
     cannot be in. This is the proof of "cannot": the `state` CHECK list is generated from
-    the enum (§6.1), the catalog comparison proves the list is the current one, and
+    the enum, the catalog comparison proves the list is the current one, and
     `PRAGMA quick_check` -- which `open_database` runs on **every** reopen -- reports a
     violated CHECK. Measured: a row written under `PRAGMA ignore_check_constraints = ON`
     reads back happily and `quick_check` returns `CHECK constraint failed in
     transaction_record`. So a foreign writer can put a bogus state in the file, and no
     reader in this package will ever see it.
 
-    Written with a raw connection because no A5a surface can produce the row -- which is
+    Written with a raw connection because no the metadata store surface can produce the row -- which is
     the point.
     """
     with store_on() as binding:

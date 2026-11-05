@@ -1,4 +1,4 @@
-"""A5b tier 5 -- what a second process sees (design section 10)."""
+"""the recovery lease tier 5 -- what a second process sees (design section 10)."""
 
 from __future__ import annotations
 

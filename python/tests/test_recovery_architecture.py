@@ -67,7 +67,7 @@ def test_public_surface_has_exactly_five_operations():
     }
 
 
-def test_a3_does_not_accept_raw_transaction_spec():
+def test_recovery_does_not_accept_raw_transaction_spec():
     annotations = get_type_hints(recovery.build_recovery_snapshot)
     assert annotations["compiled"] is CompiledSpec
     assert TransactionSpec not in annotations.values()

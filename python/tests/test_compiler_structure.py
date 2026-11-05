@@ -242,7 +242,7 @@ def test_byte_len_above_sqlite_integer_domain_is_rejected():
 
 def test_empty_effect_sequence_is_rejected():
     # Phases 10-13 are all vacuously satisfied by an empty spec, so phase 1 is the
-    # only place it can be caught (authority design §5.4).
+    # only place it can be caught (authority the specification).
     with pytest.raises(SpecValidationError, match="at least one effect"):
         compile_spec(valid_spec(effects=(), initial_surface=(), final_surface=()))
 
@@ -433,7 +433,7 @@ def test_symlink_target_with_nul_is_rejected():
 
 
 def test_symlink_target_may_be_absolute_or_contain_dotdot():
-    # A target is opaque bytes the engine fingerprints, not a path it resolves (§6),
+    # A target is opaque bytes the engine fingerprints, not a path it resolves,
     # so the project-relative grammar must NOT apply to it.
     for target in ("/etc/passwd", "../../elsewhere", "./x"):
         state = SymlinkState(target=target, mode=0o777)

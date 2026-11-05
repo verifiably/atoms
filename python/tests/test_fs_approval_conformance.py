@@ -1,4 +1,4 @@
-"""Tier 4 — approve_for_project end to end against a real ext4 volume (design §11.4)."""
+"""Tier 4 — approve_for_project end to end against a real ext4 volume."""
 
 from __future__ import annotations
 
@@ -51,12 +51,12 @@ def test_work_base_facts_is_called_exactly_when_a_directory_is_created(
     the observation would satisfy that assertion while still issuing the call the criterion
     forbids. Counting on the method fails on the call rather than on the value.
 
-    The call must be skipped rather than merely ignored for the reason design §6.2 step 7
-    gives, inherited from A4b-1 §6.6: `work_base_facts` can refuse — an unapprovable or
+    The call must be skipped rather than merely ignored for the reason the specification
+    gives, inherited from path resolution and project approval-1 the specification: `work_base_facts` can refuse — an unapprovable or
     over-constrained `work/` raises — and a specification with no `CreateDirectory` has no
     stake in the work namespace and must not be refused by it. (`metadata_root/work` itself
-    always exists by this point: A4a's `ensure_metadata_layout` creates it at bind time,
-    `bootstrap.py:11`. What is absent is `work/<txid>`, which A5 creates.)
+    always exists by this point: the capability backend's `ensure_metadata_layout` creates it at bind time,
+    `bootstrap.py:11`. What is absent is `work/<txid>`, which the metadata store creates.)
 
     Patched on the class, not the instance: approval constructs its own `PathResolver`, so
     a test never holds the instance to patch.
@@ -83,7 +83,7 @@ def test_approval_writes_nothing_into_project_space(approval_context):
     """Criterion 24. Approval is a judgment: it opens project directories read-only and
     must leave every byte of the tree it judged alone. The specification is chosen to
     exercise the branches that are most tempted to write — a `CreateDirectory` whose
-    directory does not exist yet, and a scratch set that A5 will later instantiate.
+    directory does not exist yet, and a scratch set that the metadata store will later instantiate.
 
     Compares a full recursive snapshot including names, types, sizes, inodes, and mtimes
     rather than a bare `listdir`: a same-size rewrite keeps both the entry list and the
@@ -282,7 +282,7 @@ def test_a_nested_metadata_root_is_refused_through_approval(
     ext4_nested_bound_volume,
 ):
     """Reached through approve_for_project rather than the resolver, which is what
-    ledger #5 asks for."""
+    the boundary contract asks for."""
     from atoms.fs.approval import ProjectContext
 
     with ext4_nested_bound_volume() as binding:

@@ -1,4 +1,4 @@
-"""Tier 4 -- blobs over a real ext4 metadata root (design §7.2, §7.3, §8)."""
+"""Tier 4 -- blobs over a real ext4 metadata root."""
 
 from __future__ import annotations
 
@@ -318,7 +318,7 @@ def test_a_liveness_loss_during_verification_refuses_before_descriptor_handoff(
 
 
 def test_staged_blob_is_an_ordinary_dataclass():
-    """A6 builds manifests, so a construction token would block the intended caller."""
+    """coherent capture builds manifests, so a construction token would block the intended caller."""
     assert StagedBlob(name="a", digest=f"sha256:{HEX}", byte_len=1).byte_len == 1
 
 

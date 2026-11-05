@@ -9,7 +9,7 @@ from atoms.fs.backend import UNSUPPORTED_ERRNO
 
 def test_unsupported_errno_sets_exclude_ambiguous_generic_failures():
     # A generic failure must never be readable as "this volume lacks the operation":
-    # that would report a durable volume as capability-poor (design §10).
+    # that would report a durable volume as capability-poor.
     for operation, codes in UNSUPPORTED_ERRNO.items():
         assert errno.EBADF not in codes, operation
         assert errno.EMFILE not in codes, operation

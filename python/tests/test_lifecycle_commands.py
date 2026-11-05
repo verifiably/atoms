@@ -1,6 +1,6 @@
 """Root lifecycle: fail-closed writer state, binding, and the state query.
 
-Contract: docs/2026-08-23-root-lifecycle-commands-design.md (approved at
+Contract: docs/protocol.md#root-lifecycle (approved at
 `b1469f4`). Tier 1 here is the writer-state half — the grant carrier, the
 host/root binding, the closed five-value union, and the writability gate in
 front of every cooperative mutator. The copy commands, serviceability grant,

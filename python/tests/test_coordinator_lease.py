@@ -1,4 +1,4 @@
-"""A5b tier 1 -- the lease's entry order, reclamation, resolution, and duration."""
+"""the recovery lease tier 1 -- the lease's entry order, reclamation, resolution, and duration."""
 
 from __future__ import annotations
 
@@ -152,7 +152,7 @@ def test_no_active_record_resolves_quietly(leased):
 
 
 def test_the_lease_holds_the_lock_for_its_whole_duration(leased):
-    """Authority §7.1: the lock spans the whole write phase, not merely entry."""
+    """Contract: the lock spans the whole write phase, not merely entry."""
     with leased() as lease:
         metadata_root = os.readlink(f"/proc/self/fd/{lease._binding.metadata_root_fd}")
         assert _contend(metadata_root) == 3
@@ -166,7 +166,7 @@ def test_the_lease_holds_the_lock_for_its_whole_duration(leased):
 def test_probe_survivors_are_reclaimed_before_an_early_bind_refusal(
     coordinator_on, leased
 ):
-    """Ledger #17, at the one refusal that can discriminate.
+    """the boundary contract, at the one refusal that can discriminate.
 
     The `FileNotFoundError` carries no filename -- measured `'[Errno 2] No such file or
     directory'` -- so the type is the assertion.
@@ -311,7 +311,7 @@ def _workspaces_outside_the_lease(
 def test_reclamation_survives_a_trapping_lease_entry(coordinator_on, leased):
     """`root.py`'s ordering claim, which the trap is the first thing able to test.
 
-    Ledger #23 says reclamation runs at EVERY lease entry, which holds only if it runs
+    the boundary contract says reclamation runs at EVERY lease entry, which holds only if it runs
     even when resolution then refuses, halts, or traps. The two reclamation tests above
     call `_reclaim_orphans` directly inside a lease body and so never observe the entry
     path; moving `_reclaim_orphans(store)` after resolution leaves both green and

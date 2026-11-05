@@ -94,7 +94,7 @@ def test_scratch_grammar_validates_identifiers():
     assert not is_scratch_leaf(f".#~{'x' * 300}.e07.staging")
 
 
-def test_a2_still_refuses_a_declared_chain_component():
+def test_compiler_still_refuses_a_declared_chain_component():
     spec = replace(
         valid_spec(),
         effects=(CreateFileNoClobber("e1", ".#~chain/f.txt", F),),

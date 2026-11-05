@@ -1,4 +1,4 @@
-"""A5b tier 2 -- admission: generation, the loop, re-resolution, and translation."""
+"""the recovery lease tier 2 -- admission: generation, the loop, re-resolution, and translation."""
 
 from __future__ import annotations
 
@@ -188,7 +188,7 @@ def test_a_record_collision_clears_an_earlier_candidates_occupancy(leased, monke
 
 
 def test_a_present_planned_parent_refuses_without_comparing_its_identity(leased):
-    """Design §6.4 branch two: a planned parent has no approved identity, so nothing
+    """Contract:  branch two: a planned parent has no approved identity, so nothing
     can be compared -- and a fresh observation would be authorizing itself."""
     from atoms.coordinator import admission
     from tests.coordinator_support import (
@@ -209,7 +209,7 @@ def test_a_present_planned_parent_refuses_without_comparing_its_identity(leased)
 
 
 def test_a_planned_directory_the_timeline_declares_occupied_is_admitted(leased):
-    """Design §8.2's shape. A4b approves it on purpose; admission must not refuse it.
+    """Contract:  shape. path resolution and project approval approves it on purpose; admission must not refuse it.
 
     `p`'s timeline is FILE -> ABSENT -> DIRECTORY, so `p` being a file right now is the
     proof being right, not drift. Capture verifies the blocker against that first
@@ -421,7 +421,7 @@ def test_a_changed_lookup_proof_refuses_naming_constraints(leased, monkeypatch):
 
 def test_a_parent_that_moved_across_mounts_refuses(leased, monkeypatch):
     """Mount membership. `open_child_directory` carries RESOLVE_NO_XDEV, so a parent
-    that became a mount point raises EXDEV; A5b's obligation is that the EXDEV reaches
+    that became a mount point raises EXDEV; the recovery lease's obligation is that the EXDEV reaches
     the caller as drift rather than as a bare OSError. Injected because mounting
     requires privileges this suite does not assume."""
     import errno
@@ -448,7 +448,7 @@ def test_a_parent_that_moved_across_mounts_refuses(leased, monkeypatch):
 
 
 def test_a_capability_refusal_during_re_resolution_becomes_drift(leased, monkeypatch):
-    """The second declared resolver refusal type. §9 requires both to arrive as
+    """The second declared resolver refusal type. the specification requires both to arrive as
     PreconditionRefused once a proof exists, and one type proves only one branch."""
     from atoms.coordinator import admission
     from atoms.core.errors import CapabilityUnavailable

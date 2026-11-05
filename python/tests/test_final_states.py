@@ -1,5 +1,5 @@
 """`TransactionOutcome.final_states` — the complete verified final surface,
-returned typed (2026-08-24 holdings read/evidence design §5)."""
+returned typed (2026-08-24 holdings read/evidence the specification)."""
 
 from __future__ import annotations
 
@@ -50,7 +50,7 @@ def test_final_states_is_complete_while_the_chain_carries_the_registered_subset(
 ) -> None:
     """A move registered on its destination alone: the return carries both
     locations, the registration entry exactly the registered one, the overlap
-    agreeing row-for-row (design §5's subset distinction)."""
+    agreeing row-for-row (the specification subset distinction)."""
     ingredients = coordinator_on()
     _enable_commands(ingredients, monkeypatch)
     backend, project_root, metadata_root, storage = ingredients
@@ -97,7 +97,7 @@ def test_final_states_is_complete_while_the_chain_carries_the_registered_subset(
 def test_final_states_carries_the_delete_rows_verified_absence(
     coordinator_on, monkeypatch
 ) -> None:
-    """A deletion's row is the verified `AbsentState` (design §5)."""
+    """A deletion's row is the verified `AbsentState`."""
     ingredients = coordinator_on()
     _enable_commands(ingredients, monkeypatch)
     backend, project_root, metadata_root, storage = ingredients
@@ -118,7 +118,7 @@ def test_final_states_carries_a_replace_rows_verified_post_state(
     coordinator_on, monkeypatch
 ) -> None:
     """The fifth effect variant: a replacement's row is the verified post
-    `FileState` (design §5)."""
+    `FileState`."""
     ingredients = coordinator_on()
     _enable_commands(ingredients, monkeypatch)
     backend, project_root, metadata_root, storage = ingredients
@@ -144,7 +144,7 @@ def test_final_states_carries_a_directory_row_like_any_other(
     coordinator_on, monkeypatch
 ) -> None:
     """A `CreateDirectory` row is an ordinary `DirectoryState` — present,
-    unspecial, ignorable by consumers that do not read it (design §5)."""
+    unspecial, ignorable by consumers that do not read it."""
     ingredients = coordinator_on()
     _enable_commands(ingredients, monkeypatch)
     backend, project_root, metadata_root, storage = ingredients

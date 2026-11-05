@@ -1,4 +1,4 @@
-"""Phase A gates, pipeline ordering, and refusal propagation (design §6.1, §11.5)."""
+"""Phase A gates, pipeline ordering, and refusal propagation."""
 
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ class _FakeBinding:
 
 
 class _SubContext(ProjectContext):
-    """A subclass passes an isinstance gate. §6.1 requires exact types, because a
+    """A subclass passes an isinstance gate. the specification requires exact types, because a
     subclass can override a property the pipeline reads after the gate."""
 
 
@@ -119,7 +119,7 @@ def test_a_txid_subclass_is_refused(approval_context):
 @pytest.mark.parametrize("txid", [3, None, b"tx01"])
 def test_a_non_string_txid_raises_protocol_error_not_type_error(approval_context, txid):
     """require_valid_identifier reaches re.Pattern.fullmatch, which raises TypeError on a
-    non-string. The exact-type gate is what makes §5.1's promised ProtocolError reachable."""
+    non-string. The exact-type gate is what makes the specification promised ProtocolError reachable."""
     compiled = compiled_for(CreateFileNoClobber("e1", "leaf", file_state()))
     with approval_context() as (_context, binding):
         bad = ProjectContext(binding=binding, txid=txid)  # type: ignore[arg-type]
@@ -138,7 +138,7 @@ def test_a_malformed_txid_carries_the_validation_error_as_its_cause(approval_con
 def test_a_closed_binding_refuses_before_capabilities_are_compared(approval_context):
     """Discriminating only because both refusals are armed at once. While the binding is
     live this specification raises CapabilityUnavailable; once it is closed the same call
-    must raise ProtocolError instead, because §6.1 reads `backend` before `evidence`.
+    must raise ProtocolError instead, because the specification reads `backend` before `evidence`.
     `evidence` performs no liveness check by design, so an evidence-first pipeline would
     still see the missing capability and report it for a lease that is simply gone.
 
@@ -156,7 +156,7 @@ def test_a_closed_binding_refuses_before_capabilities_are_compared(approval_cont
 
 def test_a_released_lock_refuses_the_same_way(approval_context):
     """ProjectBinding._require_active has two branches. The lock outliving check is the
-    one A5's lease will exercise for real, so both are armed here.
+    one the metadata store's lease will exercise for real, so both are armed here.
 
     The lock is released through its own `__exit__`, not by setting `_held` directly:
     `HeldProjectLock.__exit__` returns early when `_held` is already False, so poking the
@@ -176,7 +176,7 @@ def test_a_released_lock_refuses_the_same_way(approval_context):
 def test_a_missing_capability_refuses_before_any_path_is_resolved(
     approval_context, monkeypatch
 ):
-    """Ledger #6: A4b is the sole adjudicator, and it refuses before touching the
+    """the boundary contract: path resolution and project approval is the sole adjudicator, and it refuses before touching the
     project. A resolver that raises on entry proves nothing reached phase B."""
 
     def forbidden(self, rel_path):
@@ -193,7 +193,7 @@ def test_a_missing_capability_refuses_before_any_path_is_resolved(
 def test_every_declared_path_resolves_exactly_once_in_sorted_order(
     approval_context, monkeypatch
 ):
-    """§6.2: one resolution per declared path, in sorted order, so the observation set is
+    """the specification: one resolution per declared path, in sorted order, so the observation set is
     reproducible and no path is walked twice under a different lock state."""
     from atoms.fs.resolve import PathResolver
 
@@ -261,8 +261,8 @@ def test_the_proof_retains_the_objects_it_approved(approval_context):
 def test_every_resolver_exception_reaches_the_caller_unchanged(
     approval_context, monkeypatch, raised, target
 ):
-    """Ledger #20 is categorical, so every load-bearing branch is covered, not just
-    `resolve`: the constructor and `work_base_facts` are also A4b-1 calls approval makes.
+    """the boundary contract is categorical, so every load-bearing branch is covered, not just
+    `resolve`: the constructor and `work_base_facts` are also path resolution and project approval-1 calls approval makes.
     Identity rather than type, because a type assertion is satisfied by any same-class
     exception the code might raise on its own.
 
@@ -283,7 +283,7 @@ def test_every_resolver_exception_reaches_the_caller_unchanged(
             approve_for_project(compiled, context)
         assert caught.value is raised
 
-    # §11.5 requires the call count and arguments, not just the object. Exactly one call
+    # the specification requires the call count and arguments, not just the object. Exactly one call
     # reaches the injected branch: the refusal propagates rather than being caught and
     # retried, which a re-raising handler around a retry loop would not satisfy.
     assert len(seen) == 1

@@ -1,4 +1,4 @@
-"""The fresh-process half of A5b's #17 and #23 claims."""
+"""The fresh-process half of the recovery lease's #17 and #23 claims."""
 
 from __future__ import annotations
 
@@ -109,7 +109,7 @@ def main(project_root: str, metadata_root: str) -> int:
       `_durable_phase`).
 
     A lease that halts (`TransactionHalted`) is an outcome, not a crash, and that is NOT
-    gated: the A3-halt cells of design §8's placement subset are precisely the ones whose
+    gated: the the recovery model-halt cells of the specification placement subset are precisely the ones whose
     halt diagnostic the parent wants to compare, and for every other caller a halt still
     surfaces loudly -- `lease` is `null`, so anything reading `lease["active"]` fails.
     """

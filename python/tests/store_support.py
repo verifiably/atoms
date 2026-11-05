@@ -103,7 +103,7 @@ def replace_spec(effect_id: str = "e1", before: bytes = b"before", after: bytes 
 
 
 def duplicate_effect_spec():
-    """Two effects sharing one effect_id, for design §7.7's poison rule.
+    """Two effects sharing one effect_id, for the specification poison rule.
 
     build_spec does not validate and insert_record does not compile, so the `effect`
     PRIMARY KEY is what refuses -- on the *second* INSERT, after the record row and the
@@ -128,7 +128,7 @@ def two_length_spec():
 
     compile_spec accepts this -- measured -- because it never compares two paths'
     fingerprints to each other. A hash and a length are both properties of the same
-    bytes, so the store refuses it under §7.6.
+    bytes, so the store refuses it under the specification.
     """
     pre = FileState(content_hash=SHARED_DIGEST, mode=0o644, byte_len=5)
     post = FileState(content_hash=SHARED_DIGEST, mode=0o644, byte_len=6)
@@ -199,11 +199,11 @@ def release_lock(binding) -> None:
     `_active = False` (`binding.py:150-153`), so `_require_active` refuses at its first
     check and the second one is never reached. That second check --
     `if not self._lock.held` (`binding.py:113`) -- is a distinct branch guarding a
-    distinct real state: A5b's lease can end while the binding object it was built on is
+    distinct real state: the recovery lease's lease can end while the binding object it was built on is
     still perfectly alive. A test that only ever calls `binding.__exit__()` proves the
     gate refuses a closed binding and says nothing about a released lease.
 
-    The lock is private to the binding on purpose (§8.3's reasoning for `_store`), so
+    The lock is private to the binding on purpose (the specification reasoning for `_store`), so
     this reaches through the slot. It lives here once rather than at each call site so
     that the reach is a single reviewed line.
     """
@@ -231,14 +231,14 @@ def close_binding(binding) -> None:
 #: `release_lock` leaves the binding active and trips the second
 #: (`if not self._lock.held`, `binding.py:113`). A suite that only ever closes the
 #: binding proves the gate refuses a closed binding and says nothing about a lease that
-#: ended under a binding still in use -- which is the state A5b actually produces, since
+#: ended under a binding still in use -- which is the state the recovery lease actually produces, since
 #: the lock is what the lease *is* and the binding object outlives it.
 #:
 #: Every gate tier is parametrized over both, so a gate that happened to read only
 #: `binding.active` would fail half of them.
 RELEASES = (close_binding, release_lock)
 
-#: Design §7.1's public Store methods and one valid-enough argument tuple for each.
+#: Contract:  public Store methods and one valid-enough argument tuple for each.
 #: `close` is absent because it is the sole operation that succeeds after close.
 STORE_SURFACE: tuple[tuple[str, tuple[object, ...]], ...] = (
     ("transaction", ()),
@@ -363,7 +363,7 @@ def every_diagnostic_shape() -> tuple[HaltDiagnostic, ...]:
 def matching_diagnostic(effect_id: str = "only") -> HaltDiagnostic:
     """A diagnostic that AGREES with a one_effect_spec record's durable rows.
 
-    §7.6 compares a stored diagnostic's commit_decision and journal vector against the
+    the specification compares a stored diagnostic's commit_decision and journal vector against the
     record row and the effect rows, so a diagnostic assembled at random cannot be
     committed at all. A test that needs a *coherent* HALTED record on disk -- to then
     break one specific thing about it -- needs this one.

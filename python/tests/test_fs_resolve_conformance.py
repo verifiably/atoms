@@ -1,4 +1,4 @@
-"""Tier 3: A4b-1 against a real ext4 volume (design §9.3)."""
+"""Tier 3: path resolution and project approval-1 against a real ext4 volume."""
 
 from __future__ import annotations
 
@@ -16,12 +16,12 @@ from atoms.fs.lookup import LookupProof, inherited_constraints, read_lookup_cons
 from atoms.fs.resolve import PathResolver, PresentFrontier
 from tests.fs_support import descriptor_count
 
-# Both children follow A4a's _BIND_MOUNT_CHILD convention: script text plus sys.argv,
+# Both children follow the capability backend's _BIND_MOUNT_CHILD convention: script text plus sys.argv,
 # exit 77 for "namespace or mount unavailable, skip". Each builds its own single-entry
 # allowlist inline, so it needs nothing from the `tests` package on its path. Both
 # construct a PathResolver and call resolve(): asserting the errno from
 # open_child_directory, or st_dev/mnt_id from two bare descriptors, would prove a
-# property of A4a and of the kernel while leaving A4b-1's translation of it untested.
+# property of the capability backend and of the kernel while leaving path resolution and project approval-1's translation of it untested.
 _BIND_PREAMBLE = r"""
 import os
 import subprocess
@@ -189,7 +189,7 @@ def test_a_plain_ext4_directory_reports_exact_bytes(ext4_probe_fd):
 
 
 def test_a_created_directory_matches_the_inheritance_rule(ext4_probe_fd):
-    """Without this, §5.4's rule is only prose."""
+    """Without this, the specification rule is only prose."""
     parent = read_lookup_constraints(ext4_probe_fd, "ext4")
     os.mkdir("child", mode=0o700, dir_fd=ext4_probe_fd)
     child_fd = os.open("child", os.O_RDONLY | os.O_DIRECTORY, dir_fd=ext4_probe_fd)
@@ -211,7 +211,7 @@ def test_a_255_byte_name_is_accepted_and_256_refuses(ext4_bound_volume):
 def test_two_hard_links_share_an_identity_with_distinct_provenance(
     ext4_bound_volume, ext4_project_root
 ):
-    """A4b-1 reports the shared identity; whether topology merges them is A4b-2's."""
+    """path resolution and project approval-1 reports the shared identity; whether topology merges them is path resolution and project approval-2's."""
     (ext4_project_root / "left").write_text("x")
     os.link(ext4_project_root / "left", ext4_project_root / "right")
     with ext4_bound_volume() as binding:
@@ -228,7 +228,7 @@ def test_two_hard_links_share_an_identity_with_distinct_provenance(
 def test_a_path_equal_to_the_metadata_root_refuses(ext4_nested_bound_volume):
     """Needs a metadata root INSIDE the project root.
 
-    With A4a's sibling layout the metadata root's relative spelling starts with '..',
+    With the capability backend's sibling layout the metadata root's relative spelling starts with '..',
     require_rel_path rejects that, and this assertion is unreachable.
     """
     with ext4_nested_bound_volume() as binding:

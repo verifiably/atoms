@@ -339,7 +339,7 @@ def test_binding_refuses_dataclass_replacement(bound_volume):
     # ProjectBinding is deliberately NOT a dataclass — it owns a descriptor and a
     # spent flag, which are not value semantics — so replace() refuses for want of
     # __dataclass_fields__ rather than for want of the token. Either way no copy of a
-    # live binding can be fabricated, which is what A4b will rely on (ledger #16).
+    # live binding can be fabricated, which is what path resolution and project approval will rely on.
     with bound_volume() as binding, pytest.raises(TypeError):
         dataclasses.replace(binding)
 

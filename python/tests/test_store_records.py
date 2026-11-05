@@ -1,4 +1,4 @@
-"""Tier 2 -- the record layer over an in-memory-shaped store (design §11.2)."""
+"""Tier 2 -- the record layer over an in-memory-shaped store."""
 
 from __future__ import annotations
 
@@ -104,7 +104,7 @@ def test_the_diagnostic_round_trips_exactly(diagnostic):
 
 @pytest.mark.parametrize("diagnostic", every_diagnostic_shape(), ids=lambda d: d.reason.value)
 def test_the_encoded_form_contains_no_entry_identity(diagnostic):
-    """Ledger #12: a snapshot-local identity token must never become durable. A3 keeps
+    """the boundary contract: a snapshot-local identity token must never become durable. the recovery model keeps
     HaltDiagnostic token-free by construction, which is what makes it storable at all."""
     text = encode_diagnostic(diagnostic)
     assert "identity" not in text or "identity_relations" in text
@@ -203,7 +203,7 @@ def test_every_path_state_variant_round_trips_inside_a_diagnostic_entry(state):
         # Shapes that reached a *raw* exception before the field checks existed.
         # `journals: 5` left as `TypeError: 'int' object is not iterable`; `paths` as a
         # string decoded character by character and refused nothing; `effect_id: 7` was
-        # copied straight through into a HaltDiagnostic A3 would later choke on.
+        # copied straight through into a HaltDiagnostic the recovery model would later choke on.
         (lambda obj: obj.update({"journals": 5}), "journals must be an array"),
         (lambda obj: obj.update({"paths": "a.txt"}), "paths must be an array"),
         (lambda obj: obj.update({"paths": ["a.txt", 7]}), "paths[1]"),
@@ -218,7 +218,7 @@ def test_every_path_state_variant_round_trips_inside_a_diagnostic_entry(state):
 )
 def test_a_malformed_diagnostic_payload_refuses(mutate, names):
     """A missing field, an extra one, an unknown enum member, and a field of the wrong
-    primitive type all refuse -- design §9 lists a malformed payload as a
+    primitive type all refuse -- the specification lists a malformed payload as a
     MetadataStoreInvalid shape, and `halt_diagnostic` is the one column with no CHECK
     behind it, so this decoder is its entire boundary.
 
@@ -299,7 +299,7 @@ def test_referenced_digests_include_an_intermediate_postimage():
 
     The initial surface has A and the final has C. Before this repair the helper missed B
     entirely, so `connection.py`'s barrier refused a promoted B as unreferenced -- and not
-    promoting it would leave A7 without the bytes it must publish.
+    promoting it would leave the effect executor without the bytes it must publish.
     """
     from atoms.core.effects import ReplaceFile
     from atoms.core.spec import build_spec
@@ -326,8 +326,7 @@ def test_referenced_digests_include_an_intermediate_postimage():
 def test_referenced_digests_keep_conflicting_lengths_as_distinct_pairs():
     """Measured: `compile_spec` accepts one content_hash at two byte_len values.
 
-    Collapsing to digests would erase the contradiction capture must detect (A6 design
-    §7.2), in the one helper positioned to see every declared FileState at once.
+    Collapsing to digests would erase the contradiction capture must detect (Contract: ), in the one helper positioned to see every declared FileState at once.
     """
     from atoms.core.effects import ReplaceFile
     from atoms.core.spec import build_spec
@@ -395,7 +394,7 @@ def test_a_duplicate_txid_is_refused(opened_store):
 
 
 def test_a_caught_write_failure_cannot_be_committed(opened_store, store_binding):
-    """Design §7.7's poison rule, end to end.
+    """Contract:  poison rule, end to end.
 
     The duplicate effect_id fails the *second* INSERT INTO effect. By then the record
     row and the first effect row -- written by the same method call -- are already in
@@ -406,7 +405,7 @@ def test_a_caught_write_failure_cannot_be_committed(opened_store, store_binding)
     """
     with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
         # `try`/`except` rather than a nested `pytest.raises`: this is literally the
-        # shape under test -- a caller that catches A5a's failure and carries on -- and
+        # shape under test -- a caller that catches the metadata store's failure and carries on -- and
         # ruff's SIM117 refuses the nested `with` anyway.
         try:
             txn.insert_record(
@@ -478,7 +477,7 @@ def test_set_transaction_state_validates_the_txid(opened_store, bad):
     ],
 )
 def test_a_wrong_exact_type_refuses_with_protocol_error(opened_store, method, bad, refusal):
-    """§9's table: a wrong exact type is caller misuse, `ProtocolError`, never a raw
+    """the specification table: a wrong exact type is caller misuse, `ProtocolError`, never a raw
     `AttributeError` from inside the store.
 
     The four one-line setters read `.value` in their argument list, so before
@@ -609,8 +608,8 @@ def test_set_active_none_clears_the_row(opened_store, store_binding):
 
 def test_set_active_refuses_a_transaction_that_does_not_exist(opened_store):
     """foreign_keys=ON makes active.txid a real reference, so `active` can never name a
-    transaction that does not exist -- the shape authority §7.3 promises recovery will
-    never see (design §6.2).
+    transaction that does not exist -- the shape the specification promises recovery will
+    never see.
 
     Narrowed to `sqlite3.IntegrityError` naming `FOREIGN KEY` (review round 1, finding 2):
     a bare `pytest.raises(Exception)` pins that *some* refusal fired, not which one.
@@ -623,7 +622,7 @@ def test_set_active_refuses_a_transaction_that_does_not_exist(opened_store):
 @pytest.mark.parametrize("value", [42.5, "abc", b"x"])
 def test_strict_typing_refuses_a_value_that_cannot_convert(opened_store, store_binding, value):
     """STRICT coerces losslessly -- '42' and 42.0 both store as integer 42 -- so the test
-    uses the values that actually raise (design §6.2)."""
+    uses the values that actually raise."""
     raw = raw_connect(store_binding)
     try:
         with pytest.raises(sqlite3.IntegrityError) as caught:
@@ -851,7 +850,7 @@ def test_every_reachable_cross_row_rule_refuses_on_a_write(opened_store, store_b
 
 
 def test_the_cross_row_matrix_covers_every_rule_on_both_sides():
-    """The claim design §11.2 makes, as an assertion rather than a list.
+    """The claim the specification makes, as an assertion rather than a list.
 
     The read side is total. The write side covers every rule the public write API can
     actually produce; the rest are listed once, each with the API property that makes it

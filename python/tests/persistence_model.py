@@ -1,4 +1,4 @@
-"""The persistence-cut model: units, recording, durable state (design §4).
+"""The persistence-cut model: units, recording, durable state.
 
 A `RecordingCutBackend` sits beneath the audited facade -- the same seam `KillingBackend`
 occupies in the kill matrix -- and delegates every call to the real backend. Recording is
@@ -9,7 +9,7 @@ exception propagates before any `_emit_mutation`/`_emit_barrier` call is reached
 Durability units are keyed by real filesystem identity (`st_dev`, `st_ino`), captured the
 first time any Backend call references an object -- whether that reference creates it or
 merely opens something the seed already produced. Only creation (or reference-with-intent,
-per §4.1's short list: `create_exclusive`, `create_or_open` when it creates, `mkdir_child`,
+per the specification short list: `create_exclusive`, `create_or_open` when it creates, `mkdir_child`,
 `symlink_child`, `link_anchor`, `transfer_noclobber`, `exchange`, `unlink_child`,
 `rmdir_child`, `write`, `set_mode`, `set_marker_xattr`, `repair_entry_mode`) appends a
 `Mutation`; every other Backend method is a pure delegate plus fd-table bookkeeping.
@@ -22,7 +22,7 @@ hardcode nine names because every kill-matrix variant is single-effect; the exer
 `corpus-write` and `archive-move` scenarios are not, so this file derives the label from
 the write that happened rather than from a position).
 
-Design §9's falsification arms live here too, as data (`SABOTAGE_ARMS`): each one either
+Contract:  falsification arms live here too, as data (`SABOTAGE_ARMS`): each one either
 makes the recorder *swallow* one named `Barrier` -- the real `fsync` still happens, the
 covered units simply stay pending in the recorded view, which is what the survivor
 product is taken over -- or has the sequencer withhold one `Commit`'s backup advance, and
@@ -70,7 +70,7 @@ UnitKey = NewType("UnitKey", tuple)
 
 # path (root-relative, e.g. "project/d/f.txt" or "metadata/.#~chain") ->
 # ("file", bytes, mode) | ("file", bytes, mode, ("link-group", token)) | ("dir", mode) |
-# ("symlink", target) -- design §4.4/§9's WorldState.tree shape.
+# ("symlink", target) -- the specification/the specification WorldState.tree shape.
 WorldTree = dict[str, tuple]
 
 
@@ -84,8 +84,7 @@ class ModelInode:
 @dataclass(frozen=True)
 class Unit:
     """One durability unit. `payload` carries the data image for an `image` unit and the
-    mode/xattr value for a `mode`/`xattr` unit. A *creation's* mode is not a unit at all
-    (design §4.1 as amended 2026-08-15) -- it rides with the typed model inode, in
+    mode/xattr value for a `mode`/`xattr` unit. A *creation's* mode is not a unit at all -- it rides with the typed model inode, in
     `Stream.creation_modes`.
     """
 
@@ -144,7 +143,7 @@ class Stream:
         self.identity: dict[tuple[int, int], int] = {}
         self.identity_reverse: dict[int, tuple[int, int]] = {}
         self.inodes: dict[int, ModelInode] = {}
-        # The mode each recorded object was CREATED with (design §4.1 as amended
+        # The mode each recorded object was CREATED with (the specification as amended
         # 2026-08-15: creation-time mode is atomic with inode creation). It is a
         # property of the model inode, not a durability unit, so keyed replacement --
         # a rename's `remove` superseding the pending creating `insert` at the same
@@ -156,7 +155,7 @@ class Stream:
         self.entries: dict[tuple[int, str], int] = {}
         self.images: dict[int, bytearray] = {}
 
-        # Tokens that name a database-family entry (design §4.1: "the database
+        # Tokens that name a database-family entry (the specification: "the database
         # namespace is model-owned"). Once a token is known to be one, every unit
         # naming it -- entry, data, or meta -- is dropped from the recorded stream.
         self.db_tokens: set[int] = set()
@@ -164,7 +163,7 @@ class Stream:
         # Keys touched by a Mutation and not yet covered by a Barrier.
         self.pending: dict[tuple, Unit] = {}
 
-        # The seed overlay `durable_state` folds from first (design §4.3): the root
+        # The seed overlay `durable_state` folds from first: the root
         # token for each labelled root ("project"/"metadata"), the seed-era entry map,
         # every seed-era inode's mode, and every seed-era file's byte image. Populated
         # by `_snapshot_seed`, sharing `tokens`/`identity`/`inodes` above with the
@@ -177,10 +176,10 @@ class Stream:
 
         # Set by `record_scenario` once the recorded transaction finishes: the canonical
         # digest (`world_digest`) of the real, live final world -- the fidelity
-        # self-check's target (design §9).
+        # self-check's target.
         self.final_world_digest: str | None = None
 
-        # Design §9's sabotage arms (`SABOTAGE_ARMS`). `suppress` is the barrier
+        # Contract:  sabotage arms (`SABOTAGE_ARMS`). `suppress` is the barrier
         # predicate one arm installs for the length of one recording: the recorder
         # consults it before appending a `Barrier`, and a match is *swallowed* -- the
         # real filesystem still flushed, but the covered units stay pending in the
@@ -231,8 +230,7 @@ class Stream:
         live name (the anchor), and the later `transfer_noclobber` gives it a second
         live name again (the destination, replacing the source) -- both are
         `change="insert"` events leaving the token linked, so the *last* one is the cut
-        where the destination and the still-durable anchor share one inode (design
-        §9.4).
+        where the destination and the still-durable anchor share one inode.
         """
         entries: dict[tuple[int, str], int] = {}
         reverse: dict[int, set[tuple[int, str]]] = {}
@@ -270,10 +268,10 @@ class Stream:
 
 
 class RecordingCutBackend:
-    """Success-only recorder beneath the audited facade (design §4.1).
+    """Success-only recorder beneath the audited facade.
 
     Every Backend method is implemented explicitly. Pure opens and probes delegate and
-    perform fd-table/identity bookkeeping only; the methods design §4.1 lists as
+    perform fd-table/identity bookkeeping only; the methods the specification lists as
     mutating additionally resolve operands before the delegated call, and append a
     `Mutation` after it succeeds.
     """
@@ -371,7 +369,7 @@ class RecordingCutBackend:
         return frozenset(self._stream.pending)
 
     def _emit_barrier(self, covered: frozenset, *, kind: str) -> None:
-        """Append the `Barrier` this flush publishes -- unless a design §9 sabotage arm
+        """Append the `Barrier` this flush publishes -- unless a the specification sabotage arm
         swallows it (`Stream.suppress`), in which case the covered units stay pending
         and no event is appended at all: the arm's whole content is that the model's
         recorded view no longer holds a durability barrier the engine really performed.
@@ -438,7 +436,7 @@ class RecordingCutBackend:
         stream.fd_offset.pop(fd, None)
 
     # --- creation: mint a token, register the entry, emit ONE insert carrying the
-    # creation mode (design §4.1 as amended 2026-08-15 -- a create journals its inode
+    # creation mode (the specification as amended 2026-08-15 -- a create journals its inode
     # with its entry, so the mode cannot tear away beneath a durable entry; only a
     # later `set_mode`/`repair_entry_mode` change emits an independently tearing
     # `meta` unit) ----------------------------------------------------------------
@@ -580,7 +578,7 @@ class RecordingCutBackend:
         token = self._resolve_entry_token(parent, parent_fd, name)
         self._emit_mutation(Unit(("meta", token, "mode"), "mode", token, mode))
 
-    # --- durable publish: barrier coverage (design §4.2) --------------------------
+    # --- durable publish: barrier coverage --------------------------
     def flush_file(self, fd: int) -> None:
         self._inner.flush_file(fd)
         token = self._stream.fd_token.get(fd)
@@ -615,7 +613,7 @@ class RecordingCutBackend:
 
 
 def _backup_db(db_path: Path) -> bytes:
-    """A serialized in-memory copy of the SQLite database at `db_path` (design §4.1).
+    """A serialized in-memory copy of the SQLite database at `db_path`.
 
     The live database runs WAL (design's own pragma probe), and `Connection.backup`
     copies page 1 verbatim -- including the file-format-version bytes at offsets 18/19,
@@ -725,7 +723,7 @@ def attach_store_sequencer(
     on success it also backs up `atoms.db` and appends the event, rather than counting
     towards a kill countdown.
 
-    `stale_commit` is design §9's arm 5, and it is the one sabotage that is not a
+    `stale_commit` is the specification arm 5, and it is the one sabotage that is not a
     swallowed barrier: the named label's transaction still commits for real, but the
     model's durable metadata does **not** advance to it -- the `Commit` event carries the
     *previous* backup. That is exactly "cleanup and return proceed without the durable
@@ -777,7 +775,7 @@ def _snapshot_seed(project_root: str, metadata_root: str, stream: Stream) -> Non
     Shares `stream.tokens`/`stream.identity`/`stream.inodes` with `RecordingCutBackend`,
     so a later Backend call touching one of these objects (a rename, a write) resolves
     the *same* token via its (st_dev, st_ino) identity -- unifying seed-era and recorded
-    objects in one namespace (module docstring; design §4.1's inode-identity ruling).
+    objects in one namespace (module docstring; the specification inode-identity ruling).
     """
 
     def register(info: os.stat_result, *, symlink_target: str | None = None) -> int:
@@ -825,7 +823,7 @@ def _walk_lstat(base: Path):
     """Yield every (path, lstat) under `base`, recursively, never following symlinks.
 
     A directory whose *durable* mode denies the owner read or search permission is
-    yielded, never descended into, and never chmod'd: design §4.3's survivor product
+    yielded, never descended into, and never chmod'd: the specification survivor product
     branches an entry unit independently of its paired `meta mode` unit, so a
     reconstructed world legitimately contains a mode-`0` directory (Task 5's directed
     zero-mode test pins exactly that shape). Its contents are unobservable -- to the
@@ -855,7 +853,7 @@ def _content_hash(path: Path) -> str:
     """The file's content digest, or the `_UNREADABLE` marker for a mode that denies it.
 
     Same ruling as `_walk_lstat`: a survivor subset may drop a file's `meta mode` unit
-    while keeping its entry, and design §4.4 reconstructs that faithfully as a mode-`0`
+    while keeping its entry, and the specification reconstructs that faithfully as a mode-`0`
     file. Its bytes are unobservable -- to the engine as much as to this digest -- and
     the mode itself is already a digested field, so the marker records exactly what is
     knowable instead of raising.
@@ -867,12 +865,12 @@ def _content_hash(path: Path) -> str:
 
 
 def world_digest(project_root: str | Path, metadata_root: str | Path) -> str:
-    """Canonical digest of both real trees (design §9's fidelity self-check): path,
+    """Canonical digest of both real trees (the specification fidelity self-check): path,
     kind, mode, content hash, symlink target, and hard-link-group structure.
 
     `.#~chain` is **included** -- unlike `_snapshot_seed`'s bootstrap scope, chain
     reconciliation is under test here. The DB family is **excluded**: the store's
-    durable state is compared by backup identity (design §4.4), never by file bytes,
+    durable state is compared by backup identity, never by file bytes,
     and no `-wal`/`-shm`/`-journal` file is ever replayed.
     """
     entries: list[tuple[str, str, int | None, str | None, str | None, tuple[int, int] | None]] = []
@@ -915,13 +913,13 @@ def world_digest(project_root: str | Path, metadata_root: str | Path) -> str:
     return digest.hexdigest()
 
 
-# --- durable state, survivor application, reconstruction (design §4.3-4.4, §9) -----
+# --- durable state, survivor application, reconstruction -----
 
 
 @dataclass(frozen=True)
 class WorldState:
     """The surviving world at a cut. `reconstruct` reads exactly two fields: `tree`
-    (design §4's public shape) and `backup_bytes` (the resolved backup content -- a
+    (the specification public shape) and `backup_bytes` (the resolved backup content -- a
     bare, stream-independent `WorldState` must carry the bytes itself, since
     `reconstruct`'s signature takes no `Stream` to resolve `backup_id` through).
     `backup_id` is carried for identity/debugging only. `entries`/`modes`/`images` are
@@ -947,7 +945,7 @@ class WorldState:
 
 @dataclass(frozen=True)
 class Skip:
-    """An unrepresentable survivor subset (design §4.3): `reason` is one of
+    """An unrepresentable survivor subset: `reason` is one of
     `{"remove-without-target", "replace-without-target", "orphan-object-state"}`."""
 
     reason: str
@@ -985,7 +983,7 @@ def _apply_unit(
 ) -> str | None:
     """Apply one unit's effect in place; return a Skip reason, or `None` on success.
 
-    `strict=True` (`apply_survivors`) enforces design §4.3's structural-applicability
+    `strict=True` (`apply_survivors`) enforces the specification structural-applicability
     rules -- a `remove`/`replace` needs a durable-or-included target, an `image`/`mode`
     needs a durable-or-included name -- because it is judging a *hypothetical* survivor
     subset for representability. `strict=False` (`durable_state`) is folding *real*
@@ -1022,7 +1020,7 @@ def _apply_unit(
     if key[0] == "meta":
         token, field_name = key[1], key[2]
         if field_name != "mode":
-            # xattr fields carry no reconstructed/digested state (design §4.4/§9's
+            # xattr fields carry no reconstructed/digested state (the specification/the specification
             # tree shapes and `world_digest` name path/kind/mode/content/symlink/
             # link-group only) -- applying one is a structural no-op, not a skip.
             return None
@@ -1077,7 +1075,7 @@ def _materialize_tree(
 
 
 def durable_state(stream: Stream, cut: int) -> WorldState:
-    """Fold events `0..cut` into the durable world (design §4.3): the seed tree, each
+    """Fold events `0..cut` into the durable world: the seed tree, each
     `Barrier`'s covered pending units moved into the durable tree (keyed replacement --
     the last pending `Unit` at a key wins), and the latest `Commit`'s backup. Units
     still pending at `cut` are *not* included here -- `apply_survivors` extends this
@@ -1179,8 +1177,7 @@ def _apply_chosen(
 def apply_survivors(
     state: WorldState, stream: Stream, cut: int, survivors: frozenset[tuple]
 ) -> WorldState | Skip:
-    """Apply the chosen pending keys **in stream order** against `state`'s durable tree
-    (design §4.3). Every key must be pending at `cut` -- `pending_keys_at(stream, cut)`
+    """Apply the chosen pending keys **in stream order** against `state`'s durable tree. Every key must be pending at `cut` -- `pending_keys_at(stream, cut)`
     is the closed universe callers choose subsets from; a key outside it is a caller
     bug, not a representability question, and raises rather than skipping silently.
 
@@ -1194,7 +1191,7 @@ def apply_survivors(
 
 def _maximal_survivors(stream: Stream, cut: int) -> frozenset[tuple]:
     """The largest subset of `pending_keys_at(stream, cut)` `apply_survivors` accepts
-    whole -- design §9's "every pending unit surviving" fidelity check, computed
+    whole -- the specification "every pending unit surviving" fidelity check, computed
     correctly in the presence of transient, never-durable churn.
 
     Keyed replacement forgets a key's earlier pending `Unit` the moment a later one at
@@ -1204,7 +1201,7 @@ def _maximal_survivors(stream: Stream, cut: int) -> frozenset[tuple]:
     whose target was never durable and whose insert is gone. Every such leftover key is
     unconditionally excludable: applying it or not changes nothing observable (a
     `remove` with no target is already a no-op; `data`/`meta` for a nameless token
-    never surfaces in `_materialize_tree`), and design §9's own `apply_survivors`
+    never surfaces in `_materialize_tree`), and the specification own `apply_survivors`
     Step-3 text calls this shape "an unreachable inode carries no observable state" --
     so dropping it, rather than letting one leftover key fail an otherwise-legitimate
     full-survival reconstruction, is what "every pending unit surviving" means when
@@ -1232,7 +1229,7 @@ def _maximal_survivors(stream: Stream, cut: int) -> frozenset[tuple]:
 
 def _probe_root_token(stream: Stream) -> int | None:
     """The token naming `metadata/probe` (`atoms.fs.bootstrap.PROBE_DIRECTORY`) --
-    created at seed-owned bootstrap (design §4.1: bootstrap publication is seed's, not
+    created at seed-owned bootstrap (the specification: bootstrap publication is seed's, not
     recorded), so it lives in `seed_entries`, never as a recorded `Mutation`."""
     metadata_root = stream.roots.get("metadata")
     if metadata_root is None:
@@ -1310,7 +1307,7 @@ def _tree_digest(tree: WorldTree) -> str:
 
 class PendingCapExceeded(Exception):
     """A cut's pending *transactional* key count exceeded `enumerate_cells`'s
-    `pending_cap` -- loud, never sampled (design §4.3): "a cap breach means the model
+    `pending_cap` -- loud, never sampled: "a cap breach means the model
     or the engine changed, and the matrix must say so.\""""
 
 
@@ -1355,7 +1352,7 @@ def _fold(
     `apply_survivors`' own all-or-nothing contract for a chosen key. An `optional`
     (probe-noise) unit that fails is simply excluded and the pass continues: the
     maximal-applicable probe-noise fold (`_maximal_survivors`'s own greedy philosophy,
-    design §9's "an unreachable inode carries no observable state"), computed by
+    the specification "an unreachable inode carries no observable state"), computed by
     exactly the ordering that will later re-apply it, so a fold decision can never
     diverge from what `apply_survivors` itself would say about the same merged set --
     `_apply_unit` never mutates on failure, so an excluded optional key leaves no trace
@@ -1384,13 +1381,13 @@ def enumerate_cells(
     stream: Stream, *, pending_cap: int = 12
 ) -> tuple[tuple[Cell, ...], SweepAccounting]:
     """Every reconstructible cell of `stream`, materialized (erratum 2 -- a pair, never
-    an iterator): walk every cut index (design §4.3's "an index into the recorded
+    an iterator): walk every cut index (the specification "an index into the recorded
     stream"), split that cut's pending keys into TRANSACTIONAL and probe-noise
     (`_is_probe_noise`; CONTROLLER ruling #1), and take the full powerset over the
-    transactional keys **of every kind** (`entry`, `data`, `meta`) -- design §4.3's
+    transactional keys **of every kind** (`entry`, `data`, `meta`) -- the specification
     full-independence adversary, restored: a scenario's own mode/content axis is
     genuinely combinatorial (a create's entry landing without its paired mode unit is
-    §4.4's own reconstructible shape), so it is swept, not folded away.
+    the specification own reconstructible shape), so it is swept, not folded away.
 
     Every transactional combo is completed by the maximal-applicable probe-noise fold
     (`_fold`) -- capability probing's own churn is unconditionally reclaimed at lease
@@ -1402,7 +1399,7 @@ def enumerate_cells(
     just `entry`) before the walk raises `PendingCapExceeded` -- loud, never sampled.
     Measured across every `SCENARIOS` entry, the transactional dimension never exceeds
     6 simultaneously pending keys (probe-noise separately reaches 24-51) -- comfortably
-    under the default cap, and matching design §4.3's "the engine's barrier discipline
+    under the default cap, and matching the specification "the engine's barrier discipline
     keeps pending sets small" read as being about the engine's *own* transactional
     surface, not capability-probing scratch.
 
@@ -1463,7 +1460,7 @@ def enumerate_cells(
 
 def named_tuples(stream: Stream) -> dict[str, Cell]:
     """`{"dual-name-forward", "anchor-only-forward"}` and, in a caught-rollback move
-    stream, `{"dual-name-reverse", "anchor-only-reverse"}` (design §9.4).
+    stream, `{"dual-name-reverse", "anchor-only-reverse"}`.
 
     A move's transfer is a two-unit `remove`+`insert` `Mutation` sharing an object
     token that also carries a `link_anchor`-shaped insert elsewhere in the stream (a
@@ -1486,9 +1483,8 @@ def named_tuples(stream: Stream) -> dict[str, Cell]:
 
     For each match, the cut immediately after its `Mutation` names two single-survivor
     cells -- `{insert}` (both names momentarily alive: dual-name) and `{remove}` (the
-    anchor is the only surviving name: anchor-only) -- design §4.3's "a remove of an
-    entry that is durably present applies" is exactly how anchor-only arises. Design
-    §4.3/§9.4 calls both **generated, never skipped**: either resolving to `Skip`
+    anchor is the only surviving name: anchor-only) -- the specification "a remove of an
+    entry that is durably present applies" is exactly how anchor-only arises. Contract: /the specification calls both **generated, never skipped**: either resolving to `Skip`
     raises `KeyError` naming the tuple, rather than silently omitting it.
     """
     probe_tokens, _ = _probe_classification(stream)
@@ -1500,7 +1496,7 @@ def named_tuples(stream: Stream) -> dict[str, Cell]:
 
     # An anchor insert is a single-unit entry `insert` that leaves its token with a
     # SECOND live name -- `index_after`'s discriminator, applied here too. Shape alone
-    # is not enough since design §4.1's creation-mode ruling made a creation a
+    # is not enough since the specification creation-mode ruling made a creation a
     # single-unit entry insert as well (it used to carry a paired `meta mode` unit, and
     # a two-unit event was excluded from this scan for free): without the second-name
     # test, every `create_exclusive`/`mkdir_child` token would register as an anchor,
@@ -1578,7 +1574,7 @@ def complete_named_cell(cell: Cell, stream: Stream) -> Cell:
     """Complete a bare `apply_survivors`-built cell into a physically runnable one.
 
     `named_tuples` builds its four cells through `apply_survivors` with a single chosen
-    *entry* key, so every other pending key at that cut is dropped. Design §9.4 defines
+    *entry* key, so every other pending key at that cut is dropped. Contract:  defines
     those tuples purely by which **names** are live -- dual-name keeps the transfer's
     insert, anchor-only keeps its remove -- and says nothing about the modes and byte
     images of unrelated objects, which the bare cell would silently drop along with
@@ -1590,7 +1586,7 @@ def complete_named_cell(cell: Cell, stream: Stream) -> Cell:
     anyway, is offered to the same `_fold` pass the sweep uses. Two survivor
     vocabularies, one physical cell, one applicability engine.
 
-    History worth keeping: before design §4.1's creation-mode ruling (2026-08-15) a
+    History worth keeping: before the specification creation-mode ruling (2026-08-15) a
     dropped *creation* mode unit reconstructed its object at mode `0`, and both
     `minimal-move` tuples then refused the lease on an inaccessible
     `metadata/work/<txid>` instead of performing the repair their directed tests exist
@@ -1623,8 +1619,7 @@ def _resolve(rel: str, project_root: Path, metadata_root: Path) -> Path:
 
 
 def reconstruct(state: WorldState, project_root: Path, metadata_root: Path) -> None:
-    """Write `state.tree` onto fresh `project_root`/`metadata_root` directories (design
-    §4.4): model inodes become fresh files, hard-link groups reproduced with `os.link`
+    """Write `state.tree` onto fresh `project_root`/`metadata_root` directories: model inodes become fresh files, hard-link groups reproduced with `os.link`
     (files only), directory modes applied, symlink targets exact, and the cut's backup
     installed as `atoms.db` **alone** -- never any other `DB_FAMILY` name.
 
@@ -1634,7 +1629,7 @@ def reconstruct(state: WorldState, project_root: Path, metadata_root: Path) -> N
 
     Directories are created at a permissive `0o700` first and only chmod'd to their
     *durable* mode in a final, deepest-first pass -- a survivor subset can legitimately
-    include an entry `insert` without its paired `meta mode` unit (design §4.2's
+    include an entry `insert` without its paired `meta mode` unit (the specification
     independently-barrier-covered keys), so `_materialize_tree` can hand back a `0`
     (no permission bits at all) directory mode. Applying that mode immediately, before
     the directory is populated or a descendant is even created, would make every path
@@ -1718,7 +1713,7 @@ def reconstruct(state: WorldState, project_root: Path, metadata_root: Path) -> N
 def realign_durable_identities(project_root: Path, metadata_root: Path) -> int:
     """Rewrite every durable `approval_evidence` identity onto the reconstructed inodes.
 
-    Design §4.4 claims reconstruction is "exact up to inode renaming, ... safe because
+    Contract:  claims reconstruction is "exact up to inode renaming, ... safe because
     nothing durable stores inode numbers". That claim is **wrong about one durable
     document**: `transaction_record.approval_evidence`
     (`atoms.fs.approval.encode_approval_evidence`) pins `(st_dev, st_ino)` for every
@@ -1728,10 +1723,10 @@ def realign_durable_identities(project_root: Path, metadata_root: Path) -> int:
     `AssemblyHalt(APPROVAL_EVIDENCE_MISMATCH)` and raises -- **before**
     `classify_recovery` is ever reached. Reconstruction mints fresh inodes by
     construction, so without this step every record-bearing cell halts on an artifact of
-    reconstruction and the A3 agreement matrix asserts nothing at all (measured: 42 of
+    reconstruction and the the recovery model agreement matrix asserts nothing at all (measured: 42 of
     `minimal-create`'s 103 cells, and every cell that ever reached a durable record).
 
-    So the renaming §4.4 assumes is performed here, at the one place identity is durable:
+    So the renaming the specification assumes is performed here, at the one place identity is durable:
     each identity-bearing directory's `(st_dev, st_ino)` is replaced by the reconstructed
     object's real one. A declared directory that is *absent* from the reconstructed world
     keeps its recorded identity -- an absent approved directory is a genuine finding the
@@ -1845,14 +1840,14 @@ def record_scenario(
     """Seed, snapshot event 0, and record only the transaction (controller ruling).
 
     Bootstrap (`setup_clean`: seed the world, register the root) is seed-owned per
-    design §4.1 and runs unrecorded, through the plain backend. `_snapshot_seed`
+    the specification and runs unrecorded, through the plain backend. `_snapshot_seed`
     captures the tree bootstrap produced -- including the store `register_root` just
     created -- as the durable-state fold's starting overlay, so the recorded stream
     never enumerates it as entry-unit mutation. Only afterwards is the backend wrapped
     and the transaction alone run through it. `final_world_digest` is computed last, so
-    the fidelity self-check (design §9) has a live-world target to compare against.
+    the fidelity self-check has a live-world target to compare against.
 
-    `sabotage` is one design §9 `Sabotage` arm, installed for this recording only and
+    `sabotage` is one the specification `Sabotage` arm, installed for this recording only and
     audited on the way out: an arm that swallowed a different number of barriers than it
     declared has silently stopped suppressing the thing it names -- an engine refactor
     moving a flush, a scenario growing a second one -- and must fail here rather than
@@ -1891,20 +1886,19 @@ def record_scenario(
     return stream
 
 
-# --- per-cell recovery, the A3 agreement, and the side assertions (design §5) -------
+# --- per-cell recovery, the the recovery model agreement, and the side assertions -------
 
 
 @dataclass(frozen=True)
 class CellResult:
     """One cell's verdict.
 
-    `agrees` is the A3 comparison's answer, and is `True` when the comparison did not
+    `agrees` is the the recovery model comparison's answer, and is `True` when the comparison did not
     apply (no durable record, or a refusal that never reached the classifier) -- read
     `counts["classified"]` to tell "agreed" from "not compared". `halted` is true when
-    the lease entry ended in `TransactionHalted`, which is *not* a disagreement: design
-    §5's "cells where A3 halts assert the halt agrees and is preserved".
+    the lease entry ended in `TransactionHalted`, which is *not* a disagreement: the specification "cells where the recovery model halts assert the halt agrees and is preserved".
 
-    `projection`/`model_projection` are the durable and reduced projections (design §5's
+    `projection`/`model_projection` are the durable and reduced projections (the specification
     widened shape: state, commit decision, rollback result, halt diagnostic, journals,
     active). `world` is the post-recovery tree in `WorldState.tree`'s shape, consumed by
     Task 8's directed repair assertions. `counts` carries the per-cell taxonomy.
@@ -1927,7 +1921,7 @@ class CellResult:
 
 
 def world_tree(project_root: str | Path, metadata_root: str | Path) -> WorldTree:
-    """The live world in `WorldState.tree`'s shape (design §4.4/§9), for comparison
+    """The live world in `WorldState.tree`'s shape (the specification/the specification), for comparison
     against a modelled tree and for Task 8's directed assertions.
 
     Two deliberate differences from `_materialize_tree`'s modelled trees, both so a live
@@ -1935,7 +1929,7 @@ def world_tree(project_root: str | Path, metadata_root: str | Path) -> WorldTree
 
     - a hard-link group is keyed by its lexicographically first member path rather than
       by a model token, because inode numbers are exactly what reconstruction does not
-      preserve (design §4.4) while the *relation* is;
+      preserve while the *relation* is;
     - a file whose durable mode denies reading carries `None` for its content, matching
       `world_digest`'s `_UNREADABLE` marker rather than raising.
     """
@@ -1988,7 +1982,7 @@ def _normalized_tree(tree: WorldTree) -> WorldTree:
 
 def inaccessible_paths(tree: WorldTree) -> tuple[str, ...]:
     """Every path in `tree` whose durable mode denies the owner the access the engine
-    needs: read+search on a directory, read on a file (design §4.3's independent
+    needs: read+search on a directory, read on a file (the specification independent
     `meta mode` axis is what puts them there)."""
     def denied(value: tuple) -> bool:
         if value[0] == "dir":
@@ -2019,9 +2013,9 @@ def _record_txids(metadata_root: Path) -> tuple[str, ...]:
 
 
 def _chain_facts(backend, binding) -> dict:
-    """Validate the chain and pair its registrations with its settlements (design §5's
+    """Validate the chain and pair its registrations with its settlements (the specification
     "chain registration/settlement ... asserted by separate end-to-end checks", the
-    thing A3 deliberately does not model). Reuses `atoms.chain.read.validate_chain`, so
+    thing the recovery model deliberately does not model). Reuses `atoms.chain.read.validate_chain`, so
     a linearization, digest-name, or foreign-leaf fault raises from production code."""
     from atoms.chain.model import RegisteredEntry, SettledEntry
     from atoms.chain.read import validate_chain
@@ -2068,9 +2062,9 @@ def _chain_facts(backend, binding) -> dict:
 
 
 def _inspect(project_root: Path, metadata_root: Path, storage, allowlist) -> dict:
-    """The canonical durable projection plus the facts A3 does not model, read through
+    """The canonical durable projection plus the facts the recovery model does not model, read through
     ONE fresh binding: `test_coordinator_conformance.py`'s `_durable_projection` idiom
-    widened with `halt_diagnostic` (design §5), the chain, the workspace slots, and the
+    widened with `halt_diagnostic`, the chain, the workspace slots, and the
     unindexed blobs.
 
     One binding, not three: the project lock is exclusive, so a chain read taken under
@@ -2138,7 +2132,7 @@ def durable_projection(project_root, metadata_root, storage, allowlist) -> dict 
 
 
 def _model_projection(snapshot, plan) -> tuple:
-    """A3's fixed point in the durable projection's shape (design §5)."""
+    """the recovery model's fixed point in the durable projection's shape."""
     from atoms.core.recovery import apply_recovery_plan
 
     reduced = apply_recovery_plan(snapshot, plan)
@@ -2163,7 +2157,7 @@ class _Refused(Exception):
 
     **Post-ruling scope (2026-08-15).** This used to be ~48% of every sweep, because a
     creation's mode was an independently tearing unit and half the product dropped it.
-    Design §4.1's creation-mode ruling deleted that class outright, and the bucket now
+    Contract:  creation-mode ruling deleted that class outright, and the bucket now
     measures **0 on every minimal scenario**. What can still reach it is a mode *change*
     to a denying mode (`set_mode`/`repair_entry_mode` are the only remaining sources) --
     which no current scenario performs. The machinery is kept rather than deleted
@@ -2191,8 +2185,7 @@ def _enter_lease(
     nothing here.
 
     `CERTIFIED_ALLOWLIST` is patched here too, not left to whatever an earlier recording
-    happened to leave installed: `root.py` is the single production bind call site
-    (ledger #18) and it ships empty, so a lease entry that did not patch it would refuse
+    happened to leave installed: `root.py` is the single production bind call site and it ships empty, so a lease entry that did not patch it would refuse
     every volume -- and one that relied on a *leaked* patch would silently depend on the
     recording's roots still being the same mount.
     """
@@ -2234,7 +2227,7 @@ def _engine_owned(rel: str) -> bool:
     """True for a path the engine owns and may reclaim at any lease entry: capability
     probing's scratch, the workspace slots, the blob store (`_reclaim_orphans` removes
     every unindexed blob at every entry), and any reserved scratch leaf. What is left is
-    the *external* world -- the state design §5 requires recovery to preserve."""
+    the *external* world -- the state the specification requires recovery to preserve."""
     from atoms.core.scratch import is_engine_reserved_leaf
     from atoms.fs.bootstrap import PROBE_DIRECTORY
     from atoms.store.blobs import BLOBS_DIRECTORY
@@ -2275,8 +2268,8 @@ def _occupied_slots(tree: WorldTree) -> tuple[str, ...]:
 
     The slot directories themselves legitimately outlive a terminal recovery: the only
     reclamation rule is `_reclaim_orphans`' "no `transaction_record` row names this
-    txid" (`coordinator/lease.py:24`, ledger #23), and a settled transaction keeps its
-    row forever. What design §5 requires is that the slots are *empty* -- every staged
+    txid" (`coordinator/lease.py:24`, the boundary contract), and a settled transaction keeps its
+    row forever. What the specification requires is that the slots are *empty* -- every staged
     blob promoted or dropped, every work-slot scratch published or removed.
     """
     from atoms.store.workspace import STAGING_PARENT, WORK_PARENT
@@ -2326,7 +2319,7 @@ def _discard_roots(*roots: Path) -> None:
     session. Everything the sweep asserts on is already in memory by the time this runs:
     the projections, the `world` tree, and the digests.
 
-    A durable mode can still deny the walk `rmtree` needs -- rarer since design §4.1's
+    A durable mode can still deny the walk `rmtree` needs -- rarer since the specification
     creation-mode ruling, but a `set_mode` change to `0` is still representable -- so a
     permission failure retries once with every directory opened up. Cleanup never fails
     a cell: the assertions are complete before it is called.
@@ -2355,7 +2348,7 @@ def run_cell(
     retain: bool = False,
 ) -> CellResult:
     """Reconstruct one cell, recover it through the real composition path, and judge it
-    against A3 (design §5).
+    against the recovery model.
 
     The steps, in order:
 
@@ -2366,15 +2359,15 @@ def run_cell(
     3. enter a fresh `root._recovery_lease` under the test allowlist with a capturing
        spy on `atoms.coordinator.recover.classify_recovery` -- recovery runs at entry;
     4. read the canonical durable projection, widened with `halt_diagnostic`;
-    5. compute A3's own fixed point over the captured `(snapshot, plan)` and compare;
+    5. compute the recovery model's own fixed point over the captured `(snapshot, plan)` and compare;
     6. enter a **second** fresh lease and require the canonical projection and the world
        digest to be unchanged -- canonical projection equality, never SQLite byte
-       equality (design §5: "not identical physical SQLite bytes");
-    7. run the side assertions A3 does not model: the chain parses with its
+       equality (the specification: "not identical physical SQLite bytes");
+    7. run the side assertions the recovery model does not model: the chain parses with its
        registration/settlement pairing intact, no generated scratch leaf survives a
        terminal state, the workspace slots are empty, and no unindexed blob remains.
 
-    A cell with **no durable record** (a cut before the `prepared` commit) skips the A3
+    A cell with **no durable record** (a cut before the `prepared` commit) skips the the recovery model
     comparison -- there is nothing to classify -- and instead asserts the store is empty,
     every external path survives untouched, and the engine's own scratch is reclaimed.
 
@@ -2447,7 +2440,7 @@ def run_cell(
         if not inaccessible:
             failures.append(f"unexplained refusal with every mode accessible: {refusal}")
     counts["halted"] = int(halted)
-    # Two different halts reach the same exception. A3's own `HaltPlan` arrives through
+    # Two different halts reach the same exception. the recovery model's own `HaltPlan` arrives through
     # the classifier (captured, and compared below); an *assembly* halt
     # (`_halt_for_findings`, `coordinator/recover.py:499`) is raised from the topology
     # diff BEFORE any classification, so it carries no plan to compare -- what it owes
@@ -2529,7 +2522,7 @@ def run_cell(
     elif captured:
         if projection != model_projection:
             disagreement = (
-                f"durable {projection!r} disagrees with A3's fixed point "
+                f"durable {projection!r} disagrees with the recovery fixed point "
                 f"{model_projection!r}"
             )
         plan = captured[0][1]
@@ -2545,7 +2538,7 @@ def run_cell(
     if captured and drift_footprint:
         # Counted only where recovery actually classified the world: a refused or
         # record-free cell preserves the blocker by never looking at it, which is not
-        # the property design §6's drift family is about. ALL of the footprint must
+        # the property the specification drift family is about. ALL of the footprint must
         # survive -- a drift that plants three paths and keeps one is not "the external
         # blocker was preserved".
         planted = _normalized_tree(before)
@@ -2554,7 +2547,7 @@ def run_cell(
             all(settled_world.get(rel) == planted.get(rel) for rel in drift_footprint)
         )
 
-    # --- side assertions A3 does not model (design §5) ------------------------------
+    # --- side assertions the recovery model does not model ------------------------------
     chain = facts["chain"]
     failures.extend(chain["failures"])
     record = facts["record"]
@@ -2586,7 +2579,7 @@ def run_cell(
     if facts["unindexed_blobs"]:
         failures.append(f"unindexed blobs survived reclamation: {facts['unindexed_blobs']}")
 
-    # --- the mandatory second pass (design §5) --------------------------------------
+    # --- the mandatory second pass --------------------------------------
     violation: str | None = None
     try:
         _enter_lease(project_root, metadata_root, storage, monkeypatch, [], allowlist)
@@ -2665,7 +2658,7 @@ def run_cell_in_a_fresh_process(
 
 def _placement_complaints(result: CellResult, child: dict) -> tuple[str, ...]:
     """Every way the fresh-process placement of one cell disagrees with the in-process
-    one (design §8).
+    one.
 
     Three comparisons, in widening order of what they would catch:
 
@@ -2703,14 +2696,14 @@ def _placement_complaints(result: CellResult, child: dict) -> tuple[str, ...]:
     return tuple(complaints)
 
 
-# --- design §9's sabotage arms and their designated checks --------------------------
+# --- the specification sabotage arms and their designated checks --------------------------
 
 
 def _window_label(stream: Stream) -> str | None:
     """The label of the most recent store `Commit` -- the recording-time window an arm
     suppresses inside. `"e1-started"` is open from the moment the first effect's journal
     row is durably STARTED until its `DONE` row commits, which is exactly the interval
-    design §9's arms 2-4 say a mutation must become durable in."""
+    the specification arms 2-4 say a mutation must become durable in."""
     for event in reversed(stream.events):
         if type(event) is Commit:
             return event.label
@@ -2776,7 +2769,7 @@ def _publication_flush(stream: Stream, kind: str, covered: frozenset) -> bool:
 
 
 def _live_parent_flush(stream: Stream, kind: str, covered: frozenset) -> bool:
-    """Arm 4: `create_directory.py`'s live-parent flush, the *first* of §9.5's two
+    """Arm 4: `create_directory.py`'s live-parent flush, the *first* of the specification two
     cross-directory publication flushes -- distinguished from the `work/` flush that
     follows it by the published name's parent being the project root."""
     insert = _published_insert(stream, kind, covered)
@@ -2798,7 +2791,7 @@ class Designated:
 
 def blob_integrity_failures(metadata_root: Path) -> tuple[str, ...]:
     """Every way the reconstructed store fails to resolve a blob its record references
-    (design §9 arm 1's "a record-referenced blob absent or short").
+    (the specification arm 1's "a record-referenced blob absent or short").
 
     "Referenced" is the record's **final surface**: the content the transaction promised
     to materialize, which is what the payload capture stages and `promote_staging`
@@ -2810,7 +2803,7 @@ def blob_integrity_failures(metadata_root: Path) -> tuple[str, ...]:
     hand, so a spec shape this test cannot read is a real decode failure.
 
     The referenced set is asserted nonempty, for the same reason arms 2-5 assert their
-    cell reached A3: the passing answer here is "no failures", so a designated cell whose
+    cell reached the recovery model: the passing answer here is "no failures", so a designated cell whose
     record referenced no blob at all -- a cut before the record, a spec of directory-only
     effects -- would pass by checking nothing.
     """
@@ -2874,7 +2867,7 @@ def _blob_integrity_failed(designated: Designated) -> bool:
     the missing blob. `list_unindexed_blobs` walks the leaves that are present and so
     cannot see an indexed digest with no leaf either, which is why not one of the
     sweep's own assertions notices. This designated check is the only instrument that
-    does, which is exactly why design §9 gives the arm its own named failure rather than
+    does, which is exactly why the specification gives the arm its own named failure rather than
     hoping some cell differs.
     """
     return bool(blob_integrity_failures(designated.metadata_root))
@@ -2892,7 +2885,7 @@ def _designated_halt(designated: Designated) -> bool:
 
     Two guards keep this from passing vacuously on the unsabotaged half, where "did not
     halt" is the passing answer: the cell must have carried a durable record and reached
-    `classify_recovery` at all. And the halt itself must be A3's own (`plan_halted`,
+    `classify_recovery` at all. And the halt itself must be the recovery model's own (`plan_halted`,
     never a topology assembly halt) *and* carry a `DONE` journal row in its persisted
     diagnostic -- which is the designated failure's own sentence, not merely "something
     went wrong here". Measured, all three arms halt `EFFECT_TUPLE_UNATTRIBUTABLE` naming
@@ -2906,7 +2899,7 @@ def _designated_halt(designated: Designated) -> bool:
         "the designated cell carries no durable record: it cannot show a DONE row"
     )
     assert result.counts["classified"] == 1, (
-        f"the designated cell never reached A3 (counts={result.counts})"
+        f"the designated cell never reached recovery classification (counts={result.counts})"
     )
     if not result.counts["plan_halted"]:
         return False
@@ -2935,14 +2928,14 @@ def _returned_outcome_reversed(designated: Designated) -> bool:
     )
     assert result.projection is not None, "the designated cell carries no durable record"
     assert result.counts["classified"] == 1, (
-        f"the designated cell never reached A3 (counts={result.counts})"
+        f"the designated cell never reached recovery classification (counts={result.counts})"
     )
     return result.projection[0] is TransactionState.ROLLED_BACK
 
 
 @dataclass(frozen=True)
 class Sabotage:
-    """One design §9 falsification arm.
+    """One the specification falsification arm.
 
     An arm is a *recording-time suppression* plus a *designated cell* plus a *designated
     check*, and the three are one object so a sweep cannot run the check without the
@@ -3016,7 +3009,7 @@ SABOTAGE_ARMS: tuple[Sabotage, ...] = (
         swallows=1,
         check=_designated_halt,
     ),
-    # Design §9 named this arm's cut "after committed cleanup" and was re-sited
+    # Contract:  named this arm's cut "after committed cleanup" and was re-sited
     # 2026-08-15 to the decision-adjacent cut: the sequencer withholds one commit's
     # backup advance, so the stale window is `[committed, settlement-binding)` and the
     # after-cleanup cut lies past it, on a real post-decision backup that does hold
@@ -3112,7 +3105,7 @@ class SweepReport:
     """One scenario's sweep. `cells`/`deduped`/`skips` come from `enumerate_cells`'
     accounting; the three failure tuples are empty on a healthy sweep and name the cell
     and the fault when they are not. `subprocess_cells`/`subprocess_disagreements` are
-    Task 7's placement axis, and `designated_failures` names every design §9 designated
+    Task 7's placement axis, and `designated_failures` names every the specification designated
     check that failed -- empty on an unsabotaged sweep, and, on a `sabotage=` run,
     exactly the sabotaged arm's marker.
 
@@ -3151,7 +3144,7 @@ class SweepReport:
 
 @dataclass(frozen=True)
 class NamedCell:
-    """One of design §9.4's named tuples, already run. Construction asserts the cell was
+    """One of the specification named tuples, already run. Construction asserts the cell was
     clean, so a directed test reads `result` without re-checking the sweep's invariants."""
 
     scenario: str
@@ -3264,20 +3257,20 @@ class Sweeper:
         subprocess_subset: bool = False,
         sabotage: str | None = None,
     ) -> SweepReport:
-        """Sweep one scenario: every cell of `enumerate_cells`, then §9.4's named tuples.
+        """Sweep one scenario: every cell of `enumerate_cells`, then the specification named tuples.
 
-        `subprocess_subset=True` adds design §8's **placement axis** on top: a declared
+        `subprocess_subset=True` adds the specification **placement axis** on top: a declared
         subset of the swept cells is reconstructed a second time and has its *first*
         recovery run in a fresh process (`run_cell_in_a_fresh_process`), and the two
         placements' canonical projections must agree.
 
-        THE SUBSET RULE (declared, never sampled -- design §8). A cell joins the
+        THE SUBSET RULE (declared, never sampled -- the specification). A cell joins the
         subprocess arm iff it is:
 
-        1. one of design §9.4's **named-tuple cells** -- the dual-name/anchor-only worlds,
+        1. one of the specification **named-tuple cells** -- the dual-name/anchor-only worlds,
            where one inode carries two live names and a fresh process must resolve the
            same one;
-        2. an **A3-halt cell** -- `classify_recovery` returned a `HaltPlan`, so the run
+        2. an **the recovery model-halt cell** -- `classify_recovery` returned a `HaltPlan`, so the run
            persists a halt diagnostic, and the arm's sharpest assertion (the persisted
            token-free diagnostic compares byte-exactly across the placement boundary) has
            something to compare;
@@ -3302,7 +3295,7 @@ class Sweeper:
         crosses the process boundary is `serialize_projection`'s token-free document
         only.
 
-        `sabotage="<arm>"` runs design §9's falsification instead of the sweep -- see
+        `sabotage="<arm>"` runs the specification falsification instead of the sweep -- see
         `_sabotaged`. Every *unsabotaged* sweep additionally runs the designated checks
         of whichever arms name its scenario, which is where `designated_failures == ()`
         comes from: the arms' other half, that an unsabotaged run passes them.
@@ -3355,7 +3348,7 @@ class Sweeper:
             totals["drift"] += result.counts["drift_preserved"]
 
         # Retained only for the placement arm, which needs each cell's verdict *after*
-        # the whole sweep to select the A3-halt ones. A `CellResult` carries the cell's
+        # the whole sweep to select the the recovery model-halt ones. A `CellResult` carries the cell's
         # entire post-recovery world tree, and the compound sweeps run ~300 of them, so
         # an unconditional list would hold every tree of every cell alive to the end of
         # the sweep for nothing.
@@ -3374,8 +3367,8 @@ class Sweeper:
             if subprocess_subset:
                 ran.append((tuple_name, cell, result))
 
-        # Design §9's reconstruction-fidelity self-check, run inside every sweep
-        # (design §10 criterion 3, amended 2026-08-15) rather than only at the three
+        # Contract:  reconstruction-fidelity self-check, run inside every sweep
+        # rather than only at the three
         # directed-test scenarios: reconstruct the end cut with every pending unit's
         # maximal survivor subset and compare it against the live final world. Same
         # recipe as `test_full_durable_reconstruction_equals_the_live_final_world`.
@@ -3438,7 +3431,7 @@ class Sweeper:
         # pre-realignment assembly halt did, silently, for *every* record-bearing cell)
         # moves cells between buckets rather than failing anything, so only a partition
         # check notices. `classified` counts cells that reached `classify_recovery`,
-        # A3-halts included; `assembly_halted` are halts raised before classification.
+        # the recovery model-halts included; `assembly_halted` are halts raised before classification.
         partition = (
             totals["classified"]
             + totals["assembly_halted"]
@@ -3493,10 +3486,10 @@ class Sweeper:
         return report
 
     def _sabotaged(self, scenario_name: str, arm: Sabotage) -> SweepReport:
-        """One design §9 falsification arm: record `scenario_name` with `arm` installed,
+        """One the specification falsification arm: record `scenario_name` with `arm` installed,
         then run **every** designated check that names this scenario.
 
-        Not a sweep. Design §9 requires an arm to "name one required cell, and state the
+        Not a sweep. Contract:  requires an arm to "name one required cell, and state the
         expected designated failure -- never 'any cell happens to differ'", so a
         sabotaged run's verdict comes from the designated checks alone; re-enumerating
         the whole survivor product over a stream that is missing a barrier would spend a
@@ -3547,7 +3540,7 @@ class Sweeper:
         return report
 
     def designated_failures(self, scenario_name: str, stream: Stream) -> tuple[str, ...]:
-        """Run every design §9 designated check declared for `scenario_name` against
+        """Run every the specification designated check declared for `scenario_name` against
         `stream`, returning the markers of those that failed.
 
         Each check gets its arm's designated cell, reconstructed into its own fresh
@@ -3603,7 +3596,7 @@ class Sweeper:
         """The declared subprocess subset -- `__call__`'s docstring states the rule.
 
         Insertion-ordered and deduplicated by label: several store commits routinely
-        select the same first-cell-after, and a named-tuple cell can also be an A3-halt
+        select the same first-cell-after, and a named-tuple cell can also be an the recovery model-halt
         cell, but a cell is worth exactly one child.
         """
         selected: dict[str, tuple[str, Cell, CellResult]] = {}

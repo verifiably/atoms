@@ -1,4 +1,4 @@
-"""Builders shared by the A6 capture tiers.
+"""Builders shared by the coherent capture capture tiers.
 
 Plain functions, not fixtures: the fixture-registry guard requires every fixture to live
 in `tests/conftest.py`, and these are values a test constructs rather than resources a
@@ -111,7 +111,7 @@ def blocker_spec(pre) -> TransactionSpec:
     """`DeletePath("p")`, `CreateDirectory("p")`, `CreateFileNoClobber("p/q")`.
 
     `p`'s timeline is continuous (FILE -> ABSENT -> DIRECTORY) and `p/q` is absent
-    precisely BECAUSE `p` is a file -- the shape design §8.2 exists for. `pre` is either a
+    precisely BECAUSE `p` is a file -- the shape the specification exists for. `pre` is either a
     FileState or a SymlinkState, which selects the branch under test.
     """
     post = state_of(AFTER)

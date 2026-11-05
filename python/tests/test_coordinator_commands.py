@@ -1,4 +1,4 @@
-"""A7a's public registration and intent commands."""
+"""the execution substrate's public registration and intent commands."""
 
 from __future__ import annotations
 

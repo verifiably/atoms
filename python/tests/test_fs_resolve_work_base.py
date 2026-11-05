@@ -1,4 +1,4 @@
-"""work_base_facts(): the existing metadata_root/work base only (design §6.6)."""
+"""work_base_facts(): the existing metadata_root/work base only."""
 
 from __future__ import annotations
 
@@ -157,7 +157,7 @@ def test_a_work_base_on_another_mount_is_an_internal_error(
 def test_work_base_mount_refusal_precedes_directory_facts(
     monkeypatch, injected_resolver_on
 ):
-    """The mount observation is the first check after opening work/ (design §6.6)."""
+    """The mount observation is the first check after opening work/."""
     with injected_resolver_on() as (resolver, binding):
         monkeypatch.setattr(
             "atoms.fs.resolve.read_mount_id", lambda fd: binding.evidence.mount_id + 1

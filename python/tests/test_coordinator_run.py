@@ -115,7 +115,7 @@ def test_run_transaction_executes_a_created_directory_before_its_child(
 def test_run_transaction_creates_directly_nested_planned_directories(
     coordinator_on, monkeypatch
 ) -> None:
-    """Authority §9.5: a fresh directory's descriptor is handed to its descendants.
+    """Contract: a fresh directory's descriptor is handed to its descendants.
 
     Both directories are absent at capture, so `_build_descriptor_table` can only stop
     at "data"; "data/records" becomes reachable exactly when the forward
@@ -453,7 +453,7 @@ def _inspect_with(entries, *appended):
 def test_a_fulfills_naming_the_current_tip_is_accepted(
     coordinator_on, monkeypatch
 ) -> None:
-    """Design §11.2: the referent condition is membership, not strict ancestry.
+    """Contract: the referent condition is membership, not strict ancestry.
 
     An intent appended and immediately fulfilled is science's live post-intent-refusal
     shape, and the three-entry slice below is what its acceptance suite pins downstream.
@@ -533,7 +533,7 @@ def test_the_referent_check_refuses_exactly_what_the_inspection_would_condemn(
 def test_the_duplicate_check_over_refuses_only_what_a_commit_would_condemn(
     coordinator_on, monkeypatch
 ) -> None:
-    """Design §11.2: the weaker true claim, and the other half of it.
+    """Contract: the weaker true claim, and the other half of it.
 
     A registration naming an already-committed-fulfilled intent condemns the chain only
     if it *also* commits; the same registration rolled back leaves a well-formed chain.

@@ -39,7 +39,7 @@ def test_timelines_are_sorted_by_path():
 
 
 def test_repeated_path_absent_file_absent_file_is_continuous():
-    # The design §5.3 case: one path through four states across four effects.
+    # The the specification case: one path through four states across four effects.
     effects = [
         CreateFileNoClobber(effect_id="e1", path="p", post=F),
         DeletePath(effect_id="e2", path="p", pre=F),

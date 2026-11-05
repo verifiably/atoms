@@ -1,4 +1,4 @@
-"""Shared factories for the A4a filesystem-layer tests."""
+"""Shared factories for the the capability backend filesystem-layer tests."""
 
 from __future__ import annotations
 
@@ -128,7 +128,7 @@ _MOUNTINFO_CASES = {
     ),
     # Every filesystem in the barrier table gets a defaults fixture and a
     # super-options-only fixture. Shipping a table without both would ship an
-    # untested durability claim (design §11.1).
+    # untested durability claim.
     "xfs_defaults": (
         "41 25 259:2 / /data rw,noatime shared:2 - xfs /dev/nvme0n1p2 "
         "rw,attr2,inode64,logbufs=8,logbsize=32k,noquota\n"
@@ -217,7 +217,7 @@ def test_volume_or_skip_reason() -> tuple[Path | None, str]:
 
 
 def ext4_volume_or_skip_reason() -> tuple[Path | None, str]:
-    """A4b-1 approves only ext4, while A4a admits ext4, xfs, and btrfs.
+    """path resolution and project approval-1 approves only ext4, while the capability backend admits ext4, xfs, and btrfs.
 
     A contributor on btrfs must be told why this suite skips, not merely that it does.
     """
@@ -228,14 +228,14 @@ def ext4_volume_or_skip_reason() -> tuple[Path | None, str]:
     found = _filesystem_type_for(probe)
     if found != EXT4:
         return None, (
-            f"A4b-1 approves only ext4; the test volume is {found!r}. "
+            f"project approval accepts only ext4; the test volume is {found!r}. "
             "Set ATOMS_TEST_VOLUME to a directory on ext4."
         )
     return resolved, ""
 
 
 def ext4_feature_masks_or_skip_reason() -> tuple[bool, str]:
-    """Whether this kernel exposes the design §7.4 superblock feature masks.
+    """Whether this kernel exposes the the specification superblock feature masks.
 
     Distinct from `ext4_volume_or_skip_reason`: a volume can be ext4 and still refuse
     `EXT4_IOC_GET_TUNE_SB_PARAM`, which is exactly what a stock kernel on a CI runner
@@ -547,7 +547,7 @@ def probe_database_path(lock):
     """Yield the verified pathname of a throwaway database inside `probe/`.
 
     Goes through verified_child_path rather than joining, because that is the only
-    sanctioned way a pathname escapes the descriptor discipline (design §9.4).
+    sanctioned way a pathname escapes the descriptor discipline.
     """
     with metadata_layout(lock):
         info = os.fstat(lock.metadata_root_fd)
@@ -647,7 +647,7 @@ def casefold_volume_or_reason() -> tuple[Path | None, str, bool]:
     declared = os.environ.get(CASEFOLD_ENVIRONMENT)
     if declared is None:
         return None, (
-            f"{CASEFOLD_ENVIRONMENT} is unset; see the A4b-1 design §9.4 for the "
+            f"{CASEFOLD_ENVIRONMENT} is unset; see docs/development.md for the "
             "one-time setup recipe"
         ), False
     if declared == "":
@@ -670,7 +670,7 @@ def file_state(mode: int = 0o644) -> FileState:
 
 
 def nonempty_state(content: bytes, mode: int = 0o644) -> FileState:
-    """A2 refuses a FileState whose byte_len is non-zero under the empty-content hash and
+    """the spec compiler refuses a FileState whose byte_len is non-zero under the empty-content hash and
     vice versa, so ReplaceFile's two distinct states need real digests."""
     digest = hashlib.sha256(content).hexdigest()
     return FileState(
@@ -760,7 +760,7 @@ def prefixes_for(compiled: CompiledSpec) -> dict[str, ResolvedPrefix]:
     The created check compares whole prefix strings, not `startswith`: `d/newer` starts
     with `d/new` and is not beneath it. A declared endpoint that is also another
     declared path's live ancestor is observed as that same directory at both walks;
-    fingerprint agreement belongs to A6 capture, not this A4b topology fixture.
+    fingerprint agreement belongs to coherent capture capture, not this path resolution and project approval topology fixture.
     """
     created = {
         effect.path
@@ -798,9 +798,9 @@ def prefixes_for(compiled: CompiledSpec) -> dict[str, ResolvedPrefix]:
 GENERATOR_PATHS = ("a", "a/b", "d/one", "d/two", "p")
 GENERATOR_MOVES = (("d/one", "d/two"), ("a", "p"), ("d/one", "a/b"))
 GENERATED_SPECIFICATION_COUNT = 4841
-"""How many of the 12719 candidate sequences A2 admits, measured on this checkout.
+"""How many of the 12719 candidate sequences the spec compiler admits, measured on this checkout.
 
-Asserted exactly by the §7.4 property test, so a generator that silently narrows fails
+Asserted exactly by the the specification property test, so a generator that silently narrows fails
 rather than passing on a smaller matrix. Change it only alongside a pool change."""
 
 
@@ -820,10 +820,10 @@ def _generated_effect(tag: str, argument, index: int) -> Effect:
 
 
 def generated_specifications():
-    """Yield `(label, effects)` for every effect sequence A2 admits, over a fixed pool.
+    """Yield `(label, effects)` for every effect sequence the spec compiler admits, over a fixed pool.
 
     All ordered sequences of length 1-3 over 23 candidate effects: each of the four
-    single-path variants against each of five paths, plus three moves. Sequences A2
+    single-path variants against each of five paths, plus three moves. Sequences the spec compiler
     refuses are skipped rather than reported -- an input that does not compile is not an
     input to this layer.
 
@@ -856,7 +856,7 @@ def generated_specifications():
 
 def work_for(compiled: CompiledSpec) -> DirectoryConstraints | None:
     """The work-root constraints approval derives, present exactly when a CreateDirectory
-    is, which is what A3's WorkRoot rule requires."""
+    is, which is what the recovery model's WorkRoot rule requires."""
     return (
         WORK_CONSTRAINTS
         if any(

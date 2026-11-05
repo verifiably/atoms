@@ -217,7 +217,7 @@ def test_acquire_refuses_a_fifo_at_lock_after_regular_file_validation(
 
 
 def test_acquire_refuses_a_missing_parent(linux_backend, metadata_root):
-    # A4a creates only the final leaf, never intermediate directories.
+    # the capability backend creates only the final leaf, never intermediate directories.
     deep = metadata_root / "absent" / "store"
     with pytest.raises(OSError) as caught, acquire_project_lock(linux_backend, str(deep)):
         pass
@@ -227,7 +227,7 @@ def test_acquire_refuses_a_missing_parent(linux_backend, metadata_root):
 def test_absent_anchored_traversal_refuses_with_capability_unavailable(
     metadata_root, fake_backend
 ):
-    # Design §10 assigns an unavailable bootstrap prerequisite to
+    # Contract:  assigns an unavailable bootstrap prerequisite to
     # CapabilityUnavailable, not a bare OSError: nothing has gone wrong at the
     # syscall level, the volume simply cannot supply the guarded walk. This is also
     # the shape a kernel without openat2 takes, which reports ENOSYS.
@@ -453,7 +453,7 @@ def test_a_second_process_cannot_acquire_the_same_lock(linux_backend, metadata_r
 def test_a_second_process_can_acquire_once_the_lock_is_released(
     linux_backend, metadata_root
 ):
-    # The other direction, which design §11.3 requires: without it, a lock that
+    # The other direction, which the specification requires: without it, a lock that
     # never grants to anyone would satisfy the exclusion test above.
     with acquire_project_lock(linux_backend, str(metadata_root)):
         pass

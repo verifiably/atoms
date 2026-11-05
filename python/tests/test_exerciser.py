@@ -62,7 +62,7 @@ def test_latest_txid_closes_its_sqlite_connection(tmp_path):
 
 
 def test_clean_and_caught_whole_cell_subprocess_placement(exerciser_child, certified_ext4):
-    """Design §6's whole-cell placement: setup, transaction, and projection in a child.
+    """Contract:  whole-cell placement: setup, transaction, and projection in a child.
 
     The clean scenario must reach `COMMITTED` and the caught one `ROLLED_BACK` (erratum
     1: the rollback lands durably *before* the injected exception propagates, so the
@@ -78,7 +78,7 @@ def test_clean_and_caught_whole_cell_subprocess_placement(exerciser_child, certi
 
 
 def test_sigkill_arm_covers_the_compound_scenarios(exerciser_kill_matrix):
-    """Design §13.4's SIGKILL extension over the multi-effect exerciser scenarios.
+    """Contract:  SIGKILL extension over the multi-effect exerciser scenarios.
 
     `exerciser_kill_matrix` rehearses the scenario under the recording backend, kills a
     fresh child immediately after every recorded flush/exchange/transfer, and applies the
@@ -91,7 +91,7 @@ def test_sigkill_arm_covers_the_compound_scenarios(exerciser_kill_matrix):
 
 
 def test_capability_refusal_precedes_metadata_and_mutation(coordinator_on, monkeypatch):
-    """Design §6: a refusal has no recovery row — nothing durable may exist."""
+    """Contract: a refusal has no recovery row — nothing durable may exist."""
     import sqlite3
     from pathlib import Path
 

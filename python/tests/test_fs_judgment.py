@@ -1,4 +1,4 @@
-"""Tier 1 — pure judgment over hand-built resolution tables (design §11.1)."""
+"""Tier 1 — pure judgment over hand-built resolution tables."""
 
 from __future__ import annotations
 
@@ -86,7 +86,7 @@ def test_a_planned_ancestor_over_its_parents_name_max_is_refused():
 
 
 def test_a_folding_ancestor_created_first_is_admitted(injected_equivalence):
-    """Design §5.4's case, end to end through the two phases that decide it. A2 admits
+    """Contract:  case, end to end through the two phases that decide it. the spec compiler admits
     the pair — its phase 4 key is the whole path, and `A` differs from `a/x` — so the
     resolved judgment is the only thing that can accept or refuse it."""
     injected_equivalence(str.casefold)
@@ -122,11 +122,11 @@ def test_the_same_pair_is_refused_under_exact_bytes():
 def test_a_created_ancestor_ordered_after_its_descendant_is_refused(
     injected_equivalence,
 ):
-    """A2 phase 13 is lexical: it sees CreateDirectory("A") and an effect on "a/x" as
+    """the spec compiler phase 13 is lexical: it sees CreateDirectory("A") and an effect on "a/x" as
     unrelated paths and admits this. Under a folding parent they are one directory and
     the creation is too late. This is the only shape that reaches the ordering branch —
-    under exact bytes A2's verdict and the resolved verdict provably agree (design §7.4),
-    so a test that compiles cannot disagree with A2 unless the key relation differs."""
+    under exact bytes the spec compiler's verdict and the resolved verdict provably agree,
+    so a test that compiles cannot disagree with the spec compiler unless the key relation differs."""
     injected_equivalence(str.casefold)
     compiled = compiled_for(
         CreateFileNoClobber("e1", "a/x", file_state()),
@@ -316,8 +316,8 @@ def test_a_planned_leaf_over_its_parents_name_max_is_refused():
 
 def test_two_paths_colliding_in_one_parent_are_refused(injected_equivalence):
     """Case folding cannot reach this check: two leaves fold in one parent only when
-    their whole paths fold too, and A2 phase 4 refuses that pair before approval runs.
-    A truncating relation — a real filesystem equivalence class A2's key does not
+    their whole paths fold too, and the spec compiler phase 4 refuses that pair before approval runs.
+    A truncating relation — a real filesystem equivalence class the spec compiler's key does not
     subsume — is what makes the check observable."""
     injected_equivalence(truncate_to_eight)
     compiled = compiled_for(
@@ -376,7 +376,7 @@ def test_a_scratch_leaf_over_its_parents_name_max_is_refused():
 
 
 def test_colliding_scratch_leaves_are_refused(injected_equivalence):
-    """Effect IDs are exact-string and portability-key unique after A2 phase 6, so under
+    """Effect IDs are exact-string and portability-key unique after the spec compiler phase 6, so under
     case folding no two scratch leaves can collide. Truncation can: every leaf shares the
     `.#~tx01.` prefix, so an eight-byte key collapses the whole set. Regeneration is
     explicitly not a remedy — an intrinsic collision recurs under every txid."""

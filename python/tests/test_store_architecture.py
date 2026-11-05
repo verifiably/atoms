@@ -1,4 +1,4 @@
-"""Tier 6 -- properties of the package as a whole (design §11.6)."""
+"""Tier 6 -- properties of the package as a whole."""
 
 from __future__ import annotations
 
@@ -154,7 +154,7 @@ def test_the_public_surface_is_exactly_the_documented_names():
         and name
         not in {
             # Python 3.13 binds the compiler's __future__ feature object here; it is
-            # interpreter-created, not an A5a export. __all__ remains authoritative.
+            # interpreter-created, not an the metadata store export. __all__ remains authoritative.
             "annotations",
             "blobs",
             "connection",

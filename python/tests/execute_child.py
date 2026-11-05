@@ -1,4 +1,4 @@
-"""Killable A7b transaction child used by the crash matrix."""
+"""Killable the transaction coordinator transaction child used by the crash matrix."""
 
 from __future__ import annotations
 
@@ -131,7 +131,7 @@ def main(project_root: str, metadata_root: str) -> int:
                 os.umask(previous)
 
         execute.create_directory.apply = under_umask
-    # Scenario mode (design §6): the spec, the payloads, the seed world and -- when the
+    # Scenario mode: the spec, the payloads, the seed world and -- when the
     # whole cell is placed in this process -- the root registration all come from
     # `tests.exerciser`, so the child runs the same scenario the in-process exerciser
     # does rather than a second, drifting copy of it.

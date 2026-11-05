@@ -54,7 +54,7 @@ def _os_attribute_references(path):
 
 
 def test_no_direct_os_mutation_or_close_outside_the_facade():
-    """Design §5.2: the facade is the only mutation and close surface; SQLite's VFS never
+    """Contract: the facade is the only mutation and close surface; SQLite's VFS never
     spells os.* in our source, so it needs no carve-out here."""
     offenders = []
     for path in sorted(SOURCE_ROOT.rglob("*.py")):
@@ -451,7 +451,7 @@ def test_the_only_production_bind_caller_is_the_coordinator_root():
 
 
 def test_the_production_bind_call_passes_the_certified_allowlist():
-    """Ledger #18: the sole production call site names the shipping constant."""
+    """the boundary contract: the sole production call site names the shipping constant."""
     path = Path(__file__).parents[1] / "src" / "atoms" / "coordinator" / "root.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
     calls = [
@@ -502,9 +502,9 @@ def test_fs_fixture_registry_covers_every_test_argument():
 
 
 def test_fs_fixture_registry_subtracts_parametrized_arguments(tmp_path):
-    # The A4a suite parametrizes on 'absent', 'operation', 'code', and 'expected'.
+    # The the capability backend suite parametrizes on 'absent', 'operation', 'code', and 'expected'.
     # A scanner that treated every argument as a fixture would reject all four, so
-    # this pins the behavior that makes reusing A3's scanner worth the extraction.
+    # this pins the behavior that makes reusing the recovery model's scanner worth the extraction.
     (tmp_path / "test_fs_parametrized.py").write_text(
         "import pytest\n"
         "@pytest.mark.parametrize(('operation', 'code'), [('exchange', 22)])\n"
@@ -573,7 +573,7 @@ def test_resolution_internals_are_not_exported(name):
 
 
 def test_observe_imports_only_the_recovery_model():
-    """Ledger #13's "may not pre-classify" as a mechanical property.
+    """the boundary contract "may not pre-classify" as a mechanical property.
 
     A blacklist on `snapshot` would be insufficient: `atoms/core/recovery/__init__.py`
     re-exports `classify_recovery` and `authorize_recovery_step`, so a classifier is
@@ -773,7 +773,7 @@ def test_constraint_read_guard_catches_missed_conditional_mutations(source):
 
 
 def test_the_memo_never_shortcuts_the_constraints_read():
-    """A structural guard on §6.5's rule.
+    """A structural guard on the specification rule.
 
     The behavioural tests in the walk suite can only fail once someone reintroduces
     the shortcut; this one names the shape, so the reason survives a refactor. The
@@ -835,7 +835,7 @@ PURE_FS_IMPORTS = {
 
 
 def test_the_resolution_guard_still_names_exactly_the_two_mechanism_modules():
-    """The seam is the guard's module list. If A4b-2's modules were added to it they
+    """The seam is the guard's module list. If path resolution and project approval-2's modules were added to it they
     could not import a CompiledSpec; if resolve.py were removed from it, the mechanism
     could start judging."""
     source = (Path(__file__)).read_text(encoding="utf-8")
@@ -920,7 +920,7 @@ def test_the_approved_proof_retains_only_the_authorized_schema():
 
     Exact field sets make a copied frontier or mount identifier fail even if it is added
     with a default. The live binding deliberately retains its own VolumeEvidence; this
-    guard covers the fields A4b-2 copies into its proof and approved fact values.
+    guard covers the fields path resolution and project approval-2 copies into its proof and approved fact values.
     """
     from atoms.fs.approval import ProjectApprovedSpec
     from atoms.fs.topology import (
@@ -1051,7 +1051,7 @@ def test_the_pure_modules_never_decide_equality_on_a_raw_component(module_name):
 
 
 def test_approval_catches_nothing_a_resolver_raises():
-    """Ledger #20 is categorical. The correct number of handlers enclosing a resolver
+    """the boundary contract is categorical. The correct number of handlers enclosing a resolver
     call is zero — not "no blanket handler", which is the weaker rule resolve.py has.
     `contextlib.suppress` is checked too: it swallows exactly as a handler does, and a
     guard that missed it would be satisfied by the one bypass someone would reach for."""
@@ -1073,7 +1073,7 @@ def test_approval_catches_nothing_a_resolver_raises():
             if isinstance(inner, ast.Call):
                 assert _called_name(inner) not in calls, (
                     f"a handler in approval.py encloses {_called_name(inner)}(); "
-                    "ledger #20 requires every A4b-1 refusal to reach the caller "
+                    "every path-resolution refusal must reach the caller "
                     "unhandled"
                 )
 
@@ -1267,7 +1267,7 @@ def test_chain_commands_keep_the_lease_and_approval_proofs_private():
 
     # Clause 1: the creating and reading commands still enter `_recovery_lease`;
     # the two cooperative mutators enter the lifecycle-gated variant, whose
-    # stack is the same one behind the writability gate (lifecycle design §7).
+    # stack is the same one behind the writability gate.
     for name in ("register_root", "read_chain"):
         assert _enters(public[name], "_recovery_lease"), f"{name} skips _recovery_lease"
         assert not _names(public[name], "resolve"), f"{name} names resolve"

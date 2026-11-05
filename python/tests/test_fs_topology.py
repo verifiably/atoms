@@ -1,4 +1,4 @@
-"""Tier 2 — topology construction (design §11.2)."""
+"""Tier 2 — topology construction."""
 
 from __future__ import annotations
 
@@ -56,7 +56,7 @@ def test_an_undeclared_intermediate_becomes_a_topology_directory():
 
 
 def test_a_declared_intermediate_keeps_its_persistent_node():
-    """A3 requires exact persistent coverage, so a declared directory may not also get a
+    """the recovery model requires exact persistent coverage, so a declared directory may not also get a
     TopologyDirectory — that would be a second node for one directory."""
     compiled = compiled_for(
         CreateDirectory("mk", "a", DirectoryState(mode=0o755)),
@@ -71,7 +71,7 @@ def test_a_declared_intermediate_keeps_its_persistent_node():
 
 
 def test_a_create_directory_endpoint_is_a_directory_candidate():
-    """The half of the candidate set that makes design §5.4's case representable. `A` is
+    """The half of the candidate set that makes the specification case representable. `A` is
     nobody's lexical prefix, so only its being a CreateDirectory endpoint puts it in the
     key space where `a` can merge into it."""
     compiled = compiled_for(CreateDirectory("mk", "A", DirectoryState(mode=0o755)))
@@ -111,7 +111,7 @@ def test_work_scratch_parents_to_the_work_root_and_others_to_their_path():
 
 
 def test_move_scratch_parents_to_the_source_not_the_destination():
-    """A3's _validate_topology compares against the source's parent specifically."""
+    """the recovery model's _validate_topology compares against the source's parent specifically."""
     compiled = compiled_for(MoveNoClobber("mv", "src/a", "dst/b", file_state()))
     prefixes = {
         "src/a": resolved_prefix("src/a", existing_depth=1),
@@ -124,7 +124,7 @@ def test_move_scratch_parents_to_the_source_not_the_destination():
 
 
 def test_the_directory_partition_is_exactly_existing_root_and_intermediates():
-    """Design §7.3's two invariants, asserted as a partition: no declared path can be an
+    """Contract:  two invariants, asserted as a partition: no declared path can be an
     existing directory (no effect declares a DirectoryState precondition), and no
     undeclared intermediate can be planned (it would need a CreateDirectory naming it,
     which would make it declared)."""
@@ -160,7 +160,7 @@ def test_the_directory_partition_is_exactly_existing_root_and_intermediates():
 
 
 def test_a_directory_that_parents_nothing_is_not_retained():
-    """§7.3's partition names the *parent* PersistentNodes. A lone CreateDirectory has
+    """the specification partition names the *parent* PersistentNodes. A lone CreateDirectory has
     nothing declared beneath it, so its constraints bound no name and retaining them would
     put a fact in the proof that no later stage can act on."""
     compiled = compiled_for(CreateDirectory("mk", "a", DirectoryState(mode=0o755)))
@@ -287,11 +287,11 @@ def test_every_planned_component_is_asked_about(injected_equivalence):
 
 
 def test_planned_directories_merge_under_a_folding_key(injected_equivalence):
-    """Design §5.4's case. CreateDirectory("A") with an effect on a/x is one directory
+    """Contract:  case. CreateDirectory("A") with an effect on a/x is one directory
     under a folding parent. No LookupProof member is both insensitive and reproducible,
-    so the double is the only route to the behaviour (design §6.3.2).
+    so the double is the only route to the behaviour.
 
-    A2 admits the pair: its phase 4 key is the whole path, and "a" differs from "a/x"."""
+    the spec compiler admits the pair: its phase 4 key is the whole path, and "a" differs from "a/x"."""
     injected_equivalence(str.casefold)
     compiled = compiled_for(
         CreateDirectory("mk", "A", DirectoryState(mode=0o755)),
@@ -361,16 +361,16 @@ AGREEMENT_CORPUS = {
 }
 """Every effect variant, alone and combined, plus the shapes that stress the topology:
 nested creation, a move whose endpoints share a parent, and the FILE → ABSENT → DIRECTORY
-conversion. Each entry is verified to compile — a case A2 refuses is not a case."""
+conversion. Each entry is verified to compile — a case the spec compiler refuses is not a case."""
 
 
 def _prepared_snapshot(compiled, resolved):
-    """Feed a produced topology to A3's own validator.
+    """Feed a produced topology to the recovery model's own validator.
 
     This is the strongest single test in the design: _validate_topology independently
     encodes exact persistent and scratch coverage, single-parent-ness, the WorkRoot
     parent rule, the scratch/persistent shared-parent equality, and acyclicity — written
-    before A4b-2 existed.
+    before path resolution and project approval-2 existed.
     """
     from atoms.core.recovery import (
         CommitDecision,
@@ -413,7 +413,7 @@ def _prepared_snapshot(compiled, resolved):
 
 
 @pytest.mark.parametrize("label", sorted(AGREEMENT_CORPUS))
-def test_every_produced_topology_validates_through_a3(label):
+def test_every_produced_topology_validates_through_recovery(label):
     compiled = compiled_for(*AGREEMENT_CORPUS[label])
     resolved = build_topology(compiled, prefixes_for(compiled), EXT4, work_for(compiled))
     snapshot = _prepared_snapshot(compiled, resolved)
@@ -421,11 +421,11 @@ def test_every_produced_topology_validates_through_a3(label):
 
 
 @pytest.mark.parametrize("label", sorted(AGREEMENT_CORPUS))
-def test_the_rerun_reaches_a2s_verdict_on_the_named_corpus(label):
-    """The readable half of design §11.4's A2-agreement property. Under today's floor the
+def test_the_rerun_reaches_the_compiler_verdict_on_the_named_corpus(label):
+    """The readable half of the specification the spec compiler-agreement property. Under today's floor the
     resolved topology is provably identical to the lexical one, so a compiled
     specification and its re-run cannot disagree. A failure means the re-run drifted or
-    the floor moved (design §7.4)."""
+    the floor moved."""
     from atoms.fs.topology import require_resolved_surface_and_ordering
 
     compiled = compiled_for(*AGREEMENT_CORPUS[label])
@@ -433,11 +433,11 @@ def test_the_rerun_reaches_a2s_verdict_on_the_named_corpus(label):
     require_resolved_surface_and_ordering(compiled, resolved)
 
 
-def test_a3_and_the_rerun_accept_every_specification_the_generator_compiles():
+def test_recovery_and_the_rerun_accept_every_specification_the_generator_compiles():
     """Criterion 18 says *every* compiled input, and ten named examples are a corpus, not
     a property. The generator enumerates all ordered sequences of length 1-3 over a fixed
     23-effect pool -- every variant against every path in a five-path alphabet, plus three
-    moves -- and keeps the ones A2 admits. On this checkout that is 4841 specifications
+    moves -- and keeps the ones the spec compiler admits. On this checkout that is 4841 specifications
     out of 12719 candidates, and it runs in about four seconds.
 
     Bounded and deterministic rather than random: no seed to record, no flake, and a
@@ -462,13 +462,13 @@ def test_a3_and_the_rerun_accept_every_specification_the_generator_compiles():
 
 
 def test_the_rerun_refuses_a_creation_ordered_after_its_descendant(injected_equivalence):
-    """The reachable half of the re-run. A2 phase 13 is lexical: it sees
+    """The reachable half of the re-run. the spec compiler phase 13 is lexical: it sees
     CreateDirectory("A") and an effect on "a/x" as unrelated and admits this. Under a
     folding parent they are one directory and the creation is too late.
 
     The surface half has no reachable case. A declared path becomes an *ancestor node*
     only by being a directory candidate, and a directory candidate is either a lexical
-    proper prefix — which A2's own trie already walks — or a CreateDirectory endpoint,
+    proper prefix — which the spec compiler's own trie already walks — or a CreateDirectory endpoint,
     whose declared state is a DirectoryState and therefore never a blocker. A folding
     file at `A` above `a/x` is refused one phase earlier, by ancestor legality, because
     nothing creates the directory `a`. The surface branch stays as a fail-closed guard.

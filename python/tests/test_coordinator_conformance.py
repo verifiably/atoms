@@ -1,4 +1,4 @@
-"""Executor terminal states agree with A3's abstract reducer."""
+"""Executor terminal states agree with the recovery model's abstract reducer."""
 
 from __future__ import annotations
 
@@ -55,7 +55,7 @@ def _model_projection(snapshot, plan):
     )
 
 
-def test_clean_commit_reaches_the_a3_fixed_point(
+def test_clean_commit_reaches_the_recovery_fixed_point(
     coordinator_on, monkeypatch
 ) -> None:
     from atoms.coordinator import commit
@@ -89,7 +89,7 @@ def test_clean_commit_reaches_the_a3_fixed_point(
     )
 
 
-def test_caught_rollback_reaches_the_a3_fixed_point(
+def test_caught_rollback_reaches_the_recovery_fixed_point(
     coordinator_on, monkeypatch
 ) -> None:
     from atoms.coordinator import execute

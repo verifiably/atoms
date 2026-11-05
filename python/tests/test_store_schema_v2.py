@@ -1,4 +1,4 @@
-"""Schema v2's structural history gates and persisted A7 approval proof."""
+"""Schema v2's structural history gates and persisted the effect executor approval proof."""
 
 from __future__ import annotations
 

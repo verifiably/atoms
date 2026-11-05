@@ -1,4 +1,4 @@
-"""A6 tier 2 -- the descriptor table (design §5)."""
+"""coherent capture tier 2 -- the descriptor table."""
 
 from __future__ import annotations
 
@@ -45,7 +45,7 @@ def test_the_table_holds_one_descriptor_per_approved_directory(leased):
 
 
 def test_the_walk_opens_every_intermediate_directory_even_when_undeclared(leased):
-    """A5b's `_parent_paths` is scoped to admission's own job (design §6.4): it maps
+    """the recovery lease's `_parent_paths` is scoped to admission's own job: it maps
     only declared paths and their direct parent. `approved.directories` holds an entry
     for every directory prefix, declared or not, so the walk's own node-to-path table
     must be total over all of them -- borrowing admission's is not enough.
@@ -76,7 +76,7 @@ def test_the_walk_opens_every_intermediate_directory_even_when_undeclared(leased
 
 
 def test_the_root_descriptors_are_borrowed_and_survive_close(leased):
-    """§5.5: ProjectBinding and Workspace own theirs; the table closes only its own."""
+    """the specification: ProjectBinding and Workspace own theirs; the table closes only its own."""
     from atoms.coordinator.prepare import open_workspace
 
     with leased() as lease:
@@ -268,7 +268,7 @@ def test_the_work_root_is_present_when_the_topology_has_one(leased):
 def test_the_work_root_baseline_is_its_own_record_not_the_work_base(leased):
     """`workspace.work_fd` names work/<txid>; `approved.work_base` describes work/.
 
-    A4b records the child as `ApprovedPlannedDirectory(WorkRoot(),
+    path resolution and project approval records the child as `ApprovedPlannedDirectory(WorkRoot(),
     inherited_constraints(work_base.constraints, filesystem_type))` (`approval.py:155`,
     `topology.py:180`), so the child's baseline lives in `approved.directories` like every
     other node's, and the parent's retained facts are the wrong thing to compare a child
@@ -276,7 +276,7 @@ def test_the_work_root_baseline_is_its_own_record_not_the_work_base(leased):
 
     On ext4 the two carry equal values, so the only way to make the choice observable is
     to make them differ -- which means editing the proof. `ProjectApprovedSpec` is
-    token-guarded so that nothing outside A4b constructs one, and `dataclasses.replace`
+    token-guarded so that nothing outside path resolution and project approval constructs one, and `dataclasses.replace`
     refuses for the same reason (`approval.py:69-84`); a sabotage fixture is the one place
     that has to go around it. `object.__setattr__` is what the factory's own `__init__`
     uses, and each doctored proof is discarded with its lease.
@@ -343,7 +343,7 @@ def test_the_work_root_baseline_is_its_own_record_not_the_work_base(leased):
 
 
 def test_a_replaced_directory_refuses_on_identity(leased):
-    """Ledger #19: compare against the approved baseline, never reapprove."""
+    """the boundary contract: compare against the approved baseline, never reapprove."""
     from atoms.coordinator.prepare import open_workspace
 
     with leased() as lease:
@@ -361,10 +361,10 @@ def test_a_replaced_directory_refuses_on_identity(leased):
 
 
 def test_the_project_root_is_revalidated_too(leased, monkeypatch):
-    """§5.3: retention is not discharge.
+    """the specification: retention is not discharge.
 
     The binding holds the root descriptor across approval so its identity cannot drift,
-    but lookup_proof and name_max are mutable directory properties and ledger #19's rule
+    but lookup_proof and name_max are mutable directory properties and the boundary contract rule
     is that a resolved fact is compared against its approved baseline before being
     relied on. A held descriptor is not an exception the ledger grants.
     """
@@ -435,7 +435,7 @@ def test_an_occupied_planned_directory_reports_what_occupies_it(leased):
     """A planned directory is LOOKED UP, not assumed absent.
 
     Recording it as missing without a lookup would mean a matching file or symlink
-    blocker is never reported, and §8.2's whole branch would be unreachable.
+    blocker is never reported, and the specification whole branch would be unreachable.
     """
     from atoms.coordinator.prepare import open_workspace
 
@@ -455,7 +455,7 @@ def test_an_occupied_planned_directory_reports_what_occupies_it(leased):
 def test_a_fifo_blocker_is_not_reported_as_a_regular_file(leased):
     """ENOTDIR does not distinguish a regular file from a socket, FIFO, or device node.
 
-    An errno-to-kind table would have called this one REGULAR_FILE, and §8.2's
+    An errno-to-kind table would have called this one REGULAR_FILE, and the specification
     verification against the declared FileState would then compare a fabricated kind.
     """
     from atoms.coordinator.prepare import open_workspace
@@ -497,7 +497,7 @@ def test_a_symlink_blocker_is_reported_as_a_symlink(leased):
 def test_a_vanished_existing_directory_refuses_rather_than_becoming_a_stop(leased):
     """Only PLANNED directories produce stops.
 
-    A `TopologyDirectory` has no declared state, so §8's branches could never rule on
+    A `TopologyDirectory` has no declared state, so the specification branches could never rule on
     one. Approval said it exists; if it no longer opens, that is drift and it refuses.
     """
     from atoms.coordinator.prepare import open_workspace
@@ -517,7 +517,7 @@ def test_a_vanished_existing_directory_refuses_rather_than_becoming_a_stop(lease
 
 
 def test_an_undefined_errno_from_the_walk_propagates(leased, monkeypatch):
-    """§9.1: only errnos with a defined domain meaning translate.
+    """the specification: only errnos with a defined domain meaning translate.
 
     Swallowing every OSError would report a failing disk as drift.
     """
@@ -545,9 +545,9 @@ def test_an_undefined_errno_from_the_walk_propagates(leased, monkeypatch):
 def test_an_occupied_planned_directory_stops_the_walk_for_its_descendants(leased):
     """The occupied branch must stop too.
 
-    A file holds no directory entries, so `p/q` is absent -- which is exactly §8.2's
+    A file holds no directory entries, so `p/q` is absent -- which is exactly the specification
     inference. Leaving the node unstopped would make `p/q` neither resolvable nor
-    unreachable, and capture would raise ProtocolError on the case §8.2 accepts.
+    unreachable, and capture would raise ProtocolError on the case the specification accepts.
     """
     from atoms.coordinator.prepare import open_workspace
     from atoms.core.recovery.snapshot import PersistentNode

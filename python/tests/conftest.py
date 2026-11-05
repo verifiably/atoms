@@ -19,7 +19,7 @@ from tests.uncertified_host import uncertified_host
 @pytest.fixture(autouse=True)
 def _uncached_certification():
     """Each test certifies its volume afresh, so no test depends on what an
-    earlier test in the same worker certified (design 2026-10-15 §6)."""
+    earlier test in the same worker certified."""
     _probe._CERTIFIED.clear()
 
 
@@ -367,7 +367,7 @@ def directory_fd(tmp_path):
 
 @pytest.fixture
 def certified_ext4():
-    """Require the §7.4 superblock feature masks, which a stock kernel does not expose.
+    """Require the the specification superblock feature masks, which a stock kernel does not expose.
 
     For the tests the conftest capability hook cannot reach: one that asserts on a
     specific `CapabilityUnavailable` catches it first, and one that drives a child
@@ -467,12 +467,12 @@ def injected_equivalence(monkeypatch):
     import time.
 
     A factory rather than a fixed double, because the two behaviours under test need
-    different relations. Case folding merges directories (`A` and `a`), which A2 admits
+    different relations. Case folding merges directories (`A` and `a`), which the spec compiler admits
     because its phase 4 key is the whole path and `A` differs from `a/x`. Case folding
     can NOT exercise endpoint distinctness: two leaves fold in one parent only when their
-    whole paths fold too, and A2 phase 4 already refuses that pair before approval sees
+    whole paths fold too, and the spec compiler phase 4 already refuses that pair before approval sees
     it. Endpoint tests therefore use a truncating relation — a real filesystem
-    equivalence class that A2's key does not subsume.
+    equivalence class that the spec compiler's key does not subsume.
 
     `install` returns the list of names the double was asked about, in call order. That
     is the positive half of the bypass check: a call site that decides a name without the
@@ -511,7 +511,7 @@ def truncate_to_eight(name: str) -> str:
 
 @pytest.fixture
 def injected_resolver_on(bound_volume, injected_lookup):
-    """A resolver whose lookup proof is injected; valid on every A4a test volume."""
+    """A resolver whose lookup proof is injected; valid on every the capability backend test volume."""
     from atoms.fs.resolve import PathResolver
 
     @contextlib.contextmanager
@@ -677,7 +677,7 @@ def leased(coordinator_on, monkeypatch):
     The constant ships empty and production binding fails closed, so every test drives
     the real composition root with the module attribute replaced. Patching the constant
     rather than threading a parameter keeps `root.py` the single bind call site that
-    ledger #18 asserts over; a test-only allowlist parameter would create a second one.
+    the boundary contract asserts over; a test-only allowlist parameter would create a second one.
     """
     import contextlib
 
@@ -728,8 +728,8 @@ def persistence_recording(coordinator_on, monkeypatch):
 
 @pytest.fixture
 def cut_matrix(ext4_volume, test_storage_profile, monkeypatch):
-    """The persistence-cut sweep (design §5): `Sweeper(...)` sweeps a whole scenario,
-    `Sweeper.named_cell(...)` runs one of §9.4's named tuples.
+    """The persistence-cut sweep: `Sweeper(...)` sweeps a whole scenario,
+    `Sweeper.named_cell(...)` runs one of the specification named tuples.
 
     Deliberately NOT built on `persistence_recording`: that fixture records through
     `coordinator_on`, whose project root is one shared directory, and every scenario's
@@ -746,12 +746,12 @@ def cut_matrix(ext4_volume, test_storage_profile, monkeypatch):
 def exerciser_child(ext4_volume, test_storage_profile, monkeypatch):
     """Run a whole exerciser scenario -- setup, transaction, projection -- in a child.
 
-    Design §6's whole-cell placement: `tests/execute_child.py` seeds the world, registers
+    Contract:  whole-cell placement: `tests/execute_child.py` seeds the world, registers
     the root through `exerciser.setup_clean`, runs the transaction (catching exactly the
     injected failure for a `inject_failure` scenario, per erratum 1), and prints the
     canonical durable projection. Nothing about the transaction happens in this process.
 
-    The mandatory second pass happens here, in-process, because design §5 asks only that
+    The mandatory second pass happens here, in-process, because the specification asks only that
     a *fresh lease* re-enter: a subsequent entry must take no recovery action at all --
     `classify_recovery` is never reached over a settled, detached record -- and must
     leave the projection exactly where the child left it. Returns the child's projection.

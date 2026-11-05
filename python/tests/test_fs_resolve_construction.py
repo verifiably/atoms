@@ -1,4 +1,4 @@
-"""PathResolver construction: liveness, dispatch, and root refusals (design §6.1)."""
+"""PathResolver construction: liveness, dispatch, and root refusals."""
 
 from __future__ import annotations
 
@@ -150,7 +150,7 @@ def test_a_project_root_identical_to_the_metadata_root_refuses(
 def test_lookup_unavailability_precedes_path_limit_and_root_identity(
     monkeypatch, bound_volume
 ):
-    """Root facts are observed before PATH_MAX and metadata exclusion (§6.1)."""
+    """Root facts are observed before PATH_MAX and metadata exclusion."""
     with bound_volume() as binding:
         info = os.fstat(binding.project_root_fd)
         configuration = dataclasses.replace(
@@ -286,7 +286,7 @@ def test_identity_ignores_declared_spelling():
     ],
 )
 def test_every_declared_value_type_is_frozen(value, field):
-    """FrozenInstanceError specifically, per design §9.1.
+    """FrozenInstanceError specifically, per the specification.
 
     `pytest.raises(Exception)` trips B017 and would also pass against an unrelated
     AttributeError, which is what a frozen slots dataclass raises for a name that is

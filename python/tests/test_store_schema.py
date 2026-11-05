@@ -1,4 +1,4 @@
-"""Tier 1 — the schema's agreement with the enums it is generated from (design §11.1)."""
+"""Tier 1 — the schema's agreement with the enums it is generated from."""
 
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ EFFECT_MEMBERS = (
 )
 def test_every_enum_member_appears_in_the_check_list_for_its_column(members, column):
     """The CHECK lists are generated, not retyped, so a new member cannot silently
-    diverge from the value the engine writes (design §6.2)."""
+    diverge from the value the engine writes."""
     rendered = check_list(members)
     for member in members:
         assert f"'{member.value}'" in rendered
@@ -100,14 +100,13 @@ def test_variant_of_looks_up_by_exact_type_not_isinstance():
 def test_variant_of_never_derives_the_value_from_the_class_name():
     """variant_name() returns type(effect).__name__ -- 'ReplaceFile' -- while the column
     accepts EffectVariant's values -- 'replace_file'. The two spellings read as the same
-    thing and are not (design §7.1)."""
+    thing and are not."""
     for effect_type, variant in EFFECT_VARIANTS.items():
         assert variant.value != effect_type.__name__
 
 
 def test_the_ddl_is_a_tuple_of_single_statements():
-    """No statement may be executed by executescript, so none may carry a second one
-    (design §5.1 step 5)."""
+    """No statement may be executed by executescript, so none may carry a second one."""
     for statement in SCHEMA_STATEMENTS:
         body = statement.strip()
         assert body.endswith(";"), body[:40]
@@ -122,7 +121,7 @@ def test_the_expected_catalog_matches_the_ddl_object_names():
 
 def test_the_expected_catalog_carries_implicit_autoindexes_with_no_sql():
     """SQLite lists an implicit autoindex per non-INTEGER PRIMARY KEY with sql=NULL.
-    Set equality means an extra object fails as loudly as a missing one (design §5.2)."""
+    Set equality means an extra object fails as loudly as a missing one."""
     autoindexes = {
         (kind, name, tbl, sql)
         for kind, name, tbl, sql in EXPECTED_CATALOG

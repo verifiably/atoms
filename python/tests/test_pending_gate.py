@@ -1,4 +1,4 @@
-"""The post-recovery pending gate (design §10)."""
+"""The post-recovery pending gate."""
 
 from __future__ import annotations
 
@@ -77,7 +77,7 @@ def test_the_three_mutators_refuse_an_unsettled_chain(coordinator_on, monkeypatc
     pending = _unsettle(project_root)
 
     # A completed register retry answers from its retained operation record
-    # without touching the chain (lifecycle design §8), so the pending gate
+    # without touching the chain, so the pending gate
     # holds for exactly the two chain mutators.
     genesis = _durable_genesis_digest(project_root)
     assert (
@@ -124,7 +124,7 @@ def test_a_settled_chain_refuses_none_of_the_seven(coordinator_on, monkeypatch) 
 def test_the_gate_is_post_recovery_and_admits_an_interrupted_transaction(
     coordinator_on, monkeypatch
 ) -> None:
-    """Design §10.1: a registration recovery can still settle is not evidence-starved."""
+    """Contract: a registration recovery can still settle is not evidence-starved."""
     from atoms.coordinator import execute
     from atoms.core.recovery import CommitDecision, TransactionState
 

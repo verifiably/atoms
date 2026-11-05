@@ -1,4 +1,4 @@
-"""Tier 5 -- the durability claim A5a actually makes (design §11.5)."""
+"""Tier 5 -- the durability claim the metadata store actually makes."""
 
 from __future__ import annotations
 
@@ -97,7 +97,7 @@ def test_a_committed_record_reads_all_blobs_in_a_fresh_process(
 
 
 def test_a_committed_record_never_names_a_missing_blob(store_on):
-    """The behavioural half of ledger #22."""
+    """The behavioural half of the boundary contract."""
     content = b"referenced"
     digest = digest_of(content)
     with store_on() as binding:

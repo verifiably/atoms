@@ -98,7 +98,7 @@ def test_normalization_variant_paths_are_rejected():
 
 
 def test_the_create_delete_recreate_counterexample_is_rejected():
-    # Design §5.4: every no-clobber operation in this sequence succeeds, so a suite
+    # Contract: every no-clobber operation in this sequence succeeds, so a suite
     # exercising only mutation-time guards would pass while the declared final states
     # (x absent, X present) are unsatisfiable on one entry.
     with pytest.raises(SpecValidationError, match="alias"):

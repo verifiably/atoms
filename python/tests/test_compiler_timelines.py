@@ -216,7 +216,7 @@ def test_symlink_ancestor_type_change_is_permitted():
 
 
 def test_undeclared_ancestor_carries_no_constraint():
-    # Whether 'deep' exists and is a directory is a live filesystem question (A4).
+    # Whether 'deep' exists and is a directory is a live filesystem question (the filesystem layer).
     compile_spec(
         _spec(
             {"deep/nested/f": ABSENT},

@@ -1,4 +1,4 @@
-"""Tier 4 -- workspaces over a real ext4 metadata root (design §8.3, §8.5)."""
+"""Tier 4 -- workspaces over a real ext4 metadata root."""
 
 from __future__ import annotations
 
@@ -273,7 +273,7 @@ def test_creation_flushes_both_workspace_parents(opened_store, store_binding, mo
     assert flushed == [staging_inode, work_inode]
 
 
-def test_the_anchors_are_usable_by_a6_and_a7(opened_store):
+def test_the_anchors_are_usable_for_staging_and_execution(opened_store):
     with opened_store.create_workspace("tx1") as workspace:
         stage(workspace, "capture", b"bytes")
         os.mkdir("built", dir_fd=workspace.work_fd)

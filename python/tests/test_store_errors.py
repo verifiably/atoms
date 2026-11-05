@@ -1,4 +1,4 @@
-"""Design §9.1 -- narrow, result-code translation with a bare default re-raise."""
+"""Contract: narrow, result-code translation with a bare default re-raise."""
 
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ def test_a_programming_error_carrying_no_result_code_propagates(tmp_path):
 
 def test_an_extended_result_code_still_matches_its_primary(tmp_path):
     """Discrimination is on `code & 0xFF`, so SQLITE_CORRUPT_VTAB and friends match --
-    the idiom A4a already uses for SQLITE_BUSY at probe.py:367."""
+    the idiom the capability backend already uses for SQLITE_BUSY at probe.py:367."""
     extended = SQLITE_CORRUPT | (1 << 8)
     error = sqlite3.DatabaseError("synthetic")
     error.sqlite_errorcode = extended  # type: ignore[attr-defined]

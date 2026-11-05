@@ -1,4 +1,4 @@
-"""A6 tier 3 -- capture: absence, staging, flush, and refusals (design §7, §8, §9)."""
+"""coherent capture tier 3 -- capture: absence, staging, flush, and refusals."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ def payloads_for_replace() -> DictPayloads:
     return DictPayloads({digest_of(AFTER): AFTER})
 
 
-# --- the digest-length precheck (design §7.2) ---------------------------------------
+# --- the digest-length precheck ---------------------------------------
 
 
 def test_one_digest_at_two_lengths_refuses_before_anything_is_written():
@@ -56,7 +56,7 @@ def test_one_length_per_digest_passes_through():
     }
 
 
-# --- absence inference (design §8) ---------------------------------------------------
+# --- absence inference ---------------------------------------------------
 
 
 def test_capture_uses_the_descriptor_tables_modeled_children_derivation():
@@ -138,7 +138,7 @@ def test_a_drifted_regular_file_blocker_refuses(leased):
 
 
 def test_a_symlink_blocker_matching_its_declared_state_justifies_absence(leased):
-    """The symlink twin of the file branch's justified-absence test (design §8.2).
+    """The symlink twin of the file branch's justified-absence test.
 
     Without this, `_verify_stops`'s whole `elif type(expected) is SymlinkState:`
     branch is dead code as far as the suite can tell: deleting it leaves every other
@@ -154,7 +154,7 @@ def test_a_symlink_blocker_matching_its_declared_state_justifies_absence(leased)
         with open_workspace(lease, approved) as workspace, capture_initial_surface(
             lease, approved, workspace, payloads_for_replace()
         ) as captured:
-            # A symlink retains no content (design §7 step 3): only the payload
+            # A symlink retains no content: only the payload
             # capture stages, never the blocker itself.
             assert {e.digest for e in captured.manifest} == {digest_of(AFTER)}
 
@@ -201,7 +201,7 @@ def test_a_top_level_declared_absent_path_is_accepted(leased):
             assert {e.digest for e in captured.manifest} == {digest_of(AFTER)}
 
 
-# --- staging (design §7) --------------------------------------------------------------
+# --- staging --------------------------------------------------------------
 
 
 def test_a_preimage_is_staged_under_its_digest_leaf(leased):
@@ -235,10 +235,10 @@ def test_a_drifted_preimage_refuses(leased):
 
 
 def test_a_symlink_preimage_is_verified_and_not_staged(leased):
-    """§7 step 3: a symlink retains no content.
+    """the specification: a symlink retains no content.
 
-    `referenced_digests` filters on FileState and never names one, and §10's rollback
-    material for a symlink is the atomically transferred tombstone, which only A7 creates.
+    `referenced_digests` filters on FileState and never names one, and the specification rollback
+    material for a symlink is the atomically transferred tombstone, which only the effect executor creates.
     """
     from atoms.coordinator.capture import capture_initial_surface
     from atoms.coordinator.prepare import open_workspace
@@ -272,7 +272,7 @@ def test_capture_composes_with_preparation(leased):
 
 
 def test_the_descriptor_table_outlives_capture(leased):
-    """§5.5: the table is what A7 executes against."""
+    """the specification: the table is what the effect executor executes against."""
     from atoms.coordinator.capture import capture_initial_surface
     from atoms.coordinator.prepare import open_workspace, prepare_transaction
     from atoms.core.recovery.snapshot import ProjectRoot
@@ -288,7 +288,7 @@ def test_the_descriptor_table_outlives_capture(leased):
 
 
 def test_a_stray_staging_entry_refuses_rather_than_surviving_success(leased):
-    """§7.4 and criterion 10: on success, staging holds EXACTLY the manifest.
+    """the specification and criterion 10: on success, staging holds EXACTLY the manifest.
 
     `promote_staging` would refuse the stray later, but capture must not report success
     with an unrelated leaf still present.
@@ -312,11 +312,11 @@ def test_a_stray_staging_entry_refuses_rather_than_surviving_success(leased):
                 pass
 
 
-# --- durability (design §7.3) ---------------------------------------------------------
+# --- durability ---------------------------------------------------------
 
 
 def test_every_staged_file_is_flushed_before_its_sink_closes(leased, monkeypatch):
-    """§7.3 ordering. `promote_staging` flushes DIRECTORIES only, so nothing else makes
+    """the specification ordering. `promote_staging` flushes DIRECTORIES only, so nothing else makes
     the contents durable, and a lost flush is invisible until a crash.
 
     Events are keyed by GENERATION, not by file descriptor: numeric descriptors are
@@ -371,7 +371,7 @@ def test_every_staged_file_is_flushed_before_its_sink_closes(leased, monkeypatch
         assert sequence == ["open", "flush", "close"], (generation, sequence)
 
 
-# --- payload contract (design §7.1, §9) -----------------------------------------------
+# --- payload contract -----------------------------------------------
 
 
 def test_a_payload_whose_bytes_disagree_refuses(leased):
@@ -390,7 +390,7 @@ def test_a_payload_whose_bytes_disagree_refuses(leased):
 
 
 def test_a_missing_payload_binding_is_a_protocol_error(leased):
-    """§9: absent or malformed is a broken submission, not external state."""
+    """the specification: absent or malformed is a broken submission, not external state."""
     from atoms.coordinator.capture import capture_initial_surface
     from atoms.coordinator.prepare import open_workspace
 
@@ -405,10 +405,10 @@ def test_a_missing_payload_binding_is_a_protocol_error(leased):
 
 
 def test_a_payload_stream_error_propagates_as_itself(leased):
-    """§9.1: only the missing-binding signal is translated.
+    """the specification: only the missing-binding signal is translated.
 
     An `except Exception` around `open()` would convert EIO, ENOSPC, and outright bugs in
-    the consumer's source into ProtocolError, which is exactly the overreach A5a's rule
+    the consumer's source into ProtocolError, which is exactly the overreach the metadata store's rule
     forbids.
     """
     from atoms.coordinator.capture import capture_initial_surface
@@ -527,7 +527,7 @@ def test_a_declared_file_that_drifted_into_a_directory_refuses(leased):
 
 
 def test_an_extra_payload_binding_is_not_an_error(leased):
-    """§9: `open(digest)` cannot be enumerated, so capture never learns of extras.
+    """the specification: `open(digest)` cannot be enumerated, so capture never learns of extras.
 
     Detecting them would mean adding enumeration machinery for a condition that harms
     nothing -- an unrequested payload is never opened, staged, or promoted.
@@ -547,9 +547,9 @@ def test_an_extra_payload_binding_is_not_an_error(leased):
 
 
 def test_a_refusal_leaves_reclaimable_scratch_and_no_record(leased):
-    """§7.4: cleanliness is scoped to success.
+    """the specification: cleanliness is scoped to success.
 
-    Partial workspace scratch is mutation-free, no durable record exists, and A5b's
+    Partial workspace scratch is mutation-free, no durable record exists, and the recovery lease's
     reclamation removes it at the next lease entry.
     """
     from atoms.coordinator.capture import capture_initial_surface

@@ -1,4 +1,4 @@
-"""A5b tier 3 -- preparation: the gates, work-base re-resolution, publication."""
+"""the recovery lease tier 3 -- preparation: the gates, work-base re-resolution, publication."""
 
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ def test_preparation_publishes_the_record_in_one_commit(leased):
 
 
 def test_nothing_is_durable_until_the_publication_commit(leased, monkeypatch):
-    """The single barrier authority §7.3 step 4 requires.
+    """The single barrier the specification requires.
 
     The cut is driven THROUGH `prepare_transaction`, not by repeating its body: a test
     that re-implements the transaction stays green when the production function's own

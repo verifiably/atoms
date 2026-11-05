@@ -1,4 +1,4 @@
-"""The public batch path-state capture (design §9)."""
+"""The public batch path-state capture."""
 
 from __future__ import annotations
 
@@ -83,7 +83,7 @@ def test_capture_states_refuses_an_inadmissible_path_tuple(tmp_path: Path, paths
 def test_capture_states_refuses_an_entry_outside_the_closed_vocabulary(
     tmp_path: Path,
 ) -> None:
-    """Design §9.3: the vocabulary is closed by authority §6; widening is a design act."""
+    """Contract: the vocabulary is closed by the specification; widening is a design act."""
     os.mkfifo(tmp_path / "pipe")
 
     with pytest.raises(PreconditionRefused, match="pipe"):
@@ -93,7 +93,7 @@ def test_capture_states_refuses_an_entry_outside_the_closed_vocabulary(
 def test_capture_states_agrees_with_the_registration_baseline(
     coordinator_on, monkeypatch
 ) -> None:
-    """Design §9.1: one `_capture_path`, so there is no second summary model."""
+    """Contract: one `_capture_path`, so there is no second summary model."""
     ingredients = coordinator_on()
     _enable_commands(ingredients, monkeypatch)
     backend, project_root, _, _ = ingredients

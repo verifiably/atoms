@@ -107,7 +107,7 @@ UNICODE_SAMPLES = [
     "\ud800",                   # lone high surrogate - not UTF-8 encodable
     "\udfff",                   # lone low surrogate - not UTF-8 encodable
     "\ud800\udc00",             # a surrogate pair spelled as two lone code points
-    "a" * 300,                  # longer than any real NAME_MAX; admitted here (ledger #4)
+    "a" * 300,                  # longer than any real NAME_MAX; admitted here
     " leading and trailing ",
     "tab\tnewline\n",
     ".#nottilde",               # near the reserved scratch sigil without matching it
@@ -295,11 +295,11 @@ def test_effect_order_is_never_canonicalized_away():
     assert [e.effect_id for e in compiled.spec.effects] == ["e1", "e2", "e3"]
 
 
-# --- A1 interoperability ---
+# --- the core model interoperability ---
 
 @pytest.mark.parametrize("make_spec", CORPUS)
 def test_compiled_spec_survives_the_durable_round_trip(make_spec):
-    # Fresh-process recovery reconstructs the spec from stored bytes (§8.4).
+    # Fresh-process recovery reconstructs the spec from stored bytes.
     compiled = compile_spec(make_spec())
     assert from_canonical_bytes(canonical_bytes(compiled.spec)) == compiled.spec
 
@@ -311,7 +311,7 @@ def test_a_decoded_spec_recompiles_identically(make_spec):
     assert compile_spec(decoded) == compiled
 
 
-# --- §13.3 alias conformance ---
+# --- the specification alias conformance ---
 
 def test_scratch_alias_is_refused_in_leaf_and_ancestor_position():
     for path in (".#~leaf", "dir/.#~leaf", ".#~anc/child", "a/.#~anc/child"):

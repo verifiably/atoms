@@ -1,4 +1,4 @@
-"""A5b tier 6 -- import direction, package surface, and the fixture registry."""
+"""the recovery lease tier 6 -- import direction, package surface, and the fixture registry."""
 
 from __future__ import annotations
 
@@ -181,7 +181,7 @@ def test_authority_minting_and_halt_persistence_have_one_caller_each():
         and node.name == "_persist_assembly_halt"
     )
     annotations = ast.unparse(persist.args)
-    assert "ProjectApprovedSpec" not in annotations  # Design §9.3 exception.
+    assert "ProjectApprovedSpec" not in annotations  # Contract:  exception.
 
 
 def test_effect_modules_are_syscall_only_and_execution_ignores_dependencies():

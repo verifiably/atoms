@@ -477,7 +477,7 @@ def test_resolve_certification_ref_uses_explicit_env_dir_when_file_exists(
 ) -> None:
     env_dir = tmp_path / "cert"
     env_dir.mkdir()
-    ref = "docs/certification/2026-09-03-ext4-linux-7.2.2-arch1-1.json"
+    ref = next(iter(CERTIFIED_ALLOWLIST.entries)).certification_ref
     expected = env_dir / Path(ref).name
     expected.write_text("{}\n", encoding="utf-8")
 
@@ -494,7 +494,7 @@ def test_resolve_certification_ref_returns_missing_path_under_explicit_env_dir_s
 ) -> None:
     env_dir = tmp_path / "cert"
     env_dir.mkdir()
-    ref = "docs/certification/2026-09-03-ext4-linux-7.2.2-arch1-1.json"
+    ref = next(iter(CERTIFIED_ALLOWLIST.entries)).certification_ref
 
     resolved = _resolve_certification_ref(
         ref,
@@ -517,7 +517,7 @@ def test_resolve_certification_ref_returns_missing_path_under_discovered_records
     bin_dir = tmp_path / "bin"
     payload = json.dumps({"project": {"records": str(records_dir)}})
     _write_tasks_stub(bin_dir, f"printf '%s\\n' '{payload}'")
-    ref = "docs/certification/2026-09-03-ext4-linux-7.2.2-arch1-1.json"
+    ref = next(iter(CERTIFIED_ALLOWLIST.entries)).certification_ref
 
     resolved = _resolve_certification_ref(
         ref,
@@ -535,7 +535,7 @@ def test_resolve_certification_ref_returns_none_when_records_unavailable(
 ) -> None:
     root = tmp_path / "root"
     root.mkdir()
-    ref = "docs/certification/2026-09-03-ext4-linux-7.2.2-arch1-1.json"
+    ref = next(iter(CERTIFIED_ALLOWLIST.entries)).certification_ref
 
     assert _resolve_certification_ref(ref, root=root, env={"PATH": ""}) is None
 
@@ -569,7 +569,7 @@ def test_resolve_certification_ref_ignores_ambient_pretty_format(
         + payload
         + "' ;; *) printf 'pretty output\\n' ;; esac",
     )
-    ref = "docs/certification/2026-09-03-ext4-linux-7.2.2-arch1-1.json"
+    ref = next(iter(CERTIFIED_ALLOWLIST.entries)).certification_ref
 
     resolved = _resolve_certification_ref(
         ref,
@@ -584,7 +584,7 @@ def test_resolve_certification_ref_raises_on_corrupt_tasks_output(
 ) -> None:
     root = tmp_path / "root"
     root.mkdir()
-    ref = "docs/certification/2026-09-03-ext4-linux-7.2.2-arch1-1.json"
+    ref = next(iter(CERTIFIED_ALLOWLIST.entries)).certification_ref
 
     bin_bad_json = tmp_path / "bin-bad-json"
     _write_tasks_stub(bin_bad_json, "printf 'not-json\\n'")

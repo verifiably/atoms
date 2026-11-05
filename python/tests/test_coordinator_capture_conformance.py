@@ -1,4 +1,4 @@
-"""A6 tier 4 -- the observer's output against A3's two entry points (design §11.4)."""
+"""coherent capture tier 4 -- the observer's output against the recovery model's two entry points."""
 
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ def _observed(lease, approved, workspace):
 
 
 def test_a_complete_observation_is_accepted_by_build_recovery_snapshot(leased):
-    """Proves the observer satisfies A3's coverage and shape validators without A7."""
+    """Proves the observer satisfies the recovery model's coverage and shape validators without the effect executor."""
     from atoms.coordinator.prepare import open_workspace
 
     with leased() as lease:
@@ -71,7 +71,7 @@ def test_a_complete_observation_is_accepted_by_build_recovery_snapshot(leased):
 def test_a_scratch_only_observation_authorizes_a_committed_cleanup_step(leased):
     """The committed-cleanup route, driven to an exact verdict.
 
-    Ledger #13's contract for this route is specific: after one coherent complete
+    the boundary contract contract for this route is specific: after one coherent complete
     final-surface observation, each authorization observation is a *fresh* one covering
     exactly the named retained scratch slot, with empty persistent and occupancy
     coverage. A PREPARED/UNCOMMITTED snapshot carrying persistent evidence exercises a
@@ -179,11 +179,11 @@ def test_a_scratch_only_observation_authorizes_a_committed_cleanup_step(leased):
 
 
 def test_a_wrong_mode_staging_directory_is_reported_with_its_actual_mode(leased):
-    """§10's wrong-mode staging directory, observed rather than judged.
+    """the specification wrong-mode staging directory, observed rather than judged.
 
-    A6's obligation is to report the mode and occupancy it actually found; deciding that
-    the mode is *wrong* is A3's, and an observer that normalised or corrected it would
-    hide the case A7 has to repair.
+    coherent capture's obligation is to report the mode and occupancy it actually found; deciding that
+    the mode is *wrong* is the recovery model's, and an observer that normalised or corrected it would
+    hide the case the effect executor has to repair.
     """
     from atoms.coordinator.descriptors import _build_descriptor_table
     from atoms.coordinator.prepare import open_workspace
@@ -214,7 +214,7 @@ def test_a_wrong_mode_staging_directory_is_reported_with_its_actual_mode(leased)
 
 
 def test_the_prefix_relation_comes_from_real_files(leased):
-    """§11.3: over actual files and descriptors, not hand-built model values."""
+    """the specification: over actual files and descriptors, not hand-built model values."""
     from atoms.coordinator.prepare import open_workspace
 
     with leased() as lease:

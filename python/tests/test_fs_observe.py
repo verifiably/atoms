@@ -1,4 +1,4 @@
-"""A6 tier 1 -- the coherent observation mechanism (design §6)."""
+"""coherent capture tier 1 -- the coherent observation mechanism."""
 
 from __future__ import annotations
 
@@ -82,8 +82,8 @@ def test_each_pass_mints_a_fresh_token_universe(project):
     with Observation(LinuxBackend()) as second_pass:
         second = second_pass.observe(fd, "f.txt")
 
-    # A3's identity equality means "same entry, same pass". A token that survived the
-    # pass would let A3 conclude more than was observed.
+    # the recovery model's identity equality means "same entry, same pass". A token that survived the
+    # pass would let the recovery model conclude more than was observed.
     assert type(first) is ObservedFile
     assert type(second) is ObservedFile
     assert first.identity != second.identity
@@ -106,7 +106,7 @@ def test_a_directory_requires_its_modeled_children(project):
     """Failure to look is not a finding of absence.
 
     `has_unmodeled_child` is evidence. Producing `False` without enumerating would put a
-    fabricated fact into A3's input, so the route refuses rather than guessing.
+    fabricated fact into the recovery model's input, so the route refuses rather than guessing.
     """
     root, fd = project
     (root / "sub").mkdir()
@@ -224,7 +224,7 @@ def test_a_closed_observation_stream_is_a_protocol_error(project):
 
 
 def test_the_retained_descriptor_pins_the_inode(project):
-    """§11.1: assert the pin, not the reuse.
+    """the specification: assert the pin, not the reuse.
 
     Unlinking and recreating does not *force* the kernel to reallocate the inode, so a
     test that asserted distinct tokens after a recreate would pass just as readily with
@@ -383,7 +383,7 @@ def test_an_unsupported_semantic_is_a_capability_refusal():
 
 
 def test_an_undefined_errno_propagates_as_itself():
-    """Design §9.1: A5a's rule, applied to errno.
+    """Contract: the metadata store's rule, applied to errno.
 
     ENOSPC is not external state contradicting the frozen spec -- it is a full disk.
     Reporting it as PreconditionRefused would tell a consumer its intent had drifted

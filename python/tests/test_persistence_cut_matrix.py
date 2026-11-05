@@ -1,4 +1,4 @@
-"""The persistence-cut sweep: A3 agreement over every reconstructible survivor (design §5)."""
+"""The persistence-cut sweep: the recovery model agreement over every reconstructible survivor."""
 
 from __future__ import annotations
 
@@ -10,24 +10,24 @@ MOVE_BEARING = ("archive-move", "caught-rollback-move")
 
 
 @pytest.mark.parametrize("name", MINIMAL)
-def test_every_cell_of_the_minimal_scenarios_agrees_with_a3(name, cut_matrix) -> None:
+def test_every_cell_of_the_minimal_scenarios_agrees_with_recovery(name, cut_matrix) -> None:
     report = cut_matrix(name)
     assert report.cells > 0
     assert report.classified_cells > 0, (
-        "no cell reached classify_recovery: the sweep would assert nothing about A3"
+        "no cell reached classify_recovery: the sweep would assert nothing about recovery"
     )
     assert report.disagreements == ()
     assert report.second_pass_violations == ()
     assert report.side_assertion_failures == ()
     assert report.designated_failures == (), (
-        "an unsabotaged sweep must raise no design §9 designated failure"
+        "an unsabotaged sweep must raise no designated failure"
     )
 
 
 def test_an_absent_approved_directory_freezes_a_node_missing_halt(
     cut_matrix, ext4_volume, test_storage_profile, monkeypatch
 ) -> None:
-    """Design §4.4's realignment carve-out, backed by a test rather than by prose.
+    """Contract:  realignment carve-out, backed by a test rather than by prose.
 
     `realign_durable_identities` rewrites the durable approval evidence's `(st_dev,
     st_ino)` pairs onto the reconstructed inodes, but deliberately leaves an **absent**
@@ -106,8 +106,8 @@ def test_an_absent_approved_directory_freezes_a_node_missing_halt(
 
 
 @pytest.mark.parametrize("name", COMPOUND)
-def test_every_cell_of_the_compound_scenarios_agrees_with_a3(name, cut_matrix) -> None:
-    """The multi-effect and caught-rollback half of design §13.4's matrix.
+def test_every_cell_of_the_compound_scenarios_agrees_with_recovery(name, cut_matrix) -> None:
+    """The multi-effect and caught-rollback half of the specification matrix.
 
     `corpus-write` (five effects, two nested fresh directories) and `archive-move` (a
     move whose vacated source is re-created) are the documented consumer shapes; the two
@@ -121,7 +121,7 @@ def test_every_cell_of_the_compound_scenarios_agrees_with_a3(name, cut_matrix) -
     report = cut_matrix(name, caught=name.startswith("caught"))
     assert report.cells > 0
     assert report.classified_cells > 0, (
-        "no cell reached classify_recovery: the sweep would assert nothing about A3"
+        "no cell reached classify_recovery: the sweep would assert nothing about recovery"
     )
     assert report.disagreements == ()
     assert report.second_pass_violations == ()
@@ -130,7 +130,7 @@ def test_every_cell_of_the_compound_scenarios_agrees_with_a3(name, cut_matrix) -
         assert report.named_tuple_cells_ran > 0
 
 
-# The two directions of design §9.4's named tuples, and where each is recorded: the
+# The two directions of the specification named tuples, and where each is recorded: the
 # forward pair comes from `minimal-move`'s own transfer, the reverse pair from the
 # UNDO-era transfer a caught rollback emits when it re-moves the landed move.
 MOVE_DIRECTIONS = (("forward", "minimal-move", False), ("reverse", "caught-rollback-move", True))
@@ -139,7 +139,7 @@ DESTINATION = "project/d/destination.txt"
 
 
 def _assert_repaired_to_the_move_pre_state(named) -> None:
-    """Authority design §9.4's designed repair, asserted on a finished named cell.
+    """Authority the specification designed repair, asserted on a finished named cell.
 
     "Each is repaired to the pre-state the same way: remove the destination, or restore
     the source from the anchor" -- so *both* tuples, in *both* directions, owe the same
@@ -147,7 +147,7 @@ def _assert_repaired_to_the_move_pre_state(named) -> None:
     The reverse tuples are the reverse operation's own intermediates, and its pre-state
     is the same `(source present, destination absent)` the forward move started from.
 
-    `NamedCell.__post_init__` has already required the cell to be clean (A3 agreement,
+    `NamedCell.__post_init__` has already required the cell to be clean (the recovery model agreement,
     the second pass, the side assertions). What is added here is the *value* of the
     repair -- which world recovery actually converged on -- plus the rollback result,
     which is the sharp discriminator: `RESTORED` says the move's own mutations were
@@ -161,7 +161,7 @@ def _assert_repaired_to_the_move_pre_state(named) -> None:
     result = named.result
     where = f"{named.scenario} {named.tuple_name}"
     assert not result.halted, where
-    assert result.counts["classified"] == 1, f"{where}: the cell never reached A3"
+    assert result.counts["classified"] == 1, f"{where}: the cell never reached recovery classification"
     assert result.world[SOURCE][:3] == ("file", BEFORE, 0o644), (
         f"{where}: the source was not restored: {result.world.get(SOURCE)!r}"
     )
@@ -179,7 +179,7 @@ def _assert_repaired_to_the_move_pre_state(named) -> None:
 def test_dual_name_tuples_repair_by_removing_the_destination(
     direction, scenario, caught, cut_matrix
 ) -> None:
-    """Design §9.4's dual-name tuple: the insertion is durable, the removal is not.
+    """Contract:  dual-name tuple: the insertion is durable, the removal is not.
 
     The reconstructed world is the one the authority names -- "source, destination, and
     anchor all naming the original inode" -- and that is asserted here, on the cell's own
@@ -209,7 +209,7 @@ def test_dual_name_tuples_repair_by_removing_the_destination(
 def test_anchor_only_tuples_repair_by_restoring_the_source(
     direction, scenario, caught, cut_matrix
 ) -> None:
-    """Design §9.4's anchor-only tuple: the removal is durable, the insertion is not.
+    """Contract:  anchor-only tuple: the removal is durable, the insertion is not.
 
     "Both persistent paths absent, only the durable anchor surviving" -- so the
     reconstructed world is asserted to hold neither live name, which is what makes the
@@ -232,7 +232,7 @@ def test_anchor_only_tuples_repair_by_restoring_the_source(
 
 
 def test_drift_cells_preserve_external_blockers(cut_matrix) -> None:
-    """Design §6's drift family: an external blocker planted between reconstruction and
+    """Contract:  drift family: an external blocker planted between reconstruction and
     recovery survives every cell that could carry it.
 
     `drift-blocker` plants a foreign `d/f.txt` over the `DeletePath` target. Recovery may
@@ -257,7 +257,7 @@ def test_drift_cells_preserve_external_blockers(cut_matrix) -> None:
 
 @pytest.mark.parametrize("name", ("minimal-move", "minimal-replace"))
 def test_subprocess_placement_matches_in_process(name, cut_matrix) -> None:
-    """Design §8's placement axis: the same cell, recovered in a fresh process, agrees.
+    """Contract:  placement axis: the same cell, recovered in a fresh process, agrees.
 
     The subset is declared, never sampled -- `Sweeper.__call__`'s docstring states the
     rule, and the arm itself asserts the rule selected something, so a rule that silently
@@ -265,8 +265,8 @@ def test_subprocess_placement_matches_in_process(name, cut_matrix) -> None:
     an emptiness check.
 
     Two scenarios because the rule's three clauses are not all live in one stream:
-    `minimal-move` is the only minimal scenario carrying design §9.4's named tuples, and
-    it never halts; `minimal-replace` carries the A3 halts whose *persisted halt
+    `minimal-move` is the only minimal scenario carrying the specification named tuples, and
+    it never halts; `minimal-replace` carries the the recovery model halts whose *persisted halt
     diagnostic* is the arm's exact-comparison target. Sweeping only the first would leave
     that comparison comparing `None` to `None` in every cell.
     """
@@ -284,12 +284,12 @@ def _mkdir_publication_cut(stream) -> tuple[int, tuple]:
     """The cut *between* `CreateDirectory`'s two publication flushes, and the work-slot
     entry key whose removal is not durable there.
 
-    Authority §9.5 orders the cross-directory publication "fsync the live parent first
+    Contract:  orders the cross-directory publication "fsync the live parent first
     ... then fsync `work/` so the staging-name removal is durable, and only then mark
     `DONE`". Both flushes are found from the recorded stream rather than assumed: the
     publication is the two-unit `remove`+`insert` `Mutation` whose insert names `d` in the
     project root, and the cut is one past the first `Barrier` covering that insert. The
-    returned key is the transfer's `remove`, still pending at that cut -- design §4.3's
+    returned key is the transfer's `remove`, still pending at that cut -- the specification
     "the work-slot removal unit did not survive".
     """
     from tests.persistence_model import Barrier, Mutation, pending_keys_at
@@ -416,24 +416,24 @@ def _inject_one_identity(monkeypatch, path: str) -> dict[str, int]:
 def test_same_inode_work_survivor_is_landed_not_blocker(
     cut_matrix, ext4_volume, test_storage_profile, monkeypatch
 ) -> None:
-    """Design §4.5: the §9.5 tuple at the observation seam.
+    """Contract: the the specification tuple at the observation seam.
 
-    §9.5's intermediate -- the live parent durably holding the published directory while
+    the specification intermediate -- the live parent durably holding the published directory while
     the `work/` staging name's removal is not yet durable, both names one inode -- is not
-    host-reconstructible, and design §4.5 records why: no in-process cut can materialize
+    host-reconstructible, and the specification records why: no in-process cut can materialize
     it (after `transfer_noclobber` returns the `work/` name is already gone), Linux
     forbids hard-linking directories, and ext4 journals a rename as one atomic
     transaction, so no completion-ordered replay prefix splits the two directory updates.
     Measured here as well: the staging leaf's own *name* is never separately flushed
-    (§9.5 flushes the staging descriptor, which covers its mode, not its parent's entry),
+    (the specification flushes the staging descriptor, which covers its mode, not its parent's entry),
     so the recorded stream carries no durable work-slot name for a survivor subset to
     keep at all.
 
     So the physical world is the reachable half -- the cut between the two publication
     flushes, with the work-slot removal not surviving -- plus the one entry no cut can
-    produce, spliced into the cell's modelled tree at the mode §9.5's `fchmod` gives the
+    produce, spliced into the cell's modelled tree at the mode the specification `fchmod` gives the
     staging directory. Reconstruction mints it as a *separate inode* (`os.mkdir`), and the
-    identity §9.5 describes is injected at both observation seams instead.
+    identity the specification describes is injected at both observation seams instead.
 
     The assertions are the design's own sentence, "recovery removes the stale `work/`
     entry and treats the effect as landed, subject to the transaction's forward/rollback
@@ -478,7 +478,7 @@ def test_same_inode_work_survivor_is_landed_not_blocker(
     survivor = f"{slots[0]}/{remove_key[2]}"
     assert cell.state.tree["project/d"] == ("dir", 0o755), cell.state.tree["project/d"]
     assert survivor not in cell.state.tree, (
-        "the work-slot name is durable at this cut after all: the §9.5 world is "
+        "the work-slot name is durable at this cut after all: the same-inode work world is "
         "reachable and must be swept rather than spliced"
     )
     tree = dict(cell.state.tree)
@@ -498,7 +498,7 @@ def test_same_inode_work_survivor_is_landed_not_blocker(
 
     assert fired["snapshot"] > 0, "the classification seam never saw the two directories"
     assert fired["step"] > 0, "the authorization seam never saw the two directories"
-    assert not result.halted, "recovery halted on the §9.5 intermediate"
+    assert not result.halted, "recovery halted on the same-inode work-directory intermediate"
     assert result.counts["classified"] == 1
     assert result.disagreement is None, result.disagreement
     assert result.second_pass_violation is None, result.second_pass_violation
@@ -515,7 +515,7 @@ def test_same_inode_work_survivor_is_landed_not_blocker(
     )
 
 
-# --- design §9's five sabotage arms ------------------------------------------------
+# --- the specification five sabotage arms ------------------------------------------------
 #
 # Each arm suppresses ONE barrier in the model's recorded view (the real filesystem
 # still flushed; the model is what decides survivor worlds) or drops one store COMMIT's
@@ -528,10 +528,10 @@ def test_same_inode_work_survivor_is_landed_not_blocker(
 # The arms are data (`tests.persistence_model.SABOTAGE_ARMS`) rather than per-test
 # monkeypatching: the plan's sketch patched a `flush_*` function in a module, which
 # would suppress the *real* fsync and leave the model still recording a Barrier -- the
-# opposite of what design §9's arms need, since the model's recorded view is what the
+# opposite of what the specification arms need, since the model's recorded view is what the
 # survivor product is taken over.
 #
-# A sabotaged run judges its arm by its own designated check ONLY -- design §9's "never
+# A sabotaged run judges its arm by its own designated check ONLY -- the specification "never
 # 'any cell happens to differ'" -- so it does not re-enumerate the whole sweep.
 
 
@@ -550,7 +550,7 @@ def test_sabotage_2_mutation_durable_before_done(cut_matrix) -> None:
 
 
 def test_sabotage_3_move_destination_flush(cut_matrix) -> None:
-    # Reordering the two 9.4 flushes is deliberately NOT the arm (design §9):
+    # Reordering the two 9.4 flushes is deliberately NOT the arm:
     # either order yields an attributable repairable tuple; the load-bearing
     # property is both flushes preceding DONE.
     report = cut_matrix("minimal-move", sabotage="move-destination-flush")
@@ -572,7 +572,7 @@ def test_sabotage_5_committed_decision(cut_matrix) -> None:
 
 
 def test_each_sabotaged_run_fails_only_its_own_designated_check(cut_matrix) -> None:
-    """Design §9's sharpest sentence: *exactly* the designated check fails.
+    """Contract:  sharpest sentence: *exactly* the designated check fails.
 
     `minimal-create` carries three of the five arms, so a sabotaged run of it evaluates
     all three designated checks and must name only the sabotaged one -- the blob arm

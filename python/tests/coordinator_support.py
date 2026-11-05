@@ -63,8 +63,8 @@ DIRECTORY_POST = DirectoryState(mode=0o755)
 def make_child_directory(lease: Lease, name: str = "d") -> None:
     """Create one directory in project space, tolerating an existing one.
 
-    `compiled_for` declares `d/f.txt`, whose parent must already exist for A4b to
-    approve it as an `ApprovedExistingDirectory` -- the branch of §6.4 that has an
+    `compiled_for` declares `d/f.txt`, whose parent must already exist for path resolution and project approval to
+    approve it as an `ApprovedExistingDirectory` -- the branch of the specification that has an
     identity to compare against.
     """
     try:
@@ -89,7 +89,7 @@ def file_spec() -> TransactionSpec:
 
 
 def directory_spec() -> TransactionSpec:
-    """A created directory with a child, so all three §6.4 branches appear at once.
+    """A created directory with a child, so all three the specification branches appear at once.
 
     Measured shape: `ApprovedExistingDirectory(ProjectRoot())`,
     `ApprovedPlannedDirectory(PersistentNode('d'))`,
@@ -110,11 +110,11 @@ def directory_spec() -> TransactionSpec:
 def nested_directory_spec() -> TransactionSpec:
     """Two DIRECTLY NESTED planned directories, then files beneath the inner one.
 
-    The corpus-write shape of authority design §9.5: "data" and "data/records" are both
+    The corpus-write shape of authority the specification: "data" and "data/records" are both
     absent when the transaction opens, so the initial descent can stop only at "data" --
     "data/records" has no parent descriptor to be looked up from until "data" exists.
     Its `WalkStop` can therefore only be born from the forward `CreateDirectory` that
-    publishes "data", which is what §9.5's descendant-descriptor handoff requires.
+    publishes "data", which is what the specification descendant-descriptor handoff requires.
     """
     return build_spec(
         consumer_tag="test",
@@ -219,7 +219,7 @@ def create_file_spec() -> TransactionSpec:
 def spec_digest(spec: TransactionSpec) -> str:
     """A short stable identity for a spec, for comparison across a process boundary.
 
-    `canonical_json` is the same encoding A5a stores and re-verifies, so two specs share
+    `canonical_json` is the same encoding the metadata store stores and re-verifies, so two specs share
     a digest exactly when the store would treat them as one. Hashed rather than sent
     whole so the child's JSON stays small and an assertion failure stays readable.
     """
@@ -232,7 +232,7 @@ def compiled_for(lease: Lease) -> CompiledSpec:
 
 
 def compiled_creating_a_directory(lease: Lease) -> CompiledSpec:
-    """`d` must NOT exist: A4b approves it as planned only while it is absent."""
+    """`d` must NOT exist: path resolution and project approval approves it as planned only while it is absent."""
     _ = lease
     return compile_spec(directory_spec())
 
@@ -248,7 +248,7 @@ def stage_manifest(
 ) -> tuple[StagedBlob, ...]:
     """Stage each content through the workspace and describe it for promotion.
 
-    A5a's coherence barrier requires a `blob` row for every digest the record
+    the metadata store's coherence barrier requires a `blob` row for every digest the record
     references, so a spec whose final surface names a file cannot be published without
     this.
     """
@@ -436,7 +436,7 @@ def replace_the_parent_directory(lease: Lease, approved: ProjectApprovedSpec) ->
     `st_ino` every time, because the inode is freed and immediately reallocated. So the
     replacement is built beside `d` while `d` still holds its inode -- which forces a
     distinct one -- and then renamed over the emptied name. The spelling is identical
-    either way; only the identity moves, which is precisely the drift ledger #19 names.
+    either way; only the identity moves, which is precisely the drift the boundary contract names.
     """
     _ = approved
     root_fd = lease._binding.project_root_fd
@@ -455,7 +455,7 @@ def project_state(project_root: str) -> dict[str, tuple[object, ...]]:
     Three things beyond kind/mode/content, each closing a hole the others leave open:
 
     * `st_dev` and `st_ino`, because a path replaced by an inode of identical kind,
-      mode, and content is otherwise invisible. These are already how A4b states path
+      mode, and content is otherwise invisible. These are already how path resolution and project approval states path
       identity, so this is the project's own vocabulary rather than a new one.
     * the root itself, keyed `"."`, because nothing under it records a `chmod` on it --
       and against an empty root, nothing under it records anything at all.

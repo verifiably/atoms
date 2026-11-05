@@ -1,4 +1,4 @@
-"""A6 tier 5 -- adversarial, scoped to A6 (design §11.6)."""
+"""coherent capture tier 5 -- adversarial, scoped to coherent capture."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ def payloads() -> DictPayloads:
 
 
 def test_no_project_path_is_mutated_by_capture(leased, ext4_project_root):
-    """Authority §13.5. A6 writes only into staging/<txid>/.
+    """Contract: . coherent capture writes only into staging/<txid>/.
 
     `project_state` records the root itself, every descendant, `lstat` rather than
     `stat`, and st_dev/st_ino -- so a path replaced by an inode of identical kind, mode,
@@ -59,11 +59,11 @@ def test_no_project_path_is_mutated_by_a_refused_capture(leased, ext4_project_ro
 
 
 def test_a_leaf_swapped_between_the_walk_and_the_observation_refuses(leased, monkeypatch):
-    """Between two A6 steps, not before capture begins.
+    """Between two coherent capture steps, not before capture begins.
 
     The table opens and validates `d`; the observation then looks `f.txt` up beneath the
-    held descriptor. Swapping the leaf in the window between them is the race A6 itself
-    can close -- a swap after observation is A7's destructive-transfer validation, and
+    held descriptor. Swapping the leaf in the window between them is the race coherent capture itself
+    can close -- a swap after observation is the effect executor's destructive-transfer validation, and
     asserting it here would prove nothing about the code that will own it.
     """
     from atoms.coordinator import capture as capture_module
@@ -119,7 +119,7 @@ def test_a_mount_crossing_mid_walk_refuses(leased, monkeypatch):
 
 
 def test_project_root_constraint_drift_after_approval_refuses(leased, monkeypatch):
-    """§5.3: retention is not discharge."""
+    """the specification: retention is not discharge."""
     from atoms.coordinator import descriptors
     from atoms.coordinator.capture import capture_initial_surface
     from atoms.coordinator.prepare import open_workspace

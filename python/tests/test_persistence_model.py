@@ -1,4 +1,4 @@
-"""Unit decomposition, coverage, replacement, and coalescing (design §4.1-§4.2)."""
+"""Unit decomposition, coverage, replacement, and coalescing (the specification-the specification)."""
 
 import pytest
 
@@ -58,7 +58,7 @@ def test_each_store_commit_carries_a_backup(persistence_recording):
 def test_full_durable_reconstruction_equals_the_live_final_world(
     name, persistence_recording, ext4_volume
 ):
-    """Design §9's fidelity self-check, run per scenario.
+    """Contract:  fidelity self-check, run per scenario.
 
     Parametrized rather than looped over one `persistence_recording` fixture instance:
     `ext4_project_root` (`coordinator_on`'s project root) is shared across every call
@@ -71,7 +71,7 @@ def test_full_durable_reconstruction_equals_the_live_final_world(
     probing performs un-flushed create+remove churn inside the recorded transaction
     itself, leaving `data`/`meta` keys (and the occasional `remove`) permanently
     orphaned once keyed replacement forgets their paired entry -- inert leftovers with
-    zero observable effect either way, never a discarded real change (design §9's
+    zero observable effect either way, never a discarded real change (the specification
     `apply_survivors` text: "an unreachable inode carries no observable state"). The
     dropped set is asserted, not merely trusted: every dropped key must be a `data`/
     `meta` unit (nameless-token churn) or an entry `remove` (a no-op with no durable
@@ -205,7 +205,7 @@ def test_the_pending_cap_fails_loud(persistence_recording):
     pending-set size genuinely reaches 4 at some cut, so `pending_cap=3` breaches on the
     scenario's own complexity, not on the mere presence of any pending key at all.
 
-    The peak was 6 before design §4.1's creation-mode ruling (2026-08-15) folded every
+    The peak was 6 before the specification creation-mode ruling (2026-08-15) folded every
     creation's mode into its entry insert; re-measured at 4 afterwards, and the cap here
     re-tuned with it -- a cap test pinned to a stale peak stops testing the boundary and
     starts testing nothing.
@@ -233,7 +233,7 @@ def test_the_default_cap_holds_across_every_recordable_scenario(
     """The transactional dimension `pending_cap` bounds stays small on every scenario
     `SCENARIOS` carries (probe-noise is unbounded and handled separately, `_fold`) --
     `enumerate_cells`'s default `pending_cap=12` must never raise on a real recorded
-    stream. `"refusal-capability"` is excluded: design's own §6 text rules capability
+    stream. `"refusal-capability"` is excluded: design's own the specification text rules capability
     refusals outside the persistence-cut product (they raise before any durable
     transaction exists, so `persistence_recording` cannot even produce a `Stream` for
     one). Parametrized (not one shared-fixture loop) for the same reason
@@ -251,7 +251,7 @@ def test_the_default_cap_holds_across_every_recordable_scenario(
 def test_a_mode_change_tears_and_the_zero_mode_path_still_reconstructs(
     persistence_recording, ext4_volume
 ):
-    """CONTROLLER RULING (design §4.1 as amended 2026-08-15): a *creation's* mode is
+    """CONTROLLER RULING: a *creation's* mode is
     atomic with inode creation and cannot tear, but a later mode **change** is an
     independent durability unit that can -- leaving the object at the mode it was
     created with.
@@ -265,7 +265,7 @@ def test_a_mode_change_tears_and_the_zero_mode_path_still_reconstructs(
     `mkdir_child` -> `repair_entry_mode` -> `open_child_directory` -> `set_mode` ->
     `flush_file`), so the survivor product genuinely holds that directory at both modes.
 
-    The second half keeps design §4.4's mkdir-`0o700`/populate/reverse-depth-chmod
+    The second half keeps the specification mkdir-`0o700`/populate/reverse-depth-chmod
     ordering covered. No recorded stream reaches a mode-`0` object any more -- that was
     the ruling's whole point -- so the state is *derived* from a real cell with
     `dataclasses.replace` on its `tree` alone: `reconstruct` reads only `tree` and
@@ -319,7 +319,7 @@ def test_a_mode_change_tears_and_the_zero_mode_path_still_reconstructs(
         reconstruct(state, project, metadata)
         assert stat.S_IMODE(os.stat(_resolve(path, project, metadata)).st_mode) == mode
 
-    # --- the mode-0 reconstruction path (design §4.4's ordering) --------------------
+    # --- the mode-0 reconstruction path (the specification ordering) --------------------
     source = cells[modes[creation_mode]].state
     populated = next(
         (

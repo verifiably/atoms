@@ -131,7 +131,7 @@ def test_a_traversal_refusal_with_the_wrong_errno_propagates(
     # The traversal probe reads two refusals as evidence its guard works — exactly
     # ELOOP for the symlink component, exactly EXDEV for the escape. Accepting any
     # OSError there would let a volume failing for an unrelated reason report
-    # anchored_traversal present, which is the §10 propagation rule read backwards.
+    # anchored_traversal present, which is the the specification propagation rule read backwards.
     #
     # override_names is what makes this test discriminate. Injected unconditionally,
     # the errno would arrive at the EARLIER availability open of "real" and propagate
@@ -440,9 +440,9 @@ def test_a_certification_child_that_times_out_refuses(
     held_lock, metadata_root, monkeypatch, failing_child, phase
 ):
     # A child that never finishes is the failure mode a volume with broken locking is
-    # most likely to produce. TimeoutExpired escaping would put it outside the §10
+    # most likely to produce. TimeoutExpired escaping would put it outside the the specification
     # contract, where every other certification failure already lands, and would hand
-    # A5 a third exception type to know about. The phase must be named: "the write
+    # the metadata store a third exception type to know about. The phase must be named: "the write
     # child hung" and "the contention child hung" are different volume diagnoses.
     real_run = subprocess.run
     calls = []

@@ -1,4 +1,4 @@
-"""Entry observation and the anchored walk (design §6.3-§6.4)."""
+"""Entry observation and the anchored walk (the specification-the specification)."""
 
 from __future__ import annotations
 
@@ -80,7 +80,7 @@ def test_an_entry_whose_identity_is_the_metadata_root_refuses(
 def test_mount_refusal_precedes_metadata_identity_refusal(
     monkeypatch, injected_resolver_on, project_root
 ):
-    """Mount membership is observed before metadata exclusion (design §6.4)."""
+    """Mount membership is observed before metadata exclusion."""
     from atoms.fs.resolve import FilesystemIdentity
 
     (project_root / "sentinel").write_text("x")
@@ -442,12 +442,12 @@ def _counting_reader(monkeypatch, calls, replacement=None):
 def test_every_traversal_of_a_directory_re_reads_its_constraints(
     monkeypatch, injected_resolver_on, project_root
 ):
-    """The memo interns; it must not suppress observation (design §6.5).
+    """The memo interns; it must not suppress observation.
 
     FS_CASEFOLD_FL can be set on an empty directory without changing its inode, so a
     cache hit that skips the read can report stale semantics for a lookup that has
     already happened under the new ones — inside a single approval, which is a window
-    ledger #19 does not cover.
+    the boundary contract does not cover.
     """
     (project_root / "a" / "b").mkdir(parents=True)
     (project_root / "a" / "c").mkdir()
@@ -462,7 +462,7 @@ def test_every_traversal_of_a_directory_re_reads_its_constraints(
 def test_the_memo_interns_one_facts_value_per_identity(
     injected_resolver_on, project_root
 ):
-    """Re-reading must not mean re-allocating: A4b-2 compares facts by object."""
+    """Re-reading must not mean re-allocating: path resolution and project approval-2 compares facts by object."""
     (project_root / "a" / "b").mkdir(parents=True)
     (project_root / "a" / "c").mkdir()
     with injected_resolver_on() as (resolver, _):

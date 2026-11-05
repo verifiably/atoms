@@ -1,4 +1,4 @@
-"""Direct tests of the lookup-constraint reader (design §5.2-§5.4)."""
+"""Direct tests of the lookup-constraint reader (the specification-the specification)."""
 
 from __future__ import annotations
 
@@ -78,7 +78,7 @@ def test_unexpected_ioctl_errors_propagate_unwrapped(monkeypatch, directory_fd, 
     `not isinstance(caught, CapabilityUnavailable)` is satisfied by almost every OSError
     and so proves nothing about wrapping. Identity with the raised object does, and the
     call record proves the ioctl was actually reached rather than short-circuited
-    earlier — the exact blind spot A4a's review found in a propagation test.
+    earlier — the exact blind spot the capability backend's review found in a propagation test.
     """
     injected = OSError(code, "injected")
     calls = []

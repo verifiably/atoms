@@ -1,4 +1,4 @@
-"""Tier 4: the one thing injection cannot prove (design §9.4).
+"""Tier 4: the one thing injection cannot prove.
 
 FS_CASEFOLD_FL corresponds to actual folding. Requires ATOMS_CASEFOLD_VOLUME.
 """
@@ -95,7 +95,7 @@ def test_the_casefold_flag_cannot_be_changed_on_a_non_empty_directory(casefold_v
     """An ext4 behavior record. It backs no safety claim.
 
     chattr(1) says the attribute can only be *changed* — set or cleared — on an empty
-    directory, so this says nothing about the case §6.5 turns on: an empty directory
+    directory, so this says nothing about the case the specification turns on: an empty directory
     whose proof flips while its inode stays equal. Re-reading constraints on every
     traversal is what covers that; this is not a second mechanism.
     """

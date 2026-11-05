@@ -1,4 +1,4 @@
-"""The reader half of design §11.5's tier-5 claim.
+"""The reader half of the specification tier-5 claim.
 
 Run as `python -m tests.store_child <project_root> <metadata_root> <txid>`; prints one
 JSON object describing what a fresh process reads back. A module rather than an inline

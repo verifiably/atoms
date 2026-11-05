@@ -1,4 +1,4 @@
-"""Design §5.4, §7.7, and §7.8 -- the liveness gate, transaction ownership, and close."""
+"""Contract: , the specification, and the specification -- the liveness gate, transaction ownership, and close."""
 
 from __future__ import annotations
 
@@ -58,7 +58,7 @@ def test_a_stale_transaction_cannot_write_into_a_later_one(opened_store):
 
 
 def test_a_poisoned_transaction_refuses_to_commit(opened_store):
-    """Design §7.7. The mechanism here; Task 7 proves it end to end through a real
+    """Contract: . The mechanism here; Task 7 proves it end to end through a real
     mutating method whose failure the caller catches."""
     with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
         txn._poison(RuntimeError("a mutating method raised"))
@@ -89,7 +89,7 @@ def test_close_rolls_back_and_spends_an_open_transaction(opened_store):
 
 
 def test_close_inside_a_transaction_body_raises_protocol_error_not_sqlite(opened_store):
-    """The path the `__enter__`-only test above cannot reach (design §7.8).
+    """The path the `__enter__`-only test above cannot reach.
 
     `close()` closes the connection, so the exit runs against a closed database. Both
     `connection.in_transaction` and `execute("ROLLBACK")` raise
@@ -107,12 +107,12 @@ def test_close_inside_a_transaction_body_raises_protocol_error_not_sqlite(opened
 
 
 def test_a_failed_commit_leaves_no_open_transaction(opened_store, monkeypatch):
-    """§7.7's second rule: **every** exit closes the SQLite transaction, COMMIT included.
+    """the specification second rule: **every** exit closes the SQLite transaction, COMMIT included.
 
     A failed COMMIT leaves `in_transaction` true and the next `BEGIN IMMEDIATE` raising
     "cannot start a transaction within a transaction" -- measured -- so a store that
     spent its transaction object and cleared its slot on that path would refuse every
-    later transaction, reporting a caller error for a state A5a created. The proof is
+    later transaction, reporting a caller error for a state the metadata store created. The proof is
     that the *next* transaction opens.
 
     The failure is injected at the call site rather than by a deferred constraint,
