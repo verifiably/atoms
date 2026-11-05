@@ -1,4 +1,4 @@
-"""Contract: -4."""
+"""Contract: docs/protocol.md."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ def prepare_transaction(
     workspace: Workspace,
     manifest: tuple[StagedBlob, ...],
 ) -> None:
-    """Apply the gate set, then the specification-4 in one transaction."""
+    """Apply the gate set, then the specification in one transaction."""
     _require_admitted(lease, approved)
     if workspace.txid != approved.txid:
         raise ProtocolError(

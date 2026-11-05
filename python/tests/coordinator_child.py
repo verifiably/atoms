@@ -109,7 +109,7 @@ def main(project_root: str, metadata_root: str) -> int:
       `_durable_phase`).
 
     A lease that halts (`TransactionHalted`) is an outcome, not a crash, and that is NOT
-    gated: the the recovery model-halt cells of the specification placement subset are precisely the ones whose
+    gated: the recovery model-halt cells of the specification placement subset are precisely the ones whose
     halt diagnostic the parent wants to compare, and for every other caller a halt still
     surfaces loudly -- `lease` is `null`, so anything reading `lease["active"]` fails.
     """

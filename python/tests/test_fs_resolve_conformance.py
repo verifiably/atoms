@@ -1,4 +1,4 @@
-"""Tier 3: path resolution and project approval-1 against a real ext4 volume."""
+"""Tier 3: path resolution and project approval against a real ext4 volume."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from tests.fs_support import descriptor_count
 # allowlist inline, so it needs nothing from the `tests` package on its path. Both
 # construct a PathResolver and call resolve(): asserting the errno from
 # open_child_directory, or st_dev/mnt_id from two bare descriptors, would prove a
-# property of the capability backend and of the kernel while leaving path resolution and project approval-1's translation of it untested.
+# property of the capability backend and of the kernel while leaving path resolution and project approval's translation of it untested.
 _BIND_PREAMBLE = r"""
 import os
 import subprocess
@@ -211,7 +211,7 @@ def test_a_255_byte_name_is_accepted_and_256_refuses(ext4_bound_volume):
 def test_two_hard_links_share_an_identity_with_distinct_provenance(
     ext4_bound_volume, ext4_project_root
 ):
-    """path resolution and project approval-1 reports the shared identity; whether topology merges them is path resolution and project approval-2's."""
+    """path resolution and project approval reports the shared identity; whether topology merges them is path resolution and project approval's."""
     (ext4_project_root / "left").write_text("x")
     os.link(ext4_project_root / "left", ext4_project_root / "right")
     with ext4_bound_volume() as binding:

@@ -52,7 +52,7 @@ def test_work_base_facts_is_called_exactly_when_a_directory_is_created(
     forbids. Counting on the method fails on the call rather than on the value.
 
     The call must be skipped rather than merely ignored for the reason the specification
-    gives, inherited from path resolution and project approval-1 the specification: `work_base_facts` can refuse — an unapprovable or
+    gives, inherited from path resolution and project approval the specification: `work_base_facts` can refuse — an unapprovable or
     over-constrained `work/` raises — and a specification with no `CreateDirectory` has no
     stake in the work namespace and must not be refused by it. (`metadata_root/work` itself
     always exists by this point: the capability backend's `ensure_metadata_layout` creates it at bind time,

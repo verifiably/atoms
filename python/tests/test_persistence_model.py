@@ -1,4 +1,4 @@
-"""Unit decomposition, coverage, replacement, and coalescing (the specification-the specification)."""
+"""Unit decomposition, coverage, replacement, and coalescing (the specification)."""
 
 import pytest
 

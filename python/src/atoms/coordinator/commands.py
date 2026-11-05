@@ -257,7 +257,7 @@ def _capture_path(
 
 
 def _require_capture_paths(value: object) -> tuple[str, ...]:
-    """Contract: . Sortedness is `registered_surface`'s requirement, not capture's."""
+    """Contract: docs/protocol.md. Sortedness is `registered_surface`'s requirement, not capture's."""
 
     if type(value) is not tuple or any(type(path) is not str for path in value):
         raise PreconditionRefused("paths must be an exact tuple of exact strings")
@@ -1032,7 +1032,7 @@ def capture_states(
         audited.close_fd(root_fd)
 
 
-# --- The lease-held single-path read (holdings read/evidence the specification–the specification) ---
+# --- The lease-held single-path read (holdings read/evidence the specification) ---
 
 
 class NotAttemptedReason(enum.StrEnum):

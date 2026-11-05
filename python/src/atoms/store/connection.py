@@ -244,7 +244,7 @@ def _connect(binding: ProjectBinding) -> sqlite3.Connection:
 
 
 def create_store(binding: ProjectBinding) -> sqlite3.Connection:
-    """Contract: . Returns a connection to a completed store."""
+    """Contract: docs/protocol.md. Returns a connection to a completed store."""
     require_platform(binding)
     _preflight_entries(binding, require_absent=True)
 
@@ -428,7 +428,7 @@ def classify(connection: sqlite3.Connection) -> Verdict:
 
 
 def open_database(binding: ProjectBinding) -> sqlite3.Connection:
-    """Contract: , steps 1 through 6."""
+    """Contract: steps 1 through 6."""
     require_platform(binding)
     seen = _preflight_entries(binding, require_absent=False)
     if DATABASE_NAME not in seen:

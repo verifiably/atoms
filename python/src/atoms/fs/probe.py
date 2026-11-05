@@ -29,7 +29,7 @@ from atoms.fs.volume import MountEntry, VolumeConfiguration
 
 
 class ChildExit:
-    """Exit codes the the specification certification children use to report a specific verdict.
+    """Exit codes the specification certification children use to report a specific verdict.
 
     Named rather than literal so a later reordering cannot silently remap "refused
     with the wrong result code" onto "read the wrong value" — two very different
@@ -349,7 +349,7 @@ def probe_backend(
         reclaim_probe_survivors(lock)
 
 
-# Contract: -5: read the parent's committed state concurrently with the
+# Contract: read the parent's committed state concurrently with the
 # parent's held write lock, then require the write lock to refuse. busy_timeout is 0
 # so the refusal is immediate rather than a wait.
 _CHILD_CONTENDER = f"""
@@ -372,7 +372,7 @@ except sqlite3.OperationalError as caught:
 sys.exit({ChildExit.ACQUIRED_WHILE_HELD})
 """
 
-# Contract: , run only after the parent has committed. A SEPARATE invocation:
+# Contract: run only after the parent has committed. A SEPARATE invocation:
 # the parent cannot wait for a child that is itself waiting for the parent's commit.
 _CHILD_WRITER = f"""
 import sqlite3, sys
@@ -401,7 +401,7 @@ def _run_child(
     A child that does not finish is a REFUSAL, not an escaping error. Contract:  puts
     every certification failure under CapabilityUnavailable, and a TimeoutExpired
     reaching the caller would put the one failure mode a broken-locking volume is most
-    likely to produce outside the the specification contract — handing the metadata store a third exception type to
+    likely to produce outside the specification contract — handing the metadata store a third exception type to
     know about for no gain. Only TimeoutExpired is caught: an OSError from spawning the
     interpreter is a bug in this process, not a verdict about the volume.
 

@@ -167,3 +167,16 @@ def test_links_inside_fenced_code_blocks_and_external_urls_are_ignored(
 
 def test_repository_public_docs_have_no_broken_links() -> None:
     assert check_repository_links(ROOT) == []
+
+
+def test_inline_code_link_label_is_checked(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_git_repo(
+        repo,
+        {
+            "README.md": "# Title\n\nSee [`MissingSymbol`](docs/missing.md) and `[ignored](docs/ignored.md)`.\n",
+        },
+    )
+    errors = check_repository_links(repo)
+    assert len(errors) == 1
+    assert "docs/missing.md" in errors[0]

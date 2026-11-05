@@ -1,7 +1,7 @@
-"""Anchored rooted path resolution (path resolution and project approval-1 the specification).
+"""Anchored rooted path resolution (path resolution and project approval the specification).
 
 Observation only. Nothing here sees a CompiledSpec, builds a topology, or writes to
-project space; path resolution and project approval-2 composes these observations into the approval proof.
+project space; path resolution and project approval composes these observations into the approval proof.
 """
 
 from __future__ import annotations
@@ -238,7 +238,7 @@ class PathResolver:
         """Facts for the existing metadata_root/work base.
 
         NOT the recovery model's logical WorkRoot: the specification places effect-time staging in
-        work/<txid>/, which does not exist at approval time. path resolution and project approval-2 derives that
+        work/<txid>/, which does not exist at approval time. path resolution and project approval derives that
         directory's constraints from these through inherited_constraints.
 
         Unlike _facts_for, this memo DOES skip re-observation on a hit. work/ is
@@ -286,7 +286,7 @@ class PathResolver:
     def resolve(self, rel_path: str) -> ResolvedPrefix:
         """Observe the deepest existing directory prefix of one declared path.
 
-        Accepts declared persistent paths only. path resolution and project approval-2 resolves a scratch parent and
+        Accepts declared persistent paths only. path resolution and project approval resolves a scratch parent and
         validates generated leaf names against that parent's approved name_max.
         """
         backend = self._binding.backend
@@ -397,7 +397,7 @@ class PathResolver:
         a cache hit that skipped read_lookup_constraints could report EXACT_BYTES for a
         lookup that already happened under casefold semantics — a wrong answer produced
         inside one approval, which is a window the boundary contract does not cover. The memo's
-        jobs are to hand back one DirectoryFacts object per identity, so path resolution and project approval-2 can
+        jobs are to hand back one DirectoryFacts object per identity, so path resolution and project approval can
         compare by object, and to notice disagreement.
         """
         identity = _identity(os.fstat(fd))

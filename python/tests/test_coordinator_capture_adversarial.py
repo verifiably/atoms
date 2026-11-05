@@ -21,7 +21,7 @@ def payloads() -> DictPayloads:
 
 
 def test_no_project_path_is_mutated_by_capture(leased, ext4_project_root):
-    """Contract: . coherent capture writes only into staging/<txid>/.
+    """Contract: docs/protocol.md. coherent capture writes only into staging/<txid>/.
 
     `project_state` records the root itself, every descendant, `lstat` rather than
     `stat`, and st_dev/st_ino -- so a path replaced by an inode of identical kind, mode,

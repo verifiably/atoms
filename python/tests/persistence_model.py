@@ -1723,7 +1723,7 @@ def realign_durable_identities(project_root: Path, metadata_root: Path) -> int:
     `AssemblyHalt(APPROVAL_EVIDENCE_MISMATCH)` and raises -- **before**
     `classify_recovery` is ever reached. Reconstruction mints fresh inodes by
     construction, so without this step every record-bearing cell halts on an artifact of
-    reconstruction and the the recovery model agreement matrix asserts nothing at all (measured: 42 of
+    reconstruction and the recovery model agreement matrix asserts nothing at all (measured: 42 of
     `minimal-create`'s 103 cells, and every cell that ever reached a durable record).
 
     So the renaming the specification assumes is performed here, at the one place identity is durable:
@@ -1886,14 +1886,14 @@ def record_scenario(
     return stream
 
 
-# --- per-cell recovery, the the recovery model agreement, and the side assertions -------
+# --- per-cell recovery, the recovery model agreement, and the side assertions -------
 
 
 @dataclass(frozen=True)
 class CellResult:
     """One cell's verdict.
 
-    `agrees` is the the recovery model comparison's answer, and is `True` when the comparison did not
+    `agrees` is the recovery model comparison's answer, and is `True` when the comparison did not
     apply (no durable record, or a refusal that never reached the classifier) -- read
     `counts["classified"]` to tell "agreed" from "not compared". `halted` is true when
     the lease entry ended in `TransactionHalted`, which is *not* a disagreement: the specification "cells where the recovery model halts assert the halt agrees and is preserved".
@@ -2367,7 +2367,7 @@ def run_cell(
        registration/settlement pairing intact, no generated scratch leaf survives a
        terminal state, the workspace slots are empty, and no unindexed blob remains.
 
-    A cell with **no durable record** (a cut before the `prepared` commit) skips the the recovery model
+    A cell with **no durable record** (a cut before the `prepared` commit) skips the recovery model
     comparison -- there is nothing to classify -- and instead asserts the store is empty,
     every external path survives untouched, and the engine's own scratch is reclaimed.
 
@@ -3348,7 +3348,7 @@ class Sweeper:
             totals["drift"] += result.counts["drift_preserved"]
 
         # Retained only for the placement arm, which needs each cell's verdict *after*
-        # the whole sweep to select the the recovery model-halt ones. A `CellResult` carries the cell's
+        # the whole sweep to select the recovery model-halt ones. A `CellResult` carries the cell's
         # entire post-recovery world tree, and the compound sweeps run ~300 of them, so
         # an unconditional list would hold every tree of every cell alive to the end of
         # the sweep for nothing.

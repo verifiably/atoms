@@ -338,7 +338,7 @@ def test_a_cycle_is_reported_at_the_revisited_digest() -> None:
 
 
 def test_an_orphan_history_names_the_lowest_unvisited_digest() -> None:
-    """Contract: , ruled 2026-08-22: the lowest, not an arbitrary member."""
+    """Contract: ruled 2026-08-22: the lowest, not an arbitrary member."""
     genesis = "0" * 64
     low, middle, high = "5" * 64, "7" * 64, "9" * 64
     scan = _injected(
@@ -481,7 +481,7 @@ def test_a_readable_regular_staging_leaf_is_never_a_defect(chain: Chain) -> None
 def test_a_staged_registration_joins_detached_pending_without_joining_entries(
     chain: Chain,
 ) -> None:
-    """Contract: , ratified 2026-08-22: the weaker detached invariant, pinned.
+    """Contract: ratified 2026-08-22: the weaker detached invariant, pinned.
 
     A later implementation that quietly restored "every pending digest is an entry's"
     would turn this red.

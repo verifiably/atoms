@@ -1,4 +1,4 @@
-"""Contract: , the specification, and the specification -- the liveness gate, transaction ownership, and close."""
+"""Contract: the specification, and the specification -- the liveness gate, transaction ownership, and close."""
 
 from __future__ import annotations
 
@@ -58,7 +58,7 @@ def test_a_stale_transaction_cannot_write_into_a_later_one(opened_store):
 
 
 def test_a_poisoned_transaction_refuses_to_commit(opened_store):
-    """Contract: . The mechanism here; Task 7 proves it end to end through a real
+    """Contract: docs/protocol.md. The mechanism here; Task 7 proves it end to end through a real
     mutating method whose failure the caller catches."""
     with pytest.raises(ProtocolError) as caught, opened_store.transaction() as txn:
         txn._poison(RuntimeError("a mutating method raised"))

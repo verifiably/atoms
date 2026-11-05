@@ -1,4 +1,4 @@
-"""Pure judgment over a resolution table and its topology (path resolution and project approval-2 the specification).
+"""Pure judgment over a resolution table and its topology (path resolution and project approval the specification).
 
 No filesystem access, no descriptor, no syscall. Every function here takes values the
 resolution and construction phases already produced and either returns or raises. Every
@@ -33,7 +33,7 @@ def require_ancestors_legal(
     """Every component past the frontier is a directory this transaction creates first.
 
     Two routes reach the same rule. A missing component simply does not exist yet. A
-    component that exists as a file or symlink is the the specification case where absence is
+    component that exists as a file or symlink is the specification case where absence is
     inferred from the ancestor's verified state rather than probed; it is admitted only
     when the timeline removes it and creates a directory in its place.
 

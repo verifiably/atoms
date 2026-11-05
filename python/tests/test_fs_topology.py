@@ -370,7 +370,7 @@ def _prepared_snapshot(compiled, resolved):
     This is the strongest single test in the design: _validate_topology independently
     encodes exact persistent and scratch coverage, single-parent-ness, the WorkRoot
     parent rule, the scratch/persistent shared-parent equality, and acyclicity — written
-    before path resolution and project approval-2 existed.
+    before path resolution and project approval existed.
     """
     from atoms.core.recovery import (
         CommitDecision,

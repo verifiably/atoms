@@ -24,7 +24,7 @@ from atoms.fs.topology import (
     ApprovedPlannedDirectory,
 )
 
-#: Contract: . A constant so a test can drive the loop to exhaustion; an unbounded
+#: Contract: docs/protocol.md. A constant so a test can drive the loop to exhaustion; an unbounded
 #: loop would have no reachable refusal to test.
 SCRATCH_ATTEMPTS = 3
 
@@ -61,8 +61,7 @@ def _require_admitted(lease: Lease, approved: ProjectApprovedSpec) -> None:
 
 
 def admit(lease: Lease, compiled: CompiledSpec) -> ProjectApprovedSpec:
-    """Contract: .
-
+    """Contract: docs/protocol.md.
     Approval lives inside the loop because the boundary contract says regeneration voids the
     proof: each attempt produces a wholly fresh one, and names are never substituted
     into an existing proof.
@@ -192,7 +191,7 @@ def _require_planned_absent(
     if observed.present:
         first_state = _declared_first_state(approved, path)
         if first_state is not None and type(first_state) is not AbsentState:
-            # Contract: . The timeline declares an occupant here and path resolution and project approval already
+            # Contract: docs/protocol.md. The timeline declares an occupant here and path resolution and project approval already
             # approved that state against disk, so presence is the proof being right.
             # Capture verifies the blocker against this same first declared state,
             # through a descriptor; admission holds only a presence bit and must not
@@ -246,7 +245,7 @@ def _require_work_slot_free(lease: Lease, approved: ProjectApprovedSpec) -> None
 
 
 def _occupied_scratch(lease: Lease, approved: ProjectApprovedSpec) -> tuple[str, ...]:
-    """Contract: . The proof is the expected baseline and never current authority."""
+    """Contract: docs/protocol.md. The proof is the expected baseline and never current authority."""
     mapping = _parent_paths(approved)
     directories: dict[TopologyNode, object] = {
         entry.node: entry for entry in approved.directories
@@ -282,8 +281,7 @@ def _occupied_scratch(lease: Lease, approved: ProjectApprovedSpec) -> tuple[str,
 
 @contextlib.contextmanager
 def _translated_resolution() -> Iterator[None]:
-    """Contract: .
-
+    """Contract: docs/protocol.md.
     `resolve.py` raises `ProjectApprovalRefused` and `CapabilityUnavailable` -- correct
     at approval time, wrong afterwards. A post-approval divergence is drift, and the specification
     requires `PreconditionRefused`. Stated categorically over the refusal types the

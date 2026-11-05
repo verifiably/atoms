@@ -238,7 +238,7 @@ def test_the_proof_retains_the_objects_it_approved(approval_context):
     """Criterion 1 says the *exact* `CompiledSpec` passed in, and criterion 16's ledger
     entry says the live binding. Identity, not equality: `CompiledSpec` is a frozen value,
     so an equal-but-reconstructed one would compare equal while proving nothing about what
-    was actually judged, and ledger entry #19 turns on approval and use naming one object.
+    was actually judged, and the deferred-obligation contract turns on approval and use naming one object.
     """
     compiled = compiled_for(CreateFileNoClobber("e1", "leaf", file_state()))
     with approval_context() as (context, binding):
@@ -262,7 +262,7 @@ def test_every_resolver_exception_reaches_the_caller_unchanged(
     approval_context, monkeypatch, raised, target
 ):
     """the boundary contract is categorical, so every load-bearing branch is covered, not just
-    `resolve`: the constructor and `work_base_facts` are also path resolution and project approval-1 calls approval makes.
+    `resolve`: the constructor and `work_base_facts` are also path resolution and project approval calls approval makes.
     Identity rather than type, because a type assertion is satisfied by any same-class
     exception the code might raise on its own.
 

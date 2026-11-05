@@ -502,7 +502,7 @@ def test_fs_fixture_registry_covers_every_test_argument():
 
 
 def test_fs_fixture_registry_subtracts_parametrized_arguments(tmp_path):
-    # The the capability backend suite parametrizes on 'absent', 'operation', 'code', and 'expected'.
+    # The capability backend suite parametrizes on 'absent', 'operation', 'code', and 'expected'.
     # A scanner that treated every argument as a fixture would reject all four, so
     # this pins the behavior that makes reusing the recovery model's scanner worth the extraction.
     (tmp_path / "test_fs_parametrized.py").write_text(
@@ -835,7 +835,7 @@ PURE_FS_IMPORTS = {
 
 
 def test_the_resolution_guard_still_names_exactly_the_two_mechanism_modules():
-    """The seam is the guard's module list. If path resolution and project approval-2's modules were added to it they
+    """The seam is the guard's module list. If path resolution and project approval's modules were added to it they
     could not import a CompiledSpec; if resolve.py were removed from it, the mechanism
     could start judging."""
     source = (Path(__file__)).read_text(encoding="utf-8")
@@ -920,7 +920,7 @@ def test_the_approved_proof_retains_only_the_authorized_schema():
 
     Exact field sets make a copied frontier or mount identifier fail even if it is added
     with a default. The live binding deliberately retains its own VolumeEvidence; this
-    guard covers the fields path resolution and project approval-2 copies into its proof and approved fact values.
+    guard covers the fields path resolution and project approval copies into its proof and approved fact values.
     """
     from atoms.fs.approval import ProjectApprovedSpec
     from atoms.fs.topology import (

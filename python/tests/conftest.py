@@ -367,7 +367,7 @@ def directory_fd(tmp_path):
 
 @pytest.fixture
 def certified_ext4():
-    """Require the the specification superblock feature masks, which a stock kernel does not expose.
+    """Require the specification superblock feature masks, which a stock kernel does not expose.
 
     For the tests the conftest capability hook cannot reach: one that asserts on a
     specific `CapabilityUnavailable` catches it first, and one that drives a child

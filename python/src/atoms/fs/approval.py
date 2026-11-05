@@ -1,4 +1,4 @@
-"""Rooted project approval (path resolution and project approval-2 the specification).
+"""Rooted project approval (path resolution and project approval the specification).
 
 approve_for_project is the sole public construction authority for ProjectApprovedSpec.
 No except clause in this module encloses a resolver call: the boundary contract is categorical, and

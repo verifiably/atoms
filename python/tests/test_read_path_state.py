@@ -1,5 +1,5 @@
 """`read_path_state` — the lease-held, lifecycle-honoring single-path read
-(2026-08-24 holdings read/evidence the specification–the specification)."""
+(2026-08-24 holdings read/evidence the specification)."""
 
 from __future__ import annotations
 

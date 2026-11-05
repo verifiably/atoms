@@ -107,7 +107,7 @@ def check_repository_links(root: Path) -> list[str]:
             if fence is not None:
                 continue
 
-            scrubbed_line = _INLINE_CODE_RE.sub("", raw_line)
+            scrubbed_line = _INLINE_CODE_RE.sub("code", raw_line)
             for match in _LINK_RE.finditer(scrubbed_line):
                 raw_target = match.group(1).strip()
                 if not raw_target or raw_target.startswith(_EXTERNAL_PREFIXES):

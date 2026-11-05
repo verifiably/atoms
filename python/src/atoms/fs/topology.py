@@ -1,4 +1,4 @@
-"""The approved value types and the resolved topology (path resolution and project approval-2 the specification, the specification).
+"""The approved value types and the resolved topology (path resolution and project approval the specification, the specification).
 
 Pure. No filesystem access, no descriptor, no syscall. Every name comparison routes
 through lookup_equivalence_key rather than comparing raw components, so widening the

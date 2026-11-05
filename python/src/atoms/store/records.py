@@ -353,7 +353,7 @@ DELETE_ACTIVE = "DELETE FROM active"
 
 
 def require_identifier(label: str, value: object) -> str:
-    """Contract: , in two steps and in this order.
+    """Contract: in two steps and in this order.
 
     `require_valid_identifier` raises SpecValidationError for '../x' and a raw TypeError
     for 3, None, and b'tx' -- measured for all four -- because it hands its argument

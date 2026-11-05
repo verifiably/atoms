@@ -42,7 +42,7 @@ Known coverage gaps:
   there once it is off), as `docs/durability.md` and `docs/development.md` describe.
   Hosted runs exercise that code on the runner's uncertified kernel and volume and skip
   only what the runner cannot supply; no hosted pass is certified-tuple evidence. On an
-  unpaired hosted runner, 11 tests skip across 6324 collected tests: the 7
+  unpaired hosted runner, 11 tests skip across 6327 collected tests in 101 modules: the 7
   casefold-volume tests in `test_fs_resolve_casefold.py` (`ATOMS_CASEFOLD_VOLUME` unset,
   which the certified host also skips), 3 bind-mount tests in `test_fs_binding.py` and
   `test_fs_resolve_conformance.py` (no user or mount namespaces on the runner), and 1

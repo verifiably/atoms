@@ -87,7 +87,7 @@ def capture_initial_surface(
     workspace: Workspace,
     payloads: PayloadSource,
 ) -> Captured:
-    """Contract: ."""
+    """Contract: docs/protocol.md."""
     _require_admitted(lease, approved)
     # The workspace is authenticated before anything is written into it. `promote_staging`
     # already makes exactly these two checks (`blobs.py:332-335`), but it runs inside

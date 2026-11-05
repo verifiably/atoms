@@ -1,4 +1,4 @@
-"""Entry observation and the anchored walk (the specification-the specification)."""
+"""Entry observation and the anchored walk (the specification)."""
 
 from __future__ import annotations
 
@@ -462,7 +462,7 @@ def test_every_traversal_of_a_directory_re_reads_its_constraints(
 def test_the_memo_interns_one_facts_value_per_identity(
     injected_resolver_on, project_root
 ):
-    """Re-reading must not mean re-allocating: path resolution and project approval-2 compares facts by object."""
+    """Re-reading must not mean re-allocating: path resolution and project approval compares facts by object."""
     (project_root / "a" / "b").mkdir(parents=True)
     (project_root / "a" / "c").mkdir()
     with injected_resolver_on() as (resolver, _):

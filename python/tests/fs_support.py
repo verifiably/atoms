@@ -1,4 +1,4 @@
-"""Shared factories for the the capability backend filesystem-layer tests."""
+"""Shared factories for the capability backend filesystem-layer tests."""
 
 from __future__ import annotations
 
@@ -217,7 +217,7 @@ def test_volume_or_skip_reason() -> tuple[Path | None, str]:
 
 
 def ext4_volume_or_skip_reason() -> tuple[Path | None, str]:
-    """path resolution and project approval-1 approves only ext4, while the capability backend admits ext4, xfs, and btrfs.
+    """path resolution and project approval approves only ext4, while the capability backend admits ext4, xfs, and btrfs.
 
     A contributor on btrfs must be told why this suite skips, not merely that it does.
     """
@@ -235,7 +235,7 @@ def ext4_volume_or_skip_reason() -> tuple[Path | None, str]:
 
 
 def ext4_feature_masks_or_skip_reason() -> tuple[bool, str]:
-    """Whether this kernel exposes the the specification superblock feature masks.
+    """Whether this kernel exposes the specification superblock feature masks.
 
     Distinct from `ext4_volume_or_skip_reason`: a volume can be ext4 and still refuse
     `EXT4_IOC_GET_TUNE_SB_PARAM`, which is exactly what a stock kernel on a CI runner
@@ -800,7 +800,7 @@ GENERATOR_MOVES = (("d/one", "d/two"), ("a", "p"), ("d/one", "a/b"))
 GENERATED_SPECIFICATION_COUNT = 4841
 """How many of the 12719 candidate sequences the spec compiler admits, measured on this checkout.
 
-Asserted exactly by the the specification property test, so a generator that silently narrows fails
+Asserted exactly by the specification property test, so a generator that silently narrows fails
 rather than passing on a smaller matrix. Change it only alongside a pool change."""
 
 

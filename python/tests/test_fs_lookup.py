@@ -1,4 +1,4 @@
-"""Direct tests of the lookup-constraint reader (the specification-the specification)."""
+"""Direct tests of the lookup-constraint reader (the specification)."""
 
 from __future__ import annotations
 

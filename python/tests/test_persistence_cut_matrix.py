@@ -266,7 +266,7 @@ def test_subprocess_placement_matches_in_process(name, cut_matrix) -> None:
 
     Two scenarios because the rule's three clauses are not all live in one stream:
     `minimal-move` is the only minimal scenario carrying the specification named tuples, and
-    it never halts; `minimal-replace` carries the the recovery model halts whose *persisted halt
+    it never halts; `minimal-replace` carries the recovery model halts whose *persisted halt
     diagnostic* is the arm's exact-comparison target. Sweeping only the first would leave
     that comparison comparing `None` to `None` in every cell.
     """
@@ -416,7 +416,7 @@ def _inject_one_identity(monkeypatch, path: str) -> dict[str, int]:
 def test_same_inode_work_survivor_is_landed_not_blocker(
     cut_matrix, ext4_volume, test_storage_profile, monkeypatch
 ) -> None:
-    """Contract: the the specification tuple at the observation seam.
+    """Contract: the specification tuple at the observation seam.
 
     the specification intermediate -- the live parent durably holding the published directory while
     the `work/` staging name's removal is not yet durable, both names one inode -- is not

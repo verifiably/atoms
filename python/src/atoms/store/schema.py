@@ -406,7 +406,7 @@ BEGIN
     SELECT RAISE(ABORT, 'root operation is retained');
 END;""",
 )
-"""Contract: , verbatim: the DDL is the contract, including trigger
+"""Contract: verbatim: the DDL is the contract, including trigger
 names and error strings. Version 3 is exactly the frozen v2 statements plus
 these, in this order."""
 

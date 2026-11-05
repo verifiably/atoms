@@ -7,7 +7,7 @@ metadata-root identity, ancestor traversal, lookup policy, capability availabili
 live preconditions — remain the filesystem layer's.
 
 Invalid specifications are refused with ``SpecValidationError``. Unexpected internal
-exceptions propagate unchanged. Only the four precedence edges named by the the spec compiler design are
+exceptions propagate unchanged. Only the four precedence edges named by the spec compiler design are
 stable; the numbering of independent validation phases is not a general error-order contract.
 """
 
