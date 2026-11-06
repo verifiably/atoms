@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# ops-docs version 7
+# ops-docs version 8
 """A project's guide files — README.md for people, AGENTS.md for agents — rendered and
 checked inside one repository.
 
@@ -469,6 +469,17 @@ def committed_family(home, run):
     return data, parse_family(data, f"HEAD:{FAMILY_HOME}")
 
 
+def main_worktree(root, run=subprocess.run):
+    """The main checkout of `root`'s repository, so a linked worktree matches its main checkout."""
+    done = run(["git", "-C", str(root), "worktree", "list", "--porcelain"],
+               capture_output=True, text=True)
+    if done.returncode == 0:
+        first = done.stdout.splitlines()[:1]
+        if first and first[0].startswith("worktree "):
+            return pathlib.Path(first[0].removeprefix("worktree ")).resolve()
+    return root.resolve()
+
+
 def family_publish(home, home_name, run=subprocess.run, out=None):
     """Write the committed family file into every reachable member and re-render its
     guides. Never commits. 1 when a member is unreachable or its write fails."""
@@ -476,6 +487,7 @@ def family_publish(home, home_name, run=subprocess.run, out=None):
     data, fam = committed_family(home, run)
     if (home / FAMILY_HOME).read_bytes() != data:
         raise LookupError(f"{FAMILY_HOME} differs from HEAD; commit it, then publish what landed")
+    home_root = main_worktree(home, run)
     roots = resolve_roots([entry["prefix"] for entry in fam["members"]], run)
     failed, commits = False, []
     for entry in fam["members"]:
@@ -484,7 +496,7 @@ def family_publish(home, home_name, run=subprocess.run, out=None):
             out.write(f"{prefix}: unreachable\n")
             failed = True
             continue
-        if root == home.resolve():
+        if main_worktree(root, run) == home_root:
             continue
         target = root / FAMILY_COPY
         if not inside(root, target):
@@ -534,13 +546,14 @@ def family_check(home, run=subprocess.run):
     """Each member's committed tools/family.toml against the home's committed file, byte
     for byte. A home that lists itself reads its own file and is skipped."""
     data, fam = committed_family(home, run)
+    home_root = main_worktree(home, run)
     roots = resolve_roots([entry["prefix"] for entry in fam["members"]], run)
     found = []
     for entry in fam["members"]:
         prefix, root = entry["prefix"], roots[entry["prefix"]]
         if root is None:
             found.append(f"{prefix}: unreachable")
-        elif root != home.resolve():
+        elif main_worktree(root, run) != home_root:
             copy = git_show(root, FAMILY_COPY, run)
             if copy is None:
                 found.append(f"{prefix}: missing")
