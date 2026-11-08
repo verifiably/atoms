@@ -51,6 +51,11 @@ prefix = "autonomy"
 url = "https://github.com/verifiably/autonomy"
 label = "Running the daily surface unattended"
 
+# The family follows ops's code-organization guide, which each member adopts as
+# tools/code-organization.md; `note` states the family's addition to it.
+[code]
+note = "Every member uses language roots (python/, ts/), even with one language."
+
 # The README contract every member's guides are checked against: the purpose line in
 # italics, then the abstract; then these sections, optional, in this order. No status
 # region. AGENTS.md keeps the default contract.
