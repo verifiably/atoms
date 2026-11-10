@@ -1,8 +1,9 @@
 # Code organization
 
-Type: standard; document types 1. Code organization version 1 applies to
-projects that adopt it, including every member of a family whose family.toml
-declares [code].
+Type: standard; document types 1. Code organization version 1 applies to every
+project that declares `[code]` with `standard = 1` in its identity.toml, whether or
+not it belongs to a family. A family whose family.toml declares `[code]` requires each
+of its members to declare it.
 
 <!-- Vendored from https://github.com/khughitt/ops (docs/code-organization.md); never edit the copy, see tools/README.md. -->
 
@@ -75,7 +76,7 @@ A repository with more than one language puts each under a language root (`pytho
 
 ## What binds existing code
 
-The repository-layout rules (principles 1, 2, 3, 6, 10, 11 and the per-language directory columns) bind every member now; departures receive a tracked conformance piece or a recorded deviation. The in-module rules (principle 4's declared surface, principle 9's self-contained scripts, naming rule 7, and the per-language public-vs-internal column) bind new code and code touched by a change: adding to a subsystem's surface declares that surface (`index` or `__all__`), and sharing script code moves it into a package. Untouched files are not flagged.
+The repository-layout rules (principles 1, 2, 3, 6, 10, 11 and the per-language directory columns) bind every project that declares `[code]` now; departures receive a tracked conformance piece or a recorded deviation. The in-module rules (principle 4's declared surface, principle 9's self-contained scripts, naming rule 7, and the per-language public-vs-internal column) bind new code and code touched by a change: adding to a subsystem's surface declares that surface (`index` or `__all__`), and sharing script code moves it into a package. Untouched files are not flagged.
 
 ## Deviations
 
