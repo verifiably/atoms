@@ -28,6 +28,7 @@ tt := "python3 tools/tt"
 # which sets PYTEST_XDIST_AUTO_NUM_WORKERS for `-n auto` (reference: ops
 # docs/runbooks/host-configuration.md#cpu-budget). A CI runner has no host-budget, so the
 # workflow sets the count explicitly, and `ci-python` refuses to run without one.
+# Keep one testmon run per checkout and let it finish before editing files.
 # test-fast also leaves out the three fresh-process suites (the SIGKILL matrix, the
 # persistence-cut matrix, the exerciser): on 2026-09-05 (atoms-83ae5c) they were ~400 of
 # the serial suite's ~500 s and depended on nearly every source module, so with them in,
@@ -37,8 +38,9 @@ tt := "python3 tools/tt"
 # run (tests/execute_child.py, tests/coordinator_child.py) selects nothing. Both
 # omissions are deterministic and named here; `just test` runs everything, and on the
 # certified host it is the certification-tuple suite run (AGENTS.md, Gates).
-fast_cmd := "cd python && uv run --frozen pytest --testmon --ignore=tests/test_coordinator_kill_matrix.py --ignore=tests/test_persistence_cut_matrix.py --ignore=tests/test_exerciser.py"
 xdist := "-n auto --dist worksteal"
+# -v cancels pytest addopts -q so tt can record the testmon selection header.
+fast_cmd := "cd python && uv run --frozen pytest -v --testmon --ignore=tests/test_coordinator_kill_matrix.py --ignore=tests/test_persistence_cut_matrix.py --ignore=tests/test_exerciser.py " + xdist
 test_cmd := "cd python && uv run --frozen pytest " + xdist
 one_cmd := "cd python && uv run --frozen pytest"
 # Hygiene always runs; the code checks (ruff, pyright) are a broad target that tt policy
@@ -59,7 +61,7 @@ ci_remote := "origin"
 
 # Affected-only: the inner loop. An empty selection is a result, not a failure.
 test-fast:
-    {{tt}} test-fast -- sh -c '{{fast_cmd}}'
+    {{tt}} test-fast -- host-budget run -- sh -c '{{fast_cmd}}'
 
 # One file, one test, or a filter, while working on it. Needs at least one argument;
 # the whole suite is `test`. The sh -c string never holds the arguments, so quotes, $

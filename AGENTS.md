@@ -21,9 +21,10 @@ skipped locally unless forced, and hosted CI is the routine broad verification.
 `python/tools/check_doc_links.py`) always runs. The broad targets, which a policy may
 skip and record as skipped, never passed, are `check-code` (ruff, pyright), `test` (the
 full suite, including the suites the fast loop excludes; it forwards pytest arguments, as
-in `just test -rs`), `test-fast` (testmon, excluding the kill-matrix, persistence-cut and
-exerciser suites) and `ci-python`. `just check` runs hygiene then `check-code`, and
-`just gate` runs `check` then `test`. Force broad work deliberately with
+in `just test -rs`), `test-fast` (testmon on xdist workers sized by `host-budget run`,
+excluding the kill-matrix, persistence-cut and exerciser suites) and `ci-python`.
+`just check` runs hygiene then `check-code`, and `just gate` runs `check` then `test`.
+Force broad work deliberately with
 `just test-full [pytest args]` or `TT_FORCE=1 just check`. The pre-commit hook runs
 hygiene then `check-code`. The pre-push hook takes `hook-pre-push-fast` (hygiene,
 `check-code`, `test-fast`) when the push goes to `origin` and every pushed ref matches

@@ -39,9 +39,14 @@ or run in hosted CI:
 | `just check-hygiene` | Runs `python3 tools/ops-check`, `python3 tools/ops-docs check`, `tasks check`, and `python3 python/tools/check_doc_links.py`. | Always runs (mandatory on every `pre-commit` and `pre-push`). |
 | `just test-one <pytest args>` | Runs `pytest` on focused files, tests, or `-k` expressions (paths relative to `python/`, e.g. `just test-one tests/test_compiler_structure.py`). | Always runs; primary inner-loop verification command. |
 | `just check-code` | Runs `ruff check` and `pyright` inside `python/`. | Broad target; force locally with `TT_FORCE=1 just check-code` or `TT_FORCE=1 just check`. |
-| `just test-fast` | Runs `pytest --testmon` excluding the three long subprocess suites (`test_coordinator_kill_matrix.py`, `test_persistence_cut_matrix.py`, `test_exerciser.py`). | Broad target; force with `TT_FORCE=1 just test-fast`. |
+| `just test-fast` | Runs `pytest --testmon` across xdist workers sized by `host-budget run`, excluding the three long subprocess suites (`test_coordinator_kill_matrix.py`, `test_persistence_cut_matrix.py`, `test_exerciser.py`). | Broad target; force with `TT_FORCE=1 just test-fast`. |
 | `just test` / `just test-full` | Runs the complete pytest suite across `xdist` workers sized by `host-budget run` (`-n auto --dist worksteal`). | `just test` obeys `.tt.toml`; `just test-full [pytest args]` forces the full suite unconditionally. |
 | `just docs` | Runs `python3 tools/ops-docs write` to regenerate the `ops:identity` and `ops:family` regions in `README.md` and `AGENTS.md` from `identity.toml` and `tools/family.toml`. | Always runs when invoked. |
+
+Each checkout keeps its testmon database in `python/.testmondata`. Run one testmon session per
+checkout at a time and wait for it to finish before editing files. The testmon header lets
+the timing wrapper distinguish affected runs from runs widened by a new database or changed
+dependencies.
 
 ## Test volume and capability tests
 
