@@ -8,8 +8,8 @@
 # The git hooks in .githooks/ call the `hook-*` recipes, which time the hygiene under
 # their own target names and then run the broad children, each recorded on its own.
 # Every recipe runs through the vendored timing wrapper tools/tt (source of truth: ops
-# bin/tt) so the run is recorded. Design: ops docs/specs/2026-09-04-test-ci-audit-design.md,
-# ops docs/specs/2026-10-29-test-execution-policy-design.md.
+# bin/tt) so the run is recorded. Reference: ops docs/tooling.md, ops
+# docs/test-execution-policy.md.
 
 set quiet
 set positional-arguments
@@ -24,9 +24,9 @@ tt := "python3 tools/tt"
 # The full suite runs on xdist workers: serially it took a median 383 s, and 8 workers
 # with work-stealing took it to 133 s with no fixture change (the development host,
 # 2026-10-17, atoms-286555); the exerciser's ~80 s SIGKILL arm is now the critical path.
-# The worker count is the host's budget: local runs go through `host-budget run` (ops),
-# which sets PYTEST_XDIST_AUTO_NUM_WORKERS for `-n auto` (design: ops
-# docs/specs/2026-09-24-host-budget-design.md). A CI runner has no host-budget, so the
+# The worker count is the host's budget: local runs go through `host-budget run` (hostkit),
+# which sets PYTEST_XDIST_AUTO_NUM_WORKERS for `-n auto` (reference: ops
+# docs/runbooks/host-configuration.md#cpu-budget). A CI runner has no host-budget, so the
 # workflow sets the count explicitly, and `ci-python` refuses to run without one.
 # test-fast also leaves out the three fresh-process suites (the SIGKILL matrix, the
 # persistence-cut matrix, the exerciser): on 2026-09-05 (atoms-83ae5c) they were ~400 of

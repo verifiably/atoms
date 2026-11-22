@@ -33,7 +33,7 @@ hygiene runs unforced. Hook timers cover hygiene only (earlier `hook-*` timings 
 covered the code checks and suite, so the series are not comparable). Hosted CI
 (`.github/workflows/ci.yml`) runs `just ci-python`, forced, on every pushed branch and,
 through `release.yml`, on release tags, and checks its JUnit against pytest's
-collection. The suite runs on xdist workers sized by `host-budget` (ops), so no test may
+collection. The suite runs on xdist workers sized by `host-budget` (hostkit), so no test may
 depend on another test's process or order.
 
 Known coverage gaps:

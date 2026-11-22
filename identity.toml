@@ -1,6 +1,6 @@
 # What this project is. `tools/ops-docs write` renders it into the identity region of
 # README.md and AGENTS.md; `tools/ops-docs check` refuses a commit while they differ.
-# Design: ops docs/specs/2026-09-22-project-guides-design.md §3.
+# Reference: ops docs/project-guides.md (Identity records).
 name = "atoms"
 aliases = []
 purpose = "A recoverable filesystem effect engine: the crash-safe substrate"
